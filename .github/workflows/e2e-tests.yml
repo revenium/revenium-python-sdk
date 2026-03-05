@@ -1,0 +1,123 @@
+name: E2E Tests (Manual)
+
+on:
+  workflow_dispatch:  # Manual trigger only
+    inputs:
+      python-version:
+        description: 'Python version to test'
+        required: false
+        default: '3.12'
+        type: choice
+        options:
+          - '3.10'
+          - '3.11'
+          - '3.12'
+
+jobs:
+  e2e-test:
+    name: E2E Tests - Python ${{ inputs.python-version }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ inputs.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Verify API keys are set
+        run: |
+          echo "Checking if API keys are properly configured..."
+          echo "NOTE: Using GitHub Secrets for E2E tests"
+          if [ -z "$REVENIUM_METERING_API_KEY" ]; then
+            echo "❌ ERROR: REVENIUM_METERING_API_KEY secret is not set!"
+            echo "   Go to: Settings → Secrets and variables → Actions → Secrets tab"
+            exit 1
+          fi
+          if [ -z "$REVENIUM_METERING_BASE_URL" ]; then
+            echo "❌ ERROR: REVENIUM_METERING_BASE_URL secret is not set!"
+            echo "   Go to: Settings → Secrets and variables → Actions → Secrets tab"
+            exit 1
+          fi
+          echo "✅ All required secrets are set"
+        env:
+          REVENIUM_METERING_API_KEY: ${{ secrets.REVENIUM_METERING_API_KEY }}
+          REVENIUM_METERING_BASE_URL: ${{ secrets.REVENIUM_METERING_BASE_URL }}
+
+      - name: Create conftest override for E2E
+        run: |
+          cat > tests/conftest_e2e.py << 'EOF'
+          """
+          E2E test configuration - disables auto-mocking for real API calls.
+
+          This file overrides the default conftest.py fixtures to allow
+          real API calls to Revenium during E2E testing.
+          """
+          import pytest
+
+
+          def pytest_configure(config):
+              """Configure pytest with custom markers."""
+              config.addinivalue_line(
+                  "markers",
+                  "unit: Unit tests (fast, no external dependencies)"
+              )
+              config.addinivalue_line(
+                  "markers",
+                  "e2e: End-to-end integration tests (require real API keys)"
+              )
+
+
+          def pytest_collection_modifyitems(config, items):
+              """Automatically mark tests based on file patterns."""
+              for item in items:
+                  # Mark E2E tests
+                  if "test_e2e" in str(item.fspath) or "test_end_to_end" in str(item.fspath):
+                      if "e2e" not in item.keywords:
+                          item.add_marker(pytest.mark.e2e)
+                  # Mark other tests as unit tests by default
+                  else:
+                      if "unit" not in item.keywords and "e2e" not in item.keywords:
+                          item.add_marker(pytest.mark.unit)
+
+
+          # NOTE: We do NOT include mock_revenium_client fixture here
+          # This allows real API calls to Revenium during E2E tests
+          EOF
+
+      - name: Run E2E tests
+        env:
+          REVENIUM_METERING_API_KEY: ${{ secrets.REVENIUM_METERING_API_KEY }}
+          REVENIUM_METERING_BASE_URL: ${{ secrets.REVENIUM_METERING_BASE_URL }}
+          PYTEST_CURRENT_TEST: "e2e"
+        run: |
+          echo "🧪 Running E2E Tests..."
+          # Backup original and use E2E version
+          cp tests/conftest.py tests/conftest_unit_backup.py
+          cp tests/conftest_e2e.py tests/conftest.py
+
+          # Ensure cleanup happens even on failure or cancellation
+          trap 'cp tests/conftest_unit_backup.py tests/conftest.py; rm tests/conftest_unit_backup.py' EXIT
+
+          pytest tests/ -v --tb=short -m "e2e" \
+            --junitxml=e2e-test-results.xml \
+            2>&1 | tee e2e-test-output.log
+
+      - name: Upload E2E test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-test-results-py${{ inputs.python-version }}
+          path: |
+            e2e-test-results.xml
+            e2e-test-output.log
+          retention-days: 30
+
