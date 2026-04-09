@@ -52,7 +52,11 @@ metadata = {
     # "trace_id": "session-abc-123",
     # "agent": "my-agent",
     # "subscription_id": "plan-pro",
-    # "response_quality_score": 0.95
+    # "response_quality_score": 0.95,
+    # "agentic_job_id": "job-abc123",
+    # "agentic_job_name": "Process Loan Application",
+    # "agentic_job_type": "loan-processing",
+    # "agentic_job_version": "1.0.0"
 }
 
 # Make request

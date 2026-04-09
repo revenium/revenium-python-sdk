@@ -52,7 +52,14 @@ def main():
         #     "trace_id": "session-abc123",
         #
         #     # Quality metrics
-        #     "response_quality_score": 0.95  # 0.0-1.0 scale
+        #     "response_quality_score": 0.95,  # 0.0-1.0 scale
+        #
+        #     # Agentic Job tracking
+        #     "agentic_job_id": "job-abc123",
+        #     "agentic_job_name": "Process Loan Application",
+        #     "agentic_job_type": "loan-processing",
+        #     "agentic_job_version": "1.0.0"
+        #
         # }
     )
 

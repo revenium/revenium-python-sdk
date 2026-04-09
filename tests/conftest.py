@@ -44,10 +44,31 @@ def mock_revenium_client():
 
     For E2E tests, this fixture should be overridden or disabled.
     """
-    with patch('revenium_middleware._core.metering.client') as mock_client:
-        # Configure the mock to return success for all metering calls
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {'status': 'success'}
-        mock_client.ai.create_completion.return_value = mock_response
-        yield mock_client
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {'status': 'success'}
+
+    mock_client = MagicMock()
+    mock_client.ai.create_completion.return_value = mock_response
+    mock_client.ai.create_image.return_value = mock_response
+    mock_client.ai.create_video.return_value = mock_response
+    mock_client.ai.create_audio.return_value = mock_response
+
+    # Patch client in all modules that import it directly
+    patches = [
+        patch('revenium_middleware._core.metering.client', mock_client),
+        patch('revenium_middleware.client', mock_client),
+    ]
+
+    # Conditionally patch fal module if loaded
+    try:
+        import revenium_middleware.fal._metering  # noqa: F401
+        patches.append(patch('revenium_middleware.fal._metering.client', mock_client))
+    except (ImportError, ModuleNotFoundError):
+        pass
+
+    for p in patches:
+        p.start()
+    yield mock_client
+    for p in patches:
+        p.stop()
