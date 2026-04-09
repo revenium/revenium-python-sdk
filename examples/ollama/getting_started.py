@@ -40,6 +40,10 @@ response = ollama.chat(
         # "productName": "spectral-analyzer-gold",
         # "agent": "chemistry-agent",
         # "response_quality_score": 0.95,  # Optional: 0.0-1.0 scale quality metric from your evaluation logic
+        # "agentic_job_id": "job-abc123",
+        # "agentic_job_name": "Process Loan Application",
+        # "agentic_job_type": "loan-processing",
+        # "agentic_job_version": "1.0.0"
     # },
 
 )

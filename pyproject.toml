@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "revenium-python-sdk"
-version = "0.1.0"
-description = "The official Revenium Python SDK — unified AI metering middleware for OpenAI, Anthropic, Google, Ollama, LiteLLM, and Perplexity."
+version = "0.1.1"
+description = "The official Revenium Python SDK — unified AI metering middleware for OpenAI, Anthropic, Google, Ollama, LiteLLM, Perplexity, and fal.ai."
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
@@ -15,7 +15,7 @@ authors = [
 dependencies = [
     "revenium_metering>=6.8.2"
 ]
-keywords = ["sdk", "ai", "llm", "middleware", "metering", "revenium", "openai", "anthropic", "google", "ollama", "litellm", "perplexity"]
+keywords = ["sdk", "ai", "llm", "middleware", "metering", "revenium", "openai", "anthropic", "google", "ollama", "litellm", "perplexity", "fal"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Programming Language :: Python :: 3",
@@ -81,6 +81,11 @@ anthropic = [
 ollama = [
     "wrapt",
     "ollama",
+]
+fal = [
+    "wrapt",
+    "fal-client>=0.13.0",
+    "python-dotenv>=0.19.0",
 ]
 litellm = [
     "wrapt",
