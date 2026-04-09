@@ -12,7 +12,7 @@ def get_package_version() -> str:
     try:
         return version("revenium-python-sdk")
     except PackageNotFoundError:
-        return "0.1.1"
+        return "0.1.2"
 
 
 def get_middleware_source() -> str:
