@@ -66,16 +66,21 @@ def main():
         messages=[{"role": "user", "content": "What is 2 + 2?"}],
         usage_metadata={
             # All fields are optional - use what you need
-            "organizationName": "AcmeCorp",
+            "organization_name": "AcmeCorp",
             "subscription_id": "premium-plan",
-            "productName": "customer-chatbot",
+            "product_name": "customer-chatbot",
             "agent": "math-helper",
             "task_type": "calculation",
             "trace_id": "session-001",
             "subscriber": {
                 "id": "user-123",
                 "email": "user@example.com"
-            }
+            },
+            "response_quality_score": 0.95,
+            # "agentic_job_id": "job-abc123",
+            # "agentic_job_name": "Process Loan Application",
+            # "agentic_job_type": "loan-processing",
+            # "agentic_job_version": "1.0.0"
         }
     )
     print(f"   Response: {response.choices[0].message.content}")

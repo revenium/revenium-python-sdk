@@ -407,15 +407,8 @@ class TestEmbeddingsMiddleware:
         assert True  # Function ran without error
 
     def test_embeddings_wrapper_existence(self):
-        """Test that the embeddings wrapper function exists and is properly decorated."""
-        # Import and verify the wrapper exists
         from revenium_middleware.openai.middleware import embeddings_create_wrapper
-        
-        # Verify it's callable
         assert callable(embeddings_create_wrapper)
-        
-        # Verify it has the wrapt decorator
-        assert hasattr(embeddings_create_wrapper, '__wrapped__')
 
     def test_extract_function_with_various_token_counts(self):
         """Test extract_usage_data with various token counts."""

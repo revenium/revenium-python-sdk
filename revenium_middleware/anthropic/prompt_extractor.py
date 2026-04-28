@@ -145,7 +145,7 @@ def extract_response_content(response: Any, prompts_truncated: bool = False) -> 
                         # Handle other content types (tool_use, etc.)
                         try:
                             content_blocks.append(json.dumps(block.__dict__, ensure_ascii=False))
-                        except:
+                        except Exception:
                             content_blocks.append(str(block))
 
             # Join all content blocks

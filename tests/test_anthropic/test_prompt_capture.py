@@ -226,34 +226,21 @@ class TestPromptCaptureIntegration:
     """Integration tests for prompt capture with middleware."""
 
     def test_prompt_capture_disabled_by_default(self):
-        """Test that prompt capture is disabled by default."""
-        from revenium_middleware.anthropic.config import Config
+        from revenium_middleware._core.config import is_capture_prompts_enabled
 
-        # Should be False by default
-        assert Config.CAPTURE_PROMPTS is False
+        assert is_capture_prompts_enabled() is False
 
     @patch.dict('os.environ', {'REVENIUM_CAPTURE_PROMPTS': 'true'})
     def test_prompt_capture_enabled_via_env(self):
-        """Test enabling prompt capture via environment variable."""
-        # Need to reload core config (where CAPTURE_PROMPTS is defined) then provider config
-        import importlib
-        from revenium_middleware._core import config as core_config
-        from revenium_middleware.anthropic import config
-        importlib.reload(core_config)
-        importlib.reload(config)
+        from revenium_middleware._core.config import is_capture_prompts_enabled
 
-        assert config.Config.CAPTURE_PROMPTS is True
+        assert is_capture_prompts_enabled() is True
 
     @patch.dict('os.environ', {'REVENIUM_CAPTURE_PROMPTS': 'false'})
     def test_prompt_capture_disabled_via_env(self):
-        """Test disabling prompt capture via environment variable."""
-        import importlib
-        from revenium_middleware._core import config as core_config
-        from revenium_middleware.anthropic import config
-        importlib.reload(core_config)
-        importlib.reload(config)
+        from revenium_middleware._core.config import is_capture_prompts_enabled
 
-        assert config.Config.CAPTURE_PROMPTS is False
+        assert is_capture_prompts_enabled() is False
 
     def test_max_prompt_length_constant(self):
         """Test that MAX_PROMPT_LENGTH is set correctly."""

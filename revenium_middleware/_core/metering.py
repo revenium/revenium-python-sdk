@@ -7,6 +7,7 @@ import atexit
 import signal
 from typing import Literal, Awaitable, Any, Optional, Callable
 from revenium_metering import ReveniumMetering
+from revenium_middleware._core.config import validate_api_key
 
 # Get the logger that was configured in __init__.py
 logger = logging.getLogger("revenium_middleware")
@@ -14,10 +15,46 @@ logger = logging.getLogger("revenium_middleware")
 # Define a StopReason literal type for strict typing of stop_reason
 StopReason = Literal["END", "END_SEQUENCE", "TIMEOUT", "TOKEN_LIMIT", "COST_LIMIT", "COMPLETION_LIMIT", "ERROR"]
 
-api_key = os.environ.get("REVENIUM_METERING_API_KEY") or "DUMMY_API_KEY"
-client = ReveniumMetering(api_key=api_key)
+def _build_metering_client(
+    api_key: Optional[str],
+    base_url_raw: Optional[str],
+) -> Optional[ReveniumMetering]:
+    """Construct a ReveniumMetering client from raw env-var inputs.
 
-# Keep track of active metering threads
+    Returns ``None`` when the API key is missing/empty (logs a warning).
+    Raises ``ValueError`` when the API key is present but malformed.
+    Falls back to the library default when ``base_url_raw`` is set but not
+    a valid http(s) URL.
+    """
+    validated_base_url: Optional[str] = None
+    if base_url_raw is not None:
+        stripped = base_url_raw.strip()
+        if stripped.startswith("http://") or stripped.startswith("https://"):
+            validated_base_url = stripped
+        else:
+            logger.warning(
+                "REVENIUM_METERING_BASE_URL=%r is invalid (must start with http:// or https://); "
+                "falling back to default endpoint",
+                base_url_raw,
+            )
+
+    if not api_key:
+        logger.warning("Metering API key not set -- metering is disabled")
+        return None
+
+    validate_api_key(api_key)
+    if validated_base_url is not None:
+        return ReveniumMetering(api_key=api_key, base_url=validated_base_url)
+    if base_url_raw is not None:
+        return ReveniumMetering(api_key=api_key, base_url="https://api.revenium.ai/meter/")
+    return ReveniumMetering(api_key=api_key)
+
+
+api_key = os.environ.get("REVENIUM_METERING_API_KEY")
+_base_url_raw = os.environ.get("REVENIUM_METERING_BASE_URL")
+client = _build_metering_client(api_key, _base_url_raw)
+
+_threads_lock = threading.Lock()
 active_threads = []
 shutdown_event = threading.Event()
 
@@ -40,23 +77,19 @@ def handle_exit(signum=None, frame=None):
         shutdown_event.set()
 
 
-    # Iterate over a copy of the list to avoid modification issues during iteration
-    threads_to_join = list(active_threads)
+    with _threads_lock:
+        threads_to_join = list(active_threads)
     for thread in threads_to_join:
         if thread.is_alive():
             logger.debug(f"Waiting for metering thread {thread.name} to finish...")
-            thread.join(timeout=5.0) # Wait up to 5 seconds for the thread
+            thread.join(timeout=5.0)
             if thread.is_alive():
                 logger.warning(f"Metering thread {thread.name} did not complete in time.")
             else:
                 logger.debug(f"Metering thread {thread.name} finished.")
-        # Clean up thread reference if it's already finished or after joining
-        if thread in active_threads:
-             try:
-                 active_threads.remove(thread)
-             except ValueError:
-                 # Thread might have been removed by itself in the finally block
-                 pass
+        with _threads_lock:
+            if thread in active_threads:
+                active_threads.remove(thread)
 
 
     logger.debug("Shutdown complete")
@@ -100,12 +133,9 @@ class MeteringThread(threading.Thread):
         # Check shutdown event *before* starting the loop
         if shutdown_event.is_set():
             logger.debug(f"Metering thread {self.name} not starting due to shutdown.")
-            # Ensure thread is removed from active_threads if it was added
-            if self in active_threads:
-                try:
+            with _threads_lock:
+                if self in active_threads:
                     active_threads.remove(self)
-                except ValueError:
-                    pass # Should not happen if logic is correct, but handle defensively
             return
 
         try:
@@ -133,17 +163,10 @@ class MeteringThread(threading.Thread):
             else:
                 logger.debug(f"Exception ignored in metering thread {self.name} during shutdown: {str(e)}")
         finally:
-            # Ensure the thread is removed from the active list upon completion or error
-            if self in active_threads:
-                try:
+            with _threads_lock:
+                if self in active_threads:
                     active_threads.remove(self)
                     logger.debug(f"Removed thread {self.name} from active list.")
-                except ValueError:
-                     # Can happen if handle_exit removes it first during shutdown join timeout
-                     logger.debug(f"Thread {self.name} already removed from active list.")
-            else:
-                 # This case might indicate the thread wasn't properly added or removed elsewhere
-                 logger.warning(f"Thread {self.name} finished but was not found in active_threads list.")
 
 
 def run_async_in_thread(coroutine_or_func):
@@ -190,18 +213,17 @@ def run_async_in_thread(coroutine_or_func):
     # Create and start the thread
     # Pass daemon=False explicitly if that's the desired default
     thread = MeteringThread(coro, daemon=False)
-    active_threads.append(thread)
-    logger.debug(f"Starting and adding thread {thread.name} to active list (now {len(active_threads)} threads).")
+    with _threads_lock:
+        active_threads.append(thread)
+    logger.debug(f"Starting and adding thread {thread.name} to active list.")
     try:
         thread.start()
     except RuntimeError as e:
         logger.error(f"Failed to start thread {thread.name}: {e}", exc_info=True)
         # Clean up: remove the thread we failed to start
-        if thread in active_threads:
-            try:
+        with _threads_lock:
+            if thread in active_threads:
                 active_threads.remove(thread)
-            except ValueError:
-                pass # Should be there, but handle defensively
-        return None # Indicate failure to start
+        return None
 
     return thread

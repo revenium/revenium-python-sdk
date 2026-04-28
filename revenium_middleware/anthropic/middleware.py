@@ -6,6 +6,7 @@ import contextvars
 import os
 import threading
 import queue
+import uuid
 from typing import Optional, Callable, Any, Dict, Tuple
 
 # Import our provider detection and Bedrock adapter
@@ -18,6 +19,10 @@ from .bedrock_adapter import (
 # Import decorator support and metering client from core package
 from revenium_middleware import client, run_async_in_thread, shutdown_event, merge_metadata
 from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
+from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, merge_extra_body
+from revenium_middleware._core.config import is_selective_metering_enabled, is_capture_prompts_enabled
+from revenium_middleware._core.context import is_inside_decorated_function
+from revenium_middleware._core.patch_registry import register_patch
 
 # Import trace visualization functions
 from .trace_fields import (
@@ -80,7 +85,7 @@ def _emit_usage_summary(
                 output_token_count=completion_tokens,
                 total_token_count=prompt_tokens + completion_tokens,
                 transaction_id=response_id,
-                trace_id=usage_metadata.get("trace_id"),
+                trace_id=usage_metadata.get("trace_id") or usage_metadata.get("traceId"),
                 revenium_api_key=revenium_api_key,
             )
 
@@ -100,35 +105,24 @@ if os.getenv("REVENIUM_DEBUG", "").lower() in ("true", "1", "yes"):
 # Thread-safe metering infrastructure
 _metering_lock = threading.RLock()
 _metering_queue = queue.Queue(maxsize=1000)  # Prevent memory issues
-_client_cache = {}
-_client_cache_lock = threading.RLock()
+_thread_local = threading.local()
 
 
 def _get_thread_safe_client():
-    """Get a thread-safe Revenium client instance."""
-    thread_id = threading.get_ident()
+    cached = getattr(_thread_local, 'client', None)
+    if cached is not None:
+        return cached
 
-    with _client_cache_lock:
-        if thread_id in _client_cache:
-            return _client_cache[thread_id]
-
-        # Import here to avoid circular imports and ensure proper initialization
-        try:
-            # Import the client module to get a fresh instance per thread
-            import revenium_middleware
-
-            # Use the pre-instantiated client instance from revenium_middleware
-            thread_client = revenium_middleware.client
-            _client_cache[thread_id] = thread_client
-            logger.debug(f"Created thread-safe client for thread {thread_id}")
-            return thread_client
-        except Exception as e:
-            logger.warning(f"Failed to create thread-safe client: {e}")
-            return None
+    try:
+        import revenium_middleware
+        _thread_local.client = revenium_middleware.client
+        return _thread_local.client
+    except Exception as e:
+        logger.warning(f"Failed to create thread-safe client: {e}")
+        return None
 
 
 def _safe_run_async_in_thread(coro_func: Callable, *args, **kwargs):
-    """Thread-safe wrapper for async operations with proper error handling."""
     try:
         from revenium_middleware import run_async_in_thread, shutdown_event
 
@@ -136,11 +130,12 @@ def _safe_run_async_in_thread(coro_func: Callable, *args, **kwargs):
             logger.warning("Skipping async operation during shutdown")
             return None
 
-        # Use a lock to prevent concurrent async operations from interfering
         with _metering_lock:
-            thread = run_async_in_thread(coro_func(*args, **kwargs))
-            logger.debug(f"Started thread-safe async operation: {thread}")
-            return thread
+            coroutine = coro_func(*args, **kwargs)
+
+        thread = run_async_in_thread(coroutine)
+        logger.debug(f"Started thread-safe async operation: {thread}")
+        return thread
     except Exception as e:
         logger.warning(f"Error in thread-safe async operation: {e}")
         return None
@@ -162,7 +157,7 @@ def extract_prompt_data_if_enabled(
     Returns:
         Tuple of (system_prompt, input_messages, output_response, prompts_truncated)
     """
-    if not Config.CAPTURE_PROMPTS or not request_body:
+    if not is_capture_prompts_enabled() or not request_body:
         return None, None, None, None
 
     # Extract prompts from request
@@ -378,14 +373,16 @@ def _create_bedrock_metering_call(response, usage_metadata, request_time, respon
             extra_body = {}
             if trace_fields.get('has_vision_content'):
                 extra_body['hasVisionContent'] = True
+            extra_body = merge_extra_body(extra_body, extract_agentic_job_fields(usage_metadata))
 
-            # Extract organization and product names with backward compatibility
+            # Extract organization, product, and common metadata with alias support
             organization_name, product_name = _extract_organization_and_product_names(usage_metadata)
+            meta = extract_common_metadata(usage_metadata)
 
             result = client.ai.create_completion(
-                cache_creation_token_count=0,  # Bedrock doesn't provide cache info yet
+                cache_creation_token_count=0,
                 cache_read_token_count=0,
-                input_token_cost=None,  # Backend calculates pricing
+                input_token_cost=None,
                 output_token_cost=None,
                 total_cost=None,
                 output_token_count=response.usage.output_tokens,
@@ -399,21 +396,20 @@ def _create_bedrock_metering_call(response, usage_metadata, request_time, respon
                 response_time=response_time,
                 completion_start_time=response_time,
                 request_duration=int(request_duration),
-                time_to_first_token=int(request_duration),  # For non-streaming
-                stop_reason="END",  # Simplified for MVP
+                time_to_first_token=int(request_duration),
+                stop_reason="END",
                 total_token_count=response.usage.total_tokens,
                 transaction_id=response.id,
-                trace_id=usage_metadata.get("trace_id"),
-                task_type=usage_metadata.get("task_type"),
+                trace_id=meta["trace_id"],
+                task_type=meta["task_type"],
                 subscriber=subscriber if subscriber else None,
                 organization_name=organization_name,
-                subscription_id=usage_metadata.get("subscription_id"),
+                subscription_id=meta["subscription_id"],
                 product_name=product_name,
-                agent=usage_metadata.get("agent"),
-                response_quality_score=usage_metadata.get("response_quality_score"),
+                agent=meta["agent"],
+                response_quality_score=meta["response_quality_score"],
                 is_streamed=False,
                 operation_type=trace_fields.get('operation_type', 'CHAT'),
-                # Trace visualization fields
                 environment=trace_fields.get('environment'),
                 region=trace_fields.get('region'),
                 credential_alias=trace_fields.get('credential_alias'),
@@ -423,7 +419,6 @@ def _create_bedrock_metering_call(response, usage_metadata, request_time, respon
                 transaction_name=trace_fields.get('transaction_name'),
                 retry_number=trace_fields.get('retry_number'),
                 operation_subtype=trace_fields.get('operation_subtype'),
-                # Additional fields via extra_body
                 extra_body=extra_body if extra_body else None,
             )
             logger.debug("Bedrock metering call result: %s", result)
@@ -506,8 +501,12 @@ def _sanitize_metadata(metadata: dict, operation_name: str, max_depth: int = 5, 
         if isinstance(value, dict):
             sanitized[key] = _sanitize_metadata(value, operation_name, max_depth, current_depth + 1)
         elif isinstance(value, (list, tuple)):
-            # Convert lists/tuples to strings to avoid complex nested structures
-            sanitized[key] = str(value)
+            sanitized[key] = type(value)(
+                _sanitize_metadata(item, operation_name, max_depth, current_depth + 1) if isinstance(item, dict)
+                else item if isinstance(item, (str, int, float, bool, type(None)))
+                else str(item)
+                for item in value
+            )
         elif isinstance(value, (str, int, float, bool)):
             sanitized[key] = value
         elif value is None:
@@ -519,552 +518,612 @@ def _sanitize_metadata(metadata: dict, operation_name: str, max_depth: int = 5, 
     return sanitized
 
 
-def _extract_organization_and_product_names(usage_metadata: dict) -> tuple:
-    """
-    Extract organization name and product name from usage metadata.
-
-    Supports both new field names (organizationName, productName) and
-    deprecated field names (organizationId, productId) for backward compatibility.
-    New field names take precedence over deprecated ones.
-
-    Precedence order (highest to lowest):
-    1. organizationName / productName (camelCase - API-level, documented)
-    2. organization_name / product_name (snake_case - alternative)
-    3. organizationId / productId (camelCase - deprecated)
-    4. organization_id / product_id (snake_case - deprecated)
-
-    Args:
-        usage_metadata: Dictionary containing usage metadata
-
-    Returns:
-        tuple: (organization_name, product_name)
-    """
-    # Extract organization name (support both new and deprecated field names)
-    # Using 'or' logic to handle empty strings and fallback properly
-    # Check camelCase first (API-level, documented format), then snake_case, then deprecated
-    organization_name = (
-        usage_metadata.get("organizationName")
-        or usage_metadata.get("organization_name")
-        or usage_metadata.get("organizationId")
-        or usage_metadata.get("organization_id")
-    )
-
-    # Emit deprecation warning if using old field names
-    if not (usage_metadata.get("organizationName") or usage_metadata.get("organization_name")):
-        if usage_metadata.get("organizationId") or usage_metadata.get("organization_id"):
-            logger.warning(
-                "Fields 'organizationId' and 'organization_id' are deprecated. "
-                "Use 'organizationName' instead. "
-                "The old fields will be removed in a future version."
-            )
-
-    # Extract product name (support both new and deprecated field names)
-    # Using 'or' logic to handle empty strings and fallback properly
-    # Check camelCase first (API-level, documented format), then snake_case, then deprecated
-    product_name = (
-        usage_metadata.get("productName")
-        or usage_metadata.get("product_name")
-        or usage_metadata.get("productId")
-        or usage_metadata.get("product_id")
-    )
-
-    # Emit deprecation warning if using old field names
-    if not (usage_metadata.get("productName") or usage_metadata.get("product_name")):
-        if usage_metadata.get("productId") or usage_metadata.get("product_id"):
-            logger.warning(
-                "Fields 'productId' and 'product_id' are deprecated. "
-                "Use 'productName' instead. "
-                "The old fields will be removed in a future version."
-            )
-
-    return organization_name, product_name
+_extract_organization_and_product_names = extract_org_and_product
 
 
-@wrapt.patch_function_wrapper('anthropic.resources.messages.messages', 'Messages.create')
-def create_wrapper(wrapped, instance, args, kwargs):
-    """
-    Wraps the anthropic.ChatCompletion.create method to log token usage.
-    Now supports both direct Anthropic API and AWS Bedrock routing.
-    """
-    logger.debug("Anthropic client.messages.create wrapper called: %s: %s", wrapped, args)
+if register_patch("anthropic.resources.messages.messages.Messages.create"):
+    @wrapt.patch_function_wrapper('anthropic.resources.messages.messages', 'Messages.create')
+    def create_wrapper(wrapped, instance, args, kwargs):
+        if is_selective_metering_enabled() and not is_inside_decorated_function():
+            return wrapped(*args, **kwargs)
 
-    # Extract usage metadata and timing using shared handler
-    usage_metadata, request_time, request_time_dt = extract_usage_metadata_and_timing(kwargs, "create")
+        logger.debug("Anthropic client.messages.create wrapper called: %s: %s", wrapped, args)
 
-    # Check if Bedrock is disabled via environment variable
-    if os.getenv("REVENIUM_BEDROCK_DISABLE") == "1":
-        logger.debug("Bedrock support disabled via REVENIUM_BEDROCK_DISABLE")
-        provider = Provider.ANTHROPIC
-    else:
-        # Detect provider based on client and parameters
-        client_instance = getattr(instance, '_client', None) if instance else None
-        base_url = kwargs.get('base_url', None)
-        provider = detect_provider(client=client_instance, base_url=base_url)
+        usage_metadata, request_time, request_time_dt = extract_usage_metadata_and_timing(kwargs, "create")
 
-    logger.debug(f"Detected provider: {provider}")
-
-    # Route to appropriate handler
-    if provider == Provider.BEDROCK:
-        try:
-            logger.debug("Routing to Bedrock handler")
-            return _handle_bedrock_request(args, kwargs, usage_metadata, request_time_dt, request_time)
-        except (BedrockValidationError, BedrockInvokeError) as e:
-            logger.error(f"Bedrock request failed: {e}. Falling back to direct Anthropic API.")
-            # Fall back to direct Anthropic API on Bedrock-specific errors
+        if os.getenv("REVENIUM_BEDROCK_DISABLE") == "1":
+            logger.debug("Bedrock support disabled via REVENIUM_BEDROCK_DISABLE")
             provider = Provider.ANTHROPIC
-        except ImportError as e:
-            logger.error(f"Bedrock dependencies not available: {e}. Falling back to direct Anthropic API.")
-            # Fall back to direct Anthropic API if boto3 not installed
-            provider = Provider.ANTHROPIC
-        except Exception as e:
-            logger.error(f"Unexpected error in Bedrock handler: {e}. Falling back to direct Anthropic API.")
-            # Fall back to direct Anthropic API on unexpected errors
-            provider = Provider.ANTHROPIC
+        else:
+            client_instance = getattr(instance, '_client', None) if instance else None
+            base_url = kwargs.get('base_url', None)
+            provider = detect_provider(client=client_instance, base_url=base_url)
 
-    # Handle direct Anthropic API (original logic)
-    logger.debug("REVENIUM MIDDLEWARE: Calling client.messages.create with args: %s, kwargs: %s", args, kwargs)
-
-    # Capture request kwargs for vision detection before calling wrapped
-    # (need to preserve messages for detecting vision content in metering call)
-    request_kwargs = dict(kwargs)
-
-    response = wrapped(*args, **kwargs)
-    logger.debug("REVENIUM MIDDLEWARE: Received response from client.messages.create: %s", response.id)
-    logger.debug(
-        "Anthropic client.messages.create response: %s",
-        response)
-    response_time_dt = datetime.datetime.now(datetime.timezone.utc)
-    response_time = response_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    request_duration = (response_time_dt - request_time_dt).total_seconds() * 1000
-    response_id = response.id
-
-    prompt_tokens = response.usage.input_tokens
-    completion_tokens = response.usage.output_tokens
-    cache_creation_input_tokens = response.usage.cache_creation_input_tokens
-    cache_read_input_tokens = response.usage.cache_read_input_tokens
-
-    logger.debug(
-        "Anthropic client.ai.create_completion token usage - prompt: %d, completion: %d, "
-        "cache_creation_input_tokens: %d,cache_read_input_tokens: %d",
-        prompt_tokens, completion_tokens, cache_creation_input_tokens, cache_read_input_tokens
-    )
-
-    anthropic_finish_reason = None
-    if response.stop_reason:
-        anthropic_finish_reason = response.stop_reason
-
-    finish_reason_map = {
-        "end_turn": "END",
-        "tool_use": "END_SEQUENCE",
-        "max_tokens": "TOKEN_LIMIT",
-        "content_filter": "ERROR"
-    }
-    stop_reason = finish_reason_map.get(anthropic_finish_reason, "end_turn")  # type: ignore
-
-    # Extract prompt data if capture is enabled
-    (system_prompt, input_messages, output_response, prompts_truncated) = (
-        extract_prompt_data_if_enabled(kwargs, response=response)
-    )
-
-    # Get provider metadata for metering
-    provider_metadata = get_provider_metadata(provider)
-
-    async def metering_call():
-        try:
-            from revenium_middleware import shutdown_event
-
-            if shutdown_event.is_set():
-                logger.warning("Skipping metering call during shutdown")
-                return
-            logger.debug("Metering call to Revenium for completion %s with usage_metadata: %s", response_id,
-                         usage_metadata)
-
-            # Get thread-safe client
-            client = _get_thread_safe_client()
-            if not client:
-                logger.warning("No thread-safe client available for metering")
-                return
-
-            # Create subscriber object from usage metadata
-            subscriber = extract_subscriber_from_metadata(usage_metadata)
-
-            # Extract trace visualization fields (pass request kwargs for vision detection)
-            trace_fields = _extract_trace_fields(usage_metadata, request_kwargs)
-
-            # Build extra_body for additional fields not in SDK
-            extra_body = {}
-            if trace_fields.get('has_vision_content'):
-                extra_body['hasVisionContent'] = True
-
-            # Extract organization and product names with backward compatibility
-            organization_name, product_name = _extract_organization_and_product_names(usage_metadata)
-
-            result = client.ai.create_completion(
-                cache_creation_token_count=cache_creation_input_tokens,
-                cache_read_token_count=cache_read_input_tokens,
-                input_token_cost=None,
-                output_token_cost=None,
-                total_cost=None,
-                output_token_count=completion_tokens,
-                cost_type="AI",
-                model=response.model,
-                input_token_count=prompt_tokens,
-                provider=provider_metadata["provider"],
-                model_source=provider_metadata["model_source"],
-                reasoning_token_count=0,
-                request_time=request_time,
-                response_time=response_time,
-                completion_start_time=response_time,
-                request_duration=int(request_duration),
-                time_to_first_token=int(request_duration),  # For non-streaming, use the full request duration
-                stop_reason=stop_reason,
-                total_token_count=prompt_tokens + completion_tokens,
-                transaction_id=response_id,
-                trace_id=usage_metadata.get("trace_id"),
-                task_type=usage_metadata.get("task_type"),
-                subscriber=subscriber if subscriber else None,
-                organization_name=organization_name,
-                subscription_id=usage_metadata.get("subscription_id"),
-                product_name=product_name,
-                agent=usage_metadata.get("agent"),
-                response_quality_score=usage_metadata.get("response_quality_score"),
-                is_streamed=False,
-                operation_type=trace_fields.get('operation_type', 'CHAT'),
-                middleware_source="PYTHON",
-                # Trace visualization fields
-                environment=trace_fields.get('environment'),
-                region=trace_fields.get('region'),
-                credential_alias=trace_fields.get('credential_alias'),
-                trace_type=trace_fields.get('trace_type'),
-                trace_name=trace_fields.get('trace_name'),
-                parent_transaction_id=trace_fields.get('parent_transaction_id'),
-                transaction_name=trace_fields.get('transaction_name'),
-                retry_number=trace_fields.get('retry_number'),
-                operation_subtype=trace_fields.get('operation_subtype'),
-                # Prompt capture fields
-                system_prompt=system_prompt,
-                input_messages=input_messages,
-                output_response=output_response,
-                prompts_truncated=prompts_truncated,
-                # Additional fields via extra_body (for vision detection)
-                extra_body=extra_body if extra_body else None,
-            )
-            logger.debug("Metering call result: %s", result)
-            # Treat any successful resource response as success; only warn on explicit failure
-            success = False
-            try:
-                if result is None:
-                    success = False
-                elif hasattr(result, 'status_code'):
-                    status_code = int(getattr(result, 'status_code', 0) or 0)
-                    success = 200 <= status_code < 300
-                elif hasattr(result, 'resource_type') or hasattr(result, 'resourceType') or hasattr(result, 'id'):
-                    # Revenium SDK returns a resource object on success (e.g., MeteringResponseResource)
-                    success = True
-                else:
-                    # Unknown shape but non-empty result; assume success
-                    success = True
-            except Exception:
-                success = False
-
-            if success:
-                logger.debug("[REVENIUM SUCCESS] Metering call successful for transaction %s", response_id)
-            else:
-                logger.warning("[REVENIUM ERROR] Metering call did not return success for transaction %s: %s", response_id, result)
-
-            # Print usage summary if enabled (async, fire-and-forget)
-            # Print regardless of metering success - user should see API usage even if metering fails
-            _emit_usage_summary(
-                model=response.model,
-                provider=provider_metadata["provider"],
-                request_duration=request_duration,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                response_id=response_id,
-                usage_metadata=usage_metadata,
-            )
-        except Exception as e:
-            from revenium_middleware import shutdown_event
-            if not shutdown_event.is_set():
-                logger.warning(f"Error in metering call: {str(e)}")
-                # Log the full traceback for better debugging
-                import traceback
-                logger.warning(f"Traceback: {traceback.format_exc()}")
-
-    thread = _safe_run_async_in_thread(metering_call)
-    logger.debug("Metering thread started: %s", thread)
-    return response
-
-
-@wrapt.patch_function_wrapper('anthropic.resources.messages.messages', 'Messages.stream')
-def stream_wrapper(wrapped, instance, args, kwargs):
-    """
-    Wraps the anthropic.resources.messages.Messages.stream method to log token usage.
-    Extracts usage data from the final message of the stream.
-
-    Note: Bedrock streaming is not yet supported in MVP. Falls back to direct Anthropic API.
-    """
-    logger.debug("REVENIUM MIDDLEWARE: Intercepted client.messages.stream call - wrapper active")
-
-    # Extract usage metadata and timing using shared handler
-    usage_metadata, request_time, request_time_dt = extract_usage_metadata_and_timing(kwargs, "stream")
-
-    # Check if this would be a Bedrock request
-    if os.getenv("REVENIUM_BEDROCK_DISABLE") != "1":
-        client_instance = getattr(instance, '_client', None) if instance else None
-        base_url = kwargs.get('base_url', None)
-        provider = detect_provider(client=client_instance, base_url=base_url)
+        logger.debug(f"Detected provider: {provider}")
 
         if provider == Provider.BEDROCK:
             try:
-                logger.debug("Routing streaming request to Bedrock handler")
-                return _handle_bedrock_stream_request(args, kwargs, usage_metadata, request_time_dt, request_time)
-            except (BedrockValidationError, BedrockStreamError) as e:
-                logger.error(f"Bedrock streaming request failed: {e}. Falling back to direct Anthropic API.")
-                # Fall back to direct Anthropic API on Bedrock-specific errors
+                logger.debug("Routing to Bedrock handler")
+                return _handle_bedrock_request(args, kwargs, usage_metadata, request_time_dt, request_time)
+            except (BedrockValidationError, BedrockInvokeError) as e:
+                logger.error(f"Bedrock request failed: {e}. Falling back to direct Anthropic API.")
+                provider = Provider.ANTHROPIC
             except ImportError as e:
                 logger.error(f"Bedrock dependencies not available: {e}. Falling back to direct Anthropic API.")
-                # Fall back to direct Anthropic API if boto3 not installed
+                provider = Provider.ANTHROPIC
             except Exception as e:
-                logger.error(f"Unexpected error in Bedrock streaming handler: {e}. Falling back to direct Anthropic API.")
-                # Fall back to direct Anthropic API on unexpected errors
+                logger.error(f"Unexpected error in Bedrock handler: {e}. Falling back to direct Anthropic API.")
+                provider = Provider.ANTHROPIC
 
-    logger.debug("REVENIUM MIDDLEWARE: Calling client.messages.stream with args: %s, kwargs: %s", args, kwargs)
+        logger.debug("REVENIUM MIDDLEWARE: Calling client.messages.create with model=%s, max_tokens=%s",
+                     kwargs.get("model"), kwargs.get("max_tokens"))
 
-    # Capture request kwargs for vision detection before calling wrapped
-    # (need to preserve messages for detecting vision content in metering call)
-    request_kwargs = dict(kwargs)
+        request_kwargs = dict(kwargs)
 
-    stream = wrapped(*args, **kwargs)
-    logger.debug("REVENIUM MIDDLEWARE: Received stream from client.messages.stream")
+        response = wrapped(*args, **kwargs)
+        response_id = getattr(response, 'id', None) or f"anthropic-{uuid.uuid4().hex[:16]}"
+        logger.debug("REVENIUM MIDDLEWARE: Received response from client.messages.create: %s", response_id)
+        response_time_dt = datetime.datetime.now(datetime.timezone.utc)
+        response_time = response_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        request_duration = (response_time_dt - request_time_dt).total_seconds() * 1000
 
-    # Create a wrapper for the stream that will capture the final message
-    class StreamWrapper:
-        def __init__(self, stream):
-            self.stream = stream
-            self.response_time_dt = None
-            self.response_id = None
-            self.collected_content = []
-            self.final_message = None
-            self.first_token_time = None
-            self.request_start_time = time.time() * 1000  # Convert to milliseconds
+        if response.usage is None:
+            return response
 
-        def __enter__(self):
-            self.stream_context = self.stream.__enter__()
-            return self
+        prompt_tokens = response.usage.input_tokens
+        completion_tokens = response.usage.output_tokens
+        cache_creation_input_tokens = response.usage.cache_creation_input_tokens
+        cache_read_input_tokens = response.usage.cache_read_input_tokens
 
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            result = self.stream.__exit__(exc_type, exc_val, exc_tb)
+        logger.debug(
+            "Anthropic client.ai.create_completion token usage - prompt: %d, completion: %d, "
+            "cache_creation_input_tokens: %d,cache_read_input_tokens: %d",
+            prompt_tokens, completion_tokens, cache_creation_input_tokens, cache_read_input_tokens
+        )
 
-            # Get the final message with usage information
+        anthropic_finish_reason = None
+        if response.stop_reason:
+            anthropic_finish_reason = response.stop_reason
+
+        finish_reason_map = {
+            "end_turn": "END",
+            "tool_use": "END_SEQUENCE",
+            "max_tokens": "TOKEN_LIMIT",
+            "content_filter": "ERROR"
+        }
+        stop_reason = finish_reason_map.get(anthropic_finish_reason, "END")
+
+        (system_prompt, input_messages, output_response, prompts_truncated) = (
+            extract_prompt_data_if_enabled(kwargs, response=response)
+        )
+
+        provider_metadata = get_provider_metadata(provider)
+
+        async def metering_call():
             try:
-                self.final_message = self.stream_context.get_final_message()
-                self.response_time_dt = datetime.datetime.now(datetime.timezone.utc)
-                self.response_time = self.response_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-                request_duration = (self.response_time_dt - request_time_dt).total_seconds() * 1000
+                from revenium_middleware import shutdown_event
 
-                self.response_id = self.final_message.id
+                if shutdown_event.is_set():
+                    logger.warning("Skipping metering call during shutdown")
+                    return
+                logger.debug("Metering call to Revenium for completion %s with usage_metadata: %s", response_id,
+                             usage_metadata)
 
-                prompt_tokens = self.final_message.usage.input_tokens
-                completion_tokens = self.final_message.usage.output_tokens
-                cache_creation_input_tokens = self.final_message.usage.cache_creation_input_tokens
-                cache_read_input_tokens = self.final_message.usage.cache_read_input_tokens
+                client = _get_thread_safe_client()
+                if not client:
+                    logger.warning("No thread-safe client available for metering")
+                    return
 
-                logger.debug(
-                    "Anthropic client.messages.stream token usage - prompt: %d, completion: %d, "
-                    "cache_creation_input_tokens: %d, cache_read_input_tokens: %d",
-                    prompt_tokens, completion_tokens, cache_creation_input_tokens, cache_read_input_tokens
+                subscriber = extract_subscriber_from_metadata(usage_metadata)
+
+                trace_fields = _extract_trace_fields(usage_metadata, request_kwargs)
+
+                extra_body = {}
+                if trace_fields.get('has_vision_content'):
+                    extra_body['hasVisionContent'] = True
+                extra_body = merge_extra_body(extra_body, extract_agentic_job_fields(usage_metadata))
+
+                organization_name, product_name = _extract_organization_and_product_names(usage_metadata)
+                meta = extract_common_metadata(usage_metadata)
+
+                result = client.ai.create_completion(
+                    cache_creation_token_count=cache_creation_input_tokens,
+                    cache_read_token_count=cache_read_input_tokens,
+                    input_token_cost=None,
+                    output_token_cost=None,
+                    total_cost=None,
+                    output_token_count=completion_tokens,
+                    cost_type="AI",
+                    model=response.model,
+                    input_token_count=prompt_tokens,
+                    provider=provider_metadata["provider"],
+                    model_source=provider_metadata["model_source"],
+                    reasoning_token_count=0,
+                    request_time=request_time,
+                    response_time=response_time,
+                    completion_start_time=response_time,
+                    request_duration=int(request_duration),
+                    time_to_first_token=int(request_duration),
+                    stop_reason=stop_reason,
+                    total_token_count=prompt_tokens + completion_tokens,
+                    transaction_id=response_id,
+                    trace_id=meta["trace_id"],
+                    task_type=meta["task_type"],
+                    subscriber=subscriber if subscriber else None,
+                    organization_name=organization_name,
+                    subscription_id=meta["subscription_id"],
+                    product_name=product_name,
+                    agent=meta["agent"],
+                    response_quality_score=meta["response_quality_score"],
+                    is_streamed=False,
+                    operation_type=trace_fields.get('operation_type', 'CHAT'),
+                    middleware_source="PYTHON",
+                    environment=trace_fields.get('environment'),
+                    region=trace_fields.get('region'),
+                    credential_alias=trace_fields.get('credential_alias'),
+                    trace_type=trace_fields.get('trace_type'),
+                    trace_name=trace_fields.get('trace_name'),
+                    parent_transaction_id=trace_fields.get('parent_transaction_id'),
+                    transaction_name=trace_fields.get('transaction_name'),
+                    retry_number=trace_fields.get('retry_number'),
+                    operation_subtype=trace_fields.get('operation_subtype'),
+                    system_prompt=system_prompt,
+                    input_messages=input_messages,
+                    output_response=output_response,
+                    prompts_truncated=prompts_truncated,
+                    extra_body=extra_body if extra_body else None,
                 )
-
-                anthropic_finish_reason = None
-                if self.final_message.stop_reason:
-                    anthropic_finish_reason = self.final_message.stop_reason
-
-                finish_reason_map = {
-                    "end_turn": "END",
-                    "tool_use": "END_SEQUENCE",
-                    "max_tokens": "TOKEN_LIMIT",
-                    "content_filter": "ERROR"
-                }
-                stop_reason = finish_reason_map.get(anthropic_finish_reason, "end_turn")  # type: ignore
-
-                # Extract prompt data if capture is enabled (for streaming)
-                accumulated_content = ''.join(self.collected_content)
-                (system_prompt, input_messages, output_response, prompts_truncated) = (
-                    extract_prompt_data_if_enabled(kwargs, accumulated_content=accumulated_content)
-                )
-
-                # For streaming, we always use Anthropic provider metadata since Bedrock streaming falls back
-                provider_metadata = get_provider_metadata(Provider.ANTHROPIC)
-
-                async def metering_call():
-                    try:
-                        from revenium_middleware import shutdown_event
-
-                        if shutdown_event.is_set():
-                            logger.warning("Skipping metering call during shutdown")
-                            return
-                        logger.debug("Metering call to Revenium for stream completion %s", self.response_id)
-
-                        # Get thread-safe client
-                        client = _get_thread_safe_client()
-                        if not client:
-                            logger.warning("No thread-safe client available for stream metering")
-                            return
-
-                        # Create subscriber object from usage metadata
-                        subscriber = extract_subscriber_from_metadata(usage_metadata)
-
-                        # Extract trace visualization fields (pass request kwargs for vision detection)
-                        trace_fields = _extract_trace_fields(usage_metadata, request_kwargs)
-
-                        # Build extra_body for additional fields not in SDK
-                        extra_body = {}
-                        if trace_fields.get('has_vision_content'):
-                            extra_body['hasVisionContent'] = True
-
-                        # Extract organization and product names with backward compatibility
-                        organization_name, product_name = _extract_organization_and_product_names(usage_metadata)
-
-                        result = client.ai.create_completion(
-                            cache_creation_token_count=cache_creation_input_tokens,
-                            cache_read_token_count=cache_read_input_tokens,
-                            input_token_cost=None,
-                            output_token_cost=None,
-                            total_cost=None,
-                            output_token_count=completion_tokens,
-                            cost_type="AI",
-                            model=self.final_message.model,
-                            input_token_count=prompt_tokens,
-                            provider=provider_metadata["provider"],
-                            model_source=provider_metadata["model_source"],
-                            reasoning_token_count=0,
-                            request_time=request_time,
-                            response_time=self.response_time,
-                            completion_start_time=self.response_time,
-                            request_duration=int(request_duration),
-                            time_to_first_token=int(
-                                self.first_token_time - self.request_start_time) if self.first_token_time else 0,
-                            stop_reason=stop_reason,
-                            total_token_count=prompt_tokens + completion_tokens,
-                            transaction_id=self.response_id,
-                            trace_id=usage_metadata.get("trace_id"),
-                            task_type=usage_metadata.get("task_type"),
-                            subscriber=subscriber if subscriber else None,
-                            organization_name=organization_name,
-                            subscription_id=usage_metadata.get("subscription_id"),
-                            product_name=product_name,
-                            agent=usage_metadata.get("agent"),
-                            is_streamed=True,
-                            operation_type=trace_fields.get('operation_type', 'CHAT'),
-                            response_quality_score=usage_metadata.get("response_quality_score"),
-                            middleware_source="PYTHON",
-                            # Trace visualization fields
-                            environment=trace_fields.get('environment'),
-                            region=trace_fields.get('region'),
-                            credential_alias=trace_fields.get('credential_alias'),
-                            trace_type=trace_fields.get('trace_type'),
-                            trace_name=trace_fields.get('trace_name'),
-                            parent_transaction_id=trace_fields.get('parent_transaction_id'),
-                            transaction_name=trace_fields.get('transaction_name'),
-                            retry_number=trace_fields.get('retry_number'),
-                            operation_subtype=trace_fields.get('operation_subtype'),
-                            # Prompt capture fields
-                            system_prompt=system_prompt,
-                            input_messages=input_messages,
-                            output_response=output_response,
-                            prompts_truncated=prompts_truncated,
-                            # Additional fields via extra_body (for vision detection)
-                            extra_body=extra_body if extra_body else None,
-                        )
-                        logger.debug("Metering call result for stream: %s", result)
-                        # Treat any successful resource response as success; only warn on explicit failure
+                logger.debug("Metering call result: %s", result)
+                success = False
+                try:
+                    if result is None:
                         success = False
-                        try:
-                            if result is None:
-                                success = False
-                            elif hasattr(result, 'status_code'):
-                                status_code = int(getattr(result, 'status_code', 0) or 0)
-                                success = 200 <= status_code < 300
-                            elif hasattr(result, 'resource_type') or hasattr(result, 'resourceType') or hasattr(result, 'id'):
-                                success = True
-                            else:
-                                success = True
-                        except Exception:
-                            success = False
+                    elif hasattr(result, 'status_code'):
+                        status_code = int(getattr(result, 'status_code', 0) or 0)
+                        success = 200 <= status_code < 300
+                    elif hasattr(result, 'resource_type') or hasattr(result, 'resourceType') or hasattr(result, 'id'):
+                        success = True
+                    else:
+                        success = True
+                except Exception:
+                    success = False
 
-                        if success:
-                            logger.debug("[REVENIUM SUCCESS] Streaming metering call successful for transaction %s", self.response_id)
-                        else:
-                            logger.warning(
-                                "[REVENIUM ERROR] Streaming metering call did not return success for transaction %s: %s",
-                                self.response_id, result
-                            )
+                if success:
+                    logger.debug("[REVENIUM SUCCESS] Metering call successful for transaction %s", response_id)
+                else:
+                    logger.warning("[REVENIUM ERROR] Metering call did not return success for transaction %s: %s", response_id, result)
 
-                        # Print usage summary if enabled (async, fire-and-forget)
-                        # Print regardless of metering success - user should see API usage even if metering fails
-                        _emit_usage_summary(
-                            model=self.final_message.model,
-                            provider=provider_metadata["provider"],
-                            request_duration=request_duration,
-                            prompt_tokens=prompt_tokens,
-                            completion_tokens=completion_tokens,
-                            response_id=self.response_id,
-                            usage_metadata=usage_metadata,
-                        )
-                    except Exception as e:
-                        from revenium_middleware import shutdown_event
-                        if not shutdown_event.is_set():
-                            logger.warning(f"Error in metering call for stream: {str(e)}")
-                            # Log the full traceback for better debugging
-                            import traceback
-                            logger.warning(f"Traceback: {traceback.format_exc()}")
-
-                thread = _safe_run_async_in_thread(metering_call)
-                logger.debug("Metering thread started for stream: %s", thread)
-
+                _emit_usage_summary(
+                    model=response.model,
+                    provider=provider_metadata["provider"],
+                    request_duration=request_duration,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    response_id=response_id,
+                    usage_metadata=usage_metadata,
+                )
             except Exception as e:
-                logger.warning(f"Error processing final message from stream: {str(e)}")
-                import traceback
-                logger.warning(f"Traceback: {traceback.format_exc()}")
+                from revenium_middleware import shutdown_event
+                if not shutdown_event.is_set():
+                    logger.warning(f"Error in metering call: {str(e)}")
+                    import traceback
+                    logger.warning(f"Traceback: {traceback.format_exc()}")
 
-            return result
+        thread = _safe_run_async_in_thread(metering_call)
+        logger.debug("Metering thread started: %s", thread)
+        return response
 
-        @property
-        def text_stream(self):
-            # Create a wrapper for the text_stream that doesn't consume it
-            original_text_stream = self.stream_context.text_stream
-            wrapper_self = self
 
-            class TextStreamWrapper:
-                def __iter__(self):
-                    return self
+if register_patch("anthropic.resources.messages.messages.AsyncMessages.create"):
+    @wrapt.patch_function_wrapper('anthropic.resources.messages.messages', 'AsyncMessages.create')
+    def async_create_wrapper(wrapped, instance, args, kwargs):
+        import asyncio
 
-                def __next__(self):
+        if is_selective_metering_enabled() and not is_inside_decorated_function():
+            return wrapped(*args, **kwargs)
+
+        logger.debug("Anthropic async client.messages.create wrapper called")
+
+        usage_metadata, request_time, request_time_dt = extract_usage_metadata_and_timing(kwargs, "async_create")
+
+        request_kwargs = dict(kwargs)
+
+        async def _async_create():
+            response = await wrapped(*args, **kwargs)
+            logger.debug("REVENIUM MIDDLEWARE: Received async response from client.messages.create: %s", response.id)
+
+            response_time_dt = datetime.datetime.now(datetime.timezone.utc)
+            response_time = response_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            request_duration = (response_time_dt - request_time_dt).total_seconds() * 1000
+            response_id = response.id
+
+            if response.usage is None:
+                return response
+
+            prompt_tokens = response.usage.input_tokens
+            completion_tokens = response.usage.output_tokens
+            cache_creation_input_tokens = response.usage.cache_creation_input_tokens
+            cache_read_input_tokens = response.usage.cache_read_input_tokens
+
+            anthropic_finish_reason = None
+            if response.stop_reason:
+                anthropic_finish_reason = response.stop_reason
+
+            finish_reason_map = {
+                "end_turn": "END",
+                "tool_use": "END_SEQUENCE",
+                "max_tokens": "TOKEN_LIMIT",
+                "content_filter": "ERROR"
+            }
+            stop_reason = finish_reason_map.get(anthropic_finish_reason, "END")
+
+            (system_prompt, input_messages, output_response, prompts_truncated) = (
+                extract_prompt_data_if_enabled(request_kwargs, response=response)
+            )
+
+            provider_metadata = get_provider_metadata(Provider.ANTHROPIC)
+
+            async def metering_call():
+                try:
+                    from revenium_middleware import shutdown_event
+
+                    if shutdown_event.is_set():
+                        logger.warning("Skipping metering call during shutdown")
+                        return
+
+                    client = _get_thread_safe_client()
+                    if not client:
+                        logger.warning("No thread-safe client available for async metering")
+                        return
+
+                    subscriber = extract_subscriber_from_metadata(usage_metadata)
+                    trace_fields = _extract_trace_fields(usage_metadata, request_kwargs)
+
+                    extra_body = {}
+                    if trace_fields.get('has_vision_content'):
+                        extra_body['hasVisionContent'] = True
+                    extra_body = merge_extra_body(extra_body, extract_agentic_job_fields(usage_metadata))
+
+                    organization_name, product_name = _extract_organization_and_product_names(usage_metadata)
+                    meta = extract_common_metadata(usage_metadata)
+
+                    result = client.ai.create_completion(
+                        cache_creation_token_count=cache_creation_input_tokens,
+                        cache_read_token_count=cache_read_input_tokens,
+                        input_token_cost=None,
+                        output_token_cost=None,
+                        total_cost=None,
+                        output_token_count=completion_tokens,
+                        cost_type="AI",
+                        model=response.model,
+                        input_token_count=prompt_tokens,
+                        provider=provider_metadata["provider"],
+                        model_source=provider_metadata["model_source"],
+                        reasoning_token_count=0,
+                        request_time=request_time,
+                        response_time=response_time,
+                        completion_start_time=response_time,
+                        request_duration=int(request_duration),
+                        time_to_first_token=int(request_duration),
+                        stop_reason=stop_reason,
+                        total_token_count=prompt_tokens + completion_tokens,
+                        transaction_id=response_id,
+                        trace_id=meta["trace_id"],
+                        task_type=meta["task_type"],
+                        subscriber=subscriber if subscriber else None,
+                        organization_name=organization_name,
+                        subscription_id=meta["subscription_id"],
+                        product_name=product_name,
+                        agent=meta["agent"],
+                        response_quality_score=meta["response_quality_score"],
+                        is_streamed=False,
+                        operation_type=trace_fields.get('operation_type', 'CHAT'),
+                        middleware_source="PYTHON",
+                        environment=trace_fields.get('environment'),
+                        region=trace_fields.get('region'),
+                        credential_alias=trace_fields.get('credential_alias'),
+                        trace_type=trace_fields.get('trace_type'),
+                        trace_name=trace_fields.get('trace_name'),
+                        parent_transaction_id=trace_fields.get('parent_transaction_id'),
+                        transaction_name=trace_fields.get('transaction_name'),
+                        retry_number=trace_fields.get('retry_number'),
+                        operation_subtype=trace_fields.get('operation_subtype'),
+                        system_prompt=system_prompt,
+                        input_messages=input_messages,
+                        output_response=output_response,
+                        prompts_truncated=prompts_truncated,
+                        extra_body=extra_body if extra_body else None,
+                    )
+                    logger.debug("Async metering call result: %s", result)
+
+                    success = False
                     try:
-                        chunk = next(original_text_stream)
-                        # Record the time of the first token
-                        if wrapper_self.first_token_time is None and chunk:
-                            wrapper_self.first_token_time = time.time() * 1000  # Convert to milliseconds
-                        return chunk
-                    except StopIteration:
-                        raise
+                        if result is None:
+                            success = False
+                        elif hasattr(result, 'status_code'):
+                            status_code = int(getattr(result, 'status_code', 0) or 0)
+                            success = 200 <= status_code < 300
+                        elif hasattr(result, 'id'):
+                            success = True
+                        else:
+                            success = True
+                    except Exception:
+                        success = False
 
-            return TextStreamWrapper()
+                    if success:
+                        logger.debug("[REVENIUM SUCCESS] Async metering call successful for transaction %s", response_id)
+                    else:
+                        logger.warning("[REVENIUM ERROR] Async metering call did not return success for transaction %s: %s", response_id, result)
 
-        def get_final_message(self):
-            if self.final_message:
-                return self.final_message
-            return self.stream_context.get_final_message()
+                    _emit_usage_summary(
+                        model=response.model,
+                        provider=provider_metadata["provider"],
+                        request_duration=request_duration,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        response_id=response_id,
+                        usage_metadata=usage_metadata,
+                    )
+                except Exception as e:
+                    from revenium_middleware import shutdown_event
+                    if not shutdown_event.is_set():
+                        logger.warning(f"Error in async metering call: {str(e)}")
+                        import traceback
+                        logger.warning(f"Traceback: {traceback.format_exc()}")
 
-        def __iter__(self):
-            return iter(self.stream_context)
+            _safe_run_async_in_thread(metering_call)
+            return response
 
-        def __getattr__(self, name):
-            return getattr(self.stream_context, name)
-
-    return StreamWrapper(stream)
+        return _async_create()
 
 
-# Log middleware initialization
+if register_patch("anthropic.resources.messages.messages.Messages.stream"):
+    @wrapt.patch_function_wrapper('anthropic.resources.messages.messages', 'Messages.stream')
+    def stream_wrapper(wrapped, instance, args, kwargs):
+        if is_selective_metering_enabled() and not is_inside_decorated_function():
+            return wrapped(*args, **kwargs)
+
+        logger.debug("REVENIUM MIDDLEWARE: Intercepted client.messages.stream call - wrapper active")
+
+        usage_metadata, request_time, request_time_dt = extract_usage_metadata_and_timing(kwargs, "stream")
+
+        if os.getenv("REVENIUM_BEDROCK_DISABLE") != "1":
+            client_instance = getattr(instance, '_client', None) if instance else None
+            base_url = kwargs.get('base_url', None)
+            provider = detect_provider(client=client_instance, base_url=base_url)
+
+            if provider == Provider.BEDROCK:
+                try:
+                    logger.debug("Routing streaming request to Bedrock handler")
+                    return _handle_bedrock_stream_request(args, kwargs, usage_metadata, request_time_dt, request_time)
+                except (BedrockValidationError, BedrockStreamError) as e:
+                    logger.error(f"Bedrock streaming request failed: {e}. Falling back to direct Anthropic API.")
+                except ImportError as e:
+                    logger.error(f"Bedrock dependencies not available: {e}. Falling back to direct Anthropic API.")
+                except Exception as e:
+                    logger.error(f"Unexpected error in Bedrock streaming handler: {e}. Falling back to direct Anthropic API.")
+
+        logger.debug("REVENIUM MIDDLEWARE: Calling client.messages.stream with model=%s, max_tokens=%s",
+                     kwargs.get("model"), kwargs.get("max_tokens"))
+
+        request_kwargs = dict(kwargs)
+
+        stream = wrapped(*args, **kwargs)
+        logger.debug("REVENIUM MIDDLEWARE: Received stream from client.messages.stream")
+
+        class StreamWrapper:
+            def __init__(self, stream):
+                self.stream = stream
+                self.response_time_dt = None
+                self.response_id = None
+                self.collected_content = []
+                self.final_message = None
+                self.first_token_time = None
+                self.request_start_time = time.time() * 1000
+
+            def __enter__(self):
+                self.stream_context = self.stream.__enter__()
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                result = self.stream.__exit__(exc_type, exc_val, exc_tb)
+
+                try:
+                    self.final_message = self.stream_context.get_final_message()
+                    self.response_time_dt = datetime.datetime.now(datetime.timezone.utc)
+                    self.response_time = self.response_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    request_duration = (self.response_time_dt - request_time_dt).total_seconds() * 1000
+
+                    self.response_id = self.final_message.id
+
+                    if self.final_message.usage is None:
+                        return result
+
+                    prompt_tokens = self.final_message.usage.input_tokens
+                    completion_tokens = self.final_message.usage.output_tokens
+                    cache_creation_input_tokens = self.final_message.usage.cache_creation_input_tokens
+                    cache_read_input_tokens = self.final_message.usage.cache_read_input_tokens
+
+                    logger.debug(
+                        "Anthropic client.messages.stream token usage - prompt: %d, completion: %d, "
+                        "cache_creation_input_tokens: %d, cache_read_input_tokens: %d",
+                        prompt_tokens, completion_tokens, cache_creation_input_tokens, cache_read_input_tokens
+                    )
+
+                    anthropic_finish_reason = None
+                    if self.final_message.stop_reason:
+                        anthropic_finish_reason = self.final_message.stop_reason
+
+                    finish_reason_map = {
+                        "end_turn": "END",
+                        "tool_use": "END_SEQUENCE",
+                        "max_tokens": "TOKEN_LIMIT",
+                        "content_filter": "ERROR"
+                    }
+                    stop_reason = finish_reason_map.get(anthropic_finish_reason, "END")
+
+                    accumulated_content = ''.join(self.collected_content)
+                    (system_prompt, input_messages, output_response, prompts_truncated) = (
+                        extract_prompt_data_if_enabled(kwargs, accumulated_content=accumulated_content)
+                    )
+
+                    provider_metadata = get_provider_metadata(Provider.ANTHROPIC)
+
+                    async def metering_call():
+                        try:
+                            from revenium_middleware import shutdown_event
+
+                            if shutdown_event.is_set():
+                                logger.warning("Skipping metering call during shutdown")
+                                return
+                            logger.debug("Metering call to Revenium for stream completion %s", self.response_id)
+
+                            client = _get_thread_safe_client()
+                            if not client:
+                                logger.warning("No thread-safe client available for stream metering")
+                                return
+
+                            subscriber = extract_subscriber_from_metadata(usage_metadata)
+
+                            trace_fields = _extract_trace_fields(usage_metadata, request_kwargs)
+
+                            extra_body = {}
+                            if trace_fields.get('has_vision_content'):
+                                extra_body['hasVisionContent'] = True
+                            extra_body = merge_extra_body(extra_body, extract_agentic_job_fields(usage_metadata))
+
+                            organization_name, product_name = _extract_organization_and_product_names(usage_metadata)
+                            meta = extract_common_metadata(usage_metadata)
+
+                            result = client.ai.create_completion(
+                                cache_creation_token_count=cache_creation_input_tokens,
+                                cache_read_token_count=cache_read_input_tokens,
+                                input_token_cost=None,
+                                output_token_cost=None,
+                                total_cost=None,
+                                output_token_count=completion_tokens,
+                                cost_type="AI",
+                                model=self.final_message.model,
+                                input_token_count=prompt_tokens,
+                                provider=provider_metadata["provider"],
+                                model_source=provider_metadata["model_source"],
+                                reasoning_token_count=0,
+                                request_time=request_time,
+                                response_time=self.response_time,
+                                completion_start_time=self.response_time,
+                                request_duration=int(request_duration),
+                                time_to_first_token=int(
+                                    self.first_token_time - self.request_start_time) if self.first_token_time else 0,
+                                stop_reason=stop_reason,
+                                total_token_count=prompt_tokens + completion_tokens,
+                                transaction_id=self.response_id,
+                                trace_id=meta["trace_id"],
+                                task_type=meta["task_type"],
+                                subscriber=subscriber if subscriber else None,
+                                organization_name=organization_name,
+                                subscription_id=meta["subscription_id"],
+                                product_name=product_name,
+                                agent=meta["agent"],
+                                is_streamed=True,
+                                operation_type=trace_fields.get('operation_type', 'CHAT'),
+                                response_quality_score=meta["response_quality_score"],
+                                middleware_source="PYTHON",
+                                environment=trace_fields.get('environment'),
+                                region=trace_fields.get('region'),
+                                credential_alias=trace_fields.get('credential_alias'),
+                                trace_type=trace_fields.get('trace_type'),
+                                trace_name=trace_fields.get('trace_name'),
+                                parent_transaction_id=trace_fields.get('parent_transaction_id'),
+                                transaction_name=trace_fields.get('transaction_name'),
+                                retry_number=trace_fields.get('retry_number'),
+                                operation_subtype=trace_fields.get('operation_subtype'),
+                                system_prompt=system_prompt,
+                                input_messages=input_messages,
+                                output_response=output_response,
+                                prompts_truncated=prompts_truncated,
+                                extra_body=extra_body if extra_body else None,
+                            )
+                            logger.debug("Metering call result for stream: %s", result)
+                            success = False
+                            try:
+                                if result is None:
+                                    success = False
+                                elif hasattr(result, 'status_code'):
+                                    status_code = int(getattr(result, 'status_code', 0) or 0)
+                                    success = 200 <= status_code < 300
+                                elif hasattr(result, 'resource_type') or hasattr(result, 'resourceType') or hasattr(result, 'id'):
+                                    success = True
+                                else:
+                                    success = True
+                            except Exception:
+                                success = False
+
+                            if success:
+                                logger.debug("[REVENIUM SUCCESS] Streaming metering call successful for transaction %s", self.response_id)
+                            else:
+                                logger.warning(
+                                    "[REVENIUM ERROR] Streaming metering call did not return success for transaction %s: %s",
+                                    self.response_id, result
+                                )
+
+                            _emit_usage_summary(
+                                model=self.final_message.model,
+                                provider=provider_metadata["provider"],
+                                request_duration=request_duration,
+                                prompt_tokens=prompt_tokens,
+                                completion_tokens=completion_tokens,
+                                response_id=self.response_id,
+                                usage_metadata=usage_metadata,
+                            )
+                        except Exception as e:
+                            from revenium_middleware import shutdown_event
+                            if not shutdown_event.is_set():
+                                logger.warning(f"Error in metering call for stream: {str(e)}")
+                                import traceback
+                                logger.warning(f"Traceback: {traceback.format_exc()}")
+
+                    thread = _safe_run_async_in_thread(metering_call)
+                    logger.debug("Metering thread started for stream: %s", thread)
+
+                except Exception as e:
+                    logger.warning(f"Error processing final message from stream: {str(e)}")
+                    import traceback
+                    logger.warning(f"Traceback: {traceback.format_exc()}")
+
+                return result
+
+            @property
+            def text_stream(self):
+                original_text_stream = self.stream_context.text_stream
+                wrapper_self = self
+
+                class TextStreamWrapper:
+                    def __iter__(self):
+                        return self
+
+                    def __next__(self):
+                        try:
+                            chunk = next(original_text_stream)
+                            if wrapper_self.first_token_time is None and chunk:
+                                wrapper_self.first_token_time = time.time() * 1000
+                            return chunk
+                        except StopIteration:
+                            raise
+
+                return TextStreamWrapper()
+
+            def get_final_message(self):
+                if self.final_message:
+                    return self.final_message
+                return self.stream_context.get_final_message()
+
+            def __iter__(self):
+                return iter(self.stream_context)
+
+            def __getattr__(self, name):
+                return getattr(self.stream_context, name)
+
+        return StreamWrapper(stream)
+
+
 logger.debug("REVENIUM MIDDLEWARE: Anthropic middleware loaded and wrappers registered")

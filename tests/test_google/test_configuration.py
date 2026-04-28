@@ -156,16 +156,23 @@ class TestConfigurationValidation:
     """Test configuration validation logic."""
 
     def test_validate_api_key_format(self):
-        """Test API key format validation."""
-        valid_keys = [
-            "rev-key-abc123",
-            "sk-test-123456",
-            "AIzaSyABC123-456_789"
-        ]
+        """API key prefix validation accepts hak_/rev_, rejects other formats."""
+        from revenium_middleware._core.config import validate_api_key
 
-        for key in valid_keys:
-            assert len(key) > 10  # Reasonable minimum length
-            assert not key.isspace()
+        # Valid Revenium prefixes
+        validate_api_key("hak_abc123def456")
+        validate_api_key("rev_mk_3By1Ra6_abc123")
+        validate_api_key("rev_sk_3By1Ra6_abc123")
+
+        # Anything else (including other-provider keys) must be rejected.
+        invalid_keys = [
+            "rev-key-abc123",         # hyphen, not underscore
+            "sk-test-123456",         # OpenAI
+            "AIzaSyABC123-456_789",   # Google
+        ]
+        for key in invalid_keys:
+            with pytest.raises(ValueError, match='should start with "hak_" or "rev_"'):
+                validate_api_key(key)
 
     def test_validate_url_format(self):
         """Test URL format validation - should accept any valid HTTP(S) URL."""

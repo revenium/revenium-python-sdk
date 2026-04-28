@@ -40,11 +40,11 @@ def main():
         #     },
         #
         #     # Organization & billing
-        #     "organizationName": "AcmeCorp",
+        #     "organization_name": "AcmeCorp",
         #     "subscription_id": "plan-enterprise-2024",
         #
         #     # Product & task tracking
-        #     "productName": "customer-chatbot",
+        #     "product_name": "customer-chatbot",
         #     "task_type": "doc-summary",
         #     "agent": "customer-support",
         #
