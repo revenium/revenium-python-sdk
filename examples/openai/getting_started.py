@@ -36,8 +36,8 @@ client = OpenAI()
 
 # Create metadata (optional - use what you need)
 metadata = {
-    "organizationName": "AcmeCorp",
-    "productName": "customer-chatbot",
+    "organization_name": "AcmeCorp",
+    "product_name": "customer-chatbot",
 
     # Additional optional fields (uncomment to use):
     # "subscriber": {

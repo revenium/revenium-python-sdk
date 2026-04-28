@@ -35,9 +35,9 @@ response = ollama.chat(
         #     "value": "hak-abc123456"
         #   }
         # },
-        # "organizationName": "Finoptic Labs",
+        # "organization_name": "Finoptic Labs",
         # "subscription_id": "sub_gold_1234567890",
-        # "productName": "spectral-analyzer-gold",
+        # "product_name": "spectral-analyzer-gold",
         # "agent": "chemistry-agent",
         # "response_quality_score": 0.95,  # Optional: 0.0-1.0 scale quality metric from your evaluation logic
         # "agentic_job_id": "job-abc123",

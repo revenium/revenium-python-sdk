@@ -17,6 +17,9 @@ from typing import Dict, Any, Optional, List, Tuple
 
 import wrapt
 from revenium_middleware import run_async_in_thread
+from revenium_middleware._core.config import is_selective_metering_enabled
+from revenium_middleware._core.context import is_inside_decorated_function
+from revenium_middleware._core.patch_registry import register_patch
 
 # Import common utilities and types
 from ..common import (
@@ -348,20 +351,21 @@ def _apply_generate_content_wrappers():
 
                 # Check if generate_content method exists
                 if hasattr(generative_model_class, "generate_content"):
-                    logger.debug(
-                        f"Found GenerativeModel.generate_content in {module_path}"
-                    )
-
-                    # Apply wrapper using wrapt
-                    @wrapt.patch_function_wrapper(
-                        module_path, "GenerativeModel.generate_content"
-                    )
-                    def generate_content_wrapper_dynamic(
-                        wrapped, instance, args, kwargs
-                    ):
-                        return generate_content_wrapper_impl(
-                            wrapped, instance, args, kwargs
+                    patch_key = f"{module_path}.GenerativeModel.generate_content"
+                    if register_patch(patch_key):
+                        logger.debug(
+                            f"Found GenerativeModel.generate_content in {module_path}"
                         )
+
+                        @wrapt.patch_function_wrapper(
+                            module_path, "GenerativeModel.generate_content"
+                        )
+                        def generate_content_wrapper_dynamic(
+                            wrapped, instance, args, kwargs
+                        ):
+                            return generate_content_wrapper_impl(
+                                wrapped, instance, args, kwargs
+                            )
 
                     wrapped_modules.append(module_path)
                     logger.debug(
@@ -390,7 +394,9 @@ def _apply_generate_content_wrappers():
 
 
 def generate_content_wrapper_impl(wrapped, instance, args, kwargs):
-    """Enhanced wrapper that handles both streaming and non-streaming Vertex AI calls."""
+    if is_selective_metering_enabled() and not is_inside_decorated_function():
+        return wrapped(*args, **kwargs)
+
     logger.debug("Enhanced Vertex AI generate_content wrapper called!")
     logger.debug(f"Wrapper args: {args}")
     logger.debug(f"Wrapper kwargs: {kwargs}")
@@ -529,88 +535,82 @@ def generate_content_wrapper_impl(wrapped, instance, args, kwargs):
         return response
 
 
-# Wrapper for Vertex AI TextEmbeddingModel.get_embeddings method
-@wrapt.patch_function_wrapper(
-    "vertexai.language_models", "TextEmbeddingModel.get_embeddings"
-)
-def get_embeddings_wrapper(wrapped, instance, args, kwargs):
-    """Wraps the vertexai.language_models.TextEmbeddingModel.get_embeddings method to log token usage."""
-    logger.debug("Vertex AI get_embeddings wrapper called")
-
-    # Extract usage metadata from instance or kwargs
-    usage_metadata = getattr(instance, "_revenium_usage_metadata", {}) or kwargs.pop(
-        "usage_metadata", {}
+if register_patch("vertexai.language_models.TextEmbeddingModel.get_embeddings"):
+    @wrapt.patch_function_wrapper(
+        "vertexai.language_models", "TextEmbeddingModel.get_embeddings"
     )
+    def get_embeddings_wrapper(wrapped, instance, args, kwargs):
+        if is_selective_metering_enabled() and not is_inside_decorated_function():
+            return wrapped(*args, **kwargs)
 
-    # Try to extract model name from the instance using the same logic as generate_content
-    model_name_from_instance = None
-    for attr in [
-        "_model_name",
-        "model_name",
-        "_model_id",
-        "model_id",
-        "_model",
-        "model",
-    ]:
-        if hasattr(instance, attr):
-            model_name_from_instance = getattr(instance, attr)
-            logger.debug(
-                f"Found model name in embeddings instance.{attr}: {model_name_from_instance}"
-            )
-            break
+        logger.debug("Vertex AI get_embeddings wrapper called")
 
-    if not model_name_from_instance:
-        logger.debug(
-            f"Could not find model name in embeddings instance. Available attributes: {dir(instance)}"
+        usage_metadata = getattr(instance, "_revenium_usage_metadata", {}) or kwargs.pop(
+            "usage_metadata", {}
         )
-        # Try to get it from the instance string representation
-        instance_str = str(instance)
-        if "model_name=" in instance_str:
-            # Extract from string like "TextEmbeddingModel(model_name='text-embedding-004')"
-            import re
 
-            match = re.search(r"model_name='([^']+)'", instance_str)
-            if match:
-                model_name_from_instance = match.group(1)
+        model_name_from_instance = None
+        for attr in [
+            "_model_name",
+            "model_name",
+            "_model_id",
+            "model_id",
+            "_model",
+            "model",
+        ]:
+            if hasattr(instance, attr):
+                model_name_from_instance = getattr(instance, attr)
                 logger.debug(
-                    f"Extracted model name from embeddings instance string: {model_name_from_instance}"
+                    f"Found model name in embeddings instance.{attr}: {model_name_from_instance}"
                 )
-        elif "models/" in instance_str:
-            # Extract from string like "models/text-embedding-004"
-            import re
+                break
 
-            match = re.search(r"models/([^'\s)]+)", instance_str)
-            if match:
-                model_name_from_instance = match.group(1)
-                logger.debug(
-                    f"Extracted model name from embeddings instance string (models/): {model_name_from_instance}"
-                )
+        if not model_name_from_instance:
+            logger.debug(
+                f"Could not find model name in embeddings instance. Available attributes: {dir(instance)}"
+            )
+            instance_str = str(instance)
+            if "model_name=" in instance_str:
+                import re
 
-    logger.debug(
-        f"Final captured model name from Vertex AI embeddings instance: {model_name_from_instance}"
-    )
+                match = re.search(r"model_name='([^']+)'", instance_str)
+                if match:
+                    model_name_from_instance = match.group(1)
+                    logger.debug(
+                        f"Extracted model name from embeddings instance string: {model_name_from_instance}"
+                    )
+            elif "models/" in instance_str:
+                import re
 
-    # Record request time
-    request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-    logger.debug(
-        f"Calling wrapped Vertex AI get_embeddings function with args: {args}, kwargs: {kwargs}"
-    )
+                match = re.search(r"models/([^'\s)]+)", instance_str)
+                if match:
+                    model_name_from_instance = match.group(1)
+                    logger.debug(
+                        f"Extracted model name from embeddings instance string (models/): {model_name_from_instance}"
+                    )
 
-    # Call the original Vertex AI function
-    response = wrapped(*args, **kwargs)
+        logger.debug(
+            f"Final captured model name from Vertex AI embeddings instance: {model_name_from_instance}"
+        )
 
-    logger.debug("Handling Vertex AI get_embeddings response: %s", response)
+        request_time_dt = datetime.datetime.now(datetime.timezone.utc)
+        logger.debug(
+            f"Calling wrapped Vertex AI get_embeddings function with args: {args}, kwargs: {kwargs}"
+        )
 
-    # Create metering call for embeddings
-    create_vertex_ai_metering_call(
-        response=response,
-        operation_type=OperationType.EMBED,
-        request_time_dt=request_time_dt,
-        usage_metadata=usage_metadata,
-        model_name_fallback=model_name_from_instance,
-    )
+        response = wrapped(*args, **kwargs)
 
-    return response
+        logger.debug("Handling Vertex AI get_embeddings response: %s", response)
+
+        create_vertex_ai_metering_call(
+            response=response,
+            operation_type=OperationType.EMBED,
+            request_time_dt=request_time_dt,
+            usage_metadata=usage_metadata,
+            model_name_fallback=model_name_from_instance,
+        )
+
+        return response
 
 
 def handle_vertex_ai_streaming_response(
@@ -888,24 +888,28 @@ def _apply_imagen_wrappers():
                 img_model_class = getattr(module, "ImageGenerationModel")
 
                 if hasattr(img_model_class, "generate_images"):
-                    @wrapt.patch_function_wrapper(
-                        module_path, "ImageGenerationModel.generate_images"
-                    )
-                    def generate_images_wrapper_dynamic(wrapped, instance, args, kwargs):
-                        return _imagen_generate_images_impl(wrapped, instance, args, kwargs)
+                    patch_key = f"{module_path}.ImageGenerationModel.generate_images"
+                    if register_patch(patch_key):
+                        @wrapt.patch_function_wrapper(
+                            module_path, "ImageGenerationModel.generate_images"
+                        )
+                        def generate_images_wrapper_dynamic(wrapped, instance, args, kwargs):
+                            return _imagen_generate_images_impl(wrapped, instance, args, kwargs)
 
-                    wrapped_modules.append(module_path + ".ImageGenerationModel.generate_images")
-                    logger.debug(f" Applied Imagen wrapper to {module_path}.ImageGenerationModel.generate_images")
+                        wrapped_modules.append(patch_key)
+                        logger.debug(f" Applied Imagen wrapper to {patch_key}")
 
                 if hasattr(img_model_class, "edit_image"):
-                    @wrapt.patch_function_wrapper(
-                        module_path, "ImageGenerationModel.edit_image"
-                    )
-                    def edit_image_wrapper_dynamic(wrapped, instance, args, kwargs):
-                        return _imagen_edit_image_impl(wrapped, instance, args, kwargs)
+                    patch_key = f"{module_path}.ImageGenerationModel.edit_image"
+                    if register_patch(patch_key):
+                        @wrapt.patch_function_wrapper(
+                            module_path, "ImageGenerationModel.edit_image"
+                        )
+                        def edit_image_wrapper_dynamic(wrapped, instance, args, kwargs):
+                            return _imagen_edit_image_impl(wrapped, instance, args, kwargs)
 
-                    wrapped_modules.append(module_path + ".ImageGenerationModel.edit_image")
-                    logger.debug(f" Applied Imagen wrapper to {module_path}.ImageGenerationModel.edit_image")
+                        wrapped_modules.append(patch_key)
+                        logger.debug(f" Applied Imagen wrapper to {patch_key}")
 
         except ImportError:
             logger.debug(f"  Module {module_path} not available for Imagen")
@@ -938,7 +942,9 @@ def _extract_model_name_from_instance(instance) -> Optional[str]:
 
 
 def _imagen_generate_images_impl(wrapped, instance, args, kwargs):
-    """Wrapper implementation for Vertex AI ImageGenerationModel.generate_images."""
+    if is_selective_metering_enabled() and not is_inside_decorated_function():
+        return wrapped(*args, **kwargs)
+
     logger.debug("Vertex AI ImageGenerationModel.generate_images wrapper called")
 
     usage_metadata = getattr(instance, "_revenium_usage_metadata", {}) or kwargs.pop(
@@ -988,7 +994,9 @@ def _imagen_generate_images_impl(wrapped, instance, args, kwargs):
 
 
 def _imagen_edit_image_impl(wrapped, instance, args, kwargs):
-    """Wrapper implementation for Vertex AI ImageGenerationModel.edit_image."""
+    if is_selective_metering_enabled() and not is_inside_decorated_function():
+        return wrapped(*args, **kwargs)
+
     logger.debug("Vertex AI ImageGenerationModel.edit_image wrapper called")
 
     usage_metadata = getattr(instance, "_revenium_usage_metadata", {}) or kwargs.pop(
@@ -1045,27 +1053,30 @@ def _apply_veo_wrappers():
         try:
             module = importlib.import_module(module_path)
 
-            # Check for VideoGenerationModel
             if hasattr(module, "VideoGenerationModel"):
                 video_model_class = getattr(module, "VideoGenerationModel")
 
                 if hasattr(video_model_class, "generate_content"):
-                    @wrapt.patch_function_wrapper(
-                        module_path, "VideoGenerationModel.generate_content"
-                    )
-                    def veo_generate_wrapper(wrapped, instance, args, kwargs):
-                        return _veo_generate_impl(wrapped, instance, args, kwargs)
+                    patch_key = f"{module_path}.VideoGenerationModel.generate_content"
+                    if register_patch(patch_key):
+                        @wrapt.patch_function_wrapper(
+                            module_path, "VideoGenerationModel.generate_content"
+                        )
+                        def veo_generate_wrapper(wrapped, instance, args, kwargs):
+                            return _veo_generate_impl(wrapped, instance, args, kwargs)
 
-                    wrapped_modules.append(module_path + ".VideoGenerationModel.generate_content")
+                        wrapped_modules.append(patch_key)
 
                 if hasattr(video_model_class, "generate"):
-                    @wrapt.patch_function_wrapper(
-                        module_path, "VideoGenerationModel.generate"
-                    )
-                    def veo_generate_alt_wrapper(wrapped, instance, args, kwargs):
-                        return _veo_generate_impl(wrapped, instance, args, kwargs)
+                    patch_key = f"{module_path}.VideoGenerationModel.generate"
+                    if register_patch(patch_key):
+                        @wrapt.patch_function_wrapper(
+                            module_path, "VideoGenerationModel.generate"
+                        )
+                        def veo_generate_alt_wrapper(wrapped, instance, args, kwargs):
+                            return _veo_generate_impl(wrapped, instance, args, kwargs)
 
-                    wrapped_modules.append(module_path + ".VideoGenerationModel.generate")
+                        wrapped_modules.append(patch_key)
 
         except ImportError:
             logger.debug(f"  Module {module_path} not available for Veo")
@@ -1079,7 +1090,9 @@ def _apply_veo_wrappers():
 
 
 def _veo_generate_impl(wrapped, instance, args, kwargs):
-    """Wrapper implementation for Vertex AI VideoGenerationModel.generate_content."""
+    if is_selective_metering_enabled() and not is_inside_decorated_function():
+        return wrapped(*args, **kwargs)
+
     logger.debug("Vertex AI VideoGenerationModel wrapper called (Veo)")
 
     usage_metadata = getattr(instance, "_revenium_usage_metadata", {}) or kwargs.pop(

@@ -8,6 +8,7 @@ Azure mode is detected to avoid performance impact for non-Azure users.
 
 import os
 import logging
+import threading
 from typing import Optional, Dict, Any
 
 logger = logging.getLogger("revenium_middleware.extension")
@@ -143,23 +144,20 @@ class AzureConfig:
 
 # Global configuration instance - lazy loaded
 _azure_config: Optional[AzureConfig] = None
+_azure_config_lock = threading.Lock()
 
 
 def get_azure_config() -> AzureConfig:
-    """
-    Get or create Azure configuration instance.
-    
-    Lazy loading ensures non-Azure users don't pay any performance cost.
-    
-    Returns:
-        AzureConfig instance
-    """
     global _azure_config
-    
-    if _azure_config is None:
-        _azure_config = AzureConfig()
-        logger.debug("Azure configuration loaded")
-    
+
+    if _azure_config is not None:
+        return _azure_config
+
+    with _azure_config_lock:
+        if _azure_config is None:
+            _azure_config = AzureConfig()
+            logger.debug("Azure configuration loaded")
+
     return _azure_config
 
 

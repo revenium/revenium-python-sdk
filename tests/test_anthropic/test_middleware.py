@@ -269,8 +269,7 @@ class TestMiddleware:
 class TestExtractOrganizationAndProductNames:
     """Tests for _extract_organization_and_product_names backward compatibility logic."""
 
-    def test_new_camel_case_names_have_highest_precedence(self):
-        """organizationName and productName take precedence over all other variations."""
+    def test_snake_case_has_highest_precedence(self):
         usage_metadata = {
             "organizationName": "CamelCaseOrg",
             "organization_name": "snake_case_org",
@@ -282,8 +281,8 @@ class TestExtractOrganizationAndProductNames:
             "product_id": "old_snake_prod_id",
         }
         org_name, prod_name = _extract_organization_and_product_names(usage_metadata)
-        assert org_name == "CamelCaseOrg"
-        assert prod_name == "CamelCaseProduct"
+        assert org_name == "snake_case_org"
+        assert prod_name == "snake_case_product"
 
     def test_snake_case_new_names_take_precedence_over_deprecated(self):
         """organization_name and product_name take precedence over deprecated fields."""
@@ -301,7 +300,7 @@ class TestExtractOrganizationAndProductNames:
 
     def test_deprecated_camel_case_works_with_warning(self, caplog):
         """organizationId and productId still work but log deprecation warning."""
-        with caplog.at_level(logging.WARNING, logger="revenium_middleware.extension"):
+        with caplog.at_level(logging.WARNING, logger="revenium_middleware._core.fields"):
             usage_metadata = {
                 "organizationId": "old_camel_id",
                 "productId": "old_camel_prod_id",
@@ -314,7 +313,7 @@ class TestExtractOrganizationAndProductNames:
 
     def test_deprecated_snake_case_works_with_warning(self, caplog):
         """organization_id and product_id still work but log deprecation warning."""
-        with caplog.at_level(logging.WARNING, logger="revenium_middleware.extension"):
+        with caplog.at_level(logging.WARNING, logger="revenium_middleware._core.fields"):
             usage_metadata = {
                 "organization_id": "old_snake_id",
                 "product_id": "old_snake_prod_id",
@@ -325,8 +324,7 @@ class TestExtractOrganizationAndProductNames:
             assert "'organizationId' and 'organization_id' are deprecated" in caplog.text
             assert "'productId' and 'product_id' are deprecated" in caplog.text
 
-    def test_deprecated_camel_case_takes_precedence_over_snake_case(self):
-        """organizationId takes precedence over organization_id when both deprecated forms present."""
+    def test_deprecated_snake_case_takes_precedence_over_camel_case(self):
         usage_metadata = {
             "organizationId": "old_camel_id",
             "organization_id": "old_snake_id",
@@ -334,8 +332,8 @@ class TestExtractOrganizationAndProductNames:
             "product_id": "old_snake_prod_id",
         }
         org_name, prod_name = _extract_organization_and_product_names(usage_metadata)
-        assert org_name == "old_camel_id"
-        assert prod_name == "old_camel_prod_id"
+        assert org_name == "old_snake_id"
+        assert prod_name == "old_snake_prod_id"
 
     def test_empty_metadata_returns_none(self):
         """Empty metadata returns None for both fields."""
@@ -360,7 +358,7 @@ class TestExtractOrganizationAndProductNames:
 
     def test_mixed_new_and_deprecated_fields(self, caplog):
         """New organizationName with deprecated productId works correctly."""
-        with caplog.at_level(logging.WARNING, logger="revenium_middleware.extension"):
+        with caplog.at_level(logging.WARNING, logger="revenium_middleware._core.fields"):
             usage_metadata = {
                 "organizationName": "NewOrg",
                 "productId": "old_product_id",
@@ -373,7 +371,7 @@ class TestExtractOrganizationAndProductNames:
 
     def test_no_deprecation_warning_when_new_fields_used(self, caplog):
         """No deprecation warning when only new field names are used."""
-        with caplog.at_level(logging.WARNING, logger="revenium_middleware.extension"):
+        with caplog.at_level(logging.WARNING, logger="revenium_middleware._core.fields"):
             usage_metadata = {
                 "organizationName": "TestOrg",
                 "productName": "TestProduct",

@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-04-28
+
+### Added
+- API key prefix validation at SDK initialization: keys that are explicitly set but do not start with `hak_` or `rev_` now raise `ValueError` immediately instead of silently producing failing metering requests.
+- camelCase aliases for metadata fields `trace_id`, `task_type`, `subscription_id`, `agent`, and `response_quality_score`. Previously these values were silently dropped when sent as `traceId`, `taskType`, and so on.
+- Agentic job tracking via metadata fields `agentic_job_id`, `agentic_job_name`, `agentic_job_type`, and `agentic_job_version` across every provider integration.
+- LiteLLM proxy support for agentic job fields through `x-revenium-agentic-job-id` and related HTTP headers.
+
+### Fixed
+- OpenAI summary printer now sends `Authorization: Bearer <key>`, bringing it in line with the Anthropic, Google, and LiteLLM summary printers.
+- Bedrock adapter no longer sends deprecated metadata field names on the wire.
+- `REVENIUM_SELECTIVE_METERING` is now honored by every provider wrapper. Previously some wrappers ignored the flag and metered all calls.
+- Async client interception now covers `AsyncCompletions`, `AsyncMessages`, and `AsyncEmbeddings`, so async calls are metered consistently with sync calls.
+- Perplexity calls routed through the OpenAI SDK are no longer double-metered. Perplexity URLs are skipped by the OpenAI wrapper, and a patch registry prevents both wrappers from attaching to the same client.
+- Streamed completions are no longer double-metered through the async stream wrapper.
+- Concurrent shutdowns no longer race on internal thread bookkeeping.
+- A missing `response.usage` no longer raises; the middleware reports zero usage and continues.
+- Anthropic: corrected `stop_reason` mapping, metadata sanitization, and initialization guard.
+- OpenAI: trace fields are now propagated through Responses API streaming; user-provided `kwargs` are no longer mutated; Azure configuration race resolved.
+- LiteLLM: streaming and proxy-async paths metered correctly; token double-counting corrected.
+- Google: per-provider locking around shared state and improved streaming error handling.
+- fal: `Config` inheritance corrected; response objects are no longer mutated.
+- Ollama: response objects are no longer mutated by the middleware.
+- Several robustness improvements across providers: narrower exception handlers, client cache eviction, kwargs sanitization, `response.id` fallback, dynamic `CAPTURE_PROMPTS` evaluation, and dependency version pinning.
+
+### Changed
+- Metadata extraction is now centralized with a standardized `snake_case > camelCase > deprecated_snake > deprecated_camel` precedence across all providers.
+- Perplexity migrated from the deprecated `organization_id` / `product_id` fields to the centralized extraction pipeline.
+- When no API key is configured, the metering client is `None` and a clear warning is logged at initialization.
+
 ## [0.1.2] - 2026-04-09
 
 ### Added

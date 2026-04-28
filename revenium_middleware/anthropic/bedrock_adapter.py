@@ -652,6 +652,7 @@ class BedrockStreamWrapper:
             from .middleware import _get_thread_safe_client, _safe_run_async_in_thread
             from .trace_fields import detect_vision_content
             from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
+            from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, merge_extra_body
 
             if shutdown_event.is_set():
                 logger.warning("Skipping metering call during shutdown")
@@ -675,10 +676,11 @@ class BedrockStreamWrapper:
             # Detect vision content
             has_vision_content = detect_vision_content(self.messages)
 
-            # Build extra_body for vision detection
+            # Build extra_body for vision detection and agentic job fields
             extra_body = {}
             if has_vision_content:
                 extra_body['hasVisionContent'] = True
+            extra_body = merge_extra_body(extra_body, extract_agentic_job_fields(self.usage_metadata or {}))
 
             async def metering_call():
                 try:
@@ -695,9 +697,11 @@ class BedrockStreamWrapper:
 
                     # Build subscriber object from usage metadata
                     subscriber = extract_subscriber_from_metadata(self.usage_metadata)
+                    organization_name, product_name = extract_org_and_product(self.usage_metadata)
+                    meta = extract_common_metadata(self.usage_metadata)
 
                     result = client.ai.create_completion(
-                        cache_creation_token_count=0,  # Bedrock doesn't support cache tokens yet
+                        cache_creation_token_count=0,
                         cache_read_token_count=0,
                         input_token_cost=None,
                         output_token_cost=None,
@@ -715,21 +719,21 @@ class BedrockStreamWrapper:
                         request_duration=int(request_duration),
                         time_to_first_token=int(
                             self.first_token_time - self.request_start_time) if self.first_token_time else 0,
-                        stop_reason="END",  # Simplified for Bedrock
+                        stop_reason="END",
                         total_token_count=prompt_tokens + completion_tokens,
                         transaction_id=self.response_id,
-                        trace_id=self.usage_metadata.get("trace_id"),
-                        task_type=self.usage_metadata.get("task_type"),
+                        trace_id=meta["trace_id"],
+                        task_type=meta["task_type"],
                         subscriber=subscriber if subscriber else None,
-                        organization_id=self.usage_metadata.get("organization_id"),
-                        subscription_id=self.usage_metadata.get("subscription_id"),
-                        product_id=self.usage_metadata.get("product_id"),
-                        agent=self.usage_metadata.get("agent"),
+                        organization_name=organization_name,
+                        subscription_id=meta["subscription_id"],
+                        product_name=product_name,
+                        agent=meta["agent"],
                         is_streamed=True,
                         operation_type="CHAT",
-                        response_quality_score=self.usage_metadata.get("response_quality_score"),
+                        response_quality_score=meta["response_quality_score"],
                         middleware_source="PYTHON",
-                        extra_body=extra_body if extra_body else None
+                        extra_body=extra_body if extra_body else None,
                     )
                     logger.debug("Metering call result for Bedrock stream: %s", result)
                 except Exception as e:

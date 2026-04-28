@@ -47,7 +47,7 @@ def initialize():
         # Check if required environment variables are set
         api_key = os.getenv("REVENIUM_METERING_API_KEY")
         if not api_key:
-            logger.debug("REVENIUM_METERING_API_KEY not set - middleware will not meter requests")
+            logger.debug("Metering API key not set - middleware will not meter requests")
             return False
 
         # The middleware is automatically activated by importing create_wrapper
@@ -70,9 +70,8 @@ def is_initialized():
     try:
         # Check if environment is properly configured
         api_key = os.getenv("REVENIUM_METERING_API_KEY")
-        base_url = os.getenv("REVENIUM_METERING_BASE_URL")
 
-        return bool(api_key and base_url)
+        return bool(api_key)
     except Exception:
         return False
 

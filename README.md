@@ -1054,7 +1054,7 @@ Trace ID: abc-123
 
 | Variable | Description |
 |----------|-------------|
-| `REVENIUM_METERING_API_KEY` | Your Revenium API key (starts with `hak_`) |
+| `REVENIUM_METERING_API_KEY` | Your Revenium API key (starts with `hak_` or `rev_`) |
 
 ### Optional Environment Variables
 
@@ -1100,7 +1100,7 @@ Trace ID: abc-123
 
 | Issue | Solution |
 |-------|----------|
-| **Middleware not working** | Verify `REVENIUM_METERING_API_KEY` is set correctly (must start with `hak_`) |
+| **Middleware not working** | Verify `REVENIUM_METERING_API_KEY` is set correctly (must start with `hak_` or `rev_`) |
 | **No data in dashboard** | Enable debug logging with `REVENIUM_LOG_LEVEL=DEBUG` |
 | **Import errors** | Ensure the correct extra is installed (e.g., `pip install revenium-python-sdk[openai]`) |
 | **Azure: wrong model name** | Middleware auto-resolves deployment names; check with debug logging |

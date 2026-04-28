@@ -12,6 +12,9 @@ from typing import Dict, Any, Optional, Tuple
 
 import wrapt
 from revenium_middleware import run_async_in_thread
+from revenium_middleware._core.config import is_selective_metering_enabled
+from revenium_middleware._core.context import is_inside_decorated_function
+from revenium_middleware._core.patch_registry import register_patch
 
 # Import common utilities and types
 from ..common import (
@@ -24,7 +27,6 @@ from ..common import (
     create_image_metering_call,
     extract_model_name,
     extract_token_counts,
-    StreamingError,
     handle_metering_error,
     safe_getattr,
 )
@@ -182,161 +184,144 @@ def create_google_ai_metering_call(
         logger.error(f"Traceback: {traceback.format_exc()}")
 
 
-# Wrapper for Google AI generate_content method
-@wrapt.patch_function_wrapper("google.genai.models", "Models.generate_content")
-@handle_metering_error
-def generate_content_wrapper(wrapped, instance, args, kwargs):
-    """Wraps the google.genai.models.Models.generate_content method to log token usage."""
-    logger.debug("Google AI generate_content wrapper called")
+if register_patch("google.genai.models.Models.generate_content"):
+    @wrapt.patch_function_wrapper("google.genai.models", "Models.generate_content")
+    @handle_metering_error
+    def generate_content_wrapper(wrapped, instance, args, kwargs):
+        if is_selective_metering_enabled() and not is_inside_decorated_function():
+            return wrapped(*args, **kwargs)
 
-    # Extract usage metadata and store it for later use
-    usage_metadata = kwargs.pop("usage_metadata", {})
+        logger.debug("Google AI generate_content wrapper called")
 
-    # Extract config if present (for system_instruction)
-    config = kwargs.get("config")
+        usage_metadata = kwargs.pop("usage_metadata", {})
+        config = kwargs.get("config")
 
-    # Record request time
-    request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-    logger.debug(
-        f"Calling wrapped generate_content function with args: {args}, kwargs: {kwargs}"
-    )
+        request_time_dt = datetime.datetime.now(datetime.timezone.utc)
+        logger.debug(
+            f"Calling wrapped generate_content function with args: {args}, kwargs: {kwargs}"
+        )
 
-    # Call the original Google AI function
-    response = wrapped(*args, **kwargs)
+        response = wrapped(*args, **kwargs)
 
-    logger.debug("Handling generate_content response: %s", response)
+        logger.debug("Handling generate_content response: %s", response)
 
-    # Detect vision content in the request
-    contents = kwargs.get("contents") or (args[1] if args and len(args) > 1 else None)
-    has_vision = detect_vision_content(contents)
-    if has_vision:
-        usage_metadata["has_vision_content"] = True
-        logger.debug("Vision content detected in generate_content request")
+        contents = kwargs.get("contents") or (args[1] if args and len(args) > 1 else None)
+        has_vision = detect_vision_content(contents)
+        if has_vision:
+            usage_metadata["has_vision_content"] = True
+            logger.debug("Vision content detected in generate_content request")
 
-    # Extract prompt data if capture is enabled
-    system_prompt, input_messages, output_response, prompts_truncated = (
-        extract_prompt_data_if_enabled(kwargs, args=args, config=config, response=response)
-    )
+        system_prompt, input_messages, output_response, prompts_truncated = (
+            extract_prompt_data_if_enabled(kwargs, args=args, config=config, response=response)
+        )
 
-    # Create metering call using unified function
-    logger.debug("About to call create_google_ai_metering_call")
-    logger.debug(
-        f"create_google_ai_metering_call function exists: {create_google_ai_metering_call}"
-    )
-    try:
+        logger.debug("About to call create_google_ai_metering_call")
+        logger.debug(
+            f"create_google_ai_metering_call function exists: {create_google_ai_metering_call}"
+        )
+        try:
+            create_google_ai_metering_call(
+                response=response,
+                operation_type=OperationType.CHAT,
+                request_time_dt=request_time_dt,
+                usage_metadata=usage_metadata,
+                client_instance=getattr(instance, "_api_client", None),
+                system_prompt=system_prompt,
+                input_messages=input_messages,
+                output_response=output_response,
+                prompts_truncated=prompts_truncated,
+            )
+            logger.debug("create_google_ai_metering_call completed")
+        except Exception as e:
+            logger.error(f"Error in create_google_ai_metering_call: {e}")
+            import traceback
+
+            logger.error(f"Traceback: {traceback.format_exc()}")
+
+        return response
+
+
+if register_patch("google.genai.models.Models.embed_content"):
+    @wrapt.patch_function_wrapper("google.genai.models", "Models.embed_content")
+    @handle_metering_error
+    def embed_content_wrapper(wrapped, instance, args, kwargs):
+        if is_selective_metering_enabled() and not is_inside_decorated_function():
+            return wrapped(*args, **kwargs)
+
+        logger.debug("Google AI embed_content wrapper called")
+
+        usage_metadata = kwargs.pop("usage_metadata", {})
+
+        model_name_from_call = None
+        if args and len(args) > 0:
+            model_name_from_call = args[0]
+        elif "model" in kwargs:
+            model_name_from_call = kwargs["model"]
+
+        logger.debug(
+            f"Captured model name from embeddings API call: {model_name_from_call}"
+        )
+
+        request_time_dt = datetime.datetime.now(datetime.timezone.utc)
+        logger.debug(
+            f"Calling wrapped embed_content function with args: {args}, kwargs: {kwargs}"
+        )
+
+        response = wrapped(*args, **kwargs)
+
+        logger.debug("Handling embed_content response: %s", response)
+
         create_google_ai_metering_call(
             response=response,
-            operation_type=OperationType.CHAT,
+            operation_type=OperationType.EMBED,
             request_time_dt=request_time_dt,
             usage_metadata=usage_metadata,
             client_instance=getattr(instance, "_api_client", None),
-            # Prompt capture fields
-            system_prompt=system_prompt,
-            input_messages=input_messages,
-            output_response=output_response,
-            prompts_truncated=prompts_truncated,
+            model_name_fallback=model_name_from_call,
         )
-        logger.debug("create_google_ai_metering_call completed")
-    except Exception as e:
-        logger.error(f"Error in create_google_ai_metering_call: {e}")
-        import traceback
 
-        logger.error(f"Traceback: {traceback.format_exc()}")
-
-    return response
+        return response
 
 
-# Wrapper for Google AI embed_content method
-@wrapt.patch_function_wrapper("google.genai.models", "Models.embed_content")
-@handle_metering_error
-def embed_content_wrapper(wrapped, instance, args, kwargs):
-    """Wraps the google.genai.models.Models.embed_content method to log token usage."""
-    logger.debug("Google AI embed_content wrapper called")
+if register_patch("google.genai.models.Models.generate_content_stream"):
+    @wrapt.patch_function_wrapper("google.genai.models", "Models.generate_content_stream")
+    @handle_metering_error
+    def generate_content_stream_wrapper(wrapped, instance, args, kwargs):
+        if is_selective_metering_enabled() and not is_inside_decorated_function():
+            return wrapped(*args, **kwargs)
 
-    # Extract usage metadata and store it for later use
-    usage_metadata = kwargs.pop("usage_metadata", {})
+        logger.debug("Google AI generate_content_stream wrapper called")
 
-    # CRITICAL: Google AI embeddings responses don't include model name or token usage
-    # We need to capture the model name from the API call arguments as a fallback
-    model_name_from_call = None
-    if args and len(args) > 0:
-        model_name_from_call = args[0]  # First argument is the model
-    elif "model" in kwargs:
-        model_name_from_call = kwargs["model"]
+        usage_metadata = kwargs.pop("usage_metadata", {})
+        config = kwargs.get("config")
 
-    logger.debug(
-        f"Captured model name from embeddings API call: {model_name_from_call}"
-    )
+        contents = kwargs.get("contents") or (args[1] if args and len(args) > 1 else None)
+        has_vision = detect_vision_content(contents)
+        if has_vision:
+            usage_metadata["has_vision_content"] = True
+            logger.debug("Vision content detected in generate_content_stream request")
 
-    # Record request time
-    request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-    logger.debug(
-        f"Calling wrapped embed_content function with args: {args}, kwargs: {kwargs}"
-    )
+        request_kwargs = kwargs.copy()
+        request_args = args
 
-    # Call the original Google AI function
-    response = wrapped(*args, **kwargs)
+        request_time_dt = datetime.datetime.now(datetime.timezone.utc)
+        logger.debug(
+            f"Calling wrapped generate_content_stream function with args: {args}, kwargs: {kwargs}"
+        )
 
-    logger.debug("Handling embed_content response: %s", response)
+        stream = wrapped(*args, **kwargs)
 
-    # For embeddings, we need to pass the model name since it's not in the response
-    create_google_ai_metering_call(
-        response=response,
-        operation_type=OperationType.EMBED,
-        request_time_dt=request_time_dt,
-        usage_metadata=usage_metadata,
-        client_instance=getattr(instance, "_api_client", None),
-        model_name_fallback=model_name_from_call,
-    )
+        logger.debug("Handling generate_content_stream response")
 
-    return response
-
-
-# Wrapper for Google AI generate_content_stream method (streaming)
-@wrapt.patch_function_wrapper("google.genai.models", "Models.generate_content_stream")
-@handle_metering_error
-def generate_content_stream_wrapper(wrapped, instance, args, kwargs):
-    """Wraps the google.genai.models.Models.generate_content_stream method to log token usage."""
-    logger.debug("Google AI generate_content_stream wrapper called")
-
-    # Extract usage metadata and store it for later use
-    usage_metadata = kwargs.pop("usage_metadata", {})
-
-    # Extract config if present (for system_instruction)
-    config = kwargs.get("config")
-
-    # Detect vision content in the streaming request
-    contents = kwargs.get("contents") or (args[1] if args and len(args) > 1 else None)
-    has_vision = detect_vision_content(contents)
-    if has_vision:
-        usage_metadata["has_vision_content"] = True
-        logger.debug("Vision content detected in generate_content_stream request")
-
-    # Store kwargs and args for prompt extraction later
-    request_kwargs = kwargs.copy()
-    request_args = args
-
-    # Record request time
-    request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-    logger.debug(
-        f"Calling wrapped generate_content_stream function with args: {args}, kwargs: {kwargs}"
-    )
-
-    # Call the original Google AI function
-    stream = wrapped(*args, **kwargs)
-
-    logger.debug("Handling generate_content_stream response")
-
-    # Return wrapped stream that will meter usage when complete
-    return handle_streaming_response(
-        stream=stream,
-        request_time_dt=request_time_dt,
-        usage_metadata=usage_metadata,
-        client_instance=getattr(instance, "_api_client", None),
-        request_kwargs=request_kwargs,
-        request_args=request_args,
-        config=config,
-    )
+        return handle_streaming_response(
+            stream=stream,
+            request_time_dt=request_time_dt,
+            usage_metadata=usage_metadata,
+            client_instance=getattr(instance, "_api_client", None),
+            request_kwargs=request_kwargs,
+            request_args=request_args,
+            config=config,
+        )
 
 
 def handle_streaming_response(
@@ -578,90 +563,78 @@ def handle_streaming_response(
                 )
 
             except Exception as e:
-                # Don't let logging errors break the stream
-                logger.error("Error logging streaming usage: %s", e)
-                raise StreamingError(
-                    f"Failed to log streaming usage: {str(e)}",
-                    chunk_count=len(self.chunks) if self.chunks else 0,
-                    stream_state="completed",
-                ) from e
+                logger.warning("Metering error: %s", e)
 
     return StreamWrapper(stream)
 
 
-# Wrapper for Google AI generate_images method (Imagen)
-@wrapt.patch_function_wrapper("google.genai.models", "Models.generate_images")
-@handle_metering_error
-def generate_images_wrapper(wrapped, instance, args, kwargs):
-    """Wraps the google.genai.models.Models.generate_images method to meter image generation."""
-    logger.debug("Google AI generate_images wrapper called (Imagen)")
+if register_patch("google.genai.models.Models.generate_images"):
+    @wrapt.patch_function_wrapper("google.genai.models", "Models.generate_images")
+    @handle_metering_error
+    def generate_images_wrapper(wrapped, instance, args, kwargs):
+        if is_selective_metering_enabled() and not is_inside_decorated_function():
+            return wrapped(*args, **kwargs)
 
-    # Extract usage metadata
-    usage_metadata = kwargs.pop("usage_metadata", {})
+        logger.debug("Google AI generate_images wrapper called (Imagen)")
 
-    # Capture model name from args/kwargs
-    model_name = None
-    if args and len(args) > 0:
-        model_name = args[0]
-    elif "model" in kwargs:
-        model_name = kwargs["model"]
+        usage_metadata = kwargs.pop("usage_metadata", {})
 
-    # Capture image generation config
-    config = kwargs.get("config", {})
-    number_of_images = 1
-    aspect_ratio = None
+        model_name = None
+        if args and len(args) > 0:
+            model_name = args[0]
+        elif "model" in kwargs:
+            model_name = kwargs["model"]
 
-    if config:
-        if hasattr(config, "number_of_images"):
-            number_of_images = config.number_of_images or 1
-        elif isinstance(config, dict):
-            number_of_images = config.get("number_of_images", 1)
+        config = kwargs.get("config", {})
+        number_of_images = 1
+        aspect_ratio = None
 
-        if hasattr(config, "aspect_ratio"):
-            aspect_ratio = config.aspect_ratio
-        elif isinstance(config, dict):
-            aspect_ratio = config.get("aspect_ratio")
+        if config:
+            if hasattr(config, "number_of_images"):
+                number_of_images = config.number_of_images or 1
+            elif isinstance(config, dict):
+                number_of_images = config.get("number_of_images", 1)
 
-    logger.debug(
-        f"Imagen request: model={model_name}, count={number_of_images}, aspect_ratio={aspect_ratio}"
-    )
+            if hasattr(config, "aspect_ratio"):
+                aspect_ratio = config.aspect_ratio
+            elif isinstance(config, dict):
+                aspect_ratio = config.get("aspect_ratio")
 
-    # Record request time
-    request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-
-    # Call the original function
-    response = wrapped(*args, **kwargs)
-
-    # Record response time
-    response_time_dt = datetime.datetime.now(datetime.timezone.utc)
-
-    # Count actual generated images
-    actual_image_count = 0
-    if hasattr(response, "generated_images") and response.generated_images:
-        actual_image_count = len(response.generated_images)
-    elif hasattr(response, "images") and response.images:
-        actual_image_count = len(response.images)
-
-    logger.debug(
-        f"Imagen response: requested={number_of_images}, actual={actual_image_count}"
-    )
-
-    # Create image metering call
-    try:
-        create_image_metering_call(
-            model=model_name or "imagen-3.0-generate-001",
-            requested_image_count=number_of_images,
-            actual_image_count=actual_image_count,
-            request_time_dt=request_time_dt,
-            response_time_dt=response_time_dt,
-            usage_metadata=usage_metadata,
-            operation_subtype="generation",
-            aspect_ratio=aspect_ratio,
+        logger.debug(
+            f"Imagen request: model={model_name}, count={number_of_images}, aspect_ratio={aspect_ratio}"
         )
-        logger.debug("Image metering call completed for Imagen")
-    except Exception as e:
-        logger.error(f"Error in image metering call: {e}")
-        import traceback
-        logger.error(f"Traceback: {traceback.format_exc()}")
 
-    return response
+        request_time_dt = datetime.datetime.now(datetime.timezone.utc)
+
+        response = wrapped(*args, **kwargs)
+
+        response_time_dt = datetime.datetime.now(datetime.timezone.utc)
+
+        actual_image_count = 0
+        if hasattr(response, "generated_images") and response.generated_images:
+            actual_image_count = len(response.generated_images)
+        elif hasattr(response, "images") and response.images:
+            actual_image_count = len(response.images)
+
+        logger.debug(
+            f"Imagen response: requested={number_of_images}, actual={actual_image_count}"
+        )
+
+        try:
+            create_image_metering_call(
+                model=model_name or "imagen-3.0-generate-001",
+                requested_image_count=number_of_images,
+                actual_image_count=actual_image_count,
+                request_time_dt=request_time_dt,
+                response_time_dt=response_time_dt,
+                usage_metadata=usage_metadata,
+                operation_subtype="generation",
+                aspect_ratio=aspect_ratio,
+            )
+            logger.debug("Image metering call completed for Imagen")
+        except Exception as e:
+            logger.error(f"Error in image metering call: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+
+        return response
