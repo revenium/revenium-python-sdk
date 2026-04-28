@@ -3,6 +3,10 @@ import logging
 import datetime
 from revenium_middleware import client, run_async_in_thread, shutdown_event
 from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
+from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, merge_extra_body
+from revenium_middleware._core.config import is_selective_metering_enabled
+from revenium_middleware._core.context import is_inside_decorated_function
+from revenium_middleware._core.patch_registry import register_patch
 from .context import metadata_context
 from .hooks import execute_metadata_hooks
 from . import trace_fields
@@ -12,49 +16,36 @@ from .config import get_api_key
 logger = logging.getLogger("revenium_middleware.extension")
 
 
-@wrapt.patch_function_wrapper('litellm', 'completion')
-def completion_wrapper(wrapped, _, args, kwargs):
-    """
-    Wraps the litellm.completion method to log token usage.
-    Handles both streaming and non-streaming responses.
+if register_patch("litellm.completion"):
+    @wrapt.patch_function_wrapper('litellm', 'completion')
+    def completion_wrapper(wrapped, _, args, kwargs):
+        if is_selective_metering_enabled() and not is_inside_decorated_function():
+            return wrapped(*args, **kwargs)
 
-    Metadata is collected from two sources:
-    1. Context metadata (set via metadata_context API)
-    2. Explicit usage_metadata kwarg
+        logger.debug("LiteLLM completion wrapper called")
 
-    Explicit kwargs take precedence over context metadata.
-    """
-    logger.debug("LiteLLM completion wrapper called")
+        context_metadata = metadata_context.get()
+        explicit_metadata = kwargs.pop("usage_metadata", {}) if "usage_metadata" in kwargs else {}
+        usage_metadata = {**context_metadata, **explicit_metadata}
 
-    # Get context metadata first
-    context_metadata = metadata_context.get()
+        try:
+            usage_metadata = execute_metadata_hooks(usage_metadata)
+        except Exception as e:
+            logger.error(f"Error executing metadata hooks: {e}. Continuing with unmodified metadata.")
 
-    # Get explicit metadata from kwargs (takes precedence)
-    explicit_metadata = kwargs.pop("usage_metadata", {}) if "usage_metadata" in kwargs else {}
+        logger.debug("Usage metadata (merged from context and kwargs, after hooks): {}".format(usage_metadata))
 
-    # Merge: context metadata as base, explicit metadata overrides
-    usage_metadata = {**context_metadata, **explicit_metadata}
+        request_time_dt = datetime.datetime.now(datetime.timezone.utc)
+        logger.debug(f"Calling chat function with args: {args}, kwargs: {kwargs}")
 
-    # Execute registered hooks to allow modification/enrichment
-    try:
-        usage_metadata = execute_metadata_hooks(usage_metadata)
-    except Exception as e:
-        logger.error(f"Error executing metadata hooks: {e}. Continuing with unmodified metadata.")
-        # Continue with the metadata we have - don't let hook errors break the middleware
+        is_streaming = kwargs.get("stream", False)
+        logger.debug(f"is_streaming: {is_streaming}")
 
-    logger.debug("Usage metadata (merged from context and kwargs, after hooks): {}".format(usage_metadata))
-
-    request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-    logger.debug(f"Calling chat function with args: {args}, kwargs: {kwargs}")
-
-    is_streaming = kwargs.get("stream", False)
-    logger.debug(f"is_streaming: {is_streaming}")
-
-    response = wrapped(*args, **kwargs)
-    if is_streaming:
-        return handle_streaming_response(response, request_time_dt, usage_metadata)
-    else:
-        return handle_response(response, request_time_dt, usage_metadata, False)
+        response = wrapped(*args, **kwargs)
+        if is_streaming:
+            return handle_streaming_response(response, request_time_dt, usage_metadata)
+        else:
+            return handle_response(response, request_time_dt, usage_metadata, False)
 
 
 def handle_streaming_response(generator, request_time_dt, usage_metadata):
@@ -75,8 +66,12 @@ def handle_streaming_response(generator, request_time_dt, usage_metadata):
 
         # After all chunks are processed, construct the final response
         if chunks:
-            # The last chunk should contain the complete response data
-            final_response = chunks[-1]
+            for chunk in reversed(chunks):
+                if hasattr(chunk, 'usage') and chunk.usage is not None:
+                    final_response = chunk
+                    break
+            if final_response is None:
+                final_response = chunks[-1]
             handle_response(final_response, request_time_dt, usage_metadata, True)
 
     return wrapped_generator()
@@ -101,7 +96,7 @@ def handle_response(response, request_time_dt, usage_metadata, is_streaming):
         prompt_tokens = getattr(response.usage, 'prompt_tokens', 0)
         completion_tokens = getattr(response.usage, 'completion_tokens', 0)
         cached_tokens = getattr(response.usage, 'cached_tokens', 0)
-        total_tokens = prompt_tokens + completion_tokens + cached_tokens
+        total_tokens = prompt_tokens + completion_tokens
 
         logger.debug(
             "LiteLLM completion token usage - prompt: %d, completion: %d, cached: %d, total: %d",
@@ -129,48 +124,10 @@ def handle_response(response, request_time_dt, usage_metadata, is_streaming):
             # Create subscriber object from usage metadata
             subscriber = extract_subscriber_from_metadata(usage_metadata)
 
-            # Prepare arguments for create_completion
-            # Extract organization name (support both old and new field names)
-            # Priority: organization_name > organizationName > organization_id > organizationId
-            organization_name = usage_metadata.get("organization_name")
-            if organization_name is None:
-                organization_name = usage_metadata.get("organizationName")
-            if organization_name is None:
-                # Fallback to deprecated field names
-                organization_name = usage_metadata.get("organization_id")
-            if organization_name is None:
-                organization_name = usage_metadata.get("organizationId")
-
-            # Extract product name (support both old and new field names)
-            # Priority: product_name > productName > product_id > productId
-            product_name = usage_metadata.get("product_name")
-            if product_name is None:
-                product_name = usage_metadata.get("productName")
-            if product_name is None:
-                # Fallback to deprecated field names
-                product_name = usage_metadata.get("product_id")
-            if product_name is None:
-                product_name = usage_metadata.get("productId")
-
-            # Log deprecation warning if old fields are used
-            # Note: We check for old field names only when new field names are NOT present
-            # The decorators now set organization_name/product_name, so this warning
-            # only fires for users who directly use the deprecated field names
-            if usage_metadata.get("organization_id") or usage_metadata.get("organizationId"):
-                if not (usage_metadata.get("organization_name") or usage_metadata.get("organizationName")):
-                    logger.warning(
-                        "Fields 'organization_id' and 'organizationId' are deprecated. "
-                        "Use 'organization_name' or 'organizationName' instead. "
-                        "The old fields will be removed in a future version."
-                    )
-
-            if usage_metadata.get("product_id") or usage_metadata.get("productId"):
-                if not (usage_metadata.get("product_name") or usage_metadata.get("productName")):
-                    logger.warning(
-                        "Fields 'product_id' and 'productId' are deprecated. "
-                        "Use 'product_name' or 'productName' instead. "
-                        "The old fields will be removed in a future version."
-                    )
+            organization_name, product_name = extract_org_and_product(usage_metadata)
+            meta = extract_common_metadata(usage_metadata)
+            agentic_fields = extract_agentic_job_fields(usage_metadata)
+            extra_body = merge_extra_body(None, agentic_fields)
 
             completion_args = {
                 "cache_creation_token_count": cached_tokens,
@@ -192,15 +149,14 @@ def handle_response(response, request_time_dt, usage_metadata, is_streaming):
                 "stop_reason": stop_reason,
                 "total_token_count": total_tokens,
                 "transaction_id": response_id,
-                # Support both snake_case and camelCase for trace_id
-                "trace_id": usage_metadata.get("trace_id") or usage_metadata.get("traceId"),
-                "task_type": usage_metadata.get("task_type"),
+                "trace_id": meta["trace_id"],
+                "task_type": meta["task_type"],
                 "subscriber": subscriber if subscriber else None,
                 "organization_name": organization_name,
-                "subscription_id": usage_metadata.get("subscription_id"),
+                "subscription_id": meta["subscription_id"],
                 "product_name": product_name,
-                "agent": usage_metadata.get("agent"),
-                "response_quality_score": usage_metadata.get("response_quality_score"),
+                "agent": meta["agent"],
+                "response_quality_score": meta["response_quality_score"],
                 "is_streamed": is_streaming,
                 "operation_type": "CHAT",
                 "system_fingerprint": getattr(response, 'system_fingerprint', None),
@@ -283,17 +239,14 @@ def handle_response(response, request_time_dt, usage_metadata, is_streaming):
             logger.debug("Calling client.ai.create_completion with args: %s", completion_args)
 
             # The client.ai.create_completion method is not async, so don't use await
-            result = client.ai.create_completion(**completion_args)
+            result = client.ai.create_completion(**completion_args, extra_body=extra_body)
             logger.debug("Metering call result: %s", result)
 
             # Print usage summary if enabled (fire-and-forget)
             # Summary can still show token/duration metrics even without API key
             revenium_api_key = get_api_key()
 
-            # Support both snake_case and camelCase for trace_id
-            trace_id = usage_metadata.get("trace_id")
-            if trace_id is None:
-                trace_id = usage_metadata.get("traceId")
+            trace_id = meta["trace_id"]
 
             print_usage_summary(
                 model=completion_args.get("model", "unknown"),

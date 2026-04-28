@@ -58,8 +58,8 @@ response = client.models.generate_content(
         },
 
         # Organization and product tracking (names for lookup/auto-creation)
-        "organizationName": "AcmeCorp",
-        "productName": "customer-chatbot",
+        "organization_name": "AcmeCorp",
+        "product_name": "customer-chatbot",
 
         # Request identification
         "trace_id": "unique-trace-id",

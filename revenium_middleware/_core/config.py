@@ -41,6 +41,9 @@ class Config:
     RETRY_BACKOFF_FACTOR: float = 1.5
     INITIAL_RETRY_DELAY: float = 0.1
 
+    # API key validation
+    VALID_API_KEY_PREFIXES: tuple = ("hak_", "rev_")
+
     # Core environment variable names
     ENV_REVENIUM_API_KEY: str = "REVENIUM_METERING_API_KEY"
     ENV_LOG_LEVEL: str = "REVENIUM_LOG_LEVEL"
@@ -59,7 +62,7 @@ class Config:
 
     # Prompt capture settings
     ENV_REVENIUM_CAPTURE_PROMPTS: str = "REVENIUM_CAPTURE_PROMPTS"
-    CAPTURE_PROMPTS: bool = os.getenv("REVENIUM_CAPTURE_PROMPTS", "false").lower() in ("true", "1", "yes", "on")
+    CAPTURE_PROMPTS: bool = False
     MAX_PROMPT_LENGTH: int = 50_000  # Maximum characters per prompt field
 
     # Terminal summary settings
@@ -86,6 +89,10 @@ class SecurityConfig:
     SENSITIVE_PATTERNS: Set[str] = {
         'sk-', 'pk-', 'Bearer ', 'Basic ', 'Token '
     }
+
+
+def is_capture_prompts_enabled() -> bool:
+    return os.getenv("REVENIUM_CAPTURE_PROMPTS", "false").lower() in ("true", "1", "yes", "on")
 
 
 def is_selective_metering_enabled() -> bool:
@@ -163,3 +170,15 @@ def get_team_id() -> Optional[str]:
 def get_base_url() -> str:
     """Get Revenium base URL from environment (defaults to https://api.revenium.ai)."""
     return get_config_value(Config.ENV_REVENIUM_BASE_URL, Config.DEFAULT_BASE_URL)
+
+
+def validate_api_key(api_key: str) -> None:
+    """Raise ``ValueError`` if ``api_key`` does not start with a recognized Revenium prefix.
+
+    The caller is responsible for any None/empty check; this validates format only.
+    """
+    if not api_key.startswith(Config.VALID_API_KEY_PREFIXES):
+        raise ValueError(
+            'Invalid Revenium API key format. '
+            'Revenium API keys should start with "hak_" or "rev_".'
+        )

@@ -12,6 +12,13 @@ import uuid
 from typing import Dict, Any, Optional
 
 from revenium_middleware import client, run_async_in_thread, shutdown_event
+from revenium_middleware._core.fields import (
+    extract_field_with_fallback as _core_extract_field_with_fallback,
+    extract_org_and_product,
+    extract_common_metadata,
+    extract_agentic_job_fields,
+    merge_extra_body,
+)
 
 from .types import UsageData, OperationType, ProviderMetadata, TokenCounts
 from .exceptions import MeteringError, APIResponseError, safe_extract
@@ -49,47 +56,7 @@ def format_timestamp(dt: datetime.datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def extract_field_with_fallback(
-    usage_metadata: Dict[str, Any],
-    new_snake: str,
-    new_camel: str,
-    old_snake: str,
-    old_camel: str,
-    field_label: str,
-) -> Optional[str]:
-    """
-    Extract field with 4-level fallback and deprecation warning.
-
-    Args:
-        usage_metadata: Dictionary containing usage metadata
-        new_snake: New snake_case field name (e.g., "organization_name")
-        new_camel: New camelCase field name (e.g., "organizationName")
-        old_snake: Old snake_case field name (e.g., "organization_id")
-        old_camel: Old camelCase field name (e.g., "organizationId")
-        field_label: Human-readable label for the field (e.g., "organization")
-
-    Returns:
-        The field value with precedence: new_snake > new_camel > old_snake > old_camel
-    """
-    # Extract with precedence: new_snake > new_camel > old_snake > old_camel
-    value = usage_metadata.get(new_snake)
-    if value is None:
-        value = usage_metadata.get(new_camel)
-    if value is None:
-        value = usage_metadata.get(old_snake)
-    if value is None:
-        value = usage_metadata.get(old_camel)
-
-    # Log deprecation warning if old fields are used without new fields
-    if usage_metadata.get(old_snake) or usage_metadata.get(old_camel):
-        if not (usage_metadata.get(new_snake) or usage_metadata.get(new_camel)):
-            logger.warning(
-                f"Fields '{old_camel}' and '{old_snake}' are deprecated. "
-                f"Use '{new_camel}' or '{new_snake}' instead. "
-                "The old fields will be removed in a future version."
-            )
-
-    return value
+extract_field_with_fallback = _core_extract_field_with_fallback
 
 
 def calculate_duration_ms(
@@ -184,45 +151,23 @@ async def log_token_usage(
         "middleware_source": "python",  # Required parameter for Google Python middleware
     }
 
-    # Add optional metadata fields if they exist (using snake_case for Python client)
-    if usage_metadata.get("trace_id"):
-        completion_args["trace_id"] = usage_metadata.get("trace_id")
-    if usage_metadata.get("task_type"):
-        completion_args["task_type"] = usage_metadata.get("task_type")
-
-    # Extract organization and product names with deprecation warnings
-    organization_name = extract_field_with_fallback(
-        usage_metadata,
-        "organization_name",
-        "organizationName",
-        "organization_id",
-        "organizationId",
-        "organization",
-    )
-    product_name = extract_field_with_fallback(
-        usage_metadata,
-        "product_name",
-        "productName",
-        "product_id",
-        "productId",
-        "product",
-    )
-
-    # Add to completion_args using new field names
+    organization_name, product_name = extract_org_and_product(usage_metadata)
     if organization_name:
         completion_args["organization_name"] = organization_name
-
     if product_name:
         completion_args["product_name"] = product_name
 
-    if usage_metadata.get("subscription_id"):
-        completion_args["subscription_id"] = usage_metadata.get("subscription_id")
-    if usage_metadata.get("agent"):
-        completion_args["agent"] = usage_metadata.get("agent")
-    if usage_metadata.get("response_quality_score"):
-        completion_args["response_quality_score"] = usage_metadata.get(
-            "response_quality_score"
-        )
+    meta = extract_common_metadata(usage_metadata)
+    if meta["trace_id"]:
+        completion_args["trace_id"] = meta["trace_id"]
+    if meta["task_type"]:
+        completion_args["task_type"] = meta["task_type"]
+    if meta["subscription_id"]:
+        completion_args["subscription_id"] = meta["subscription_id"]
+    if meta["agent"]:
+        completion_args["agent"] = meta["agent"]
+    if meta["response_quality_score"]:
+        completion_args["response_quality_score"] = meta["response_quality_score"]
 
     # Add vision content flag if detected
     if usage_metadata.get("has_vision_content"):
@@ -372,13 +317,16 @@ async def log_token_usage(
         safe_args['output_response'] = '[REDACTED]'
     logger.debug("Calling client.ai.create_completion with args: %s", safe_args)
 
-    # Debug logging for metering call
+    agentic_fields = extract_agentic_job_fields(usage_metadata)
+    extra_body = merge_extra_body(completion_args.get("extra_body"), agentic_fields)
+    if extra_body:
+        completion_args["extra_body"] = extra_body
+
     logger.debug(
         f"Metering call for {operation_type.value}: {transaction_id}, tokens: {prompt_tokens}+{completion_tokens}={total_tokens}"
     )
 
     try:
-        # The client.ai.create_completion method is not async, so don't use await
         result = client.ai.create_completion(**completion_args)
         logger.debug("Metering call result: %s", result)
         logger.info(" REVENIUM SUCCESS: Metering call successful: %s", result.id)
@@ -497,30 +445,21 @@ def _build_common_metadata_args(usage_metadata: Dict[str, Any]) -> Dict[str, Any
     """
     args = {}
 
-    # Optional metadata fields
-    if usage_metadata.get("trace_id"):
-        args["trace_id"] = usage_metadata["trace_id"]
-    if usage_metadata.get("task_type"):
-        args["task_type"] = usage_metadata["task_type"]
-
-    # Organization and product names with deprecation fallback
-    organization_name = extract_field_with_fallback(
-        usage_metadata, "organization_name", "organizationName",
-        "organization_id", "organizationId", "organization",
-    )
-    product_name = extract_field_with_fallback(
-        usage_metadata, "product_name", "productName",
-        "product_id", "productId", "product",
-    )
+    organization_name, product_name = extract_org_and_product(usage_metadata)
     if organization_name:
         args["organization_name"] = organization_name
     if product_name:
         args["product_name"] = product_name
 
-    if usage_metadata.get("subscription_id"):
-        args["subscription_id"] = usage_metadata["subscription_id"]
-    if usage_metadata.get("agent"):
-        args["agent"] = usage_metadata["agent"]
+    meta = extract_common_metadata(usage_metadata)
+    if meta["trace_id"]:
+        args["trace_id"] = meta["trace_id"]
+    if meta["task_type"]:
+        args["task_type"] = meta["task_type"]
+    if meta["subscription_id"]:
+        args["subscription_id"] = meta["subscription_id"]
+    if meta["agent"]:
+        args["agent"] = meta["agent"]
 
     # Trace visualization fields
     environment = usage_metadata.get("environment") or trace_fields.get_environment()
@@ -688,6 +627,11 @@ async def log_image_usage(
     # Add common metadata
     image_args.update(_build_common_metadata_args(usage_metadata))
 
+    agentic_fields = extract_agentic_job_fields(usage_metadata)
+    extra_body = merge_extra_body(image_args.get("extra_body"), agentic_fields)
+    if extra_body:
+        image_args["extra_body"] = extra_body
+
     logger.debug("Calling client.ai.create_image with args: %s", image_args)
 
     try:
@@ -785,6 +729,11 @@ async def log_video_usage(
 
     # Add common metadata
     video_args.update(_build_common_metadata_args(usage_metadata))
+
+    agentic_fields = extract_agentic_job_fields(usage_metadata)
+    extra_body = merge_extra_body(video_args.get("extra_body"), agentic_fields)
+    if extra_body:
+        video_args["extra_body"] = extra_body
 
     logger.debug("Calling client.ai.create_video with args: %s", video_args)
 

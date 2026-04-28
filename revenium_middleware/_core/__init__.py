@@ -18,6 +18,16 @@ from .context import (
 )
 from .decorators import revenium_meter, revenium_metadata, track_usage
 from .config import is_selective_metering_enabled
+from .fields import (
+    extract_field_with_fallback,
+    extract_with_aliases,
+    extract_organization_name,
+    extract_product_name,
+    extract_org_and_product,
+    extract_common_metadata,
+    extract_agentic_job_fields,
+    merge_extra_body,
+)
 from .trace_fields import (
     get_environment,
     get_region,
@@ -51,6 +61,15 @@ __all__ = [
     "merge_metadata",
     # Config
     "is_selective_metering_enabled",
+    # Field extraction
+    "extract_field_with_fallback",
+    "extract_with_aliases",
+    "extract_organization_name",
+    "extract_product_name",
+    "extract_org_and_product",
+    "extract_common_metadata",
+    "extract_agentic_job_fields",
+    "merge_extra_body",
     # Trace fields
     "get_environment",
     "get_region",

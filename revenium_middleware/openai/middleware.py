@@ -8,6 +8,10 @@ from enum import Enum
 import wrapt
 from revenium_middleware import client, run_async_in_thread, shutdown_event, merge_metadata
 from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
+from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, merge_extra_body
+from revenium_middleware._core.config import is_selective_metering_enabled, is_capture_prompts_enabled
+from revenium_middleware._core.context import is_inside_decorated_function
+from revenium_middleware._core.patch_registry import register_patch
 
 # Azure OpenAI support imports
 from .provider import Provider, detect_provider, get_provider_metadata, is_azure_provider
@@ -53,7 +57,7 @@ def extract_prompt_data_if_enabled(
     Returns:
         Tuple of (system_prompt, input_messages, output_response, prompts_truncated)
     """
-    if not Config.CAPTURE_PROMPTS or not request_body:
+    if not is_capture_prompts_enabled() or not request_body:
         return None, None, None, None
 
     # Extract prompts from request
@@ -218,6 +222,9 @@ def _validate_extract_usage_inputs(response: Any, operation_type: OperationType,
 
     if not hasattr(response, 'usage'):
         raise ValidationError("Response object must have 'usage' attribute")
+
+    if response.usage is None:
+        raise ValidationError("Response object 'usage' attribute must not be None")
 
 
 def extract_usage_data(response, operation_type: OperationType, request_time: str, response_time: str, request_duration: float,
@@ -415,47 +422,29 @@ async def log_token_usage(
         "middleware_source": "PYTHON",
     }
 
-    # Add optional fields only if they have values
-    if usage_metadata.get("trace_id"):
-        completion_args["trace_id"] = usage_metadata.get("trace_id")
-    if usage_metadata.get("task_type"):
-        completion_args["task_type"] = usage_metadata.get("task_type")
+    organization_name, product_name = extract_org_and_product(usage_metadata)
+    meta = extract_common_metadata(usage_metadata)
+
+    if meta["trace_id"]:
+        completion_args["trace_id"] = meta["trace_id"]
+    if meta["task_type"]:
+        completion_args["task_type"] = meta["task_type"]
     if subscriber:
         completion_args["subscriber"] = subscriber
-    # Extract organization name (support both old and new field names)
-    # New field names take precedence over deprecated field names
-    # Using 'or' logic to handle empty strings and fallback properly
-    organization_name = (
-        usage_metadata.get("organization_name")
-        or usage_metadata.get("organizationName")
-        or usage_metadata.get("organization_id")
-        or usage_metadata.get("organizationId")
-    )
     if organization_name:
         completion_args["organization_name"] = organization_name
-        # Legacy alias for backward compatibility (deprecated, will be removed in future version)
-        completion_args["organization_id"] = organization_name
-
-    if usage_metadata.get("subscription_id"):
-        completion_args["subscription_id"] = usage_metadata.get("subscription_id")
-
-    # Extract product name (support both old and new field names)
-    # New field names take precedence over deprecated field names
-    # Using 'or' logic to handle empty strings and fallback properly
-    product_name = (
-        usage_metadata.get("product_name")
-        or usage_metadata.get("productName")
-        or usage_metadata.get("product_id")
-        or usage_metadata.get("productId")
-    )
+    if meta["subscription_id"]:
+        completion_args["subscription_id"] = meta["subscription_id"]
     if product_name:
         completion_args["product_name"] = product_name
-        # Legacy alias for backward compatibility (deprecated, will be removed in future version)
-        completion_args["product_id"] = product_name
-    if usage_metadata.get("agent"):
-        completion_args["agent"] = usage_metadata.get("agent")
-    if usage_metadata.get("response_quality_score"):
-        completion_args["response_quality_score"] = usage_metadata.get("response_quality_score")
+    if meta["agent"]:
+        completion_args["agent"] = meta["agent"]
+    if meta["response_quality_score"]:
+        completion_args["response_quality_score"] = meta["response_quality_score"]
+
+    agentic_fields = extract_agentic_job_fields(usage_metadata)
+    if agentic_fields:
+        completion_args["extra_body"] = merge_extra_body(completion_args.get("extra_body"), agentic_fields)
 
     # Add trace visualization fields only if they have values
     if environment:
@@ -526,7 +515,7 @@ async def log_token_usage(
                     output_token_count=completion_tokens,
                     total_token_count=total_tokens,
                     transaction_id=response_id,
-                    trace_id=usage_metadata.get("trace_id"),
+                    trace_id=meta["trace_id"],
                     revenium_api_key=revenium_api_key,
                 )
 
@@ -578,11 +567,14 @@ def create_metering_call(
         (response_time_dt - request_time_dt).total_seconds() * 1000
     )
 
-    # Extract usage data using unified function
-    usage_data, transaction_id = extract_usage_data(
-        response, operation_type, request_time, response_time,
-        request_duration, client_instance
-    )
+    try:
+        usage_data, transaction_id = extract_usage_data(
+            response, operation_type, request_time, response_time,
+            request_duration, client_instance
+        )
+    except (ValidationError, Exception) as e:
+        logger.warning("Skipping metering for response with invalid usage data: %s", e)
+        return
 
     # Override streaming and timing info
     usage_data["is_streamed"] = is_streamed
@@ -771,12 +763,12 @@ def _extract_langchain_usage_metadata():
         return {}
 
 
-@wrapt.patch_function_wrapper('openai.resources.embeddings', 'Embeddings.create')
 def embeddings_create_wrapper(wrapped, instance, args, kwargs):
-    """Wraps the openai.embeddings.create method to log token usage."""
     logger.debug("OpenAI/Azure OpenAI embeddings.create wrapper called")
 
-    # Capture request body before modifications (for operation detection)
+    if is_selective_metering_enabled() and not is_inside_decorated_function():
+        return wrapped(*args, **kwargs)
+
     request_body = kwargs.copy()
 
     # Extract API-level metadata from kwargs
@@ -833,14 +825,19 @@ def embeddings_create_wrapper(wrapped, instance, args, kwargs):
     return response
 
 
-@wrapt.patch_function_wrapper('openai.resources.chat.completions', 'Completions.create')
 def create_wrapper(wrapped, instance, args, kwargs):
-    """
-    Wraps the openai.ChatCompletion.create method to log token usage.
-    Handles both streaming and non-streaming responses for OpenAI and
-    Azure OpenAI.
-    """
     logger.debug("OpenAI/Azure OpenAI chat.completions.create wrapper called")
+
+    if is_selective_metering_enabled() and not is_inside_decorated_function():
+        return wrapped(*args, **kwargs)
+
+    # The Perplexity middleware patches the same Completions.create slot. When
+    # both middlewares are loaded the wrappers chain via wrapt — defer
+    # Perplexity-bound calls to the Perplexity wrapper to avoid double-metering.
+    _client = getattr(instance, '_client', None)
+    _base_url = getattr(_client, 'base_url', None) if _client else None
+    if _base_url and "perplexity" in str(_base_url).lower():
+        return wrapped(*args, **kwargs)
 
     # Capture request body before modifications (for operation detection)
     request_body = kwargs.copy()
@@ -860,10 +857,11 @@ def create_wrapper(wrapped, instance, args, kwargs):
 
     # If streaming, add stream_options to include usage information
     if stream:
-        # Initialize stream_options if it doesn't exist
+        kwargs = dict(kwargs)
         if 'stream_options' not in kwargs:
             kwargs['stream_options'] = {}
-        # Add include_usage flag to get token counts in the response
+        else:
+            kwargs['stream_options'] = dict(kwargs['stream_options'])
         kwargs['stream_options']['include_usage'] = True
         logger.debug(
             "Added include_usage to stream_options for accurate token "
@@ -889,13 +887,11 @@ def create_wrapper(wrapped, instance, args, kwargs):
             )
             azure_config.validate_deployment()
 
-    # Record request time
     request_time_dt = datetime.datetime.now(datetime.timezone.utc)
     logger.debug(
         f"Calling wrapped function with args: {args}, kwargs: {kwargs}"
     )
 
-    # Call the original OpenAI function
     response = wrapped(*args, **kwargs)
 
     # Record time to first token (for non-streaming, same as full response)
@@ -1223,23 +1219,18 @@ def handle_streaming_response(
     return StreamWrapper(iter(stream))
 
 
-@wrapt.patch_function_wrapper('openai.resources.responses', 'Responses.create')
 def responses_create_wrapper(wrapped, instance, args, kwargs):
-    """
-    Wraps the openai.responses.create method to log token usage.
-    Handles both streaming and non-streaming responses for OpenAI Responses API.
-
-    Note: The Responses API automatically includes usage data in streaming responses
-    without requiring stream_options configuration (unlike Chat Completions API).
-    """
     logger.debug("OpenAI Responses API create wrapper called")
 
-    # Extract usage metadata and store it for later use
-    usage_metadata = kwargs.pop("usage_metadata", {})
+    if is_selective_metering_enabled() and not is_inside_decorated_function():
+        return wrapped(*args, **kwargs)
 
-    # Try to extract usage_metadata from LangChain context if not found in kwargs
-    if not usage_metadata:
-        usage_metadata = _extract_langchain_usage_metadata()
+    api_metadata = kwargs.pop("usage_metadata", {})
+
+    if not api_metadata:
+        api_metadata = _extract_langchain_usage_metadata()
+
+    usage_metadata = merge_metadata(api_metadata)
 
     # Check if this is a streaming request
     stream = kwargs.get('stream', False)
@@ -1422,6 +1413,57 @@ def handle_streaming_responses(stream, request_time_dt, usage_metadata,
                 else:
                     resolved_model_name = raw_model_name
 
+                from .trace_fields import (
+                    get_environment, get_region, get_credential_alias,
+                    get_trace_type, get_trace_name,
+                    get_parent_transaction_id,
+                    get_transaction_name, get_retry_number,
+                    detect_operation_type,
+                    validate_trace_type, validate_trace_name
+                )
+
+                environment = (
+                    self.usage_metadata.get('environment') or
+                    get_environment()
+                )
+                region = (
+                    self.usage_metadata.get('region') or
+                    get_region()
+                )
+                credential_alias = (
+                    self.usage_metadata.get('credentialAlias') or
+                    self.usage_metadata.get('credential_alias') or
+                    get_credential_alias()
+                )
+                trace_type_raw = (
+                    self.usage_metadata.get('traceType') or
+                    self.usage_metadata.get('trace_type')
+                )
+                trace_type = validate_trace_type(trace_type_raw) if trace_type_raw else get_trace_type()
+                trace_name_raw = (
+                    self.usage_metadata.get('traceName') or
+                    self.usage_metadata.get('trace_name')
+                )
+                trace_name = validate_trace_name(trace_name_raw) if trace_name_raw else get_trace_name()
+                parent_transaction_id = (
+                    self.usage_metadata.get('parentTransactionId') or
+                    self.usage_metadata.get('parent_transaction_id') or
+                    get_parent_transaction_id()
+                )
+                transaction_name = (
+                    self.usage_metadata.get('transactionName') or
+                    self.usage_metadata.get('transaction_name') or
+                    get_transaction_name(self.usage_metadata)
+                )
+                retry_number = self.usage_metadata.get(
+                    'retryNumber',
+                    self.usage_metadata.get('retry_number', get_retry_number())
+                )
+                operation_info = detect_operation_type(
+                    provider, "/responses", {}
+                )
+                operation_subtype = operation_info.get('operationSubtype')
+
                 async def metering_call():
                     await log_token_usage(
                         response_id=self.response_id,
@@ -1440,8 +1482,16 @@ def handle_streaming_responses(stream, request_time_dt, usage_metadata,
                         system_fingerprint=None,
                         is_streamed=True,
                         time_to_first_token=0,
-                        # Map Responses API to CHAT operation type for Revenium backend compatibility
                         operation_type=OperationType.CHAT,
+                        environment=environment,
+                        operation_subtype=operation_subtype,
+                        retry_number=retry_number,
+                        parent_transaction_id=parent_transaction_id,
+                        transaction_name=transaction_name,
+                        region=region,
+                        credential_alias=credential_alias,
+                        trace_type=trace_type,
+                        trace_name=trace_name,
                     )
 
                 thread = run_async_in_thread(metering_call())
@@ -1449,3 +1499,246 @@ def handle_streaming_responses(stream, request_time_dt, usage_metadata,
 
     # Return the wrapped stream
     return StreamResponseWrapper(iter(stream))
+
+
+def _wrap_async_stream(stream, request_time_dt, usage_metadata, client_instance=None, request_body=None):
+    class AsyncStreamWrapper:
+        def __init__(self, stream):
+            self.stream = stream
+            self.chunks = []
+            self.response_id = None
+            self.model = None
+            self.finish_reason = None
+            self.final_usage = None
+            self.first_token_time = None
+            self._finalized = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                chunk = await self.stream.__anext__()
+            except StopAsyncIteration:
+                self._finalize()
+                raise
+
+            if self.response_id is None and hasattr(chunk, 'id'):
+                self.response_id = chunk.id
+            if self.model is None and hasattr(chunk, 'model'):
+                self.model = chunk.model
+            if chunk.choices and chunk.choices[0].finish_reason:
+                self.finish_reason = chunk.choices[0].finish_reason
+            if hasattr(chunk, 'usage') and chunk.usage:
+                self.final_usage = chunk.usage
+            if self.first_token_time is None and chunk.choices and hasattr(chunk.choices[0], 'delta') and getattr(chunk.choices[0].delta, 'content', None):
+                self.first_token_time = datetime.datetime.now(datetime.timezone.utc)
+            self.chunks.append(chunk)
+            return chunk
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            self._finalize()
+
+        def _finalize(self):
+            if self._finalized:
+                return
+            self._finalized = True
+
+            if not self.chunks and not self.final_usage:
+                return
+
+            prompt_tokens = 0
+            completion_tokens = 0
+            cached_tokens = 0
+
+            if self.final_usage:
+                prompt_tokens = getattr(self.final_usage, 'prompt_tokens', 0) or 0
+                completion_tokens = getattr(self.final_usage, 'completion_tokens', 0) or 0
+                if hasattr(self.final_usage, 'prompt_tokens_details') and self.final_usage.prompt_tokens_details:
+                    cached_tokens = getattr(self.final_usage.prompt_tokens_details, 'cached_tokens', 0) or 0
+
+            total_tokens = prompt_tokens + completion_tokens
+            time_to_first_token = int((self.first_token_time - request_time_dt).total_seconds() * 1000) if self.first_token_time else 0
+
+            response_time_dt = datetime.datetime.now(datetime.timezone.utc)
+            request_time = request_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            response_time = response_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            request_duration = (response_time_dt - request_time_dt).total_seconds() * 1000
+
+            try:
+                create_metering_call(
+                    type('Response', (), {
+                        'id': self.response_id,
+                        'model': self.model or 'unknown',
+                        'usage': self.final_usage,
+                        'system_fingerprint': None,
+                    })(),
+                    OperationType.CHAT,
+                    request_time_dt,
+                    usage_metadata,
+                    client_instance=client_instance,
+                    is_streamed=True,
+                    time_to_first_token=time_to_first_token,
+                    request_body=request_body
+                )
+            except Exception as e:
+                logger.warning("Async stream metering error: %s", e)
+
+    return AsyncStreamWrapper(stream)
+
+
+def async_create_wrapper(wrapped, instance, args, kwargs):
+    logger.debug("OpenAI/Azure OpenAI async chat.completions.create wrapper called")
+
+    if is_selective_metering_enabled() and not is_inside_decorated_function():
+        return wrapped(*args, **kwargs)
+
+    # See sync create_wrapper above: defer Perplexity-bound calls to the
+    # Perplexity wrapper to avoid double-metering when both middlewares chain.
+    _client = getattr(instance, '_client', None)
+    _base_url = getattr(_client, 'base_url', None) if _client else None
+    if _base_url and "perplexity" in str(_base_url).lower():
+        return wrapped(*args, **kwargs)
+
+    request_body = kwargs.copy()
+
+    api_metadata = kwargs.pop("usage_metadata", {}) if "usage_metadata" in kwargs else {}
+
+    if not api_metadata:
+        api_metadata = _extract_langchain_usage_metadata()
+
+    usage_metadata = merge_metadata(api_metadata)
+
+    stream = kwargs.get('stream', False)
+
+    if stream:
+        kwargs = dict(kwargs)
+        if 'stream_options' not in kwargs:
+            kwargs['stream_options'] = {}
+        else:
+            kwargs['stream_options'] = dict(kwargs['stream_options'])
+        kwargs['stream_options']['include_usage'] = True
+
+    client_instance = getattr(instance, '_client', None)
+    provider = detect_provider(client=client_instance)
+
+    if is_azure_provider(provider):
+        azure_config = get_azure_config()
+        if not azure_config.is_valid():
+            logger.warning(
+                "Azure OpenAI detected but configuration is incomplete. "
+                "Set AZURE_OPENAI_ENDPOINT for proper Azure support."
+            )
+        else:
+            logger.debug(f"Azure OpenAI configuration validated: {azure_config.to_dict()}")
+            azure_config.validate_deployment()
+
+    request_time_dt = datetime.datetime.now(datetime.timezone.utc)
+
+    async def _async_invoke():
+        response = await wrapped(*args, **kwargs)
+
+        first_token_time_dt = datetime.datetime.now(datetime.timezone.utc)
+        time_to_first_token = int(
+            (first_token_time_dt - request_time_dt).total_seconds() * 1000
+        )
+
+        if stream:
+            return _wrap_async_stream(
+                response,
+                request_time_dt,
+                usage_metadata,
+                client_instance=getattr(instance, '_client', None),
+                request_body=request_body
+            )
+
+        create_metering_call(
+            response,
+            OperationType.CHAT,
+            request_time_dt,
+            usage_metadata,
+            client_instance=getattr(instance, '_client', None),
+            time_to_first_token=time_to_first_token,
+            request_body=request_body
+        )
+
+        return response
+
+    return _async_invoke()
+
+
+def async_embeddings_create_wrapper(wrapped, instance, args, kwargs):
+    logger.debug("OpenAI/Azure OpenAI async embeddings.create wrapper called")
+
+    if is_selective_metering_enabled() and not is_inside_decorated_function():
+        return wrapped(*args, **kwargs)
+
+    request_body = kwargs.copy()
+
+    api_metadata = kwargs.pop("usage_metadata", {}) if "usage_metadata" in kwargs else {}
+
+    if not api_metadata:
+        api_metadata = _extract_langchain_usage_metadata()
+
+    usage_metadata = merge_metadata(api_metadata)
+
+    client_instance = getattr(instance, '_client', None)
+    provider = detect_provider(client=client_instance)
+
+    if is_azure_provider(provider):
+        azure_config = get_azure_config()
+        if not azure_config.is_valid():
+            logger.warning(
+                "Azure OpenAI detected but configuration is incomplete. "
+                "Set AZURE_OPENAI_ENDPOINT for proper Azure support."
+            )
+        else:
+            logger.debug(f"Azure OpenAI configuration validated: {azure_config.to_dict()}")
+            azure_config.validate_deployment()
+
+    request_time_dt = datetime.datetime.now(datetime.timezone.utc)
+
+    async def _async_invoke():
+        response = await wrapped(*args, **kwargs)
+
+        create_metering_call(
+            response,
+            OperationType.EMBED,
+            request_time_dt,
+            usage_metadata,
+            client_instance=getattr(instance, '_client', None),
+            request_body=request_body
+        )
+
+        return response
+
+    return _async_invoke()
+
+
+if register_patch('openai.resources.chat.completions.Completions.create'):
+    wrapt.wrap_function_wrapper(
+        'openai.resources.chat.completions', 'Completions.create', create_wrapper
+    )
+
+if register_patch('openai.resources.chat.completions.AsyncCompletions.create'):
+    wrapt.wrap_function_wrapper(
+        'openai.resources.chat.completions', 'AsyncCompletions.create', async_create_wrapper
+    )
+
+if register_patch('openai.resources.embeddings.Embeddings.create'):
+    wrapt.wrap_function_wrapper(
+        'openai.resources.embeddings', 'Embeddings.create', embeddings_create_wrapper
+    )
+
+if register_patch('openai.resources.embeddings.AsyncEmbeddings.create'):
+    wrapt.wrap_function_wrapper(
+        'openai.resources.embeddings', 'AsyncEmbeddings.create', async_embeddings_create_wrapper
+    )
+
+if register_patch('openai.resources.responses.Responses.create'):
+    wrapt.wrap_function_wrapper(
+        'openai.resources.responses', 'Responses.create', responses_create_wrapper
+    )

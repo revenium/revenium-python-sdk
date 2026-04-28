@@ -8,10 +8,17 @@ that do NOT require fal_client to be installed, enabling independent testing.
 import logging
 import datetime
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from revenium_middleware import client, run_async_in_thread, shutdown_event
 from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
+from revenium_middleware._core.fields import (
+    extract_field_with_fallback as _core_extract_field_with_fallback,
+    extract_org_and_product,
+    extract_common_metadata,
+    extract_agentic_job_fields,
+    merge_extra_body,
+)
 from .trace_fields import (
     get_environment,
     get_region,
@@ -34,31 +41,7 @@ def generate_transaction_id() -> str:
     return f"fal-{uuid.uuid4().hex[:16]}"
 
 
-def extract_field_with_fallback(
-    usage_metadata: Dict[str, Any],
-    new_snake: str,
-    new_camel: str,
-    old_snake: str,
-    old_camel: str,
-    field_label: str,
-) -> Optional[str]:
-    """Extract field with 4-level fallback and deprecation warning."""
-    value = usage_metadata.get(new_snake)
-    if value is None:
-        value = usage_metadata.get(new_camel)
-    if value is None:
-        value = usage_metadata.get(old_snake)
-    if value is None:
-        value = usage_metadata.get(old_camel)
-
-    if usage_metadata.get(old_snake) or usage_metadata.get(old_camel):
-        if not (usage_metadata.get(new_snake) or usage_metadata.get(new_camel)):
-            logger.warning(
-                "Fields '%s' and '%s' are deprecated. Use '%s' or '%s' instead.",
-                old_camel, old_snake, new_camel, new_snake,
-            )
-
-    return value
+extract_field_with_fallback = _core_extract_field_with_fallback
 
 
 # =============================================================================
@@ -236,18 +219,8 @@ def _build_common_args(
     subscriber = extract_subscriber_from_metadata(usage_metadata)
     normalized_model = normalize_model_name(application)
 
-    organization_name = extract_field_with_fallback(
-        usage_metadata,
-        "organization_name", "organizationName",
-        "organization_id", "organizationId",
-        "organization",
-    )
-    product_name = extract_field_with_fallback(
-        usage_metadata,
-        "product_name", "productName",
-        "product_id", "productId",
-        "product",
-    )
+    organization_name, product_name = extract_org_and_product(usage_metadata)
+    meta = extract_common_metadata(usage_metadata)
 
     return {
         "model": normalized_model,
@@ -257,13 +230,13 @@ def _build_common_args(
         "response_time": response_time,
         "request_duration": int(request_duration),
         "transaction_id": transaction_id,
-        "trace_id": usage_metadata.get("trace_id"),
-        "task_type": usage_metadata.get("task_type"),
+        "trace_id": meta["trace_id"],
+        "task_type": meta["task_type"],
         "subscriber": subscriber if subscriber else None,
         "organization_name": organization_name,
-        "subscription_id": usage_metadata.get("subscription_id"),
+        "subscription_id": meta["subscription_id"],
         "product_name": product_name,
-        "agent": usage_metadata.get("agent"),
+        "agent": meta["agent"],
         "middleware_source": get_middleware_source(),
         "environment": get_environment(),
         "region": get_region(),
@@ -306,6 +279,9 @@ def handle_metering(
                 application, request_time_dt, usage_metadata, transaction_id, is_streamed
             )
 
+            agentic_fields = extract_agentic_job_fields(usage_metadata)
+            extra_body = merge_extra_body(None, agentic_fields)
+
             logger.debug(
                 "Metering fal.ai call - application: %s, media_type: %s",
                 application, media_type,
@@ -321,6 +297,7 @@ def handle_metering(
                     quality=image_fields.get("quality"),
                     aspect_ratio=image_fields.get("aspect_ratio"),
                     operation_subtype="generation",
+                    extra_body=extra_body,
                 )
             elif media_type == "video":
                 video_fields = extract_video_fields(result, arguments)
@@ -332,6 +309,7 @@ def handle_metering(
                     fps=video_fields.get("fps"),
                     aspect_ratio=video_fields.get("aspect_ratio"),
                     operation_subtype="generation",
+                    extra_body=extra_body,
                 )
             elif media_type == "audio":
                 audio_fields = extract_audio_fields(result, arguments)
@@ -340,9 +318,9 @@ def handle_metering(
                     duration_seconds=audio_fields.get("duration_seconds"),
                     character_count=audio_fields.get("character_count"),
                     operation_subtype=audio_fields.get("operation_subtype"),
+                    extra_body=extra_body,
                 )
             else:
-                # Fallback: completions endpoint for text/unknown models
                 metering_result = client.ai.create_completion(
                     **common,
                     input_token_count=0,
@@ -355,6 +333,7 @@ def handle_metering(
                     reasoning_token_count=0,
                     cache_creation_token_count=0,
                     cache_read_token_count=0,
+                    extra_body=extra_body,
                 )
 
             logger.debug("Metering call result: %s", metering_result)

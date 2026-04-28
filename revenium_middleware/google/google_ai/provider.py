@@ -10,6 +10,7 @@ Migrated from the original provider.py with updates for the new architecture.
 
 import os
 import logging
+import threading
 from enum import Enum, auto
 from typing import Optional, Any
 
@@ -64,7 +65,7 @@ def detect_provider(client: Optional[Any] = None) -> GoogleAIEndpoint:
 
     # 4. Check if we have API key (Gemini Developer API)
     if os.getenv("GOOGLE_API_KEY"):
-        logger.debug("Gemini Developer API endpoint detected via GOOGLE_API_KEY")
+        logger.debug("API key detected for Gemini Developer API endpoint")
         return GoogleAIEndpoint.GEMINI_DEVELOPER_API
 
     # 5. Default to Gemini Developer API
@@ -99,37 +100,28 @@ def is_vertex_ai_endpoint(endpoint: GoogleAIEndpoint) -> bool:
 # Global endpoint cache to avoid repeated detection
 _detected_endpoint: Optional[GoogleAIEndpoint] = None
 _endpoint_detection_attempted: bool = False
+_endpoint_lock = threading.Lock()
 
 
 def get_or_detect_provider(
     client: Optional[Any] = None, force_redetect: bool = False
 ) -> GoogleAIEndpoint:
-    """
-    Get cached endpoint or detect if not already done.
-
-    This provides lazy loading - detection only happens when needed and is cached.
-
-    Args:
-        client: Google GenAI client instance
-        force_redetect: Force re-detection even if cached
-
-    Returns:
-        Detected endpoint
-    """
     global _detected_endpoint, _endpoint_detection_attempted
 
     if force_redetect or not _endpoint_detection_attempted:
-        _detected_endpoint = detect_provider(client)
-        _endpoint_detection_attempted = True
-        logger.debug(
-            f"Google AI SDK endpoint detection completed: {_detected_endpoint}"
-        )
+        with _endpoint_lock:
+            if force_redetect or not _endpoint_detection_attempted:
+                _detected_endpoint = detect_provider(client)
+                _endpoint_detection_attempted = True
+                logger.debug(
+                    f"Google AI SDK endpoint detection completed: {_detected_endpoint}"
+                )
 
     return _detected_endpoint
 
 
 def reset_provider_cache():
-    """Reset endpoint detection cache. Useful for testing."""
     global _detected_endpoint, _endpoint_detection_attempted
-    _detected_endpoint = None
-    _endpoint_detection_attempted = False
+    with _endpoint_lock:
+        _detected_endpoint = None
+        _endpoint_detection_attempted = False

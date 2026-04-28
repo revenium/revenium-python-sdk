@@ -15,6 +15,7 @@ import logging
 from typing import Dict, Any, Optional, Tuple
 
 from .config import Config
+from revenium_middleware._core.config import is_capture_prompts_enabled
 from revenium_middleware._core.prompt_extraction import (
     extract_streaming_response_content as _core_extract_streaming_response_content,
 )
@@ -359,7 +360,7 @@ def extract_prompt_data_if_enabled(
     Returns:
         Tuple of (system_prompt, input_messages, output_response, prompts_truncated)
     """
-    if not Config.CAPTURE_PROMPTS:
+    if not is_capture_prompts_enabled():
         return None, None, None, None
 
     try:

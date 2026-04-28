@@ -14,6 +14,15 @@ from revenium_middleware import (
     shutdown_event,
     merge_metadata,
 )
+from revenium_middleware._core.config import is_selective_metering_enabled
+from revenium_middleware._core.context import is_inside_decorated_function
+from revenium_middleware._core.patch_registry import register_patch
+from revenium_middleware._core.fields import (
+    extract_org_and_product,
+    extract_common_metadata,
+    extract_agentic_job_fields,
+    merge_extra_body,
+)
 
 from .provider import get_provider_metadata, Provider
 from .trace_fields import (
@@ -37,12 +46,9 @@ logger = logging.getLogger("revenium_middleware.perplexity.sdk")
 
 
 def perplexity_create_wrapper(wrapped, instance, args, kwargs):
-    """
-    Wrapper for perplexity.chat.completions.create to add Revenium metering.
+    if is_selective_metering_enabled() and not is_inside_decorated_function():
+        return wrapped(*args, **kwargs)
 
-    This wrapper intercepts calls to the native Perplexity SDK and sends
-    usage data to Revenium.
-    """
     logger.debug("Native Perplexity SDK chat completion wrapper called")
 
     # Get usage_metadata from extra_body if present
@@ -203,35 +209,35 @@ async def send_perplexity_metering_data(
             "reasoning_token_count": 0,
         }
 
-        # Add optional fields from usage_metadata if they have values
-        if usage_metadata.get("trace_id"):
-            completion_args["trace_id"] = usage_metadata.get("trace_id")
-        if usage_metadata.get("task_type"):
-            completion_args["task_type"] = usage_metadata.get("task_type")
-        if usage_metadata.get("organization_id"):
-            completion_args["organization_id"] = usage_metadata.get("organization_id")
-        if usage_metadata.get("subscription_id"):
-            completion_args["subscription_id"] = usage_metadata.get("subscription_id")
-        if usage_metadata.get("product_id"):
-            completion_args["product_id"] = usage_metadata.get("product_id")
-        if usage_metadata.get("agent"):
-            completion_args["agent"] = usage_metadata.get("agent")
+        organization_name, product_name = extract_org_and_product(usage_metadata)
+        if organization_name:
+            completion_args["organization_name"] = organization_name
+        if product_name:
+            completion_args["product_name"] = product_name
+
+        meta = extract_common_metadata(usage_metadata)
+        for key, value in meta.items():
+            if value:
+                completion_args[key] = value
+
         if usage_metadata.get("subscriber"):
             completion_args["subscriber"] = usage_metadata.get("subscriber")
 
-        # Add custom metadata fields (service, step, service_name, etc.)
-        # These are additional fields that may be used for tracing/tracking
         custom_fields = ["service", "step", "service_name"]
         for field in custom_fields:
             if usage_metadata.get(field):
                 completion_args[field] = usage_metadata.get(field)
 
-        # Add trace visualization fields from trace_fields
         for key, value in trace_fields.items():
             if value is not None:
                 completion_args[key] = value
 
-        # Send to Revenium
+        agentic_fields = extract_agentic_job_fields(usage_metadata)
+        extra_body = merge_extra_body(None, agentic_fields)
+
+        if extra_body:
+            completion_args["extra_body"] = extra_body
+
         logger.debug(f"Sending metering data to Revenium: {completion_args}")
         result = client.ai.create_completion(**completion_args)
         logger.debug(f"Metering call result: {result}")
@@ -241,16 +247,15 @@ async def send_perplexity_metering_data(
             logger.warning(f"Error in metering call: {str(e)}")
 
 
-# Try to patch the Perplexity SDK if it's installed
 try:
     import perplexity.resources.chat.completions  # noqa: F401
 
-    # Apply the wrapper
-    wrapt.wrap_function_wrapper(
-        'perplexity.resources.chat.completions',
-        'Completions.create',
-        perplexity_create_wrapper
-    )
-    logger.debug("Successfully patched native Perplexity SDK")
+    if register_patch("perplexity.resources.chat.completions.Completions.create"):
+        wrapt.wrap_function_wrapper(
+            'perplexity.resources.chat.completions',
+            'Completions.create',
+            perplexity_create_wrapper
+        )
+        logger.debug("Successfully patched native Perplexity SDK")
 except (ImportError, AttributeError) as e:
     logger.debug(f"Native Perplexity SDK not available or incompatible: {e}")

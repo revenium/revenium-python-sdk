@@ -1,47 +1,52 @@
 from litellm.integrations.custom_logger import CustomLogger
 from revenium_middleware import client, run_async_in_thread
+from revenium_middleware._core.fields import merge_extra_body
 import logging
 
 logger = logging.getLogger("revenium_middleware.extension")
 
 
 def _extract_organization_name(headers, metadata):
-    """
-    Extract organization name with fallback priority.
-
-    Priority: x-revenium-organization-name > x-revenium-organization-id > user_api_key_team_alias
-
-    Args:
-        headers: Request headers dictionary
-        metadata: Request metadata dictionary
-
-    Returns:
-        Organization name string or None
-    """
     organization_name = headers.get("x-revenium-organization-name")
     if organization_name is None:
-        organization_name = headers.get("x-revenium-organization-id")
+        old_value = headers.get("x-revenium-organization-id")
+        if old_value:
+            logger.warning(
+                "Header 'x-revenium-organization-id' is deprecated. "
+                "Use 'x-revenium-organization-name' instead."
+            )
+        organization_name = old_value
     if organization_name is None:
         organization_name = metadata.get('user_api_key_team_alias', '') or None
     return organization_name
 
 
 def _extract_product_name(headers):
-    """
-    Extract product name with fallback priority.
-
-    Priority: x-revenium-product-name > x-revenium-product-id
-
-    Args:
-        headers: Request headers dictionary
-
-    Returns:
-        Product name string or None
-    """
     product_name = headers.get("x-revenium-product-name")
     if product_name is None:
-        product_name = headers.get("x-revenium-product-id")
+        old_value = headers.get("x-revenium-product-id")
+        if old_value:
+            logger.warning(
+                "Header 'x-revenium-product-id' is deprecated. "
+                "Use 'x-revenium-product-name' instead."
+            )
+        product_name = old_value
     return product_name
+
+
+def _extract_agentic_job_from_headers(headers):
+    mapping = {
+        "agenticJobId": "x-revenium-agentic-job-id",
+        "agenticJobName": "x-revenium-agentic-job-name",
+        "agenticJobType": "x-revenium-agentic-job-type",
+        "agenticJobVersion": "x-revenium-agentic-job-version",
+    }
+    result = {}
+    for wire_name, header_name in mapping.items():
+        value = headers.get(header_name)
+        if value:
+            result[wire_name] = value
+    return result
 
 
 class MiddlewareHandler(CustomLogger):
@@ -80,9 +85,10 @@ class MiddlewareHandler(CustomLogger):
                 "value": credential_value
             }
 
-        # Extract organization and product names using helper functions
         organization_name = _extract_organization_name(headers, metadata)
         product_name = _extract_product_name(headers)
+        agentic_fields = _extract_agentic_job_from_headers(headers)
+        extra_body = merge_extra_body(None, agentic_fields)
 
         completion_args = {
             "cache_creation_token_count": 0,
@@ -100,7 +106,7 @@ class MiddlewareHandler(CustomLogger):
             "request_time": start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "response_time": end_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "completion_start_time": end_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "request_duration": (end_time - start_time).total_seconds() * 1000,  # Convert to milliseconds
+            "request_duration": (end_time - start_time).total_seconds() * 1000,
             "time_to_first_token": (end_time - start_time).total_seconds() * 1000,
             "stop_reason": "END",
             "total_token_count": usage.total_tokens,
@@ -120,8 +126,15 @@ class MiddlewareHandler(CustomLogger):
         }
 
         logger.debug("Calling client.ai.create_completion with args: %s", completion_args)
-        result = client.ai.create_completion(**completion_args)
-        logger.debug("Result from create_completion: %s", result)
+
+        async def metering_call():
+            try:
+                result = client.ai.create_completion(**completion_args, extra_body=extra_body)
+                logger.debug("Proxy metering call result: %s", result)
+            except Exception as e:
+                logger.warning("Proxy metering call failed: %s", e)
+
+        run_async_in_thread(metering_call())
 
         return
 
@@ -164,9 +177,10 @@ class MiddlewareHandler(CustomLogger):
                 "value": credential_value
             }
 
-        # Extract organization and product names using helper functions
         organization_name = _extract_organization_name(headers, metadata)
         product_name = _extract_product_name(headers)
+        agentic_fields = _extract_agentic_job_from_headers(headers)
+        extra_body = merge_extra_body(None, agentic_fields)
 
         completion_args = {
             "cache_creation_token_count": 0,
@@ -184,9 +198,8 @@ class MiddlewareHandler(CustomLogger):
             "request_time": start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "response_time": end_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "completion_start_time": end_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "request_duration": (end_time - start_time).total_seconds() * 1000,  # Convert to milliseconds
+            "request_duration": (end_time - start_time).total_seconds() * 1000,
             "time_to_first_token": (end_time - start_time).total_seconds() * 1000,
-            # Time to first token in milliseconds
             "stop_reason": "ERROR",
             "total_token_count": usage.get("total_tokens", 0),
             "transaction_id": getattr(response_obj, "id", "error-no-id"),
@@ -200,18 +213,19 @@ class MiddlewareHandler(CustomLogger):
             "response_quality_score": headers.get("x-revenium-response-quality-score"),
             "is_streamed": metadata.get('hidden_params', {}).get('optional_params', {}).get('stream', False),
             "operation_type": "CHAT",
-            "middleware_source": "PROXY"
-        # "error_message": error_message,
-            # "error_type": error_type,
-            # "mediation_latency": metadata['hidden_params']['litellm_overhead_time_ms'],
+            "middleware_source": "PROXY",
         }
 
         logger.debug("Calling client.ai.create_completion with args (failure): %s", completion_args)
-        try:
-            result = client.ai.create_completion(**completion_args)
-            logger.debug("Result from create_completion (failure): %s", result)
-        except Exception as e:
-            logger.error("Error logging failure event: %s", e)
+
+        async def metering_call():
+            try:
+                result = client.ai.create_completion(**completion_args, extra_body=extra_body)
+                logger.debug("Result from create_completion (failure): %s", result)
+            except Exception as e:
+                logger.error("Error logging failure event: %s", e)
+
+        run_async_in_thread(metering_call())
 
 
 proxy_handler_instance = MiddlewareHandler()

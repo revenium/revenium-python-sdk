@@ -71,7 +71,7 @@ def fetch_completion_metrics(
     for attempt in range(max_retries):
         try:
             request = Request(url_with_params)
-            request.add_header("Authorization", revenium_api_key)
+            request.add_header("Authorization", f"Bearer {revenium_api_key}")
             request.add_header("Content-Type", "application/json")
 
             with urlopen(request, timeout=Config.SUMMARY_API_TIMEOUT) as response:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "revenium-python-sdk"
-version = "0.1.2"
+version = "0.1.3"
 description = "The official Revenium Python SDK — unified AI metering middleware for OpenAI, Anthropic, Google, Ollama, LiteLLM, Perplexity, and fal.ai."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -37,7 +37,7 @@ classifiers = [
 
 [project.optional-dependencies]
 openai = [
-    "wrapt",
+    "wrapt>=1.14.0",
     "openai>=1.0.0",
     "python-dotenv>=0.19.0",
 ]
@@ -47,53 +47,53 @@ langchain = [
     "langchain-core>=0.1.0",
 ]
 perplexity = [
-    "wrapt",
+    "wrapt>=1.14.0",
     "python-dotenv>=0.19.0",
 ]
 perplexity-openai = [
-    "wrapt",
+    "wrapt>=1.14.0",
     "openai>=1.0.0",
     "python-dotenv>=0.19.0",
 ]
 perplexity-native = [
-    "wrapt",
+    "wrapt>=1.14.0",
     "perplexityai>=0.1.0",
     "python-dotenv>=0.19.0",
 ]
 google = [
-    "wrapt",
+    "wrapt>=1.14.0",
 ]
 google-genai = [
-    "wrapt",
+    "wrapt>=1.14.0",
     "google-genai>=0.1.0",
     "python-dotenv",
 ]
 google-vertex = [
-    "wrapt",
+    "wrapt>=1.14.0",
     "vertexai>=1.0.0",
     "python-dotenv",
 ]
 anthropic = [
-    "wrapt",
-    "anthropic",
+    "wrapt>=1.14.0",
+    "anthropic>=0.30.0",
     "python-dotenv>=0.19.0",
 ]
 ollama = [
-    "wrapt",
-    "ollama",
+    "wrapt>=1.14.0",
+    "ollama>=0.3.0",
 ]
 fal = [
-    "wrapt",
+    "wrapt>=1.14.0",
     "fal-client>=0.13.0",
     "python-dotenv>=0.19.0",
 ]
 litellm = [
-    "wrapt",
-    "litellm",
+    "wrapt>=1.14.0",
+    "litellm>=1.40.0",
 ]
 litellm-proxy = [
-    "wrapt",
-    "litellm[proxy]",
+    "wrapt>=1.14.0",
+    "litellm[proxy]>=1.40.0",
 ]
 
 dev = [
@@ -106,11 +106,11 @@ dev = [
     "freezegun",
     "openai-responses>=0.12.0",
     "requests",
-    "wrapt",
+    "wrapt>=1.14.0",
     "python-dotenv>=0.19.0",
-    "anthropic",
+    "anthropic>=0.30.0",
     "boto3",
-    "ollama",
+    "ollama>=0.3.0",
 ]
 
 [tool.pytest.ini_options]

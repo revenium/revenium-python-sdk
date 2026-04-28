@@ -18,6 +18,15 @@ from revenium_middleware import (
     shutdown_event,
     merge_metadata,
 )
+from revenium_middleware._core.config import is_selective_metering_enabled
+from revenium_middleware._core.context import is_inside_decorated_function
+from revenium_middleware._core.patch_registry import register_patch
+from revenium_middleware._core.fields import (
+    extract_org_and_product,
+    extract_common_metadata,
+    extract_agentic_job_fields,
+    merge_extra_body,
+)
 
 from .provider import Provider, detect_provider, get_provider_metadata
 from .trace_fields import (
@@ -213,41 +222,40 @@ def send_metering_data(
                 "is_streamed": is_streaming,
                 "cost_type": "AI",
                 "operation_type": operation_type.value,
-                # Optional fields with defaults
                 "cache_creation_token_count": 0,
                 "cache_read_token_count": 0,
                 "reasoning_token_count": 0,
             }
 
-            # Add optional fields from usage_metadata if they have values
-            if usage_metadata.get("trace_id"):
-                completion_args["trace_id"] = usage_metadata.get("trace_id")
-            if usage_metadata.get("task_type"):
-                completion_args["task_type"] = usage_metadata.get("task_type")
-            if usage_metadata.get("organization_id"):
-                completion_args["organization_id"] = usage_metadata.get("organization_id")
-            if usage_metadata.get("subscription_id"):
-                completion_args["subscription_id"] = usage_metadata.get("subscription_id")
-            if usage_metadata.get("product_id"):
-                completion_args["product_id"] = usage_metadata.get("product_id")
-            if usage_metadata.get("agent"):
-                completion_args["agent"] = usage_metadata.get("agent")
+            organization_name, product_name = extract_org_and_product(usage_metadata)
+            if organization_name:
+                completion_args["organization_name"] = organization_name
+            if product_name:
+                completion_args["product_name"] = product_name
+
+            meta = extract_common_metadata(usage_metadata)
+            for key, value in meta.items():
+                if value:
+                    completion_args[key] = value
+
             if usage_metadata.get("subscriber"):
                 completion_args["subscriber"] = usage_metadata.get("subscriber")
 
-            # Add custom metadata fields (service, step, service_name, etc.)
-            # These are additional fields that may be used for tracing/tracking
             custom_fields = ["service", "step", "service_name"]
             for field in custom_fields:
                 if usage_metadata.get(field):
                     completion_args[field] = usage_metadata.get(field)
 
-            # Add trace visualization fields from trace_fields
             for key, value in trace_fields.items():
                 if value is not None:
                     completion_args[key] = value
 
-            # Send to Revenium
+            agentic_fields = extract_agentic_job_fields(usage_metadata)
+            extra_body = merge_extra_body(None, agentic_fields)
+
+            if extra_body:
+                completion_args["extra_body"] = extra_body
+
             logger.debug(f"Sending metering data: {completion_args}")
             result = client.ai.create_completion(**completion_args)
             logger.debug(f"Metering call result: {result}")
@@ -305,57 +313,43 @@ def handle_streaming_response(
             )
 
 
-@wrapt.patch_function_wrapper('openai.resources.chat.completions', 'Completions.create')
 def create_wrapper(wrapped, instance, args, kwargs):
-    """
-    Wrapper for openai.chat.completions.create to add Revenium metering.
+    if is_selective_metering_enabled() and not is_inside_decorated_function():
+        return wrapped(*args, **kwargs)
 
-    This wrapper:
-    1. Detects if the client is using Perplexity base URL
-    2. Captures request timing and metadata
-    3. Calls the original OpenAI method
-    4. Sends usage data to Revenium asynchronously
-    5. Returns the original response unchanged
-    """
+    # The Perplexity API is OpenAI-compatible, so this wrapper patches the same
+    # openai.resources.chat.completions.Completions.create slot as the OpenAI
+    # middleware. Without this guard, calls made by a plain OpenAI client would
+    # be metered and tagged as PERPLEXITY. Defer non-Perplexity calls to the
+    # next wrapper (or original).
+    client_instance = getattr(instance, '_client', None)
+    base_url = getattr(client_instance, 'base_url', None) if client_instance else None
+    if not (base_url and "perplexity" in str(base_url).lower()):
+        return wrapped(*args, **kwargs)
+
     logger.debug("Perplexity chat completion wrapper called")
 
-    # Extract usage_metadata from kwargs or extra_body
     api_metadata = kwargs.pop("usage_metadata", {})
 
-    # Also check extra_body for usage_metadata (for backward compatibility)
     extra_body = kwargs.get('extra_body', {})
     if isinstance(extra_body, dict) and 'usage_metadata' in extra_body:
         extra_metadata = extra_body.pop('usage_metadata', {})
-        # Merge with existing usage_metadata (kwargs takes precedence)
         api_metadata = {**extra_metadata, **api_metadata}
 
-    # Merge with decorator metadata (API metadata takes precedence)
     usage_metadata = merge_metadata(api_metadata)
 
-    # Detect provider
-    client_instance = getattr(instance, '_client', None)
-    base_url = getattr(client_instance, 'base_url', None) if client_instance else None
     provider = detect_provider(client=client_instance, base_url=base_url)
 
-    # Get model from kwargs
     model = kwargs.get('model', 'unknown')
-
-    # Check if streaming
     is_streaming = kwargs.get('stream', False)
 
-    # Record request time
     request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-
-    # Generate transaction ID using timestamp for consistency
     transaction_id = f"perplexity-{request_time_dt.timestamp()}"
 
-    # Call original method
     logger.debug(f"Calling original create with model: {model}, streaming: {is_streaming}")
     response = wrapped(*args, **kwargs)
 
-    # Handle response based on streaming
     if is_streaming:
-        # Wrap the stream to collect usage data
         return handle_streaming_response(
             response,
             request_time_dt,
@@ -365,7 +359,6 @@ def create_wrapper(wrapped, instance, args, kwargs):
             transaction_id,
         )
     else:
-        # Send metering data for non-streaming response
         send_metering_data(
             response,
             request_time_dt,
@@ -376,4 +369,10 @@ def create_wrapper(wrapped, instance, args, kwargs):
             transaction_id=transaction_id,
         )
         return response
+
+
+if register_patch("perplexity:openai.resources.chat.completions.Completions.create"):
+    wrapt.wrap_function_wrapper(
+        'openai.resources.chat.completions', 'Completions.create', create_wrapper
+    )
 

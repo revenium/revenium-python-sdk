@@ -7,6 +7,10 @@ logger = logging.getLogger("revenium_middleware.extension")
 
 from revenium_middleware import client, run_async_in_thread, shutdown_event, merge_metadata
 from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
+from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, merge_extra_body
+from revenium_middleware._core.config import is_selective_metering_enabled
+from revenium_middleware._core.context import is_inside_decorated_function
+from revenium_middleware._core.patch_registry import register_patch
 from .trace_fields import (
     get_environment,
     get_region,
@@ -20,201 +24,97 @@ from .trace_fields import (
 )
 
 
-def add_transaction_id_to_response(response, transaction_id):
-    """
-    Add the Revenium transaction ID to an Ollama response object.
-
-    This function adds the transaction ID as an attribute to the response
-    object. The attribute can be accessed via response._revenium_transaction_id
-
-    Args:
-        response: The Ollama response object (ChatResponse or GenerateResponse)
-        transaction_id: The transaction ID string to add
-    """
-    try:
-        # Add as attribute (works with response.attribute access)
-        # Ollama responses are Pydantic models, so we use setattr
-        setattr(response, '_revenium_transaction_id', transaction_id)
-        logger.debug(
-            "Added transaction ID %s to response",
-            transaction_id
-        )
-    except (TypeError, AttributeError) as e:
-        # If attribute setting doesn't work, log a warning
-        logger.warning(
-            "Could not add transaction ID as attribute: %s",
-            str(e)
-        )
 
 
-def extract_field_with_fallback(
-    usage_metadata, new_snake, new_camel, old_snake, old_camel, field_label
-):
-    """
-    Extract field with 4-level fallback and deprecation warning.
+if register_patch("ollama.chat"):
+    @wrapt.patch_function_wrapper('ollama', 'chat')
+    def chat_wrapper(wrapped, _, args, kwargs):
+        if is_selective_metering_enabled() and not is_inside_decorated_function():
+            return wrapped(*args, **kwargs)
 
-    Args:
-        usage_metadata: Dictionary containing usage metadata
-        new_snake: New snake_case field name (e.g., "organization_name")
-        new_camel: New camelCase field name (e.g., "organizationName")
-        old_snake: Old snake_case field name (e.g., "organization_id")
-        old_camel: Old camelCase field name (e.g., "organizationId")
-        field_label: Human-readable label for the field (e.g., "organization")
+        logger.debug("Ollama chat wrapper called")
 
-    Returns:
-        The field value with precedence: new_snake > new_camel > old_snake > old_camel
-    """
-    # Extract with precedence: new_snake > new_camel > old_snake > old_camel
-    value = usage_metadata.get(new_snake)
-    if value is None:
-        value = usage_metadata.get(new_camel)
-    if value is None:
-        value = usage_metadata.get(old_snake)
-    if value is None:
-        value = usage_metadata.get(old_camel)
+        api_metadata = kwargs.pop("usage_metadata", {}) if "usage_metadata" in kwargs else {}
+        usage_metadata = merge_metadata(api_metadata)
+        is_streaming = kwargs.get("stream", False)
 
-    # Log deprecation warning if old fields are used without new fields
-    if usage_metadata.get(old_snake) or usage_metadata.get(old_camel):
-        if not (usage_metadata.get(new_snake) or usage_metadata.get(new_camel)):
-            logger.warning(
-                f"Fields '{old_camel}' and '{old_snake}' are deprecated. "
-                f"Use '{new_camel}' or '{new_snake}' instead. "
-                "The old fields will be removed in a future version."
+        request_time_dt = datetime.datetime.now(datetime.timezone.utc)
+        transaction_id = f"ollama-{request_time_dt.timestamp()}"
+
+        logger.debug(f"Calling chat function with args: {args}, kwargs: {kwargs}")
+
+        response = wrapped(*args, **kwargs)
+
+        if is_streaming and isinstance(response, types.GeneratorType):
+            return handle_streaming_response(
+                response, request_time_dt, usage_metadata,
+                transaction_id, 'chat', kwargs
             )
+        else:
+            logger.debug("Ollama chat response: %s", response)
+            handle_response(
+                response, request_time_dt, usage_metadata,
+                False, transaction_id, 'chat', kwargs
+            )
+            return response
 
-    return value
+
+if register_patch("ollama.generate"):
+    @wrapt.patch_function_wrapper('ollama', 'generate')
+    def generate_wrapper(wrapped, _, args, kwargs):
+        if is_selective_metering_enabled() and not is_inside_decorated_function():
+            return wrapped(*args, **kwargs)
+
+        logger.debug("Ollama generate wrapper called")
+
+        api_metadata = kwargs.pop("usage_metadata", {}) if "usage_metadata" in kwargs else {}
+        usage_metadata = merge_metadata(api_metadata)
+        is_streaming = kwargs.get("stream", False)
+
+        request_time_dt = datetime.datetime.now(datetime.timezone.utc)
+        transaction_id = f"ollama-{request_time_dt.timestamp()}"
+
+        logger.debug(f"Calling generate function with args: {args}, kwargs: {kwargs}")
+
+        response = wrapped(*args, **kwargs)
+
+        if is_streaming and isinstance(response, types.GeneratorType):
+            return handle_streaming_response(
+                response, request_time_dt, usage_metadata,
+                transaction_id, 'generate', kwargs
+            )
+        else:
+            logger.debug("Ollama generate response: %s", response)
+            handle_response(
+                response, request_time_dt, usage_metadata,
+                False, transaction_id, 'generate', kwargs
+            )
+            return response
 
 
+if register_patch("ollama.embed"):
+    @wrapt.patch_function_wrapper('ollama', 'embed')
+    def embed_wrapper(wrapped, _, args, kwargs):
+        if is_selective_metering_enabled() and not is_inside_decorated_function():
+            return wrapped(*args, **kwargs)
 
-# extract_subscriber_from_metadata is imported from _core.subscriber
+        logger.debug("Ollama embed wrapper called")
+        api_metadata = kwargs.pop("usage_metadata", {}) if "usage_metadata" in kwargs else {}
+        usage_metadata = merge_metadata(api_metadata)
 
+        request_time_dt = datetime.datetime.now(datetime.timezone.utc)
+        transaction_id = f"ollama-{request_time_dt.timestamp()}"
 
-@wrapt.patch_function_wrapper('ollama', 'chat')
-def chat_wrapper(wrapped, _, args, kwargs):
-    """
-    Wraps the ollama.chat method to log token usage.
-    Handles both streaming and non-streaming responses.
-    """
-    logger.debug("Ollama chat wrapper called")
+        logger.debug(f"Calling embed function with args: {args}, kwargs: {kwargs}")
 
-    # Extract API-level metadata from kwargs
-    api_metadata = kwargs.pop("usage_metadata", {}) if "usage_metadata" in kwargs else {}
+        response = wrapped(*args, **kwargs)
 
-    # Merge with decorator metadata (API-level takes precedence)
-    usage_metadata = merge_metadata(api_metadata)
-
-    is_streaming = kwargs.get("stream", False)
-
-    # If streaming is enabled, add stream_options to include usage information
-    # if is_streaming and "stream_options" not in kwargs:
-    #     kwargs["stream_options"] = {"include_usage": True}
-    # elif is_streaming and isinstance(kwargs.get("stream_options"), dict):
-    #     kwargs["stream_options"]["include_usage"] = True
-
-    request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-    # Generate transaction ID using the same timestamp for consistency
-    transaction_id = f"ollama-{request_time_dt.timestamp()}"
-
-    logger.debug(f"Calling chat function with args: {args}, kwargs: {kwargs}")
-
-    response = wrapped(*args, **kwargs)
-
-    # Check if response is a generator (streaming response)
-    if is_streaming and isinstance(response, types.GeneratorType):
-        return handle_streaming_response(
+        logger.debug("Ollama embed response: %s", response)
+        handle_embeddings_response(
             response, request_time_dt, usage_metadata,
-            transaction_id, 'chat', kwargs
-        )
-    else:
-        # Handle non-streaming response
-        logger.debug("Ollama chat response: %s", response)
-
-        # Add transaction ID to response object
-        add_transaction_id_to_response(response, transaction_id)
-
-        handle_response(
-            response, request_time_dt, usage_metadata,
-            False, transaction_id, 'chat', kwargs
-        )
-        return response
-
-
-@wrapt.patch_function_wrapper('ollama', 'generate')
-def generate_wrapper(wrapped, _, args, kwargs):
-    """
-    Wraps the ollama.generate method to log token usage.
-    Handles both streaming and non-streaming responses.
-    """
-    logger.debug("Ollama generate wrapper called")
-
-    # Extract API-level metadata from kwargs
-    api_metadata = kwargs.pop("usage_metadata", {}) if "usage_metadata" in kwargs else {}
-
-    # Merge with decorator metadata (API-level takes precedence)
-    usage_metadata = merge_metadata(api_metadata)
-
-    is_streaming = kwargs.get("stream", False)
-
-    # Note: ollama.generate() doesn't support stream_options parameter
-    # Token usage is included by default in the final chunk
-
-    request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-    # Generate transaction ID using the same timestamp for consistency
-    transaction_id = f"ollama-{request_time_dt.timestamp()}"
-
-    logger.debug(f"Calling generate function with args: {args}, kwargs: {kwargs}")
-
-    response = wrapped(*args, **kwargs)
-
-    # Check if response is a generator (streaming response)
-    if is_streaming and isinstance(response, types.GeneratorType):
-        return handle_streaming_response(
-            response, request_time_dt, usage_metadata,
-            transaction_id, 'generate', kwargs
-        )
-    else:
-        # Handle non-streaming response
-        logger.debug("Ollama generate response: %s", response)
-
-        # Add transaction ID to response object
-        add_transaction_id_to_response(response, transaction_id)
-
-        handle_response(
-            response, request_time_dt, usage_metadata,
-            False, transaction_id, 'generate', kwargs
+            transaction_id, kwargs
         )
         return response
-
-
-@wrapt.patch_function_wrapper('ollama', 'embed')
-def embed_wrapper(wrapped, _, args, kwargs):
-    """
-    Wraps the ollama.embed method to log token usage for embeddings.
-    Handles both single and batch embedding requests.
-    """
-    logger.debug("Ollama embed wrapper called")
-    usage_metadata = kwargs.pop("usage_metadata", {}) if "usage_metadata" in kwargs else {}
-
-    request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-    # Generate transaction ID using the same timestamp for consistency
-    transaction_id = f"ollama-{request_time_dt.timestamp()}"
-
-    logger.debug(f"Calling embed function with args: {args}, kwargs: {kwargs}")
-
-    response = wrapped(*args, **kwargs)
-
-    # Handle embeddings response (embeddings are not streamed)
-    logger.debug("Ollama embed response: %s", response)
-
-    # Add transaction ID to response object
-    add_transaction_id_to_response(response, transaction_id)
-
-    # Handle embeddings response - embeddings only have input tokens, no output tokens
-    handle_embeddings_response(
-        response, request_time_dt, usage_metadata,
-        transaction_id, kwargs
-    )
-    return response
 
 
 def handle_streaming_response(
@@ -247,8 +147,6 @@ def handle_streaming_response(
         # Collect all chunks and add transaction ID to each
         for chunk in generator:
             chunks.append(chunk)
-            # Add transaction ID to each chunk
-            add_transaction_id_to_response(chunk, transaction_id)
             yield chunk
 
         # After all chunks are processed, construct the final response
@@ -347,25 +245,11 @@ def handle_response(
             transaction_name = get_transaction_name(usage_metadata)
             retry_number = get_retry_number()
 
-            # Extract organization and product names with deprecation warnings
-            organization_name = extract_field_with_fallback(
-                usage_metadata,
-                "organization_name",
-                "organizationName",
-                "organization_id",
-                "organizationId",
-                "organization",
-            )
-            product_name = extract_field_with_fallback(
-                usage_metadata,
-                "product_name",
-                "productName",
-                "product_id",
-                "productId",
-                "product",
-            )
+            organization_name, product_name = extract_org_and_product(usage_metadata)
+            meta = extract_common_metadata(usage_metadata)
+            agentic_fields = extract_agentic_job_fields(usage_metadata)
+            extra_body = merge_extra_body(None, agentic_fields)
 
-            # Prepare arguments for create_completion
             completion_args = {
                 "cache_creation_token_count": cached_tokens,
                 "cache_read_token_count": 0,
@@ -386,17 +270,16 @@ def handle_response(
                 "stop_reason": stop_reason,
                 "total_token_count": total_tokens,
                 "transaction_id": response_id,
-                "trace_id": usage_metadata.get("trace_id"),
-                "task_type": usage_metadata.get("task_type"),
+                "trace_id": meta["trace_id"],
+                "task_type": meta["task_type"],
                 "subscriber": subscriber if subscriber else None,
                 "organization_name": organization_name,
-                "subscription_id": usage_metadata.get("subscription_id"),
+                "subscription_id": meta["subscription_id"],
                 "product_name": product_name,
-                "agent": usage_metadata.get("agent"),
-                "response_quality_score": usage_metadata.get("response_quality_score"),
+                "agent": meta["agent"],
+                "response_quality_score": meta["response_quality_score"],
                 "is_streamed": is_streaming,
                 "middleware_source": "PYTHON",
-                # Trace visualization fields
                 "operation_type": operation_type,
                 "environment": environment,
                 "region": region,
@@ -405,13 +288,12 @@ def handle_response(
                 "trace_name": trace_name,
                 "parent_transaction_id": parent_transaction_id,
                 "transaction_name": transaction_name,
-                "retry_number": retry_number
+                "retry_number": retry_number,
+                "extra_body": extra_body
             }
 
-            # Log the arguments at debug level
             logger.debug("Arguments for create_completion: %s", completion_args)
 
-            # The client.ai.create_completion method is not async, so don't use await
             result = client.ai.create_completion(**completion_args)
             logger.debug("Metering call result: %s", result)
         except Exception as e:
@@ -491,25 +373,11 @@ def handle_embeddings_response(
             transaction_name = get_transaction_name(usage_metadata)
             retry_number = get_retry_number()
 
-            # Extract organization and product names with deprecation warnings
-            organization_name = extract_field_with_fallback(
-                usage_metadata,
-                "organization_name",
-                "organizationName",
-                "organization_id",
-                "organizationId",
-                "organization",
-            )
-            product_name = extract_field_with_fallback(
-                usage_metadata,
-                "product_name",
-                "productName",
-                "product_id",
-                "productId",
-                "product",
-            )
+            organization_name, product_name = extract_org_and_product(usage_metadata)
+            meta = extract_common_metadata(usage_metadata)
+            agentic_fields = extract_agentic_job_fields(usage_metadata)
+            extra_body = merge_extra_body(None, agentic_fields)
 
-            # Prepare arguments for create_completion
             completion_args = {
                 "cache_creation_token_count": cached_tokens,
                 "cache_read_token_count": 0,
@@ -530,17 +398,16 @@ def handle_embeddings_response(
                 "stop_reason": stop_reason,
                 "total_token_count": total_tokens,
                 "transaction_id": response_id,
-                "trace_id": usage_metadata.get("trace_id"),
-                "task_type": usage_metadata.get("task_type"),
+                "trace_id": meta["trace_id"],
+                "task_type": meta["task_type"],
                 "subscriber": subscriber if subscriber else None,
                 "organization_name": organization_name,
-                "subscription_id": usage_metadata.get("subscription_id"),
+                "subscription_id": meta["subscription_id"],
                 "product_name": product_name,
-                "agent": usage_metadata.get("agent"),
-                "response_quality_score": usage_metadata.get("response_quality_score"),
-                "is_streamed": False,  # Embeddings are never streamed
+                "agent": meta["agent"],
+                "response_quality_score": meta["response_quality_score"],
+                "is_streamed": False,
                 "middleware_source": "PYTHON",
-                # Trace visualization fields
                 "operation_type": operation_type,
                 "environment": environment,
                 "region": region,
@@ -549,13 +416,12 @@ def handle_embeddings_response(
                 "trace_name": trace_name,
                 "parent_transaction_id": parent_transaction_id,
                 "transaction_name": transaction_name,
-                "retry_number": retry_number
+                "retry_number": retry_number,
+                "extra_body": extra_body
             }
 
-            # Log the arguments at debug level
             logger.debug("Arguments for create_completion: %s", completion_args)
 
-            # The client.ai.create_completion method is not async, so don't use await
             result = client.ai.create_completion(**completion_args)
             logger.debug("Metering call result: %s", result)
         except Exception as e:
