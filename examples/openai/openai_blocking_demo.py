@@ -11,8 +11,8 @@ Pre-requisites
 
        pip install 'revenium-python-sdk[openai]'
 
-2. Create a budget rule on the dev tenant with a hard limit low enough to
-   trip after the first request. Sample::
+2. Create a budget rule on the team configured below with a hard limit low
+   enough to trip after the first request. Sample::
 
        curl -X POST -H "x-api-key: $REVENIUM_METERING_API_KEY" \\
          "$REVENIUM_ENFORCEMENT_BASE_URL/v2/api/ai/budget-rules" \\
@@ -24,7 +24,7 @@ Pre-requisites
        REVENIUM_CIRCUIT_BREAKER_ENABLED=true
        REVENIUM_METERING_API_KEY=hak_...
        REVENIUM_TEAM_ID=...                # hashed team ID
-       REVENIUM_ENFORCEMENT_BASE_URL=https://api.dev.hcapp.io/profitstream
+       REVENIUM_ENFORCEMENT_BASE_URL=https://api.revenium.ai/profitstream
        OPENAI_API_KEY=sk-...
 
 Run::

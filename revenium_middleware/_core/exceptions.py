@@ -6,7 +6,7 @@ provider subpackage (openai, anthropic, google, …) raises the same exception
 type and downstream callers can ``except ReveniumCostLimitExceeded`` once.
 """
 
-from typing import Optional
+from typing import Optional, Union
 
 
 class ReveniumCostLimitExceeded(Exception):
@@ -24,7 +24,7 @@ class ReveniumCostLimitExceeded(Exception):
         current_value: Optional[float] = None,
         threshold: Optional[float] = None,
         resets_at: Optional[str] = None,
-        rule_id: Optional[str] = None,
+        rule_id: Optional[Union[str, int]] = None,
     ):
         super().__init__(message)
         self.message = message

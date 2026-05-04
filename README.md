@@ -1144,7 +1144,7 @@ Rules with `shadowMode: true` are observe-and-log: they are skipped by `check_en
 
 ### End-to-End Example
 
-See [`examples/openai/openai_blocking_demo.py`](examples/openai/openai_blocking_demo.py) for a runnable demo that hits dev with the canonical cost-controls test rule.
+See [`examples/openai/openai_blocking_demo.py`](examples/openai/openai_blocking_demo.py) for a runnable end-to-end demo using a seeded budget rule.
 
 ---
 

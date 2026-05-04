@@ -183,13 +183,22 @@ def _fetch_rules() -> Optional[list]:
 
 
 def _refresh_cache() -> None:
+    """Refresh the in-memory rule cache.
+
+    Only advances ``_cache_timestamp`` on a successful fetch — a transient
+    network error must not poison the stale-cache trigger and silently
+    suppress retries for the next ``_CACHE_TTL`` window. Disk persistence
+    happens outside ``_cache_lock`` so a slow filesystem write can't block
+    concurrent ``check_enforcement`` callers on the pre-call path.
+    """
     global _cached_rules, _cache_timestamp
     rules = _fetch_rules()
+    if rules is None:
+        return
     with _cache_lock:
-        if rules is not None:
-            _cached_rules = rules
-            _persist_cache_to_disk(rules)
+        _cached_rules = rules
         _cache_timestamp = time.monotonic()
+    _persist_cache_to_disk(rules)
 
 
 def _poll_loop() -> None:
