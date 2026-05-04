@@ -7,6 +7,8 @@ from enum import Enum
 
 import wrapt
 from revenium_middleware import client, run_async_in_thread, shutdown_event, merge_metadata
+from revenium_middleware._core.enforcement import check_enforcement
+from revenium_middleware._core.exceptions import ReveniumCostLimitExceeded  # noqa: F401 — re-exported via openai.exceptions
 from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
 
 # Azure OpenAI support imports
@@ -810,6 +812,10 @@ def embeddings_create_wrapper(wrapped, instance, args, kwargs):
 
     # Record request time
     request_time_dt = datetime.datetime.now(datetime.timezone.utc)
+
+    # Enforcement pre-call check — may raise ReveniumCostLimitExceeded
+    check_enforcement(usage_metadata)
+
     logger.debug(
         f"Calling wrapped embeddings function with args: {args}, "
         f"kwargs: {kwargs}"
@@ -891,6 +897,10 @@ def create_wrapper(wrapped, instance, args, kwargs):
 
     # Record request time
     request_time_dt = datetime.datetime.now(datetime.timezone.utc)
+
+    # Enforcement pre-call check — may raise ReveniumCostLimitExceeded
+    check_enforcement(usage_metadata)
+
     logger.debug(
         f"Calling wrapped function with args: {args}, kwargs: {kwargs}"
     )
@@ -1246,6 +1256,10 @@ def responses_create_wrapper(wrapped, instance, args, kwargs):
 
     # Record request time
     request_time_dt = datetime.datetime.now(datetime.timezone.utc)
+
+    # Enforcement pre-call check — may raise ReveniumCostLimitExceeded
+    check_enforcement(usage_metadata)
+
     logger.debug(f"Calling wrapped responses function with args: {args}, kwargs: {kwargs}")
 
     # Call the original OpenAI function

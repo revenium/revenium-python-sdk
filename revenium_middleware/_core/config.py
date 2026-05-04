@@ -71,6 +71,15 @@ class Config:
     SUMMARY_API_TIMEOUT: float = 5.0
     DEFAULT_BASE_URL: str = "https://api.revenium.ai"
 
+    # Enforcement / circuit breaker — see _core/enforcement.py.
+    # Taxonomy locked in BACK-1154 docs; keep in sync across SDKs.
+    ENV_REVENIUM_BYPASS: str = "REVENIUM_BYPASS"
+    ENV_CIRCUIT_BREAKER_ENABLED: str = "REVENIUM_CIRCUIT_BREAKER_ENABLED"
+    ENV_REVENIUM_ENFORCEMENT_BASE_URL: str = "REVENIUM_ENFORCEMENT_BASE_URL"
+    ENV_REVENIUM_CB_POLL_INTERVAL_SECONDS: str = "REVENIUM_CB_POLL_INTERVAL_SECONDS"
+    ENV_REVENIUM_CB_FAIL_MODE: str = "REVENIUM_CB_FAIL_MODE"
+    ENV_REVENIUM_CACHE_DIR: str = "REVENIUM_CACHE_DIR"
+
 
 class SecurityConfig:
     """Security-related configuration shared across all providers."""
