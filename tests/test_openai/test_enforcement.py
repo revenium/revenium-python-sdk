@@ -37,10 +37,16 @@ def _reset_enforcement_state(monkeypatch):
     enforcement.stop_polling()
 
 
-def _seed_rules(monkeypatch, rules: list, *, ttl_age: float = 0.0) -> None:
-    """Inject rules directly into the in-memory cache, bypassing the poller."""
+def _seed_rules(monkeypatch, rules: list, *, ttl_age: float = 0.0, initialized: bool = True) -> None:
+    """Inject rules directly into the in-memory cache, bypassing the poller.
+
+    ``initialized=True`` (default) models a successful fetch having populated
+    the cache. Pass ``initialized=False`` to model the boot state where no
+    fetch has yet completed (relevant to fail-closed semantics).
+    """
     monkeypatch.setattr(enforcement, "_cached_rules", list(rules))
     monkeypatch.setattr(enforcement, "_cache_timestamp", float("inf") if ttl_age == 0.0 else 0.0)
+    monkeypatch.setattr(enforcement, "_cache_initialized", initialized)
     # Block both the poller and any synchronous refresh from clobbering us.
     monkeypatch.setattr(enforcement, "_ensure_poller_running", lambda: None)
     monkeypatch.setattr(enforcement, "_fetch_rules", lambda: None)
@@ -131,19 +137,29 @@ def test_credential_scoped_rule_blocks_matching_credential(monkeypatch):
         enforcement.check_enforcement({"subscriber_credential": "alice-key"})
 
 
-def test_fail_closed_with_empty_cache_raises(monkeypatch):
-    """``REVENIUM_CB_FAIL_MODE=closed`` must refuse when no rules are cached."""
+def test_fail_closed_with_uninitialized_cache_raises(monkeypatch):
+    """``REVENIUM_CB_FAIL_MODE=closed`` must refuse when the cache has never loaded."""
     monkeypatch.setenv("REVENIUM_CIRCUIT_BREAKER_ENABLED", "true")
     monkeypatch.setenv("REVENIUM_CB_FAIL_MODE", "closed")
-    _seed_rules(monkeypatch, [])
+    _seed_rules(monkeypatch, [], initialized=False)
     with pytest.raises(ReveniumCostLimitExceeded):
         enforcement.check_enforcement({})
+
+
+def test_fail_closed_with_initialized_empty_cache_passes(monkeypatch):
+    """A successful fetch that returns ``[]`` (HTTP 204 = no rules apply) must
+    pass through even in fail-closed mode — the server explicitly said the
+    request is permitted, so blocking it would be a false positive."""
+    monkeypatch.setenv("REVENIUM_CIRCUIT_BREAKER_ENABLED", "true")
+    monkeypatch.setenv("REVENIUM_CB_FAIL_MODE", "closed")
+    _seed_rules(monkeypatch, [], initialized=True)
+    enforcement.check_enforcement({})
 
 
 def test_fail_open_with_empty_cache_passes(monkeypatch):
     """Default fail-mode is open — empty cache means pass through."""
     monkeypatch.setenv("REVENIUM_CIRCUIT_BREAKER_ENABLED", "true")
-    _seed_rules(monkeypatch, [])
+    _seed_rules(monkeypatch, [], initialized=False)
     enforcement.check_enforcement({})
 
 

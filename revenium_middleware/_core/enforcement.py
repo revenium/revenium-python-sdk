@@ -32,6 +32,11 @@ _RULES_CACHE_FILENAME = "revenium_enforcement_rules.json"
 _cached_rules: List[dict] = []
 _cache_lock = threading.Lock()
 _cache_timestamp = 0.0
+# True once any successful fetch (even an empty list / HTTP 204) or a disk
+# snapshot load has populated the cache. Distinguishes "server says no rules
+# apply" from "we have never heard back from the server" — fail-closed must
+# only block in the latter case.
+_cache_initialized = False
 
 _poll_thread: Optional[threading.Thread] = None
 _poll_lock = threading.Lock()
@@ -99,7 +104,7 @@ def _get_enforcement_base_url() -> str:
 
 
 def _load_cache_from_disk() -> None:
-    global _cached_rules, _cache_timestamp, _disk_load_attempted
+    global _cached_rules, _cache_timestamp, _disk_load_attempted, _cache_initialized
     if _disk_load_attempted:
         return
     _disk_load_attempted = True
@@ -116,6 +121,7 @@ def _load_cache_from_disk() -> None:
                 # but the disk snapshot prevents fail-closed from raising on
                 # the very first request after a process restart.
                 _cache_timestamp = 0.0
+                _cache_initialized = True
             logger.debug("Loaded %d enforcement rule(s) from %s", len(data), path)
     except Exception:
         logger.debug("Failed to read enforcement cache from %s", path, exc_info=True)
@@ -191,13 +197,14 @@ def _refresh_cache() -> None:
     happens outside ``_cache_lock`` so a slow filesystem write can't block
     concurrent ``check_enforcement`` callers on the pre-call path.
     """
-    global _cached_rules, _cache_timestamp
+    global _cached_rules, _cache_timestamp, _cache_initialized
     rules = _fetch_rules()
     if rules is None:
         return
     with _cache_lock:
         _cached_rules = rules
         _cache_timestamp = time.monotonic()
+        _cache_initialized = True
     _persist_cache_to_disk(rules)
 
 
@@ -269,11 +276,12 @@ def check_enforcement(usage_metadata: Optional[dict] = None) -> None:
     _ensure_poller_running()
     rules = _get_rules()
 
-    # Fail-closed mode: if we have no rules at all (e.g. first call after
-    # boot, fetch errored, no on-disk snapshot), refuse to pass through.
-    if not rules and _fail_mode_is_closed():
+    # Fail-closed mode: only block when the cache has *never* loaded. An
+    # empty list from a successful fetch (HTTP 204 = "no rules apply") is a
+    # valid initialized state and must pass through.
+    if _fail_mode_is_closed() and not _cache_initialized:
         raise ReveniumCostLimitExceeded(
-            "Request blocked: enforcement cache is empty and "
+            "Request blocked: enforcement cache is uninitialized and "
             "REVENIUM_CB_FAIL_MODE=closed."
         )
 
@@ -307,7 +315,15 @@ def check_enforcement(usage_metadata: Optional[dict] = None) -> None:
 
 
 def stop_polling() -> None:
-    """Gracefully stop the background polling thread."""
+    """Gracefully stop the background polling thread.
+
+    Reads ``_poll_thread`` under ``_poll_lock`` to avoid a TOCTOU race with
+    ``_ensure_poller_running`` spinning the thread up on a concurrent first
+    request — without the lock, shutdown could observe ``None`` and skip the
+    ``join`` even though a poller is alive.
+    """
     _stop_event.set()
-    if _poll_thread is not None:
-        _poll_thread.join(timeout=5)
+    with _poll_lock:
+        thread = _poll_thread
+    if thread is not None:
+        thread.join(timeout=5)
