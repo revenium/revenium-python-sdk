@@ -1150,6 +1150,19 @@ Available log levels:
 
 For detailed documentation, visit [docs.revenium.io](https://docs.revenium.io)
 
+### Server-Side Cost Controls
+
+Cost controls (spend limits, throttling, alerts) are managed server-side in Revenium, not in this SDK. The SDK reports usage; Revenium evaluates it against your cost controls.
+
+The cost-controls API endpoint has been renamed:
+
+| Status | Endpoint |
+| --- | --- |
+| New (preferred) | `/v2/api/ai/cost-controls` |
+| Deprecated (alias, returns `Deprecation` header; planned removal in a future release) | `/v2/api/ai/budget-rules` |
+
+This Python SDK does not call either endpoint directly — no SDK changes are required. If you manage cost controls via the Revenium API, HTTP client, or `curl`, point new integrations at `/v2/api/ai/cost-controls`. See [docs.revenium.io](https://docs.revenium.io) for the current API reference.
+
 ## Contributing
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md)
