@@ -1048,6 +1048,106 @@ Trace ID: abc-123
 
 ---
 
+## Cost Controls / Enforcement
+
+Block outbound provider requests client-side when a Revenium cost-limit rule trips. When the circuit breaker is enabled, the middleware polls enforcement rules from the Revenium API in a background daemon thread and raises `ReveniumCostLimitExceeded` **before** the upstream call, preventing spend beyond the configured limit.
+
+Currently wired for the OpenAI provider (other providers land via per-provider follow-on tickets).
+
+### Enable
+
+```bash
+pip install 'revenium-python-sdk[openai]'
+```
+
+```env
+REVENIUM_CIRCUIT_BREAKER_ENABLED=true
+REVENIUM_METERING_API_KEY=hak_your_key_here
+REVENIUM_TEAM_ID=your_hashed_team_id
+REVENIUM_ENFORCEMENT_BASE_URL=https://api.revenium.ai/profitstream  # optional
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REVENIUM_CIRCUIT_BREAKER_ENABLED` | `false` | Master switch. `true` / `1` / `yes` / `on` to enable. |
+| `REVENIUM_BYPASS` | `false` | When `true`, every `check_enforcement` call short-circuits to a no-op. Useful for incident response. |
+| `REVENIUM_TEAM_ID` | — | Hashed team ID. Path component on rule fetches; required when the breaker is enabled. |
+| `REVENIUM_ENFORCEMENT_BASE_URL` | origin of `REVENIUM_METERING_BASE_URL` | Base URL for the enforcement API. Set when the enforcement API lives behind a context-path. |
+| `REVENIUM_CB_POLL_INTERVAL_SECONDS` | `60` | Background poll interval for rule refreshes. |
+| `REVENIUM_CB_FAIL_MODE` | `open` | `open` (default) lets calls through when no cache exists; `closed` raises `ReveniumCostLimitExceeded` until rules are loaded. |
+| `REVENIUM_CACHE_DIR` | — | When set, the rule cache is mirrored to `<dir>/revenium_enforcement_rules.json` so a restarted process doesn't fail-closed on the very first call. |
+
+### Public API
+
+Enforcement auto-initializes when the OpenAI middleware loads:
+
+```python
+import revenium_middleware.openai  # auto-instruments openai
+import openai
+
+client = openai.OpenAI()
+```
+
+The pre-call check fires before every chat / embeddings / responses call. When the circuit breaker is disabled, it is a no-op. When enabled:
+
+1. A daemon thread (`revenium-enforcement-poll`) starts on first use.
+2. It polls `GET {REVENIUM_ENFORCEMENT_BASE_URL}/v2/api/ai/enforcement-rules/{REVENIUM_TEAM_ID}` every `REVENIUM_CB_POLL_INTERVAL_SECONDS` with the `x-api-key` header.
+3. Rules are cached in-process (120 s TTL, refresh-on-stale with thundering-herd guard).
+4. `204 No Content` is treated as "no rules configured" — the cache is cleared.
+
+### Exception Contract
+
+```python
+from revenium_middleware.openai import ReveniumCostLimitExceeded
+```
+
+When a tripped rule matches the current request, the middleware raises before the OpenAI call is made. All structured fields are populated when the server provides them:
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `message` | `str` | Human-readable reason, e.g. `"Request blocked by Revenium enforcement rule: monthly-gpt4-cap"` |
+| `rule_name` | `str \| None` | Server-side rule name |
+| `current_value` | `float \| None` | Current metric value at the time of the block |
+| `threshold` | `float \| None` | Configured limit |
+| `resets_at` | `str \| None` | ISO-8601 timestamp the rule next resets |
+| `rule_id` | `str \| int \| None` | Server-side rule identifier |
+
+`ReveniumCostLimitExceeded` does **not** inherit from `ReveniumMiddlewareError`, so the OpenAI middleware's `handle_exception_safely` decorator never swallows it — it always reaches your `except` block.
+
+```python
+from revenium_middleware.openai import ReveniumCostLimitExceeded
+import openai
+
+client = openai.OpenAI()
+
+try:
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": "Summarize the meeting notes"}],
+    )
+except ReveniumCostLimitExceeded as exc:
+    print(f"Cost limit reached: {exc.message}")
+    print(f"Rule {exc.rule_name}: {exc.current_value} / {exc.threshold}; resets {exc.resets_at}")
+```
+
+### Fail-Open vs Fail-Closed
+
+By default (`REVENIUM_CB_FAIL_MODE=open`) enforcement failures never propagate to user code. If the rule fetch errors (network, 5xx, auth), the previous in-memory cache is preserved and a debug log line is emitted. If there is no cache yet, enforcement behaves as if no rules are configured and the request continues.
+
+Set `REVENIUM_CB_FAIL_MODE=closed` to refuse calls until at least one rule fetch (or `REVENIUM_CACHE_DIR` snapshot) succeeds. Pair with `REVENIUM_CACHE_DIR` so a process restart loads the last-known rules rather than blocking every call until the first poll completes.
+
+### Shadow Mode
+
+Rules with `shadowMode: true` are observe-and-log: they are skipped by `check_enforcement`. Use shadow mode on the server side to audit a rule before flipping it to enforce.
+
+### End-to-End Example
+
+See [`examples/openai/openai_blocking_demo.py`](examples/openai/openai_blocking_demo.py) for a runnable end-to-end demo using a seeded budget rule.
+
+---
+
 ## Configuration Reference
 
 ### Required Environment Variables
@@ -1149,6 +1249,12 @@ Available log levels:
 ## Documentation
 
 For detailed documentation, visit [docs.revenium.io](https://docs.revenium.io)
+
+### Server-Side Cost Controls
+
+Cost controls (spend limits, throttling, alerts) are managed server-side in Revenium, not in this SDK. The SDK reports usage; Revenium evaluates it against your configured cost controls.
+
+The cost-controls API endpoint is `/v2/api/ai/cost-controls`. This Python SDK does not call the endpoint directly — no SDK changes are required to use cost controls. If you manage cost controls via the Revenium API, HTTP client, or `curl`, see [docs.revenium.io](https://docs.revenium.io) for the current API reference.
 
 ## Contributing
 
