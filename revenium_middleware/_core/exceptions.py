@@ -33,3 +33,11 @@ class BudgetExceededError(Exception):
         self.threshold = threshold
         self.resets_at = resets_at
         self.rule_id = rule_id
+
+
+# Deprecated alias preserved for backward compatibility. The exception was
+# renamed in v0.1.5 to align with the Go and Node SDKs and the backend
+# `BudgetExceededException`. Existing code that does
+# `except ReveniumCostLimitExceeded:` continues to catch the new exception
+# unchanged. Plan to remove in a future major release.
+ReveniumCostLimitExceeded = BudgetExceededError

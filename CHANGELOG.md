@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Outcome values are now reported as `float`, preserving fractional dollars (previously truncated by `int()`).
-- Renamed `ReveniumCostLimitExceeded` to `BudgetExceededError` to unify the exception name across Python, Node, and Go SDKs and align with the backend `BudgetExceededException`. The class is still exported from `revenium_middleware._core.exceptions` and `revenium_middleware.openai`.
+- Renamed `ReveniumCostLimitExceeded` to `BudgetExceededError` to align the exception name across Python, Node, and Go SDKs. The old name remains as a deprecated alias, so existing `except ReveniumCostLimitExceeded:` code keeps working.
 - Refreshed example model references to match the current verified Revenium model catalog.
 
 ### Fixed

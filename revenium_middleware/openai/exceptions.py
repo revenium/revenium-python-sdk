@@ -5,7 +5,10 @@ This module defines a hierarchy of exceptions that provide better error handling
 and more specific error information for different failure scenarios.
 """
 
-from revenium_middleware._core.exceptions import BudgetExceededError  # noqa: F401
+from revenium_middleware._core.exceptions import (  # noqa: F401
+    BudgetExceededError,
+    ReveniumCostLimitExceeded,
+)
 
 
 class ReveniumMiddlewareError(Exception):
