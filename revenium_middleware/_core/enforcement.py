@@ -3,7 +3,7 @@ Enforcement engine for the Revenium circuit breaker.
 
 Polls cost-limit rules from the Revenium API in a daemon thread and caches
 them in memory. ``check_enforcement(...)`` is a pre-call hook that raises
-``ReveniumCostLimitExceeded`` when a tripped rule matches the current
+``BudgetExceededError`` when a tripped rule matches the current
 request, blocking the outbound provider call before any spend occurs.
 
 Opt-in via ``REVENIUM_CIRCUIT_BREAKER_ENABLED``. Disabled by default so the
@@ -21,7 +21,7 @@ from urllib.parse import quote, urlparse
 import httpx
 
 from .config import Config
-from .exceptions import ReveniumCostLimitExceeded
+from .exceptions import BudgetExceededError
 
 logger = logging.getLogger("revenium_middleware.extension")
 
@@ -276,7 +276,7 @@ def check_enforcement(usage_metadata: Optional[dict] = None) -> None:
     is disabled or no rules are tripped.
 
     Raises:
-        ReveniumCostLimitExceeded: when a cost-limit rule blocks the call.
+        BudgetExceededError: when a cost-limit rule blocks the call.
             All structured fields (``rule_name``, ``current_value``,
             ``threshold``, ``resets_at``, ``rule_id``) are populated when the
             server provides them.
@@ -295,7 +295,7 @@ def check_enforcement(usage_metadata: Optional[dict] = None) -> None:
     # valid initialized state and must pass through. Use the snapshot taken
     # under _cache_lock so the decision can't see a torn write.
     if _fail_mode_is_closed() and not initialized:
-        raise ReveniumCostLimitExceeded(
+        raise BudgetExceededError(
             "Request blocked: enforcement cache is uninitialized and "
             "REVENIUM_CB_FAIL_MODE=closed."
         )
@@ -319,7 +319,7 @@ def check_enforcement(usage_metadata: Optional[dict] = None) -> None:
             continue
 
         rule_name = rule.get("name", "cost limit")
-        raise ReveniumCostLimitExceeded(
+        raise BudgetExceededError(
             message=f"Request blocked by Revenium enforcement rule: {rule_name}",
             rule_name=rule_name,
             current_value=_coerce_float(rule.get("currentValue")),

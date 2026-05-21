@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-05-21
+
+### Added
+- `AgenticOutcomeClient` and `AgenticOutcomeSettings` for emitting agentic-job outcomes (`CONVERTED`, `DEFLECTED`, `ESCALATED`) alongside completion and tool-event metering.
+- `examples/agentic_outcomes/` example pack — runnable demo scripts (sales, coding, customer support) showing how to emit outcomes from real agent workflows.
+- Automatic team-id discovery from the configured Revenium API key. Setting `REVENIUM_TEAM_ID` is no longer required when the SDK can resolve the team from the API key.
+
+### Changed
+- Outcome values are now reported as `float`, preserving fractional dollars (previously truncated by `int()`).
+- Renamed `ReveniumCostLimitExceeded` to `BudgetExceededError` to unify the exception name across Python, Node, and Go SDKs and align with the backend `BudgetExceededException`. The class is still exported from `revenium_middleware._core.exceptions` and `revenium_middleware.openai`.
+- Refreshed example model references to match the current verified Revenium model catalog.
+
+### Fixed
+- Bedrock adapter now correctly maps `claude-opus-4-7`.
+- Agentic-outcomes example scripts now reject `--count 0` instead of failing with a `ZeroDivisionError`.
+
+### Documentation
+- README now documents the agentic outcomes API.
+- Cost-control terminology note ported from the Go SDK README for consistency across SDKs.
+
 ## [0.1.4] - 2026-05-08
 
 ### Added
@@ -72,7 +92,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Selective metering via `REVENIUM_SELECTIVE_METERING` environment variable
 - Configurable logging with `REVENIUM_LOG_LEVEL`
 
-### Notes
-- This package supersedes the individual provider packages (`revenium-middleware-openai`, `revenium-middleware-anthropic`, etc.)
-- The import path remains `revenium_middleware` for backward compatibility
-- Requires `revenium_metering>=6.8.2`

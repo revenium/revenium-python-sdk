@@ -10,7 +10,7 @@ Usage:
 """
 import logging
 
-from revenium_middleware._core.exceptions import ReveniumCostLimitExceeded
+from revenium_middleware._core.exceptions import BudgetExceededError
 
 logger = logging.getLogger(__name__)
 
@@ -22,4 +22,4 @@ except ImportError:
     logger.debug("OpenAI middleware dependencies not available, middleware not loaded")
     create_wrapper = None  # type: ignore
 
-__all__ = ["create_wrapper", "ReveniumCostLimitExceeded"]
+__all__ = ["create_wrapper", "BudgetExceededError"]

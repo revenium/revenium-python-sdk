@@ -41,7 +41,7 @@ def main():
         print("Making API call with detailed metadata tracking...")
 
         message = client.messages.create(
-            model="claude-3-haiku-20240307",
+            model="claude-opus-4-7",
             max_tokens=150,
             temperature=0.8,
             messages=[

@@ -47,7 +47,7 @@ def openai_streaming_example():
     print("Assistant: ", end="", flush=True)
     
     basic_stream = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5.5",
         messages=[
             {"role": "user", "content": "Count from 1 to 5 slowly"}
         ],
@@ -67,7 +67,7 @@ def openai_streaming_example():
     print("Assistant: ", end="", flush=True)
     
     metadata_stream = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5.5",
         messages=[
             {"role": "user", "content": "Write a haiku about middleware"}
         ],

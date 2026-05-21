@@ -39,7 +39,7 @@ def handle_customer_query(question: str) -> str:
 
     # This call automatically includes the decorator metadata
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5.5",
         messages=[
             {
                 "role": "system",
@@ -73,7 +73,7 @@ def analyze_multiple_queries(queries: list) -> list:
         print(f"\n  Query {i}/{len(queries)}: {query}")
 
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.5",
             messages=[{"role": "user", "content": query}],
             max_tokens=50
         )
@@ -123,7 +123,7 @@ def premium_feature(prompt: str) -> str:
     print(f"\nPremium feature processing: {prompt}")
 
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5.5",
         messages=[{"role": "user", "content": prompt}],
         max_tokens=100
     )
@@ -156,7 +156,7 @@ def nested_decorator_example():
         def inner_function():
             print("   Inner function called")
             response = client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello!"}],
                 max_tokens=20
             )

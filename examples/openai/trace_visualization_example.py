@@ -41,7 +41,7 @@ def example_1_basic_trace_visualization():
     client = OpenAI()
 
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5.5",
         messages=[
             {"role": "user", "content": "What is your refund policy?"}
         ],
@@ -78,7 +78,7 @@ def example_2_distributed_tracing():
     # Parent call
     print("\n🔵 Parent Transaction: Extract Key Points")
     parent_response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5.5",
         messages=[
             {
                 "role": "user",
@@ -100,7 +100,7 @@ def example_2_distributed_tracing():
     os.environ['REVENIUM_TRANSACTION_NAME'] = 'Summarize Points'
 
     child1_response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5.5",
         messages=[
             {
                 "role": "user",
@@ -121,7 +121,7 @@ def example_2_distributed_tracing():
     os.environ['REVENIUM_TRANSACTION_NAME'] = 'Generate Tags'
 
     child2_response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5.5",
         messages=[
             {"role": "user", "content": "Generate 3 tags for this content."}
         ],
@@ -158,7 +158,7 @@ def example_3_retry_tracking():
         print(f"\nAttempt {retry_num + 1} (retry_number={retry_num})")
 
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.5",
             messages=[
                 {
                     "role": "user",
@@ -205,7 +205,7 @@ def example_4_multi_region_deployment():
         print(f"\nProcessing in region: {region}")
 
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.5",
             messages=[
                 {"role": "user", "content": f"Hello from {region}!"}
             ],
@@ -259,7 +259,7 @@ def example_5_custom_trace_categorization():
         print(f"Type: {workflow['type']}")
 
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.5",
             messages=[
                 {"role": "user", "content": workflow['prompt']}
             ],

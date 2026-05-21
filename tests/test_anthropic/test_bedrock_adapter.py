@@ -25,6 +25,11 @@ class TestModelMapping:
 
     def test_known_model_mapping(self):
         """Test mapping for known models."""
+        assert _model_id("claude-opus-4-7") == "anthropic.claude-opus-4-7"
+        assert _model_id("us.claude-opus-4-7") == "us.anthropic.claude-opus-4-7"
+        assert _model_id("eu.claude-opus-4-7") == "eu.anthropic.claude-opus-4-7"
+        assert _model_id("au.claude-opus-4-7") == "au.anthropic.claude-opus-4-7"
+        assert _model_id("global.claude-opus-4-7") == "global.anthropic.claude-opus-4-7"
         assert _model_id("claude-3-opus-20240229") == "anthropic.claude-3-opus-20240229-v1:0"
         assert _model_id("claude-3-sonnet-20240229") == "anthropic.claude-3-sonnet-20240229-v1:0"
         assert _model_id("claude-3-haiku-20240307") == "us.anthropic.claude-3-5-haiku-20241022-v1:0"

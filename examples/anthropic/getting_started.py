@@ -18,7 +18,7 @@ def main():
     client = anthropic.Anthropic()
 
     message = client.messages.create(
-        model="claude-3-haiku-20240307",
+        model="claude-opus-4-7",
         max_tokens=100,
         messages=[
             {

@@ -8,7 +8,7 @@ from enum import Enum
 import wrapt
 from revenium_middleware import client, run_async_in_thread, shutdown_event, merge_metadata
 from revenium_middleware._core.enforcement import check_enforcement
-from revenium_middleware._core.exceptions import ReveniumCostLimitExceeded  # noqa: F401 — re-exported via openai.exceptions
+from revenium_middleware._core.exceptions import BudgetExceededError  # noqa: F401 — re-exported via openai.exceptions
 from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
 from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, merge_extra_body
 from revenium_middleware._core.config import is_selective_metering_enabled, is_capture_prompts_enabled
@@ -807,7 +807,7 @@ def embeddings_create_wrapper(wrapped, instance, args, kwargs):
     # Record request time
     request_time_dt = datetime.datetime.now(datetime.timezone.utc)
 
-    # Enforcement pre-call check — may raise ReveniumCostLimitExceeded
+    # Enforcement pre-call check — may raise BudgetExceededError
     check_enforcement(usage_metadata)
 
     logger.debug(
@@ -897,7 +897,7 @@ def create_wrapper(wrapped, instance, args, kwargs):
 
     request_time_dt = datetime.datetime.now(datetime.timezone.utc)
 
-    # Enforcement pre-call check — may raise ReveniumCostLimitExceeded
+    # Enforcement pre-call check — may raise BudgetExceededError
     check_enforcement(usage_metadata)
 
     logger.debug(
@@ -1250,7 +1250,7 @@ def responses_create_wrapper(wrapped, instance, args, kwargs):
     # Record request time
     request_time_dt = datetime.datetime.now(datetime.timezone.utc)
 
-    # Enforcement pre-call check — may raise ReveniumCostLimitExceeded
+    # Enforcement pre-call check — may raise BudgetExceededError
     check_enforcement(usage_metadata)
 
     logger.debug(f"Calling wrapped responses function with args: {args}, kwargs: {kwargs}")
@@ -1654,7 +1654,7 @@ def async_create_wrapper(wrapped, instance, args, kwargs):
 
     request_time_dt = datetime.datetime.now(datetime.timezone.utc)
 
-    # Enforcement pre-call check — may raise ReveniumCostLimitExceeded
+    # Enforcement pre-call check — may raise BudgetExceededError
     check_enforcement(usage_metadata)
 
     async def _async_invoke():
@@ -1720,7 +1720,7 @@ def async_embeddings_create_wrapper(wrapped, instance, args, kwargs):
 
     request_time_dt = datetime.datetime.now(datetime.timezone.utc)
 
-    # Enforcement pre-call check — may raise ReveniumCostLimitExceeded
+    # Enforcement pre-call check — may raise BudgetExceededError
     check_enforcement(usage_metadata)
 
     async def _async_invoke():

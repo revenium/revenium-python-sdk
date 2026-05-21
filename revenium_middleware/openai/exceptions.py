@@ -5,7 +5,7 @@ This module defines a hierarchy of exceptions that provide better error handling
 and more specific error information for different failure scenarios.
 """
 
-from revenium_middleware._core.exceptions import ReveniumCostLimitExceeded  # noqa: F401
+from revenium_middleware._core.exceptions import BudgetExceededError  # noqa: F401
 
 
 class ReveniumMiddlewareError(Exception):
@@ -72,7 +72,7 @@ def handle_exception_safely(func):
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
-        except ReveniumCostLimitExceeded:
+        except BudgetExceededError:
             # Enforcement exceptions must reach the caller — never swallow.
             raise
         except ReveniumMiddlewareError as e:

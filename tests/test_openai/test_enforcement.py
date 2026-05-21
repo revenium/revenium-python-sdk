@@ -14,7 +14,7 @@ import importlib
 import pytest
 
 from revenium_middleware._core import enforcement
-from revenium_middleware._core.exceptions import ReveniumCostLimitExceeded
+from revenium_middleware._core.exceptions import BudgetExceededError
 
 
 @pytest.fixture(autouse=True)
@@ -86,7 +86,7 @@ def test_breached_rule_raises_with_structured_fields(monkeypatch):
         ],
     )
 
-    with pytest.raises(ReveniumCostLimitExceeded) as exc_info:
+    with pytest.raises(BudgetExceededError) as exc_info:
         enforcement.check_enforcement({})
 
     err = exc_info.value
@@ -102,7 +102,7 @@ def test_legacy_blocked_flag_still_honored(monkeypatch):
     """Pre-BACK-1133 servers used ``blocked`` instead of ``breached``."""
     monkeypatch.setenv("REVENIUM_CIRCUIT_BREAKER_ENABLED", "true")
     _seed_rules(monkeypatch, [{"name": "legacy-rule", "blocked": True}])
-    with pytest.raises(ReveniumCostLimitExceeded) as exc_info:
+    with pytest.raises(BudgetExceededError) as exc_info:
         enforcement.check_enforcement({})
     assert exc_info.value.rule_name == "legacy-rule"
 
@@ -133,7 +133,7 @@ def test_credential_scoped_rule_blocks_matching_credential(monkeypatch):
         monkeypatch,
         [{"name": "alice-only", "breached": True, "credential": "alice-key"}],
     )
-    with pytest.raises(ReveniumCostLimitExceeded):
+    with pytest.raises(BudgetExceededError):
         enforcement.check_enforcement({"subscriber_credential": "alice-key"})
 
 
@@ -142,7 +142,7 @@ def test_fail_closed_with_uninitialized_cache_raises(monkeypatch):
     monkeypatch.setenv("REVENIUM_CIRCUIT_BREAKER_ENABLED", "true")
     monkeypatch.setenv("REVENIUM_CB_FAIL_MODE", "closed")
     _seed_rules(monkeypatch, [], initialized=False)
-    with pytest.raises(ReveniumCostLimitExceeded):
+    with pytest.raises(BudgetExceededError):
         enforcement.check_enforcement({})
 
 
@@ -203,7 +203,7 @@ def test_cache_dir_persists_and_loads(monkeypatch, tmp_path):
     monkeypatch.setattr(enforcement, "_ensure_poller_running", lambda: None)
     monkeypatch.setattr(enforcement, "_fetch_rules", lambda: None)
 
-    with pytest.raises(ReveniumCostLimitExceeded) as exc_info:
+    with pytest.raises(BudgetExceededError) as exc_info:
         enforcement.check_enforcement({})
     assert exc_info.value.rule_name == "persisted"
 
@@ -211,7 +211,7 @@ def test_cache_dir_persists_and_loads(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 # Wrapper-propagation tests
 #
-# The OpenAI wrappers must let ``ReveniumCostLimitExceeded`` escape so callers
+# The OpenAI wrappers must let ``BudgetExceededError`` escape so callers
 # can ``except`` it. ``handle_exception_safely`` lives next to them and treats
 # every other ``ReveniumMiddlewareError`` subclass as graceful-degradation —
 # so a regression in either the dedicated re-raise guard inside that decorator
@@ -226,7 +226,7 @@ def _patch_check_enforcement_raises(monkeypatch):
     from revenium_middleware.openai import middleware as openai_middleware
 
     def _raise(_metadata):
-        raise ReveniumCostLimitExceeded(
+        raise BudgetExceededError(
             message="budget breached",
             rule_name="propagation-test",
         )
@@ -250,30 +250,30 @@ def test_handle_exception_safely_does_not_swallow_cost_limit():
 
     @handle_exception_safely
     def fn():
-        raise ReveniumCostLimitExceeded(message="x", rule_name="r")
+        raise BudgetExceededError(message="x", rule_name="r")
 
-    with pytest.raises(ReveniumCostLimitExceeded):
+    with pytest.raises(BudgetExceededError):
         fn()
 
 
 def test_create_wrapper_propagates_cost_limit_exception(_patch_check_enforcement_raises):
     from revenium_middleware.openai.middleware import create_wrapper
 
-    with pytest.raises(ReveniumCostLimitExceeded):
+    with pytest.raises(BudgetExceededError):
         create_wrapper(_stub_wrapped, _StubInstance(), (), {"usage_metadata": {}})
 
 
 def test_embeddings_create_wrapper_propagates_cost_limit_exception(_patch_check_enforcement_raises):
     from revenium_middleware.openai.middleware import embeddings_create_wrapper
 
-    with pytest.raises(ReveniumCostLimitExceeded):
+    with pytest.raises(BudgetExceededError):
         embeddings_create_wrapper(_stub_wrapped, _StubInstance(), (), {"usage_metadata": {}})
 
 
 def test_responses_create_wrapper_propagates_cost_limit_exception(_patch_check_enforcement_raises):
     from revenium_middleware.openai.middleware import responses_create_wrapper
 
-    with pytest.raises(ReveniumCostLimitExceeded):
+    with pytest.raises(BudgetExceededError):
         responses_create_wrapper(_stub_wrapped, _StubInstance(), (), {"usage_metadata": {}})
 
 
@@ -281,12 +281,12 @@ def test_async_create_wrapper_propagates_cost_limit_exception(_patch_check_enfor
     """Async chat.completions wrapper raises synchronously before returning a coroutine."""
     from revenium_middleware.openai.middleware import async_create_wrapper
 
-    with pytest.raises(ReveniumCostLimitExceeded):
+    with pytest.raises(BudgetExceededError):
         async_create_wrapper(_stub_wrapped, _StubInstance(), (), {"usage_metadata": {}})
 
 
 def test_async_embeddings_create_wrapper_propagates_cost_limit_exception(_patch_check_enforcement_raises):
     from revenium_middleware.openai.middleware import async_embeddings_create_wrapper
 
-    with pytest.raises(ReveniumCostLimitExceeded):
+    with pytest.raises(BudgetExceededError):
         async_embeddings_create_wrapper(_stub_wrapped, _StubInstance(), (), {"usage_metadata": {}})

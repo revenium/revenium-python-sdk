@@ -2,7 +2,7 @@
 End-to-end demo for Revenium cost-controls / circuit breaker on OpenAI.
 
 When ``REVENIUM_CIRCUIT_BREAKER_ENABLED=true`` and a budget rule on the
-configured team trips, the second call raises ``ReveniumCostLimitExceeded``
+configured team trips, the second call raises ``BudgetExceededError``
 *before* the outbound OpenAI request — no spend, no rate-limit hit.
 
 Pre-requisites
@@ -45,7 +45,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import revenium_middleware.openai  # noqa: E402, F401 — auto-instrument
-from revenium_middleware.openai import ReveniumCostLimitExceeded  # noqa: E402
+from revenium_middleware.openai import BudgetExceededError  # noqa: E402
 
 import openai  # noqa: E402
 
@@ -64,12 +64,12 @@ def call_once(label: str) -> None:
     client = openai.OpenAI()
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.5",
             messages=[{"role": "user", "content": f"Say hi — call {label}."}],
             max_tokens=8,
         )
         print(f"[{label}] OK — {response.choices[0].message.content!r}")
-    except ReveniumCostLimitExceeded as exc:
+    except BudgetExceededError as exc:
         print(f"[{label}] BLOCKED — rule={exc.rule_name!r} "
               f"current={exc.current_value} threshold={exc.threshold} "
               f"resets_at={exc.resets_at!r} rule_id={exc.rule_id!r}")

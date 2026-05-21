@@ -1,15 +1,15 @@
 """
 Core exceptions shared across all Revenium middleware providers.
 
-The unified SDK ships ``ReveniumCostLimitExceeded`` from ``_core`` so every
+The unified SDK ships ``BudgetExceededError`` from ``_core`` so every
 provider subpackage (openai, anthropic, google, …) raises the same exception
-type and downstream callers can ``except ReveniumCostLimitExceeded`` once.
+type and downstream callers can ``except BudgetExceededError`` once.
 """
 
 from typing import Optional, Union
 
 
-class ReveniumCostLimitExceeded(Exception):
+class BudgetExceededError(Exception):
     """Raised when a Revenium enforcement rule blocks the outbound request.
 
     Inherits directly from ``Exception`` (not from any middleware-error base)

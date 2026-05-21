@@ -78,7 +78,7 @@ def analyze_with_claude(customer_data: dict, question: str) -> str:
     )
 
     response = client.messages.create(
-        model="claude-3-haiku-20240307",
+        model="claude-opus-4-7",
         max_tokens=150,
         messages=[
             {
