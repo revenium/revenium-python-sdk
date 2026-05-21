@@ -19,15 +19,15 @@ class TestEmbeddingsUnit:
     """Unit tests for embeddings functionality."""
 
     def test_embeddings_wrapper_existence(self):
-        """Test that the embeddings wrapper function exists and is properly decorated."""
+        """Test that the embeddings wrapper function exists and is callable."""
         # Import and verify the wrapper exists
         from revenium_middleware.ollama.middleware import embed_wrapper
 
-        # Verify it's callable
+        # Verify it's callable. Whether the importable symbol still carries
+        # wrapt's `__wrapped__` attribute is a wrapt-version implementation
+        # detail; the behavioral check ("ollama.embed has been wrapped") lives
+        # in test_embeddings_wrapper_applied below.
         assert callable(embed_wrapper)
-
-        # Verify it has the wrapt decorator
-        assert hasattr(embed_wrapper, '__wrapped__')
 
     def test_embeddings_wrapper_applied(self):
         """Test that the embeddings wrapper is applied to ollama.embed."""

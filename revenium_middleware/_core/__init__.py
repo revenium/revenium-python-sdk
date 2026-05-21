@@ -6,7 +6,7 @@ provider-specific middleware implementations.
 """
 
 from .metering import run_async_in_thread, shutdown_event, client
-from .exceptions import ReveniumCostLimitExceeded
+from .exceptions import BudgetExceededError
 from .enforcement import check_enforcement, is_circuit_breaker_enabled, stop_polling
 from .context import (
     is_inside_decorated_function,
@@ -49,7 +49,7 @@ __all__ = [
     "run_async_in_thread",
     "shutdown_event",
     # Enforcement / circuit breaker
-    "ReveniumCostLimitExceeded",
+    "BudgetExceededError",
     "check_enforcement",
     "is_circuit_breaker_enabled",
     "stop_polling",

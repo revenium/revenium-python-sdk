@@ -33,7 +33,7 @@ def demo_human_format():
 
     client = OpenAI()
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5.5",
         messages=[
             {"role": "user", "content": "What is 2+2? Answer in one word."}
         ],
@@ -58,7 +58,7 @@ def demo_json_format():
 
     client = OpenAI()
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5.5",
         messages=[
             {"role": "user", "content": "What is 3+3? Answer in one word."}
         ],
@@ -83,7 +83,7 @@ def demo_disabled():
 
     client = OpenAI()
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5.5",
         messages=[
             {"role": "user", "content": "What is 5+5? Answer in one word."}
         ],

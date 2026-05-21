@@ -106,12 +106,36 @@ import revenium_middleware_openai  # Auto-initializes on import
 
 client = openai.OpenAI()
 response = client.chat.completions.create(
-    model="gpt-4o-mini",
+    model="gpt-5.5",
     messages=[{"role": "user", "content": "Hello!"}]
 )
 print(response.choices[0].message.content)
 # Usage data automatically sent to Revenium
 ```
+
+---
+
+## Agentic Outcomes (Outcome-Based Metering)
+
+Emit per-agent terminal outcomes (`CONVERTED`, `DEFLECTED`, `ESCALATED`) alongside completion and tool-event records, so dashboards show business value next to AI cost.
+
+```python
+from revenium_middleware.agentic_outcomes import AgenticOutcomeClient, AgenticOutcomeSettings
+
+settings = AgenticOutcomeSettings(api_key="rev_sk_...")
+client = AgenticOutcomeClient(settings)
+
+client.emit_completion(...)                # one per LLM call
+client.emit_tool_event(...)                # one per tool / step
+client.report_outcome(job_id, {...})       # close the job with a terminal outcome
+client.close()
+```
+
+The job is created implicitly by the first metric ingested for `agenticJobId`. Call `client.create_job(job_id)` explicitly if you need to record an agent run before emitting any metrics.
+
+See [`examples/agentic_outcomes/`](examples/agentic_outcomes/) for runnable demos (sales / coding / support) with configurable failure rates and outcome distributions.
+
+**API reference:** [docs.revenium.io](https://docs.revenium.io) · per-endpoint reference at [revenium.readme.io/reference/meter_ai_completion](https://revenium.readme.io/reference/meter_ai_completion).
 
 ---
 
@@ -132,7 +156,7 @@ client = openai.OpenAI()
 
 # Basic chat completion
 response = client.chat.completions.create(
-    model="gpt-4o-mini",
+    model="gpt-5.5",
     messages=[{"role": "user", "content": "Hello!"}],
     usage_metadata={
         "organizationName": "AcmeCorp",
@@ -144,7 +168,7 @@ response = client.chat.completions.create(
 
 # Streaming
 stream = client.chat.completions.create(
-    model="gpt-4o-mini",
+    model="gpt-5.5",
     messages=[{"role": "user", "content": "Tell me a story"}],
     stream=True
 )
@@ -204,7 +228,7 @@ client = anthropic.Anthropic()
 
 # Basic message
 message = client.messages.create(
-    model="claude-3-haiku-20240307",
+    model="claude-opus-4-7",
     max_tokens=100,
     messages=[{"role": "user", "content": "Hello!"}],
     usage_metadata={
@@ -216,7 +240,7 @@ message = client.messages.create(
 
 # Streaming
 with client.messages.stream(
-    model="claude-3-haiku-20240307",
+    model="claude-opus-4-7",
     max_tokens=200,
     messages=[{"role": "user", "content": "Tell me a story"}],
     usage_metadata={"task_type": "creative"}
@@ -242,7 +266,7 @@ client = anthropic.AnthropicBedrock(
 )
 
 message = client.messages.create(
-    model="anthropic.claude-3-haiku-20240307-v1:0",
+    model="claude-opus-4-7",
     max_tokens=100,
     messages=[{"role": "user", "content": "Hello from Bedrock!"}]
 )
@@ -266,6 +290,11 @@ message = client.messages.create(
 
 | Anthropic Model | Bedrock Model ID |
 |----------------|------------------|
+| `claude-opus-4-7` | `anthropic.claude-opus-4-7` |
+| `us.claude-opus-4-7` | `us.anthropic.claude-opus-4-7` |
+| `eu.claude-opus-4-7` | `eu.anthropic.claude-opus-4-7` |
+| `au.claude-opus-4-7` | `au.anthropic.claude-opus-4-7` |
+| `global.claude-opus-4-7` | `global.anthropic.claude-opus-4-7` |
 | `claude-3-opus-20240229` | `anthropic.claude-3-opus-20240229-v1:0` |
 | `claude-3-sonnet-20240229` | `anthropic.claude-3-sonnet-20240229-v1:0` |
 | `claude-3-haiku-20240307` | `us.anthropic.claude-3-5-haiku-20241022-v1:0` |
@@ -430,7 +459,7 @@ litellm.api_base = os.getenv("LITELLM_PROXY_URL")
 litellm.api_key = os.getenv("LITELLM_API_KEY")
 
 response = litellm.completion(
-    model="gpt-4o-mini",
+    model="gpt-5.5",
     messages=[{"role": "user", "content": "Hello!"}],
     usage_metadata={
         "organizationName": "AcmeCorp",
@@ -588,7 +617,7 @@ handler = ReveniumCallbackHandler(
     agent_name="support_agent"
 )
 
-llm = ChatOpenAI(model="gpt-4", callbacks=[handler])
+llm = ChatOpenAI(model="gpt-5.5", callbacks=[handler])
 response = llm.invoke("Hello!")
 ```
 
@@ -627,7 +656,7 @@ result = agent.invoke(
 from revenium_middleware_langchain import AsyncReveniumCallbackHandler
 
 handler = AsyncReveniumCallbackHandler(trace_id="async-session")
-llm = ChatOpenAI(model="gpt-4", callbacks=[handler])
+llm = ChatOpenAI(model="gpt-5.5", callbacks=[handler])
 response = await llm.ainvoke("Hello!")
 ```
 
@@ -673,7 +702,7 @@ Add business context to any API call by passing a `usage_metadata` dictionary. A
 
 ```python
 response = client.chat.completions.create(
-    model="gpt-4o-mini",
+    model="gpt-5.5",
     messages=[{"role": "user", "content": "Hello!"}],
     usage_metadata={
         "trace_id": "conv-28a7e9d4",
@@ -736,7 +765,7 @@ REVENIUM_TRACE_TYPE=customer-support
 
 ```python
 response = client.chat.completions.create(
-    model="gpt-4o-mini",
+    model="gpt-5.5",
     messages=[{"role": "user", "content": "Hello!"}],
     usage_metadata={
         "environment": "production",
@@ -760,7 +789,7 @@ workflow_id = str(uuid.uuid4())
 
 # Step 1: Parent operation
 parent_response = client.chat.completions.create(
-    model="gpt-4o-mini",
+    model="gpt-5.5",
     messages=[{"role": "user", "content": "Analyze this document"}],
     usage_metadata={
         "trace_id": "analysis-session-456",
@@ -771,7 +800,7 @@ parent_response = client.chat.completions.create(
 
 # Step 2: Child operation linked to parent
 child_response = client.chat.completions.create(
-    model="gpt-4o-mini",
+    model="gpt-5.5",
     messages=[{"role": "user", "content": "Summarize findings"}],
     usage_metadata={
         "trace_id": "analysis-session-456",
@@ -802,7 +831,7 @@ from revenium_middleware import revenium_metadata
 def handle_customer_query(question: str) -> str:
     # All API calls automatically include the decorator metadata
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5.5",
         messages=[{"role": "user", "content": question}]
     )
     return response.choices[0].message.content
@@ -841,13 +870,13 @@ def outer_function():
 def mixed_metadata():
     # Uses decorator metadata
     response1 = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5.5",
         messages=[{"role": "user", "content": "Hello"}]
     )
 
     # API-level metadata overrides decorator's task_type
     response2 = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5.5",
         messages=[{"role": "user", "content": "Hello"}],
         usage_metadata={
             "task_type": "special-override",  # Overrides decorator
@@ -876,7 +905,7 @@ from revenium_middleware import revenium_meter, revenium_metadata
 def premium_feature(prompt: str) -> str:
     # This WILL be metered (decorated with @revenium_meter)
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-5.5",
         messages=[{"role": "user", "content": prompt}]
     )
     return response.choices[0].message.content
@@ -884,7 +913,7 @@ def premium_feature(prompt: str) -> str:
 def free_feature(prompt: str) -> str:
     # This will NOT be metered (no @revenium_meter decorator)
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5.5",
         messages=[{"role": "user", "content": prompt}]
     )
     return response.choices[0].message.content
@@ -970,7 +999,7 @@ from openai import OpenAI
 
 client = OpenAI()
 response = client.chat.completions.create(
-    model="gpt-4o-mini",
+    model="gpt-5.5",
     messages=[
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "What is the capital of France?"}
@@ -1017,7 +1046,7 @@ export REVENIUM_TEAM_ID=your-team-id-here
 ============================================================
 REVENIUM USAGE SUMMARY
 ============================================================
-Model: gpt-4o-mini
+Model: gpt-5.5
 Provider: OPENAI
 Duration: 1.23s
 
@@ -1035,7 +1064,7 @@ Trace ID: abc-123
 ### JSON Format
 
 ```json
-{"model":"gpt-4o-mini","provider":"OPENAI","durationSeconds":1.23,"inputTokenCount":150,"outputTokenCount":250,"totalTokenCount":400,"cost":0.000045,"costStatus":"available","traceId":"abc-123"}
+{"model":"gpt-5.5","provider":"OPENAI","durationSeconds":1.23,"inputTokenCount":150,"outputTokenCount":250,"totalTokenCount":400,"cost":0.000045,"costStatus":"available","traceId":"abc-123"}
 ```
 
 ### Cost Status
@@ -1050,7 +1079,9 @@ Trace ID: abc-123
 
 ## Cost Controls / Enforcement
 
-Block outbound provider requests client-side when a Revenium cost-limit rule trips. When the circuit breaker is enabled, the middleware polls enforcement rules from the Revenium API in a background daemon thread and raises `ReveniumCostLimitExceeded` **before** the upstream call, preventing spend beyond the configured limit.
+Block outbound provider requests client-side when a Revenium cost control trips. When the circuit breaker is enabled, the middleware polls compiled enforcement rules from the Revenium API in a background daemon thread and raises `BudgetExceededError` **before** the upstream call, preventing spend beyond the configured limit.
+
+> **Terminology note:** The customer-facing entity is called a **cost control**, served by the backend at `/v2/api/ai/cost-controls`. This SDK polls a separate compiled-rules feed at `/v2/api/ai/enforcement-rules/{teamId}` and is unaffected by changes to the CRUD path — no SDK upgrade is required.
 
 Currently wired for the OpenAI provider (other providers land via per-provider follow-on tickets).
 
@@ -1076,7 +1107,7 @@ REVENIUM_ENFORCEMENT_BASE_URL=https://api.revenium.ai/profitstream  # optional
 | `REVENIUM_TEAM_ID` | — | Hashed team ID. Path component on rule fetches; required when the breaker is enabled. |
 | `REVENIUM_ENFORCEMENT_BASE_URL` | origin of `REVENIUM_METERING_BASE_URL` | Base URL for the enforcement API. Set when the enforcement API lives behind a context-path. |
 | `REVENIUM_CB_POLL_INTERVAL_SECONDS` | `60` | Background poll interval for rule refreshes. |
-| `REVENIUM_CB_FAIL_MODE` | `open` | `open` (default) lets calls through when no cache exists; `closed` raises `ReveniumCostLimitExceeded` until rules are loaded. |
+| `REVENIUM_CB_FAIL_MODE` | `open` | `open` (default) lets calls through when no cache exists; `closed` raises `BudgetExceededError` until rules are loaded. |
 | `REVENIUM_CACHE_DIR` | — | When set, the rule cache is mirrored to `<dir>/revenium_enforcement_rules.json` so a restarted process doesn't fail-closed on the very first call. |
 
 ### Public API
@@ -1100,7 +1131,7 @@ The pre-call check fires before every chat / embeddings / responses call. When t
 ### Exception Contract
 
 ```python
-from revenium_middleware.openai import ReveniumCostLimitExceeded
+from revenium_middleware.openai import BudgetExceededError
 ```
 
 When a tripped rule matches the current request, the middleware raises before the OpenAI call is made. All structured fields are populated when the server provides them:
@@ -1114,20 +1145,20 @@ When a tripped rule matches the current request, the middleware raises before th
 | `resets_at` | `str \| None` | ISO-8601 timestamp the rule next resets |
 | `rule_id` | `str \| int \| None` | Server-side rule identifier |
 
-`ReveniumCostLimitExceeded` does **not** inherit from `ReveniumMiddlewareError`, so the OpenAI middleware's `handle_exception_safely` decorator never swallows it — it always reaches your `except` block.
+`BudgetExceededError` does **not** inherit from `ReveniumMiddlewareError`, so the OpenAI middleware's `handle_exception_safely` decorator never swallows it — it always reaches your `except` block.
 
 ```python
-from revenium_middleware.openai import ReveniumCostLimitExceeded
+from revenium_middleware.openai import BudgetExceededError
 import openai
 
 client = openai.OpenAI()
 
 try:
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5.5",
         messages=[{"role": "user", "content": "Summarize the meeting notes"}],
     )
-except ReveniumCostLimitExceeded as exc:
+except BudgetExceededError as exc:
     print(f"Cost limit reached: {exc.message}")
     print(f"Rule {exc.rule_name}: {exc.current_value} / {exc.threshold}; resets {exc.resets_at}")
 ```

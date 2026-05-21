@@ -30,7 +30,7 @@ print("Environment: REVENIUM_CAPTURE_PROMPTS not set or set to 'false'")
 print()
 
 response = client.messages.create(
-    model="claude-3-haiku-20240307",
+    model="claude-opus-4-7",
     max_tokens=100,
     system="You are a helpful assistant.",
     messages=[
@@ -66,7 +66,7 @@ if capture_enabled:
     print()
     
     response = client.messages.create(
-        model="claude-3-haiku-20240307",
+        model="claude-opus-4-7",
         max_tokens=100,
         system="You are a geography expert.",
         messages=[
@@ -99,7 +99,7 @@ if capture_enabled:
     print()
     
     with client.messages.stream(
-        model="claude-3-haiku-20240307",
+        model="claude-opus-4-7",
         max_tokens=100,
         system="You are a helpful assistant.",
         messages=[
@@ -140,7 +140,7 @@ if capture_enabled:
     long_prompt = "You are a helpful assistant. " * 2000  # ~56,000 chars
     
     response = client.messages.create(
-        model="claude-3-haiku-20240307",
+        model="claude-opus-4-7",
         max_tokens=50,
         system=long_prompt,
         messages=[

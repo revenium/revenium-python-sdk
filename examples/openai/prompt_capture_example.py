@@ -29,7 +29,7 @@ print("Environment: REVENIUM_CAPTURE_PROMPTS not set or set to 'false'")
 print()
 
 response = client.chat.completions.create(
-    model="gpt-4o-mini",
+    model="gpt-5.5",
     max_tokens=100,
     messages=[
         {"role": "system", "content": "You are a helpful assistant."},
@@ -65,7 +65,7 @@ if capture_enabled:
     print()
     
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5.5",
         max_tokens=100,
         messages=[
             {"role": "system", "content": "You are a geography expert."},
@@ -98,7 +98,7 @@ if capture_enabled:
     print()
     
     stream = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5.5",
         max_tokens=100,
         stream=True,
         messages=[
@@ -141,7 +141,7 @@ if capture_enabled:
     long_prompt = "You are a helpful assistant. " * 2000  # ~56,000 chars
     
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5.5",
         max_tokens=50,
         messages=[
             {"role": "system", "content": long_prompt},

@@ -54,7 +54,7 @@ def main():
     # Basic completion - automatically metered
     print("\n1. Basic completion (auto-metered):")
     response = litellm.completion(
-        model="gpt-4o-mini",
+        model="gpt-5.5",
         messages=[{"role": "user", "content": "Say 'Hello from Revenium!' in one line."}]
     )
     print(f"   Response: {response.choices[0].message.content}")
@@ -62,7 +62,7 @@ def main():
     # Completion with metadata - for enhanced analytics
     print("\n2. Completion with metadata (enhanced analytics):")
     response = litellm.completion(
-        model="gpt-4o-mini",
+        model="gpt-5.5",
         messages=[{"role": "user", "content": "What is 2 + 2?"}],
         usage_metadata={
             # All fields are optional - use what you need

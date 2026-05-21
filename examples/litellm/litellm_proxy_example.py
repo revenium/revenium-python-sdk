@@ -41,7 +41,7 @@ headers = {
 }
 
 data = {
-    "model": "openai/gpt-4o-mini", # Ensure your proxy is configured with this model
+    "model": "openai/gpt-5.5", # Ensure your proxy is configured with this model
     "messages": [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "Please verify you're ready to assist me."}

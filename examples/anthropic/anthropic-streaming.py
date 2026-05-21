@@ -60,7 +60,7 @@ def main():
 
         # Use streaming API with context manager
         with client.messages.stream(
-            model="claude-3-haiku-20240307",
+            model="claude-opus-4-7",
             max_tokens=200,
             temperature=0.9,
             messages=[

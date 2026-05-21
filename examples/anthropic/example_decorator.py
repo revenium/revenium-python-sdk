@@ -37,7 +37,7 @@ def handle_customer_query(question: str) -> str:
     print(f"Question: {question}")
     
     response = client.messages.create(
-        model="claude-3-haiku-20240307",
+        model="claude-opus-4-7",
         max_tokens=100,
         messages=[
             {"role": "user", "content": question}
@@ -69,7 +69,7 @@ def analyze_multiple_queries(queries: list) -> list:
         print(f"\nProcessing query {i}/{len(queries)}: {query}")
         
         response = client.messages.create(
-            model="claude-3-haiku-20240307",
+            model="claude-opus-4-7",
             max_tokens=50,
             messages=[
                 {"role": "user", "content": query}
@@ -102,7 +102,7 @@ def premium_feature(prompt: str) -> str:
     print("Note: This is only metered if REVENIUM_SELECTIVE_METERING=true")
     
     response = client.messages.create(
-        model="claude-3-haiku-20240307",
+        model="claude-opus-4-7",
         max_tokens=100,
         messages=[
             {"role": "user", "content": prompt}
@@ -132,7 +132,7 @@ def nested_decorator_example():
     # This call uses outer decorator metadata
     print("\nOuter context call:")
     response1 = client.messages.create(
-        model="claude-3-haiku-20240307",
+        model="claude-opus-4-7",
         max_tokens=50,
         messages=[
             {"role": "user", "content": "What is 2+2?"}
@@ -150,7 +150,7 @@ def nested_decorator_example():
     def inner_function():
         print("\nInner context call:")
         response2 = client.messages.create(
-            model="claude-3-haiku-20240307",
+            model="claude-opus-4-7",
             max_tokens=50,
             messages=[
                 {"role": "user", "content": "What is 3+3?"}
@@ -180,7 +180,7 @@ def streaming_with_decorator(prompt: str):
     print("Response: ", end="", flush=True)
     
     with client.messages.stream(
-        model="claude-3-haiku-20240307",
+        model="claude-opus-4-7",
         max_tokens=100,
         messages=[
             {"role": "user", "content": prompt}

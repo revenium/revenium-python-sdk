@@ -73,7 +73,7 @@ def main():
     
     # Make a simple API call
     message = client.messages.create(
-        model="claude-3-haiku-20240307",
+        model="claude-opus-4-7",
         max_tokens=100,
         messages=[
             {"role": "user", "content": "Say 'Hello, World!' and nothing else."}

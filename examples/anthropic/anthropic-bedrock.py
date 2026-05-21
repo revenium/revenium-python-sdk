@@ -40,7 +40,7 @@ def example_1_basic_chat():
 
     try:
         response = client.messages.create(
-            model="claude-3-haiku-20240307",
+            model="claude-opus-4-7",
             messages=[{"role": "user", "content": "Hello! What is AI?"}],
             max_tokens=50,
         )
@@ -78,7 +78,7 @@ def example_2_chat_with_metadata():
 
     try:
         response = client.messages.create(
-            model="claude-3-haiku-20240307",
+            model="claude-opus-4-7",
             messages=[{"role": "user", "content": "Explain machine learning briefly."}],
             max_tokens=75,
             usage_metadata={
@@ -126,7 +126,7 @@ def example_3_bedrock_integration():
 
     try:
         response = client.messages.create(
-            model="claude-3-haiku-20240307",  # Automatically maps to Bedrock model ID
+            model="claude-opus-4-7",  # Automatically maps to Bedrock model ID
             messages=[{"role": "user", "content": "What is AWS Bedrock?"}],
             max_tokens=100,
             usage_metadata={
@@ -180,7 +180,7 @@ def example_4_streaming():
     try:
         print("Starting streaming response...")
         with client.messages.stream(
-            model="claude-3-haiku-20240307",
+            model="claude-opus-4-7",
             messages=[
                 {"role": "user", "content": "Count from 1 to 5, one number per line."}
             ],
@@ -238,7 +238,7 @@ def example_5_bedrock_streaming():
     try:
         print("Starting Bedrock streaming response...")
         with client.messages.stream(
-            model="claude-3-haiku-20240307",
+            model="claude-opus-4-7",
             messages=[
                 {"role": "user", "content": "Write a haiku about streaming data."}
             ],
@@ -275,9 +275,13 @@ def demonstrate_model_mapping():
     print("The middleware automatically maps Anthropic model names to Bedrock IDs:")
 
     model_mappings = {
-        "claude-3-opus-20240229": "anthropic.claude-3-opus-20240229-v1:0",
-        "claude-3-sonnet-20240229": "anthropic.claude-3-sonnet-20240229-v1:0",
-        "claude-3-haiku-20240307": "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+        # claude-opus-4-7 — region variants (verified 2026-05-12)
+        "claude-opus-4-7": "anthropic.claude-opus-4-7",
+        "claude-opus-4-7 (us)": "us.anthropic.claude-opus-4-7",
+        "claude-opus-4-7 (eu)": "eu.anthropic.claude-opus-4-7",
+        "claude-opus-4-7 (au)": "au.anthropic.claude-opus-4-7",
+        "claude-opus-4-7 (global)": "global.anthropic.claude-opus-4-7",
+        # claude-3-5 series
         "claude-3-5-sonnet-20240620": "anthropic.claude-3-5-sonnet-20240620-v1:0",
         "claude-3-5-sonnet-20241022": "anthropic.claude-3-5-sonnet-20241022-v2:0",
         "claude-3-5-haiku-20241022": "anthropic.claude-3-5-haiku-20241022-v1:0",

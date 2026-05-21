@@ -157,6 +157,9 @@ from ._core import (  # noqa: E402
 # Re-export tool metering utilities from revenium_metering (v6.8.2+)
 from revenium_metering import meter_tool, report_tool_call, configure  # noqa: E402
 
+# Agentic-outcome client (used by examples/agentic_outcomes/ pack)
+from .agentic_outcomes import AgenticOutcomeClient, AgenticOutcomeSettings  # noqa: E402
+
 __all__ = [
     # Metering exports
     "client",
@@ -181,4 +184,7 @@ __all__ = [
     "meter_tool",
     "report_tool_call",
     "configure",
+    # Agentic-outcome exports
+    "AgenticOutcomeClient",
+    "AgenticOutcomeSettings",
 ]

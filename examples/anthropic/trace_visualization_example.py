@@ -41,7 +41,7 @@ def example_1_basic_trace_visualization():
     client = Anthropic()
 
     response = client.messages.create(
-        model="claude-3-haiku-20240307",
+        model="claude-opus-4-7",
         max_tokens=100,
         messages=[
             {"role": "user", "content": "What is your refund policy?"}
@@ -79,7 +79,7 @@ def example_2_distributed_tracing():
     # Parent call
     print("\n🔵 Parent Transaction: Extract Key Points")
     parent_response = client.messages.create(
-        model="claude-3-haiku-20240307",
+        model="claude-opus-4-7",
         max_tokens=100,
         messages=[
             {
@@ -102,7 +102,7 @@ def example_2_distributed_tracing():
     os.environ['REVENIUM_TRANSACTION_NAME'] = 'Summarize Points'
 
     child1_response = client.messages.create(
-        model="claude-3-haiku-20240307",
+        model="claude-opus-4-7",
         max_tokens=50,
         messages=[
             {"role": "user", "content": "Summarize in one sentence: AI transforms industries"}
@@ -121,7 +121,7 @@ def example_2_distributed_tracing():
     os.environ['REVENIUM_TRANSACTION_NAME'] = 'Generate Tags'
 
     child2_response = client.messages.create(
-        model="claude-3-haiku-20240307",
+        model="claude-opus-4-7",
         max_tokens=50,
         messages=[
             {"role": "user", "content": "Generate 3 tags for: AI transformation"}
@@ -161,7 +161,7 @@ def example_3_retry_tracking():
 
         try:
             response = client.messages.create(
-                model="claude-3-haiku-20240307",
+                model="claude-opus-4-7",
                 max_tokens=50,
                 messages=[
                     {"role": "user", "content": "Say 'Success!'"}
@@ -222,7 +222,7 @@ def example_4_custom_categorization():
         os.environ['REVENIUM_TRANSACTION_NAME'] = config['transaction']
 
         response = client.messages.create(
-            model="claude-3-haiku-20240307",
+            model="claude-opus-4-7",
             max_tokens=50,
             messages=[
                 {"role": "user", "content": config['content']}
@@ -262,7 +262,7 @@ def example_5_usage_metadata_override():
     print("   traceType=priority-workflow")
 
     response = client.messages.create(
-        model="claude-3-haiku-20240307",
+        model="claude-opus-4-7",
         max_tokens=50,
         messages=[
             {"role": "user", "content": "Hello!"}

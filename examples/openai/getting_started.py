@@ -61,7 +61,7 @@ metadata = {
 
 # Make request
 response = client.chat.completions.create(
-    model="gpt-4o-mini",
+    model="gpt-5.5",
     messages=[
         {"role": "user", "content": "Hello! Introduce yourself in one sentence."}
     ],

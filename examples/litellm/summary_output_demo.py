@@ -66,7 +66,7 @@ def demo_completion():
     print("-" * 40)
 
     response = litellm.completion(
-        model="gpt-4o-mini",
+        model="gpt-5.5",
         messages=[
             {"role": "user", "content": "Say 'Hello, World!' in exactly 3 words."}
         ],

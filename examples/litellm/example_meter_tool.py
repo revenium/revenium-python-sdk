@@ -84,7 +84,7 @@ def analyze_with_litellm(data: dict) -> str:
     This call is automatically metered by the LiteLLM middleware.
     """
     response = litellm.completion(
-        model="gpt-4o-mini",
+        model="gpt-5.5",
         messages=[
             {
                 "role": "user",

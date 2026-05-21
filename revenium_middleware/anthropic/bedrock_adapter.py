@@ -109,6 +109,11 @@ _cache_lock = threading.RLock()
 
 # Simple model mapping from Anthropic to Bedrock model IDs
 _MODEL_MAP = {
+    "claude-opus-4-7": "anthropic.claude-opus-4-7",
+    "us.claude-opus-4-7": "us.anthropic.claude-opus-4-7",
+    "eu.claude-opus-4-7": "eu.anthropic.claude-opus-4-7",
+    "au.claude-opus-4-7": "au.anthropic.claude-opus-4-7",
+    "global.claude-opus-4-7": "global.anthropic.claude-opus-4-7",
     "claude-3-opus-20240229": "anthropic.claude-3-opus-20240229-v1:0",
     "claude-3-sonnet-20240229": "anthropic.claude-3-sonnet-20240229-v1:0",
     "claude-3-haiku-20240307": "us.anthropic.claude-3-5-haiku-20241022-v1:0",
