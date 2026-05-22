@@ -10,8 +10,6 @@ from revenium_middleware._core.patch_registry import register_patch
 from .context import metadata_context
 from .hooks import execute_metadata_hooks
 from . import trace_fields
-from .summary_printer import print_usage_summary
-from .config import get_api_key
 
 logger = logging.getLogger("revenium_middleware.extension")
 
@@ -243,24 +241,6 @@ def handle_response(response, request_time_dt, usage_metadata, is_streaming):
             # The client.ai.create_completion method is not async, so don't use await
             result = client.ai.create_completion(**completion_args, extra_body=extra_body)
             logger.debug("Metering call result: %s", result)
-
-            # Print usage summary if enabled (fire-and-forget)
-            # Summary can still show token/duration metrics even without API key
-            revenium_api_key = get_api_key()
-
-            trace_id = meta["trace_id"]
-
-            print_usage_summary(
-                model=completion_args.get("model", "unknown"),
-                provider=completion_args.get("provider", "LITELLM"),
-                request_duration=request_duration,
-                input_token_count=prompt_tokens,
-                output_token_count=completion_tokens,
-                total_token_count=total_tokens,
-                transaction_id=response_id,
-                trace_id=trace_id,
-                revenium_api_key=revenium_api_key,
-            )
         except Exception as e:
             if not shutdown_event.is_set():
                 logger.warning(f"Error in metering call: {str(e)}")

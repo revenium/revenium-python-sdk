@@ -72,7 +72,7 @@ def summarize_with_gpt(text: str) -> str:
     This call is automatically metered by the OpenAI middleware.
     """
     response = client.chat.completions.create(
-        model="gpt-5.5",
+        model="gpt-4o-mini",
         messages=[
             {
                 "role": "system",

@@ -1,4 +1,5 @@
 import logging
+import warnings
 from typing import Any, Dict, Mapping, Optional
 
 logger = logging.getLogger(__name__)
@@ -29,11 +30,14 @@ def extract_field_with_fallback(
 
     if source.get(old_snake) or source.get(old_camel):
         if not (source.get(new_snake) or source.get(new_camel)):
-            logger.warning(
-                "Fields '%s' and '%s' are deprecated. Use '%s' or '%s' instead. "
-                "The old fields will be removed in a future version.",
-                old_camel, old_snake, new_camel, new_snake,
+            msg = (
+                "Fields '%s' and '%s' are deprecated and are no longer "
+                "accepted by the Revenium backend. The SDK is translating to "
+                "'%s' for this call. Use '%s' or '%s' instead. The "
+                "input-layer aliases will be removed in the next major release."
             )
+            logger.warning(msg, old_camel, old_snake, new_camel, new_camel, new_snake)
+            warnings.warn(msg % (old_camel, old_snake, new_camel, new_camel, new_snake), DeprecationWarning, stacklevel=3)
 
     return value
 

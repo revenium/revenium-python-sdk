@@ -36,7 +36,7 @@ LLM_STEPS = (
             system_prompt="Classify an inbound customer support ticket.",
             input_template="Classify {job_name}; identify intent, urgency, and routing.",
             output_template="Ticket classified with urgency and likely resolution path."),
-    LlmStep("kb-search", "gpt-5.5", "chatgpt", 1500, 400, 600, 0.0006,
+    LlmStep("kb-search", "gpt-4o-mini", "chatgpt", 1500, 400, 600, 0.0006,
             agent_role="kb-retriever",
             system_prompt="Find relevant knowledge-base guidance for a support ticket.",
             input_template="Search support knowledge for {scenario_type} in {job_name}.",

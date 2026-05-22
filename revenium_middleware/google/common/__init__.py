@@ -61,14 +61,6 @@ from .protocols import (
     get_token_count,
 )
 
-from .summary_printer import (
-    CompletionMetrics,
-    fetch_completion_metrics,
-    format_and_print_json_summary,
-    format_and_print_human_summary,
-    print_usage_summary,
-)
-
 __all__ = [
     # Types
     "OperationType",
@@ -118,10 +110,4 @@ __all__ = [
     "has_token_counts",
     "safe_getattr",
     "get_token_count",
-    # Summary Printer
-    "CompletionMetrics",
-    "fetch_completion_metrics",
-    "format_and_print_json_summary",
-    "format_and_print_human_summary",
-    "print_usage_summary",
 ]

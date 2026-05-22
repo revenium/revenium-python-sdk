@@ -47,7 +47,7 @@ def openai_responses_example():
 
     try:
         basic_response = openai_client.responses.create(
-            model="gpt-5.5",
+            model="gpt-4o-mini",
             input="What is the Responses API in one sentence?"
             # No usage_metadata - still automatically tracked!
         )
@@ -67,7 +67,7 @@ def openai_responses_example():
 
     try:
         metadata_response = openai_client.responses.create(
-            model="gpt-5.5",
+            model="gpt-4o-mini",
             input="Explain the benefits of the Responses API in 2 sentences.",
 
             # ✨ All metadata fields are optional - add what you need!
@@ -105,7 +105,7 @@ def openai_responses_example():
 
     try:
         instructions_response = openai_client.responses.create(
-            model="gpt-5.5",
+            model="gpt-4o-mini",
             instructions="You are a helpful assistant that explains technical concepts clearly.",
             input="What is middleware?",
 
@@ -133,7 +133,7 @@ def openai_responses_example():
         print("💬 Streaming response: ", end="", flush=True)
 
         stream_response = openai_client.responses.create(
-            model="gpt-5.5",
+            model="gpt-4o-mini",
             input="Count from 1 to 5 slowly",
             stream=True,
 
@@ -166,7 +166,7 @@ def openai_responses_example():
         # First turn
         print("Turn 1: Asking about Python...")
         response1 = openai_client.responses.create(
-            model="gpt-5.5",
+            model="gpt-4o-mini",
             input="What is Python?",
 
             usage_metadata={
@@ -183,7 +183,7 @@ def openai_responses_example():
         # Second turn - using previous_response_id for context
         print("Turn 2: Following up on Python...")
         response2 = openai_client.responses.create(
-            model="gpt-5.5",
+            model="gpt-4o-mini",
             input="What are its main use cases?",
             previous_response_id=response1.id,
 

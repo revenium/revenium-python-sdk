@@ -64,7 +64,7 @@ def call_once(label: str) -> None:
     client = openai.OpenAI()
     try:
         response = client.chat.completions.create(
-            model="gpt-5.5",
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": f"Say hi — call {label}."}],
             max_tokens=8,
         )

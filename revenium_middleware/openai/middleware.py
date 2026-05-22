@@ -24,7 +24,6 @@ from .exceptions import (
     ReveniumMiddlewareError, ValidationError, MeteringError,
     NetworkError, AuthenticationError, categorize_exception, handle_exception_safely
 )
-from .summary_printer import print_usage_summary
 
 # LangChain integration utilities
 from .langchain._utils import is_langchain_available
@@ -499,31 +498,6 @@ async def log_token_usage(
         result = client.ai.create_completion(**completion_args)
         logger.debug("Metering call result: %s", result)
         logger.debug(f"✅ REVENIUM SUCCESS: Metering call successful: {result.id}")
-
-        # Print usage summary if enabled (async, fire-and-forget)
-        # Try to get API key from client, fallback to environment variable
-        revenium_api_key = None
-        if hasattr(client, 'api_key'):
-            revenium_api_key = client.api_key
-        else:
-            revenium_api_key = os.getenv('REVENIUM_METERING_API_KEY')
-
-        if revenium_api_key:
-            # Run summary printing in background thread to avoid blocking
-            def _print_summary_async():
-                print_usage_summary(
-                    model=model,
-                    provider=provider,
-                    request_duration=request_duration,
-                    input_token_count=prompt_tokens,
-                    output_token_count=completion_tokens,
-                    total_token_count=total_tokens,
-                    transaction_id=response_id,
-                    trace_id=meta["trace_id"],
-                    revenium_api_key=revenium_api_key,
-                )
-
-            run_async_in_thread(_print_summary_async)
     except Exception as e:
         if not shutdown_event.is_set():
             # Categorize the exception for better error handling

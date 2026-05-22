@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2026-05-22
+
+### Removed
+- Removed terminal usage-summary printer (opt-in `REVENIUM_PRINT_SUMMARY`) — undocumented dev feature; dashboard remains the source of truth for cost confirmation.
+
+### Changed
+- Refresh OpenAI model name in README and examples from `gpt-5.5` / `gpt-5.5-mini` to `gpt-4o-mini` so copy-paste examples resolve against current OpenAI catalogues.
+- Refresh OpenAI getting-started example to use a realistic prompt + token count so the first metered call produces a visible non-trivial cost.
+- Migration note: `organizationId` and `productId` field aliases remain accepted by the SDK as a backward-compat input convenience (with `DeprecationWarning`), but the backend has stopped silently mapping them and the canonical wire shape is `organizationName` and `productName`. New examples and documentation use the canonical names.
+
 ## [0.1.5] - 2026-05-21
 
 ### Added

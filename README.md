@@ -106,7 +106,7 @@ import revenium_middleware_openai  # Auto-initializes on import
 
 client = openai.OpenAI()
 response = client.chat.completions.create(
-    model="gpt-5.5",
+    model="gpt-4o-mini",
     messages=[{"role": "user", "content": "Hello!"}]
 )
 print(response.choices[0].message.content)
@@ -156,7 +156,7 @@ client = openai.OpenAI()
 
 # Basic chat completion
 response = client.chat.completions.create(
-    model="gpt-5.5",
+    model="gpt-4o-mini",
     messages=[{"role": "user", "content": "Hello!"}],
     usage_metadata={
         "organizationName": "AcmeCorp",
@@ -168,7 +168,7 @@ response = client.chat.completions.create(
 
 # Streaming
 stream = client.chat.completions.create(
-    model="gpt-5.5",
+    model="gpt-4o-mini",
     messages=[{"role": "user", "content": "Tell me a story"}],
     stream=True
 )
@@ -459,7 +459,7 @@ litellm.api_base = os.getenv("LITELLM_PROXY_URL")
 litellm.api_key = os.getenv("LITELLM_API_KEY")
 
 response = litellm.completion(
-    model="gpt-5.5",
+    model="gpt-4o-mini",
     messages=[{"role": "user", "content": "Hello!"}],
     usage_metadata={
         "organizationName": "AcmeCorp",
@@ -617,7 +617,7 @@ handler = ReveniumCallbackHandler(
     agent_name="support_agent"
 )
 
-llm = ChatOpenAI(model="gpt-5.5", callbacks=[handler])
+llm = ChatOpenAI(model="gpt-4o-mini", callbacks=[handler])
 response = llm.invoke("Hello!")
 ```
 
@@ -656,7 +656,7 @@ result = agent.invoke(
 from revenium_middleware_langchain import AsyncReveniumCallbackHandler
 
 handler = AsyncReveniumCallbackHandler(trace_id="async-session")
-llm = ChatOpenAI(model="gpt-5.5", callbacks=[handler])
+llm = ChatOpenAI(model="gpt-4o-mini", callbacks=[handler])
 response = await llm.ainvoke("Hello!")
 ```
 
@@ -702,7 +702,7 @@ Add business context to any API call by passing a `usage_metadata` dictionary. A
 
 ```python
 response = client.chat.completions.create(
-    model="gpt-5.5",
+    model="gpt-4o-mini",
     messages=[{"role": "user", "content": "Hello!"}],
     usage_metadata={
         "trace_id": "conv-28a7e9d4",
@@ -724,7 +724,7 @@ response = client.chat.completions.create(
 )
 ```
 
-**Deprecation notice:** The old field names `organizationId`, `organization_id`, `productId`, and `product_id` are still supported for backward compatibility but are deprecated. Use `organizationName` and `productName` for new implementations.
+**Deprecation notice:** The legacy field aliases `organizationId`, `organization_id`, `productId`, and `product_id` are accepted by this SDK only as an input-layer convenience and emit a `DeprecationWarning`. The Revenium backend no longer accepts them — they are translated to `organizationName` / `productName` before the wire call. Migrate to `organization_name` / `organizationName` and `product_name` / `productName` now; the input-layer aliases will be removed in the next major release.
 
 **API Reference:** [Complete metadata field documentation](https://revenium.readme.io/reference/meter_ai_completion)
 
@@ -765,7 +765,7 @@ REVENIUM_TRACE_TYPE=customer-support
 
 ```python
 response = client.chat.completions.create(
-    model="gpt-5.5",
+    model="gpt-4o-mini",
     messages=[{"role": "user", "content": "Hello!"}],
     usage_metadata={
         "environment": "production",
@@ -789,7 +789,7 @@ workflow_id = str(uuid.uuid4())
 
 # Step 1: Parent operation
 parent_response = client.chat.completions.create(
-    model="gpt-5.5",
+    model="gpt-4o-mini",
     messages=[{"role": "user", "content": "Analyze this document"}],
     usage_metadata={
         "trace_id": "analysis-session-456",
@@ -800,7 +800,7 @@ parent_response = client.chat.completions.create(
 
 # Step 2: Child operation linked to parent
 child_response = client.chat.completions.create(
-    model="gpt-5.5",
+    model="gpt-4o-mini",
     messages=[{"role": "user", "content": "Summarize findings"}],
     usage_metadata={
         "trace_id": "analysis-session-456",
@@ -831,7 +831,7 @@ from revenium_middleware import revenium_metadata
 def handle_customer_query(question: str) -> str:
     # All API calls automatically include the decorator metadata
     response = client.chat.completions.create(
-        model="gpt-5.5",
+        model="gpt-4o-mini",
         messages=[{"role": "user", "content": question}]
     )
     return response.choices[0].message.content
@@ -870,13 +870,13 @@ def outer_function():
 def mixed_metadata():
     # Uses decorator metadata
     response1 = client.chat.completions.create(
-        model="gpt-5.5",
+        model="gpt-4o-mini",
         messages=[{"role": "user", "content": "Hello"}]
     )
 
     # API-level metadata overrides decorator's task_type
     response2 = client.chat.completions.create(
-        model="gpt-5.5",
+        model="gpt-4o-mini",
         messages=[{"role": "user", "content": "Hello"}],
         usage_metadata={
             "task_type": "special-override",  # Overrides decorator
@@ -905,7 +905,7 @@ from revenium_middleware import revenium_meter, revenium_metadata
 def premium_feature(prompt: str) -> str:
     # This WILL be metered (decorated with @revenium_meter)
     response = client.chat.completions.create(
-        model="gpt-5.5",
+        model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}]
     )
     return response.choices[0].message.content
@@ -913,7 +913,7 @@ def premium_feature(prompt: str) -> str:
 def free_feature(prompt: str) -> str:
     # This will NOT be metered (no @revenium_meter decorator)
     response = client.chat.completions.create(
-        model="gpt-5.5",
+        model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}]
     )
     return response.choices[0].message.content
@@ -999,7 +999,7 @@ from openai import OpenAI
 
 client = OpenAI()
 response = client.chat.completions.create(
-    model="gpt-5.5",
+    model="gpt-4o-mini",
     messages=[
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "What is the capital of France?"}
@@ -1018,62 +1018,6 @@ Prompt capture works with both streaming and non-streaming requests, and with mu
 - Only enable in environments where data capture is appropriate
 - Ensure compliance with your data privacy policies
 - Use selective metering with `@revenium_meter` to control which calls are captured
-
----
-
-## Terminal Summary Output
-
-Display a cost and usage summary in your terminal after each API request. Useful for development, debugging, and monitoring AI costs in real-time.
-
-### Configuration
-
-| Environment Variable | Values | Description |
-|---------------------|--------|-------------|
-| `REVENIUM_PRINT_SUMMARY` | `false` (default), `true` or `human`, `json` | Controls output format |
-| `REVENIUM_TEAM_ID` | Your team ID | Required to fetch and display cost information |
-
-```bash
-# Enable human-readable output
-export REVENIUM_PRINT_SUMMARY=human
-
-# Required for cost display (find in Revenium web app)
-export REVENIUM_TEAM_ID=your-team-id-here
-```
-
-### Human-Readable Format
-
-```
-============================================================
-REVENIUM USAGE SUMMARY
-============================================================
-Model: gpt-5.5
-Provider: OPENAI
-Duration: 1.23s
-
-Token Usage:
-  Input Tokens:  150
-  Output Tokens: 250
-  Total Tokens:  400
-
-Cost: $0.000045
-
-Trace ID: abc-123
-============================================================
-```
-
-### JSON Format
-
-```json
-{"model":"gpt-5.5","provider":"OPENAI","durationSeconds":1.23,"inputTokenCount":150,"outputTokenCount":250,"totalTokenCount":400,"cost":0.000045,"costStatus":"available","traceId":"abc-123"}
-```
-
-### Cost Status
-
-| Scenario | Display |
-|----------|---------|
-| Cost available | `$0.000045` |
-| `REVENIUM_TEAM_ID` set, cost pending | `Pending (aggregating... check Revenium dashboard)` |
-| `REVENIUM_TEAM_ID` not set | `Add REVENIUM_TEAM_ID to see pricing` |
 
 ---
 
@@ -1155,7 +1099,7 @@ client = openai.OpenAI()
 
 try:
     response = client.chat.completions.create(
-        model="gpt-5.5",
+        model="gpt-4o-mini",
         messages=[{"role": "user", "content": "Summarize the meeting notes"}],
     )
 except BudgetExceededError as exc:
@@ -1194,9 +1138,8 @@ See [`examples/openai/openai_blocking_demo.py`](examples/openai/openai_blocking_
 | `REVENIUM_METERING_BASE_URL` | `https://api.revenium.ai` | Revenium API endpoint |
 | `REVENIUM_LOG_LEVEL` | `INFO` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
 | `REVENIUM_CAPTURE_PROMPTS` | `false` | Enable prompt capture |
-| `REVENIUM_PRINT_SUMMARY` | `false` | Terminal output: `false`, `true`/`human`, `json` |
 | `REVENIUM_SELECTIVE_METERING` | `false` | Only meter `@revenium_meter` decorated functions |
-| `REVENIUM_TEAM_ID` | - | Team ID for cost display in terminal summary |
+| `REVENIUM_TEAM_ID` | - | Team ID for cost lookups |
 | `REVENIUM_ENVIRONMENT` | - | Deployment environment (auto-detects from `ENVIRONMENT`, `DEPLOYMENT_ENV`) |
 | `REVENIUM_REGION` | - | Cloud region (auto-detects from `AWS_REGION`, `AZURE_REGION`, `GCP_REGION`) |
 | `REVENIUM_CREDENTIAL_ALIAS` | - | Human-readable API key name |
