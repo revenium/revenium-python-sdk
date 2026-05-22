@@ -39,7 +39,7 @@ async def basic_async_chat_example():
     
     # Wrap LangChain LLM with Revenium tracking
     llm = wrap(
-        ChatOpenAI(model="gpt-5.5"),
+        ChatOpenAI(model="gpt-4o-mini"),
         usage_metadata={
             "trace_id": "async-example-001",
             "task_type": "basic-chat",
@@ -59,7 +59,7 @@ async def async_streaming_example():
     
     # Wrap streaming LLM
     llm = wrap(
-        ChatOpenAI(model="gpt-5.5", streaming=True),
+        ChatOpenAI(model="gpt-4o-mini", streaming=True),
         usage_metadata={
             "trace_id": "async-stream-001",
             "task_type": "streaming-chat"
@@ -106,7 +106,7 @@ async def concurrent_operations_example():
     
     # Create multiple LLMs for concurrent operations
     chat_llm = wrap(
-        ChatOpenAI(model="gpt-5.5"),
+        ChatOpenAI(model="gpt-4o-mini"),
         usage_metadata={"task_type": "concurrent-chat"}
     )
     
@@ -123,7 +123,7 @@ async def concurrent_operations_example():
         return await embedding_model.aembed_query("Concurrency in programming")
     
     async def streaming_task():
-        stream_llm = wrap(ChatOpenAI(model="gpt-5.5", streaming=True))
+        stream_llm = wrap(ChatOpenAI(model="gpt-4o-mini", streaming=True))
         chunks = []
         async for chunk in stream_llm.astream("Explain async/await"):
             chunks.append(chunk.content)
@@ -148,7 +148,7 @@ async def error_handling_example():
     
     # Create LLM with error-prone configuration
     llm = wrap(
-        ChatOpenAI(model="gpt-5.5", max_tokens=1),  # Very low token limit
+        ChatOpenAI(model="gpt-4o-mini", max_tokens=1),  # Very low token limit
         usage_metadata={"task_type": "error-handling-test"}
     )
     
@@ -168,7 +168,7 @@ async def streaming_with_metadata_example():
 
     # Create streaming LLM with metadata
     llm = wrap(
-        ChatOpenAI(model="gpt-5.5", streaming=True),
+        ChatOpenAI(model="gpt-4o-mini", streaming=True),
         usage_metadata={
             "trace_id": "stream-metadata-001",
             "task_type": "streaming-count",
@@ -194,7 +194,7 @@ async def advanced_configuration_example():
     # Method 1: Using wrap() with comprehensive metadata
     llm1 = wrap(
         ChatOpenAI(
-            model="gpt-5.5",
+            model="gpt-4o-mini",
             temperature=0.7,
             max_tokens=150
         ),
@@ -212,7 +212,7 @@ async def advanced_configuration_example():
     )
     
     # Method 2: Using attach_to() for in-place modification
-    llm2 = ChatOpenAI(model="gpt-5.5")
+    llm2 = ChatOpenAI(model="gpt-4o-mini")
     attach_to(
         llm2,
         usage_metadata={

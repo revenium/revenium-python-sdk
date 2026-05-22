@@ -40,56 +40,11 @@ from .prompt_extractor import (
     extract_streaming_response_content
 )
 
-# Import summary printer
-from .summary_printer import print_usage_summary
-
 logger = logging.getLogger("revenium_middleware.extension")
 
 # Define usage context for thread-safe metadata storage
 usage_context = contextvars.ContextVar('usage_metadata', default={})
 
-
-def _emit_usage_summary(
-    model: str,
-    provider: str,
-    request_duration: float,
-    prompt_tokens: int,
-    completion_tokens: int,
-    response_id: str,
-    usage_metadata: Dict[str, Any],
-) -> None:
-    """
-    Helper function to emit usage summary asynchronously.
-
-    Runs summary printing in a background thread to avoid blocking API responses.
-    This is a fire-and-forget operation that never fails the main request.
-
-    Args:
-        model: The model name
-        provider: The provider name
-        request_duration: Request duration in milliseconds
-        prompt_tokens: Number of input tokens
-        completion_tokens: Number of output tokens
-        response_id: The transaction ID
-        usage_metadata: Metadata dictionary containing trace_id and other info
-    """
-    revenium_api_key = os.getenv(Config.ENV_REVENIUM_API_KEY)
-    if revenium_api_key:
-        # Run summary printing in background thread to avoid blocking
-        def _print_summary_async():
-            print_usage_summary(
-                model=model,
-                provider=provider,
-                request_duration=request_duration,
-                input_token_count=prompt_tokens,
-                output_token_count=completion_tokens,
-                total_token_count=prompt_tokens + completion_tokens,
-                transaction_id=response_id,
-                trace_id=usage_metadata.get("trace_id") or usage_metadata.get("traceId"),
-                revenium_api_key=revenium_api_key,
-            )
-
-        run_async_in_thread(_print_summary_async)
 
 # Ensure debug logging is enabled when REVENIUM_DEBUG is set
 if os.getenv("REVENIUM_DEBUG", "").lower() in ("true", "1", "yes"):
@@ -692,16 +647,6 @@ if register_patch("anthropic.resources.messages.messages.Messages.create"):
                     logger.debug("[REVENIUM SUCCESS] Metering call successful for transaction %s", response_id)
                 else:
                     logger.warning("[REVENIUM ERROR] Metering call did not return success for transaction %s: %s", response_id, result)
-
-                _emit_usage_summary(
-                    model=response.model,
-                    provider=provider_metadata["provider"],
-                    request_duration=request_duration,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    response_id=response_id,
-                    usage_metadata=usage_metadata,
-                )
             except Exception as e:
                 from revenium_middleware import shutdown_event
                 if not shutdown_event.is_set():
@@ -854,16 +799,6 @@ if register_patch("anthropic.resources.messages.messages.AsyncMessages.create"):
                         logger.debug("[REVENIUM SUCCESS] Async metering call successful for transaction %s", response_id)
                     else:
                         logger.warning("[REVENIUM ERROR] Async metering call did not return success for transaction %s: %s", response_id, result)
-
-                    _emit_usage_summary(
-                        model=response.model,
-                        provider=provider_metadata["provider"],
-                        request_duration=request_duration,
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=completion_tokens,
-                        response_id=response_id,
-                        usage_metadata=usage_metadata,
-                    )
                 except Exception as e:
                     from revenium_middleware import shutdown_event
                     if not shutdown_event.is_set():
@@ -1065,16 +1000,6 @@ if register_patch("anthropic.resources.messages.messages.Messages.stream"):
                                     "[REVENIUM ERROR] Streaming metering call did not return success for transaction %s: %s",
                                     self.response_id, result
                                 )
-
-                            _emit_usage_summary(
-                                model=self.final_message.model,
-                                provider=provider_metadata["provider"],
-                                request_duration=request_duration,
-                                prompt_tokens=prompt_tokens,
-                                completion_tokens=completion_tokens,
-                                response_id=self.response_id,
-                                usage_metadata=usage_metadata,
-                            )
                         except Exception as e:
                             from revenium_middleware import shutdown_event
                             if not shutdown_event.is_set():

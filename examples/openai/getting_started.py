@@ -61,11 +61,45 @@ metadata = {
 
 # Make request
 response = client.chat.completions.create(
-    model="gpt-5.5",
+    model="gpt-4o-mini",
     messages=[
-        {"role": "user", "content": "Hello! Introduce yourself in one sentence."}
+        {
+            "role": "system",
+            "content": (
+                "You are a helpful technical writing assistant. When the user "
+                "gives you a paragraph of text, produce (a) a concise 2-3 "
+                "sentence summary written in plain English, and (b) a bullet "
+                "list of the 3 most important points. Keep the tone neutral "
+                "and professional. Do not invent facts that are not in the "
+                "source paragraph. If the paragraph is ambiguous, prefer the "
+                "most literal interpretation and note the ambiguity briefly "
+                "at the end of your summary."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Summarize the following paragraph.\n\n"
+                "Modern distributed systems rely heavily on observability to "
+                "remain operable at scale. Observability is typically broken "
+                "down into three pillars: metrics, logs, and traces. Metrics "
+                "are numeric measurements aggregated over time and are well "
+                "suited to dashboards and alerting because they are cheap to "
+                "store and query. Logs are discrete event records that "
+                "capture rich context but are expensive to retain at high "
+                "cardinality. Distributed traces stitch together the path of "
+                "a single request as it crosses service boundaries, making "
+                "them invaluable for diagnosing latency and correctness "
+                "issues that no single service can explain on its own. "
+                "Mature platforms combine all three so that operators can "
+                "move fluidly between a high-level alert, the underlying "
+                "events that caused it, and the precise request path that "
+                "produced the failure."
+            ),
+        },
     ],
-    usage_metadata=metadata
+    max_tokens=400,
+    usage_metadata=metadata,
 )
 
 # Display response

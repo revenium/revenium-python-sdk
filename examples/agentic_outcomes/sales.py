@@ -15,7 +15,7 @@ LLM_STEPS = (
             system_prompt="Identify high-fit prospects for a sales agent.",
             input_template="Review the next lead for {job_name} and summarize fit signals.",
             output_template="Lead fit scored and routed to qualification."),
-    LlmStep("sales.qualification", "gpt-5.5", "chatgpt", 2200, 700, 2200, 0.0008,
+    LlmStep("sales.qualification", "gpt-4o-mini", "chatgpt", 2200, 700, 2200, 0.0008,
             system_prompt="Qualify pipeline opportunities using CRM and product-fit context.",
             input_template="Qualify the prospect for {job_name}; include buying intent and risk.",
             output_template="Qualification complete with fit, urgency, and next best action."),

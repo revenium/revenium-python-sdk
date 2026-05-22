@@ -8,12 +8,9 @@ this via class inheritance and re-export symbols for backward compatibility.
 
 import logging
 import os
-from typing import Set, Literal, Union, Optional
+from typing import Set, Optional
 
 logger = logging.getLogger(__name__)
-
-# Type alias for summary format
-SummaryFormat = Literal["human", "json"]
 
 
 class Config:
@@ -65,13 +62,9 @@ class Config:
     CAPTURE_PROMPTS: bool = False
     MAX_PROMPT_LENGTH: int = 50_000  # Maximum characters per prompt field
 
-    # Terminal summary settings
-    ENV_REVENIUM_PRINT_SUMMARY: str = "REVENIUM_PRINT_SUMMARY"
+    # Revenium API targeting
     ENV_REVENIUM_TEAM_ID: str = "REVENIUM_TEAM_ID"
     ENV_REVENIUM_BASE_URL: str = "REVENIUM_METERING_BASE_URL"
-    SUMMARY_RETRY_ATTEMPTS: int = 3
-    SUMMARY_RETRY_DELAY: float = 2.0
-    SUMMARY_API_TIMEOUT: float = 5.0
     DEFAULT_BASE_URL: str = "https://api.revenium.ai"
 
     # Enforcement / circuit breaker — see _core/enforcement.py.
@@ -137,38 +130,6 @@ def get_timeout_config() -> dict:
         'background_thread': Config.BACKGROUND_THREAD_TIMEOUT,
         'stream': Config.STREAM_TIMEOUT,
     }
-
-
-def parse_print_summary_value(value: Optional[str]) -> Union[bool, SummaryFormat]:
-    """
-    Parse REVENIUM_PRINT_SUMMARY environment variable value.
-
-    Returns:
-        False if disabled, 'human' or 'json' if enabled
-    """
-    if value is None:
-        return False
-
-    value_lower = value.lower().strip()
-
-    if value_lower in ('false', '0', 'no', 'off', 'disabled', ''):
-        return False
-    elif value_lower in ('true', '1', 'yes', 'on', 'enabled', 'human'):
-        return 'human'
-    elif value_lower == 'json':
-        return 'json'
-    else:
-        logger.warning(
-            f"Invalid REVENIUM_PRINT_SUMMARY value '{value}'. "
-            f"Expected 'true', 'human', 'json', or 'false'. Defaulting to disabled."
-        )
-        return False
-
-
-def get_print_summary_config() -> Union[bool, SummaryFormat]:
-    """Get print summary configuration from environment."""
-    value = get_config_value(Config.ENV_REVENIUM_PRINT_SUMMARY)
-    return parse_print_summary_value(value)
 
 
 def get_team_id() -> Optional[str]:

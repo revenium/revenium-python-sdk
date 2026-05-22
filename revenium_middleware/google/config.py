@@ -10,7 +10,6 @@ import os
 from revenium_middleware._core.config import (  # noqa: F401
     Config as _CoreConfig,
     SecurityConfig,
-    SummaryFormat,
     get_config_value,
     is_debug_enabled,
     get_timeout_config,

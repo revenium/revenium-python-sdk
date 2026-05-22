@@ -13,9 +13,6 @@ from typing import Optional, Dict, Any, Union, Literal
 
 from revenium_middleware._core.config import (
     Config as _CoreConfig,
-    SummaryFormat,
-    parse_print_summary_value,
-    get_print_summary_config,
     get_team_id,
     get_base_url,
 )
@@ -52,14 +49,9 @@ from revenium_middleware._core.trace_fields import (  # noqa: F401 — re-export
 
 logger = logging.getLogger(__name__)
 
-# Summary output configuration (re-exported from core)
-ENV_REVENIUM_PRINT_SUMMARY = _CoreConfig.ENV_REVENIUM_PRINT_SUMMARY
+# Revenium API targeting (re-exported from core)
 ENV_REVENIUM_TEAM_ID = _CoreConfig.ENV_REVENIUM_TEAM_ID
 ENV_REVENIUM_METERING_BASE_URL = _CoreConfig.ENV_REVENIUM_BASE_URL
-
-SUMMARY_RETRY_ATTEMPTS = _CoreConfig.SUMMARY_RETRY_ATTEMPTS
-SUMMARY_RETRY_DELAY: float = 1.0  # Google uses 1.0s
-SUMMARY_API_TIMEOUT = _CoreConfig.SUMMARY_API_TIMEOUT
 DEFAULT_BASE_URL = _CoreConfig.DEFAULT_BASE_URL
 
 
@@ -201,5 +193,5 @@ def detect_operation_type(
     return 'CHAT'
 
 
-# parse_print_summary_value, get_print_summary_config, get_team_id, get_base_url
-# are imported from revenium_middleware._core.config at the top of this file
+# get_team_id, get_base_url are imported from revenium_middleware._core.config
+# at the top of this file

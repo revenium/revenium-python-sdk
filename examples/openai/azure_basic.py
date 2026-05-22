@@ -61,7 +61,7 @@ def azure_basic_example():
         print("To test chat completions, update .env to use a chat model:")
         print("- Comment out the embeddings section")
         print("- Uncomment the chat testing section")
-        print("- Set AZURE_OPENAI_DEPLOYMENT=gpt-5.5")
+        print("- Set AZURE_OPENAI_DEPLOYMENT=gpt-4o-mini")
         print("\n   Skipping chat examples and testing embeddings instead...\n")
     else:
         # Example 1: Basic Azure chat completion (no metadata)
@@ -120,7 +120,7 @@ def azure_basic_example():
     print("Example 3: Azure embeddings")
 
     if is_chat_model:
-        print("Note: Current deployment is a chat model (gpt-5.5).")
+        print("Note: Current deployment is a chat model (gpt-4o-mini).")
         print("Embeddings require an embedding model like text-embedding-3-large.")
         print("To test embeddings, switch .env to embeddings configuration.")
         print("Skipping embeddings examples.\n")

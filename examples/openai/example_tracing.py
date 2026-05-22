@@ -47,7 +47,7 @@ def example_1_retry_tracking():
             print(f"\n🔄 Attempt {attempt + 1}/{max_retries} (retry_number={attempt})")
             
             response = client.chat.completions.create(
-                model="gpt-5.5",
+                model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
                 usage_metadata={
                     "retry_number": attempt,  # 0 for first attempt, 1+ for retries
@@ -85,7 +85,7 @@ def example_2_distributed_tracing():
     # Parent operation
     print("\n📊 Parent Operation: Document Analysis")
     parent_response = client.chat.completions.create(
-        model="gpt-5.5",
+        model="gpt-4o-mini",
         messages=[{
             "role": "user",
             "content": "Analyze this text: 'AI is transforming software development.'"
@@ -106,7 +106,7 @@ def example_2_distributed_tracing():
     # Child operation 1: Summarize
     print("\n📝 Child Operation 1: Summarize Findings")
     child1_response = client.chat.completions.create(
-        model="gpt-5.5",
+        model="gpt-4o-mini",
         messages=[{
             "role": "user",
             "content": "Summarize: AI is transforming software development."
@@ -127,7 +127,7 @@ def example_2_distributed_tracing():
     # Child operation 2: Extract keywords
     print("\n🔑 Child Operation 2: Extract Keywords")
     child2_response = client.chat.completions.create(
-        model="gpt-5.5",
+        model="gpt-4o-mini",
         messages=[{
             "role": "user",
             "content": "Extract 3 keywords from: AI is transforming software development."
@@ -173,7 +173,7 @@ def example_3_dynamic_trace_names():
         print(f"\n👤 User: {session['user_id']}, Session: {session['session_id']}")
 
         response = client.chat.completions.create(
-            model="gpt-5.5",
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": session['message']}],
             usage_metadata={
                 "trace_id": session['session_id'],
@@ -210,7 +210,7 @@ def example_4_environment_and_region():
 
     # Normal call - uses env vars
     response1 = client.chat.completions.create(
-        model="gpt-5.5",
+        model="gpt-4o-mini",
         messages=[{"role": "user", "content": "Test message"}],
         usage_metadata={
             "trace_id": "env-test-1",
@@ -222,7 +222,7 @@ def example_4_environment_and_region():
 
     # Override for special case (e.g., cross-region call)
     response2 = client.chat.completions.create(
-        model="gpt-5.5",
+        model="gpt-4o-mini",
         messages=[{"role": "user", "content": "Cross-region test"}],
         usage_metadata={
             "trace_id": "env-test-2",
@@ -253,7 +253,7 @@ def example_5_complete_tracing_scenario():
     for attempt in range(2):
         try:
             step1_response = client.chat.completions.create(
-                model="gpt-5.5",
+                model="gpt-4o-mini",
                 messages=[{"role": "user", "content": "Explain quantum computing"}],
                 usage_metadata={
                     "trace_id": workflow_id,
@@ -278,7 +278,7 @@ def example_5_complete_tracing_scenario():
     # Step 2: Follow-up question (child of step 1)
     print(f"\n❓ Step 2: Follow-up Question")
     step2_response = client.chat.completions.create(
-        model="gpt-5.5",
+        model="gpt-4o-mini",
         messages=[{"role": "user", "content": "Give me an example"}],
         usage_metadata={
             "trace_id": workflow_id,
@@ -296,7 +296,7 @@ def example_5_complete_tracing_scenario():
     # Step 3: Summary (child of step 1)
     print(f"\n📝 Step 3: Generate Summary")
     step3_response = client.chat.completions.create(
-        model="gpt-5.5",
+        model="gpt-4o-mini",
         messages=[{"role": "user", "content": "Summarize quantum computing in one sentence"}],
         usage_metadata={
             "trace_id": workflow_id,

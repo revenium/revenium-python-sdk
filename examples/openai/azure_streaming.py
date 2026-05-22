@@ -62,7 +62,7 @@ def azure_streaming_example():
         print("To test streaming chat, update .env to use a chat model:")
         print("- Comment out the embeddings section")
         print("- Uncomment the chat testing section")
-        print("- Set AZURE_OPENAI_DEPLOYMENT=gpt-5.5")
+        print("- Set AZURE_OPENAI_DEPLOYMENT=gpt-4o-mini")
         print("\n   Testing embeddings instead (no streaming for embeddings)...\n")
     else:
         # Example 1: Basic Azure streaming (no metadata)

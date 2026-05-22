@@ -8,6 +8,21 @@ properly with appropriate mocking and state management.
 import pytest
 from unittest.mock import patch, MagicMock
 
+from revenium_middleware._core.fields import _reset_deprecation_warning_cache
+
+
+@pytest.fixture(autouse=True)
+def _reset_deprecation_warning_gate():
+    """Reset the once-per-key DeprecationWarning gate between tests.
+
+    The gate prevents per-call log flood in production. Tests that assert a
+    DeprecationWarning fires on a specific call rely on a clean cache; this
+    fixture provides that without coupling test files to module internals.
+    """
+    _reset_deprecation_warning_cache()
+    yield
+    _reset_deprecation_warning_cache()
+
 
 def pytest_configure(config):
     """Configure pytest with custom markers."""

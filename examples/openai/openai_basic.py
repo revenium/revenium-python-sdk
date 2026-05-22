@@ -45,7 +45,7 @@ def openai_basic_example():
     print("Example 1: Basic chat completion (automatic tracking)")
     
     basic_response = openai_client.chat.completions.create(
-        model="gpt-5.5",
+        model="gpt-4o-mini",
         messages=[
             {"role": "user", "content": "What is TypeScript in one sentence?"}
         ]
@@ -61,7 +61,7 @@ def openai_basic_example():
     print("Example 2: Chat completion with rich metadata")
     
     metadata_response = openai_client.chat.completions.create(
-        model="gpt-5.5",
+        model="gpt-4o-mini",
         messages=[
             {"role": "user", "content": "Explain the benefits of using middleware in 2 sentences."}
         ],

@@ -1,5 +1,6 @@
 import logging
-from typing import Any, Dict, Mapping, Optional
+import warnings
+from typing import Any, Dict, Mapping, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -9,6 +10,21 @@ AGENTIC_JOB_FIELD_MAP = {
     "agenticJobType": ("agentic_job_type", "agenticJobType"),
     "agenticJobVersion": ("agentic_job_version", "agenticJobVersion"),
 }
+
+# Tracks (old_field, new_field) pairs already warned about in this process,
+# so high-volume callers don't get a deprecation log flood per call.
+_WARNED_DEPRECATED_FIELDS: Set[Tuple[str, str]] = set()
+
+
+def _reset_deprecation_warning_cache() -> None:
+    """Clear the once-per-key deprecation-warning gate.
+
+    Intended for test isolation — production callers should not need this.
+    Test suites with autouse fixtures call this before each test so that tests
+    which assert a warning fires on a specific call do not bleed across each
+    other.
+    """
+    _WARNED_DEPRECATED_FIELDS.clear()
 
 
 def extract_field_with_fallback(
@@ -29,11 +45,17 @@ def extract_field_with_fallback(
 
     if source.get(old_snake) or source.get(old_camel):
         if not (source.get(new_snake) or source.get(new_camel)):
-            logger.warning(
-                "Fields '%s' and '%s' are deprecated. Use '%s' or '%s' instead. "
-                "The old fields will be removed in a future version.",
-                old_camel, old_snake, new_camel, new_snake,
-            )
+            key = (old_camel, new_camel)
+            if key not in _WARNED_DEPRECATED_FIELDS:
+                _WARNED_DEPRECATED_FIELDS.add(key)
+                msg = (
+                    "Fields '%s' and '%s' are deprecated and are no longer "
+                    "accepted by the Revenium backend. The SDK is translating to "
+                    "'%s' for this call. Use '%s' or '%s' instead. The "
+                    "input-layer aliases will be removed in the next major release."
+                )
+                logger.warning(msg, old_camel, old_snake, new_camel, new_camel, new_snake)
+                warnings.warn(msg % (old_camel, old_snake, new_camel, new_camel, new_snake), DeprecationWarning, stacklevel=3)
 
     return value
 

@@ -24,7 +24,6 @@ from .types import UsageData, OperationType, ProviderMetadata, TokenCounts
 from .exceptions import MeteringError, APIResponseError, safe_extract
 from .protocols import has_token_counts, safe_getattr, get_token_count
 from . import trace_fields
-from .summary_printer import print_usage_summary
 
 logger = logging.getLogger("revenium_middleware.extension")
 
@@ -409,31 +408,6 @@ def create_metering_call(
     # Execute in background thread
     run_async_in_thread(metering_call())
 
-    # Print usage summary if enabled (fire-and-forget)
-    # Get the API key from the client
-    revenium_api_key = getattr(client, "api_key", None)
-    if revenium_api_key:
-        # Support both snake_case and camelCase for trace_id
-        trace_id = usage_metadata.get("trace_id")
-        if trace_id is None:
-            trace_id = usage_metadata.get("traceId")
-
-        # Run summary printing in background thread to avoid blocking
-        def _print_summary_sync():
-            print_usage_summary(
-                model=usage_data.model,
-                provider=usage_data.provider,
-                request_duration=usage_data.request_duration,
-                input_token_count=usage_data.input_token_count,
-                output_token_count=usage_data.output_token_count,
-                total_token_count=usage_data.total_token_count,
-                transaction_id=usage_data.transaction_id,
-                trace_id=trace_id,
-                revenium_api_key=revenium_api_key,
-            )
-
-        run_async_in_thread(_print_summary_sync)
-
 
 def _build_common_metadata_args(usage_metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -807,26 +781,6 @@ def create_image_metering_call(
 
     run_async_in_thread(metering_call())
 
-    # Print usage summary if enabled
-    revenium_api_key = getattr(client, "api_key", None)
-    if revenium_api_key:
-        trace_id = usage_metadata.get("trace_id") or usage_metadata.get("traceId")
-
-        def _print_summary_sync():
-            print_usage_summary(
-                model=model,
-                provider=provider,
-                request_duration=request_duration,
-                input_token_count=0,
-                output_token_count=0,
-                total_token_count=0,
-                transaction_id=transaction_id,
-                trace_id=trace_id,
-                revenium_api_key=revenium_api_key,
-            )
-
-        run_async_in_thread(_print_summary_sync)
-
 
 def create_video_metering_call(
     model: str,
@@ -869,26 +823,6 @@ def create_video_metering_call(
         )
 
     run_async_in_thread(metering_call())
-
-    # Print usage summary if enabled
-    revenium_api_key = getattr(client, "api_key", None)
-    if revenium_api_key:
-        trace_id = usage_metadata.get("trace_id") or usage_metadata.get("traceId")
-
-        def _print_summary_sync():
-            print_usage_summary(
-                model=model,
-                provider=provider,
-                request_duration=request_duration,
-                input_token_count=0,
-                output_token_count=0,
-                total_token_count=0,
-                transaction_id=transaction_id,
-                trace_id=trace_id,
-                revenium_api_key=revenium_api_key,
-            )
-
-        run_async_in_thread(_print_summary_sync)
 
 
 @safe_extract

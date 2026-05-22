@@ -45,7 +45,7 @@ LLM_STEPS = (
             system_prompt="Plan a safe coding-agent workflow from a developer request.",
             input_template="Create an execution plan for {scenario_type} in {job_name}.",
             output_template="Plan produced with affected files, tests, and risk notes."),
-    LlmStep("draft", "gpt-5.5", "chatgpt", 4500, 2200, 3800, 0.0355,
+    LlmStep("draft", "gpt-4o-mini", "chatgpt", 4500, 2200, 3800, 0.0355,
             agent_role="implementation",
             system_prompt="Implement a focused code change that follows the plan.",
             input_template="Draft the code change for {scenario_key}; preserve existing behavior.",

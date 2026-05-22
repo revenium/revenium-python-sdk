@@ -56,7 +56,7 @@ def example_1_basic_trace_visualization():
     
     try:
         response = litellm.completion(
-            model="gpt-5.5",
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": "What is your refund policy?"}],
             usage_metadata={
                 "organization_name": "acme-corp",
@@ -93,7 +93,7 @@ def example_2_distributed_tracing():
     print("\n🔵 Parent Transaction: Extract Key Points")
     try:
         litellm.completion(
-            model="gpt-5.5",
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": "Extract 3 key points from: AI is transforming industries."}],
             usage_metadata={
                 "organization_name": "acme-corp",
@@ -110,7 +110,7 @@ def example_2_distributed_tracing():
         os.environ['REVENIUM_TRANSACTION_NAME'] = 'Summarize Points'
         
         litellm.completion(
-            model="gpt-5.5",
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": "Summarize the key points in one sentence."}],
             usage_metadata={
                 "organization_name": "acme-corp",
@@ -126,7 +126,7 @@ def example_2_distributed_tracing():
         os.environ['REVENIUM_TRANSACTION_NAME'] = 'Generate Tags'
         
         litellm.completion(
-            model="gpt-5.5",
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": "Generate 3 tags for this content."}],
             usage_metadata={
                 "organization_name": "acme-corp",
@@ -159,7 +159,7 @@ def example_3_retry_tracking():
 
         try:
             litellm.completion(
-                model="gpt-5.5",
+                model="gpt-4o-mini",
                 messages=[{"role": "user", "content": "Fetch user data for user ID 12345"}],
                 usage_metadata={
                     "organization_name": "acme-corp",
@@ -196,7 +196,7 @@ def example_4_multi_region():
 
         try:
             litellm.completion(
-                model="gpt-5.5",
+                model="gpt-4o-mini",
                 messages=[{"role": "user", "content": f"Generate a welcome message for users in {region}"}],
                 usage_metadata={
                     "organization_name": "acme-corp",
@@ -226,7 +226,7 @@ def example_5_parameter_based_fields():
     # Pass all trace fields via usage_metadata
     try:
         response = litellm.completion(
-            model="gpt-5.5",
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": "What are the benefits of cloud computing?"}],
             usage_metadata={
                 "organization_name": "acme-corp",
