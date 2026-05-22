@@ -1,4 +1,5 @@
 import logging
+import warnings
 
 import pytest
 
@@ -7,6 +8,7 @@ from revenium_middleware._core.fields import (
     extract_common_metadata,
     extract_field_with_fallback,
     extract_org_and_product,
+    extract_organization_name,
     extract_with_aliases,
     merge_extra_body,
 )
@@ -82,6 +84,17 @@ class TestExtractFieldWithFallback:
         with caplog.at_level(logging.WARNING):
             self._call(source)
         assert "deprecated" not in caplog.text.lower()
+
+    def test_deprecation_warning_emitted_once_per_field_pair(self):
+        # The conftest autouse fixture clears the gate; calling the deprecated
+        # path twice should produce exactly one DeprecationWarning.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            extract_organization_name({"organizationId": "x"})
+            extract_organization_name({"organizationId": "y"})
+        deprecation_warnings = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        assert len(deprecation_warnings) == 1
+        assert "organizationId" in str(deprecation_warnings[0].message)
 
 
 class TestExtractWithAliases:
