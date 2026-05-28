@@ -653,6 +653,7 @@ class BedrockStreamWrapper:
         try:
             # Import here to avoid circular imports
             from revenium_middleware import shutdown_event
+            from revenium_middleware._core import submit_ai_event
             from .provider import Provider, get_provider_metadata
             from .middleware import _get_thread_safe_client, _safe_run_async_in_thread
             from .trace_fields import detect_vision_content
@@ -705,41 +706,41 @@ class BedrockStreamWrapper:
                     organization_name, product_name = extract_org_and_product(self.usage_metadata)
                     meta = extract_common_metadata(self.usage_metadata)
 
-                    result = client.ai.create_completion(
-                        cache_creation_token_count=0,
-                        cache_read_token_count=0,
-                        input_token_cost=None,
-                        output_token_cost=None,
-                        total_cost=None,
-                        output_token_count=completion_tokens,
-                        cost_type="AI",
-                        model=self.final_message.model,
-                        input_token_count=prompt_tokens,
-                        provider=provider_metadata["provider"],
-                        model_source=provider_metadata["model_source"],
-                        reasoning_token_count=0,
-                        request_time=self.request_time,
-                        response_time=self.response_time,
-                        completion_start_time=self.response_time,
-                        request_duration=int(request_duration),
-                        time_to_first_token=int(
+                    result = submit_ai_event("completion", {
+                        "cache_creation_token_count": 0,
+                        "cache_read_token_count": 0,
+                        "input_token_cost": None,
+                        "output_token_cost": None,
+                        "total_cost": None,
+                        "output_token_count": completion_tokens,
+                        "cost_type": "AI",
+                        "model": self.final_message.model,
+                        "input_token_count": prompt_tokens,
+                        "provider": provider_metadata["provider"],
+                        "model_source": provider_metadata["model_source"],
+                        "reasoning_token_count": 0,
+                        "request_time": self.request_time,
+                        "response_time": self.response_time,
+                        "completion_start_time": self.response_time,
+                        "request_duration": int(request_duration),
+                        "time_to_first_token": int(
                             self.first_token_time - self.request_start_time) if self.first_token_time else 0,
-                        stop_reason="END",
-                        total_token_count=prompt_tokens + completion_tokens,
-                        transaction_id=self.response_id,
-                        trace_id=meta["trace_id"],
-                        task_type=meta["task_type"],
-                        subscriber=subscriber if subscriber else None,
-                        organization_name=organization_name,
-                        subscription_id=meta["subscription_id"],
-                        product_name=product_name,
-                        agent=meta["agent"],
-                        is_streamed=True,
-                        operation_type="CHAT",
-                        response_quality_score=meta["response_quality_score"],
-                        middleware_source="PYTHON",
-                        extra_body=extra_body if extra_body else None,
-                    )
+                        "stop_reason": "END",
+                        "total_token_count": prompt_tokens + completion_tokens,
+                        "transaction_id": self.response_id,
+                        "trace_id": meta["trace_id"],
+                        "task_type": meta["task_type"],
+                        "subscriber": subscriber if subscriber else None,
+                        "organization_name": organization_name,
+                        "subscription_id": meta["subscription_id"],
+                        "product_name": product_name,
+                        "agent": meta["agent"],
+                        "is_streamed": True,
+                        "operation_type": "CHAT",
+                        "response_quality_score": meta["response_quality_score"],
+                        "middleware_source": "PYTHON",
+                        "extra_body": extra_body if extra_body else None,
+                    })
                     logger.debug("Metering call result for Bedrock stream: %s", result)
                 except Exception as e:
                     if not shutdown_event.is_set():

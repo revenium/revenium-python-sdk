@@ -139,6 +139,98 @@ See [`examples/agentic_outcomes/`](examples/agentic_outcomes/) for runnable demo
 
 ---
 
+## Idempotency
+
+Every metering POST from the provider middleware automatically includes an `Idempotency-Key` header. If the Revenium API receives the same key with the same body within 24 hours, it returns the cached response instead of double-billing — making metering submissions safe to retry.
+
+### Default
+
+A fresh UUID v4 is generated automatically for every metering call. No action required.
+
+### Override
+
+Use the `idempotency_key` context manager to tie metering to a business-level identifier so the same logical operation never double-meters across retries:
+
+```python
+from revenium_middleware import idempotency_key
+
+with idempotency_key(f"order-{order_id}"):
+    response = openai.chat.completions.create(...)
+```
+
+The context manager is backed by `contextvars`, so it scopes correctly across threads and asyncio tasks.
+
+### Backend behavior
+
+| Scenario | Backend response |
+| -- | -- |
+| First call with key K and body B | Executes, caches for 24h |
+| Retry with same K and same B | Returns cached response (no double-bill) |
+| Same K with different B | `409 idempotency_key_mismatch` |
+| Concurrent in-flight with same K | `409 idempotency_key_in_progress` + `Retry-After: 1` |
+| Malformed key | `400 invalid_idempotency_key` |
+
+See [docs.revenium.io/integrations/idempotency](https://docs.revenium.io/integrations/idempotency) for full backend semantics.
+
+### Key format
+
+`Idempotency-Key` must be 1–255 printable ASCII characters. UUID v4 is the recommended format and what the SDK generates by default.
+
+---
+
+## Webhook Signature Verification
+
+Revenium signs every outbound webhook with HMAC-SHA256 when a signing secret is configured. The SDK ships a verification helper so your handler can validate signatures without writing crypto.
+
+Two headers arrive on every signed delivery:
+
+| Header | Value |
+| -- | -- |
+| `X-Revenium-Signature-256` | `sha256=<hex>`. During a 24h rotation overlap: `sha256=A, sha256=B`. |
+| `X-Revenium-Webhook-Timestamp` | Unix seconds at signing time. |
+
+### FastAPI example
+
+```python
+import os
+
+from fastapi import FastAPI, Header, HTTPException, Request
+
+from revenium_middleware.webhooks import verify_signature
+
+app = FastAPI()
+SIGNING_SECRETS = [os.environ["REVENIUM_WEBHOOK_SECRET"]]
+
+
+@app.post("/webhooks/revenium")
+async def receive(
+    request: Request,
+    x_revenium_signature_256: str = Header(...),
+    x_revenium_webhook_timestamp: str = Header(...),
+):
+    body = await request.body()
+    if not verify_signature(
+        payload=body,
+        signature_header=x_revenium_signature_256,
+        timestamp_header=x_revenium_webhook_timestamp,
+        secrets=SIGNING_SECRETS,
+    ):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    # ... process the event
+    return {"ok": True}
+```
+
+### Secret rotation
+
+When you rotate a signing secret in the Revenium dashboard with the default 24-hour overlap, both the old and new secrets are active simultaneously and every webhook is signed with both. Supply both values in `SIGNING_SECRETS` during the overlap window; remove the old one once it expires.
+
+### Webhooks without a signing secret
+
+Webhook deliveries without a configured signing secret arrive without HMAC headers. If your endpoint receives both signed and unsigned traffic, branch on header presence: treat missing headers as legacy unsigned mode and missing-signature-on-signed-only endpoints as an authentication failure.
+
+---
+
 ## Provider Usage Guides
 
 ### OpenAI

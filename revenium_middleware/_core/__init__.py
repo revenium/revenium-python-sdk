@@ -6,6 +6,7 @@ provider-specific middleware implementations.
 """
 
 from .metering import run_async_in_thread, shutdown_event, client
+from .metering_submission import submit_ai_event
 from .exceptions import BudgetExceededError
 from .enforcement import check_enforcement, is_circuit_breaker_enabled, stop_polling
 from .context import (
@@ -17,6 +18,9 @@ from .context import (
     set_injected_metadata,
     clear_injected_metadata,
     merge_metadata,
+    idempotency_key,
+    get_idempotency_key,
+    set_idempotency_key,
 )
 from .decorators import revenium_meter, revenium_metadata, track_usage
 from .config import is_selective_metering_enabled
@@ -48,6 +52,7 @@ __all__ = [
     "client",
     "run_async_in_thread",
     "shutdown_event",
+    "submit_ai_event",
     # Enforcement / circuit breaker
     "BudgetExceededError",
     "check_enforcement",
@@ -66,6 +71,9 @@ __all__ = [
     "set_injected_metadata",
     "clear_injected_metadata",
     "merge_metadata",
+    "idempotency_key",
+    "get_idempotency_key",
+    "set_idempotency_key",
     # Config
     "is_selective_metering_enabled",
     # Field extraction

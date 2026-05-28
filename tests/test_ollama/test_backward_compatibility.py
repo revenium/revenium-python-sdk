@@ -19,8 +19,10 @@ def _find_deprecation_warning(mock_logger, field_name):
 class TestLegacyFieldNames:
 
     @patch('revenium_middleware.ollama.middleware.client')
-    def test_legacy_organization_id_camelcase(self, mock_client, mock_ollama_chat_response):
+    @patch('revenium_middleware.ollama.middleware.submit_ai_event')
+    def test_legacy_organization_id_camelcase(self, mock_submit, mock_client, mock_ollama_chat_response):
         mock_client.ai.create_completion.return_value = {"status": "success"}
+        mock_submit.return_value = {"status": "success"}
 
         with patch.object(Client, '_request', return_value=mock_ollama_chat_response):
             with patch('revenium_middleware._core.fields.logger') as mock_logger:
@@ -36,14 +38,14 @@ class TestLegacyFieldNames:
                 time.sleep(0.2)
 
                 assert _find_deprecation_warning(mock_logger, 'organizationId')
-
-                assert mock_client.ai.create_completion.called
-                call_args = mock_client.ai.create_completion.call_args[1]
-                assert call_args['organization_name'] == 'legacy-org-camel'
+                assert mock_submit.called
+                assert mock_submit.call_args[0][1]['organization_name'] == 'legacy-org-camel'
 
     @patch('revenium_middleware.ollama.middleware.client')
-    def test_legacy_organization_id_snakecase(self, mock_client, mock_ollama_chat_response):
+    @patch('revenium_middleware.ollama.middleware.submit_ai_event')
+    def test_legacy_organization_id_snakecase(self, mock_submit, mock_client, mock_ollama_chat_response):
         mock_client.ai.create_completion.return_value = {"status": "success"}
+        mock_submit.return_value = {"status": "success"}
 
         with patch.object(Client, '_request', return_value=mock_ollama_chat_response):
             with patch('revenium_middleware._core.fields.logger') as mock_logger:
@@ -59,14 +61,14 @@ class TestLegacyFieldNames:
                 time.sleep(0.2)
 
                 assert _find_deprecation_warning(mock_logger, 'organization_id')
-
-                assert mock_client.ai.create_completion.called
-                call_args = mock_client.ai.create_completion.call_args[1]
-                assert call_args['organization_name'] == 'legacy-org-snake'
+                assert mock_submit.called
+                assert mock_submit.call_args[0][1]['organization_name'] == 'legacy-org-snake'
 
     @patch('revenium_middleware.ollama.middleware.client')
-    def test_legacy_product_id_camelcase(self, mock_client, mock_ollama_chat_response):
+    @patch('revenium_middleware.ollama.middleware.submit_ai_event')
+    def test_legacy_product_id_camelcase(self, mock_submit, mock_client, mock_ollama_chat_response):
         mock_client.ai.create_completion.return_value = {"status": "success"}
+        mock_submit.return_value = {"status": "success"}
 
         with patch.object(Client, '_request', return_value=mock_ollama_chat_response):
             with patch('revenium_middleware._core.fields.logger') as mock_logger:
@@ -82,14 +84,14 @@ class TestLegacyFieldNames:
                 time.sleep(0.2)
 
                 assert _find_deprecation_warning(mock_logger, 'productId')
-
-                assert mock_client.ai.create_completion.called
-                call_args = mock_client.ai.create_completion.call_args[1]
-                assert call_args['product_name'] == 'legacy-product-camel'
+                assert mock_submit.called
+                assert mock_submit.call_args[0][1]['product_name'] == 'legacy-product-camel'
 
     @patch('revenium_middleware.ollama.middleware.client')
-    def test_legacy_product_id_snakecase(self, mock_client, mock_ollama_chat_response):
+    @patch('revenium_middleware.ollama.middleware.submit_ai_event')
+    def test_legacy_product_id_snakecase(self, mock_submit, mock_client, mock_ollama_chat_response):
         mock_client.ai.create_completion.return_value = {"status": "success"}
+        mock_submit.return_value = {"status": "success"}
 
         with patch.object(Client, '_request', return_value=mock_ollama_chat_response):
             with patch('revenium_middleware._core.fields.logger') as mock_logger:
@@ -105,14 +107,14 @@ class TestLegacyFieldNames:
                 time.sleep(0.2)
 
                 assert _find_deprecation_warning(mock_logger, 'product_id')
-
-                assert mock_client.ai.create_completion.called
-                call_args = mock_client.ai.create_completion.call_args[1]
-                assert call_args['product_name'] == 'legacy-product-snake'
+                assert mock_submit.called
+                assert mock_submit.call_args[0][1]['product_name'] == 'legacy-product-snake'
 
     @patch('revenium_middleware.ollama.middleware.client')
-    def test_new_fields_take_precedence_over_legacy(self, mock_client, mock_ollama_chat_response):
+    @patch('revenium_middleware.ollama.middleware.submit_ai_event')
+    def test_new_fields_take_precedence_over_legacy(self, mock_submit, mock_client, mock_ollama_chat_response):
         mock_client.ai.create_completion.return_value = {"status": "success"}
+        mock_submit.return_value = {"status": "success"}
 
         with patch.object(Client, '_request', return_value=mock_ollama_chat_response):
             with patch('revenium_middleware._core.fields.logger') as mock_logger:
@@ -131,8 +133,6 @@ class TestLegacyFieldNames:
 
                 assert not _find_deprecation_warning(mock_logger, 'organizationId')
                 assert not _find_deprecation_warning(mock_logger, 'productId')
-
-                assert mock_client.ai.create_completion.called
-                call_args = mock_client.ai.create_completion.call_args[1]
-                assert call_args['organization_name'] == 'new-org'
-                assert call_args['product_name'] == 'new-product'
+                assert mock_submit.called
+                assert mock_submit.call_args[0][1]['organization_name'] == 'new-org'
+                assert mock_submit.call_args[0][1]['product_name'] == 'new-product'

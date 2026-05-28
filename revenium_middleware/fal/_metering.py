@@ -11,6 +11,7 @@ import uuid
 from typing import Any, Dict
 
 from revenium_middleware import client, run_async_in_thread, shutdown_event
+from revenium_middleware._core import submit_ai_event
 from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
 from revenium_middleware._core.fields import (
     extract_field_with_fallback as _core_extract_field_with_fallback,
@@ -291,52 +292,56 @@ def handle_metering(
 
             if media_type == "image":
                 image_fields = extract_image_fields(result, arguments)
-                metering_result = client.ai.create_image(
+                image_args = {
                     **common,
-                    requested_image_count=image_fields.get("requested_image_count", 1),
-                    actual_image_count=image_fields.get("actual_image_count", 1),
-                    resolution=image_fields.get("resolution"),
-                    quality=image_fields.get("quality"),
-                    aspect_ratio=image_fields.get("aspect_ratio"),
-                    operation_subtype="generation",
-                    extra_body=extra_body,
-                )
+                    "requested_image_count": image_fields.get("requested_image_count", 1),
+                    "actual_image_count": image_fields.get("actual_image_count", 1),
+                    "resolution": image_fields.get("resolution"),
+                    "quality": image_fields.get("quality"),
+                    "aspect_ratio": image_fields.get("aspect_ratio"),
+                    "operation_subtype": "generation",
+                    "extra_body": extra_body,
+                }
+                metering_result = submit_ai_event("image", image_args)
             elif media_type == "video":
                 video_fields = extract_video_fields(result, arguments)
-                metering_result = client.ai.create_video(
+                video_args = {
                     **common,
-                    duration_seconds=video_fields.get("duration_seconds", 0.0),
-                    requested_duration_seconds=video_fields.get("requested_duration_seconds"),
-                    resolution=video_fields.get("resolution"),
-                    fps=video_fields.get("fps"),
-                    aspect_ratio=video_fields.get("aspect_ratio"),
-                    operation_subtype="generation",
-                    extra_body=extra_body,
-                )
+                    "duration_seconds": video_fields.get("duration_seconds", 0.0),
+                    "requested_duration_seconds": video_fields.get("requested_duration_seconds"),
+                    "resolution": video_fields.get("resolution"),
+                    "fps": video_fields.get("fps"),
+                    "aspect_ratio": video_fields.get("aspect_ratio"),
+                    "operation_subtype": "generation",
+                    "extra_body": extra_body,
+                }
+                metering_result = submit_ai_event("video", video_args)
             elif media_type == "audio":
                 audio_fields = extract_audio_fields(result, arguments)
-                metering_result = client.ai.create_audio(
+                audio_args = {
                     **common,
-                    duration_seconds=audio_fields.get("duration_seconds"),
-                    character_count=audio_fields.get("character_count"),
-                    operation_subtype=audio_fields.get("operation_subtype"),
-                    extra_body=extra_body,
-                )
+                    "duration_seconds": audio_fields.get("duration_seconds"),
+                    "character_count": audio_fields.get("character_count"),
+                    "operation_subtype": audio_fields.get("operation_subtype"),
+                    "extra_body": extra_body,
+                }
+                metering_result = submit_ai_event("audio", audio_args)
             else:
-                metering_result = client.ai.create_completion(
+                completion_args = {
                     **common,
-                    input_token_count=0,
-                    output_token_count=1,
-                    total_token_count=1,
-                    cost_type="AI",
-                    stop_reason="END",
-                    is_streamed=is_streamed,
-                    completion_start_time=common["response_time"],
-                    reasoning_token_count=0,
-                    cache_creation_token_count=0,
-                    cache_read_token_count=0,
-                    extra_body=extra_body,
-                )
+                    "input_token_count": 0,
+                    "output_token_count": 1,
+                    "total_token_count": 1,
+                    "cost_type": "AI",
+                    "stop_reason": "END",
+                    "is_streamed": is_streamed,
+                    "completion_start_time": common["response_time"],
+                    "reasoning_token_count": 0,
+                    "cache_creation_token_count": 0,
+                    "cache_read_token_count": 0,
+                    "extra_body": extra_body,
+                }
+                metering_result = submit_ai_event("completion", completion_args)
 
             logger.debug("Metering call result: %s", metering_result)
 

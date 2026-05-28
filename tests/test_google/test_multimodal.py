@@ -331,15 +331,16 @@ class TestVideoMeteringCall:
 class TestLogImageUsage:
     """Test the async log_image_usage function."""
 
+    @patch("revenium_middleware._core.metering_submission.client")
     @patch("revenium_middleware.google.common.utils.client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
-    def test_log_image_usage_calls_create_image(self, mock_shutdown, mock_client):
+    def test_log_image_usage_calls_create_image(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_image_usage
 
         mock_shutdown.is_set.return_value = False
         mock_result = Mock()
         mock_result.id = "img-result-123"
-        mock_client.ai.create_image.return_value = mock_result
+        mock_metering_client.ai.create_image.return_value = mock_result
 
         asyncio.run(log_image_usage(
             transaction_id="txn-img-001",
@@ -352,8 +353,8 @@ class TestLogImageUsage:
             usage_metadata={"trace_id": "test-trace"},
         ))
 
-        mock_client.ai.create_image.assert_called_once()
-        call_kwargs = mock_client.ai.create_image.call_args[1]
+        mock_metering_client.ai.create_image.assert_called_once()
+        call_kwargs = mock_metering_client.ai.create_image.call_args[1]
         assert call_kwargs["model"] == "imagen-3.0-generate-001"
         assert call_kwargs["provider"] == "Google"
         assert call_kwargs["requested_image_count"] == 1
@@ -362,9 +363,10 @@ class TestLogImageUsage:
         assert call_kwargs["middleware_source"] == "python"
         assert call_kwargs["trace_id"] == "test-trace"
 
+    @patch("revenium_middleware._core.metering_submission.client")
     @patch("revenium_middleware.google.common.utils.client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
-    def test_log_image_usage_skips_during_shutdown(self, mock_shutdown, mock_client):
+    def test_log_image_usage_skips_during_shutdown(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_image_usage
 
         mock_shutdown.is_set.return_value = True
@@ -380,17 +382,18 @@ class TestLogImageUsage:
             usage_metadata={},
         ))
 
-        mock_client.ai.create_image.assert_not_called()
+        mock_metering_client.ai.create_image.assert_not_called()
 
+    @patch("revenium_middleware._core.metering_submission.client")
     @patch("revenium_middleware.google.common.utils.client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
-    def test_log_image_usage_passes_aspect_ratio(self, mock_shutdown, mock_client):
+    def test_log_image_usage_passes_aspect_ratio(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_image_usage
 
         mock_shutdown.is_set.return_value = False
         mock_result = Mock()
         mock_result.id = "img-result-ar"
-        mock_client.ai.create_image.return_value = mock_result
+        mock_metering_client.ai.create_image.return_value = mock_result
 
         asyncio.run(log_image_usage(
             transaction_id="txn-img-ar",
@@ -404,7 +407,7 @@ class TestLogImageUsage:
             aspect_ratio="16:9",
         ))
 
-        call_kwargs = mock_client.ai.create_image.call_args[1]
+        call_kwargs = mock_metering_client.ai.create_image.call_args[1]
         assert call_kwargs["aspect_ratio"] == "16:9"
 
 
@@ -414,15 +417,16 @@ class TestLogImageUsage:
 class TestLogVideoUsage:
     """Test the async log_video_usage function."""
 
+    @patch("revenium_middleware._core.metering_submission.client")
     @patch("revenium_middleware.google.common.utils.client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
-    def test_log_video_usage_calls_create_video(self, mock_shutdown, mock_client):
+    def test_log_video_usage_calls_create_video(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_video_usage
 
         mock_shutdown.is_set.return_value = False
         mock_result = Mock()
         mock_result.id = "vid-result-456"
-        mock_client.ai.create_video.return_value = mock_result
+        mock_metering_client.ai.create_video.return_value = mock_result
 
         asyncio.run(log_video_usage(
             transaction_id="txn-vid-001",
@@ -438,8 +442,8 @@ class TestLogVideoUsage:
             async_operation=True,
         ))
 
-        mock_client.ai.create_video.assert_called_once()
-        call_kwargs = mock_client.ai.create_video.call_args[1]
+        mock_metering_client.ai.create_video.assert_called_once()
+        call_kwargs = mock_metering_client.ai.create_video.call_args[1]
         assert call_kwargs["model"] == "veo-2.0-generate-001"
         assert call_kwargs["provider"] == "Google"
         assert call_kwargs["duration_seconds"] == 8.0
@@ -450,9 +454,10 @@ class TestLogVideoUsage:
         assert call_kwargs["async_operation"] is True
         assert call_kwargs["trace_id"] == "vid-trace"
 
+    @patch("revenium_middleware._core.metering_submission.client")
     @patch("revenium_middleware.google.common.utils.client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
-    def test_log_video_usage_skips_during_shutdown(self, mock_shutdown, mock_client):
+    def test_log_video_usage_skips_during_shutdown(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_video_usage
 
         mock_shutdown.is_set.return_value = True
@@ -467,17 +472,18 @@ class TestLogVideoUsage:
             usage_metadata={},
         ))
 
-        mock_client.ai.create_video.assert_not_called()
+        mock_metering_client.ai.create_video.assert_not_called()
 
+    @patch("revenium_middleware._core.metering_submission.client")
     @patch("revenium_middleware.google.common.utils.client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
-    def test_log_video_usage_passes_aspect_ratio(self, mock_shutdown, mock_client):
+    def test_log_video_usage_passes_aspect_ratio(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_video_usage
 
         mock_shutdown.is_set.return_value = False
         mock_result = Mock()
         mock_result.id = "vid-result-ar"
-        mock_client.ai.create_video.return_value = mock_result
+        mock_metering_client.ai.create_video.return_value = mock_result
 
         asyncio.run(log_video_usage(
             transaction_id="txn-vid-ar",
@@ -490,7 +496,7 @@ class TestLogVideoUsage:
             aspect_ratio="9:16",
         ))
 
-        call_kwargs = mock_client.ai.create_video.call_args[1]
+        call_kwargs = mock_metering_client.ai.create_video.call_args[1]
         assert call_kwargs["aspect_ratio"] == "9:16"
 
 
@@ -500,15 +506,16 @@ class TestLogVideoUsage:
 class TestHasVisionContentFlag:
     """Test that has_vision_content flag is passed through to completion args."""
 
+    @patch("revenium_middleware._core.metering_submission.client")
     @patch("revenium_middleware.google.common.utils.client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
-    def test_has_vision_content_in_completion_args(self, mock_shutdown, mock_client):
+    def test_has_vision_content_in_completion_args(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_token_usage
 
         mock_shutdown.is_set.return_value = False
         mock_result = Mock()
         mock_result.id = "test-result"
-        mock_client.ai.create_completion.return_value = mock_result
+        mock_metering_client.ai.create_completion.return_value = mock_result
 
         asyncio.run(log_token_usage(
             transaction_id="txn-vision-001",
@@ -524,19 +531,20 @@ class TestHasVisionContentFlag:
             usage_metadata={"has_vision_content": True},
         ))
 
-        mock_client.ai.create_completion.assert_called_once()
-        call_kwargs = mock_client.ai.create_completion.call_args[1]
+        mock_metering_client.ai.create_completion.assert_called_once()
+        call_kwargs = mock_metering_client.ai.create_completion.call_args[1]
         assert call_kwargs.get("has_vision_content") is True
 
+    @patch("revenium_middleware._core.metering_submission.client")
     @patch("revenium_middleware.google.common.utils.client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
-    def test_no_vision_content_flag_when_not_set(self, mock_shutdown, mock_client):
+    def test_no_vision_content_flag_when_not_set(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_token_usage
 
         mock_shutdown.is_set.return_value = False
         mock_result = Mock()
         mock_result.id = "test-result"
-        mock_client.ai.create_completion.return_value = mock_result
+        mock_metering_client.ai.create_completion.return_value = mock_result
 
         asyncio.run(log_token_usage(
             transaction_id="txn-text-001",
@@ -552,7 +560,7 @@ class TestHasVisionContentFlag:
             usage_metadata={},
         ))
 
-        call_kwargs = mock_client.ai.create_completion.call_args[1]
+        call_kwargs = mock_metering_client.ai.create_completion.call_args[1]
         assert "has_vision_content" not in call_kwargs
 
 

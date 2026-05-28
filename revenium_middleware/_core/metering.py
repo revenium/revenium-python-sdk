@@ -3,6 +3,7 @@ import time
 import logging
 import asyncio
 import threading
+import contextvars
 import atexit
 import signal
 from typing import Literal, Awaitable, Any, Optional, Callable
@@ -116,11 +117,12 @@ else:
 
 
 class MeteringThread(threading.Thread):
-    def __init__(self, coro, *args, **kwargs):
+    def __init__(self, coro, *args, ctx: Optional[contextvars.Context] = None, **kwargs):
         # Default to non-daemon threads so atexit handlers wait for them
         daemon = kwargs.pop('daemon', False)
         super().__init__(*args, **kwargs)
         self.coro = coro
+        self.ctx = ctx
         self.daemon = daemon # Store daemon status
         self.error = None
         self.loop = None
@@ -144,8 +146,11 @@ class MeteringThread(threading.Thread):
             asyncio.set_event_loop(self.loop)
             logger.debug(f"Metering thread {self.name} started with loop {id(self.loop)}")
             try:
-                # Run the coroutine until it completes
-                self.loop.run_until_complete(self.coro)
+                # Run the coroutine until it completes, inside the captured context if available
+                if self.ctx is not None:
+                    self.ctx.run(self.loop.run_until_complete, self.coro)
+                else:
+                    self.loop.run_until_complete(self.coro)
             finally:
                 # Ensure async generators are properly shut down
                 logger.debug(f"Shutting down async generators for loop {id(self.loop)} in thread {self.name}")
@@ -210,9 +215,13 @@ def run_async_in_thread(coroutine_or_func):
          return None
 
 
+    # Capture the current context so contextvars (e.g. idempotency_key) propagate
+    # into the worker thread, which otherwise starts with an empty context.
+    ctx = contextvars.copy_context()
+
     # Create and start the thread
     # Pass daemon=False explicitly if that's the desired default
-    thread = MeteringThread(coro, daemon=False)
+    thread = MeteringThread(coro, ctx=ctx, daemon=False)
     with _threads_lock:
         active_threads.append(thread)
     logger.debug(f"Starting and adding thread {thread.name} to active list.")

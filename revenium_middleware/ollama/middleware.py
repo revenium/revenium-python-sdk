@@ -6,6 +6,7 @@ import types
 logger = logging.getLogger("revenium_middleware.extension")
 
 from revenium_middleware import client, run_async_in_thread, shutdown_event, merge_metadata
+from revenium_middleware._core import submit_ai_event
 from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
 from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, merge_extra_body
 from revenium_middleware._core.config import is_selective_metering_enabled
@@ -296,7 +297,7 @@ def handle_response(
 
             logger.debug("Arguments for create_completion: %s", completion_args)
 
-            result = client.ai.create_completion(**completion_args)
+            result = submit_ai_event("completion", completion_args)
             logger.debug("Metering call result: %s", result)
         except Exception as e:
             if not shutdown_event.is_set():
@@ -426,7 +427,7 @@ def handle_embeddings_response(
 
             logger.debug("Arguments for create_completion: %s", completion_args)
 
-            result = client.ai.create_completion(**completion_args)
+            result = submit_ai_event("completion", completion_args)
             logger.debug("Metering call result: %s", result)
         except Exception as e:
             if not shutdown_event.is_set():
