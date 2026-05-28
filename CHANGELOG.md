@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7] - 2026-05-28
+
+### Added
+- HMAC webhook verification helper (`revenium_middleware.webhooks.verify_signature`) for verifying webhook payloads signed by Revenium. Supports secret rotation by accepting multiple secrets, multiple signatures per request (RFC 7230 multi-value headers), configurable timestamp tolerance, and case-insensitive hex comparison. README includes a FastAPI verification example.
+- Automatic `Idempotency-Key` generation for AI metering submissions. Duplicate retries of the same metered event are now safely deduplicated by the Revenium backend without any caller-side work. Callers can still override the key explicitly via the new `idempotency_key` context manager when they need to control the value (for example, to tie metering to an upstream request id).
+
+### Changed
+- All provider integrations (OpenAI, Anthropic, Google, Ollama, LiteLLM, Perplexity, fal.ai) now submit metered AI events through a single shared `submit_ai_event` wrapper. This unifies idempotency-key handling across providers and makes future header-level changes a single-point edit.
+- `Idempotency-Key` is also inlined on the per-instance metering client used by the agentic-outcomes API, so outcomes submissions get the same dedup semantics as completion metering.
+
+### Security
+- `verify_signature` now rejects empty-string secrets at the type guard. An empty secret would otherwise be used as a zero-byte HMAC key, which any caller could forge against trivially. Configuration mistakes that produce empty secrets now fail closed.
+
+### Fixed
+- `MeteringThread` now correctly propagates Python `contextvars` from the calling thread, so metadata set via `set_idempotency_key`, decorators, or context managers reaches the background metering worker reliably.
+- `set_idempotency_key('')` and an empty `idempotency_key=` argument now raise `ValueError` instead of silently bypassing dedup. An `Idempotency-Key` passed through `extra_headers` is similarly rejected to avoid two competing sources of truth.
+- The `Idempotency-Key` header guard in `submit_ai_event` is now case-insensitive, so callers passing alternate casings (e.g. `idempotency-key`) through `extra_headers` still hit the guard rather than silently shadowing the wrapper's value.
+- Deprecated-field log warnings (`organizationId` / `productId` aliases) are now deduplicated per field pair so high-volume applications using legacy aliases no longer get a `logger.warning` flood on every call.
+
 ## [0.1.6] - 2026-05-22
 
 ### Removed

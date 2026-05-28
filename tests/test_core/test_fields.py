@@ -1,5 +1,4 @@
 import logging
-import warnings
 
 import pytest
 
@@ -8,7 +7,6 @@ from revenium_middleware._core.fields import (
     extract_common_metadata,
     extract_field_with_fallback,
     extract_org_and_product,
-    extract_organization_name,
     extract_with_aliases,
     merge_extra_body,
 )
@@ -85,16 +83,49 @@ class TestExtractFieldWithFallback:
             self._call(source)
         assert "deprecated" not in caplog.text.lower()
 
-    def test_deprecation_warning_emitted_once_per_field_pair(self):
-        # The conftest autouse fixture clears the gate; calling the deprecated
-        # path twice should produce exactly one DeprecationWarning.
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            extract_organization_name({"organizationId": "x"})
-            extract_organization_name({"organizationId": "y"})
-        deprecation_warnings = [w for w in caught if issubclass(w.category, DeprecationWarning)]
-        assert len(deprecation_warnings) == 1
-        assert "organizationId" in str(deprecation_warnings[0].message)
+    def test_logger_warning_dedups_per_field_pair(self, caplog):
+        """logger.warning has no built-in dedup; the module gates it on a (old, new) pair
+        so high-volume callers using deprecated aliases don't get a log flood per call."""
+        source = {"organizationId": "old"}
+        with caplog.at_level(logging.WARNING):
+            self._call(source)
+            self._call(source)
+            self._call(source)
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING and "deprecated" in r.getMessage().lower()]
+        assert len(warning_records) == 1
+
+    def test_logger_warning_dedup_is_per_pair_not_global(self, caplog):
+        """Different deprecated-field pairs each get one warning; the dedup is keyed by pair."""
+        with caplog.at_level(logging.WARNING):
+            self._call({"organizationId": "org"})
+            self._call({"productId": "prod"}, new_snake="product_name", new_camel="productName",
+                       old_snake="product_id", old_camel="productId", field_label="product")
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING and "deprecated" in r.getMessage().lower()]
+        assert len(warning_records) == 2
+
+    def test_logger_warning_dedup_is_thread_safe(self, caplog):
+        """Many threads racing on the same first-call must produce at most one logger.warning.
+        Without a lock around the check-then-add, concurrent threads could all see "not present"
+        and emit duplicate startup lines before the set converges."""
+        import threading
+
+        source = {"organizationId": "old"}
+        thread_count = 32
+        barrier = threading.Barrier(thread_count)
+
+        def worker():
+            barrier.wait()
+            self._call(source)
+
+        with caplog.at_level(logging.WARNING):
+            threads = [threading.Thread(target=worker) for _ in range(thread_count)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING and "deprecated" in r.getMessage().lower()]
+        assert len(warning_records) == 1
 
 
 class TestExtractWithAliases:

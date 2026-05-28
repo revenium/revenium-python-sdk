@@ -39,7 +39,12 @@ The example scripts wrap this in a simulation engine — configurable timing, fa
 
 ## Run from the command line
 
+The scenario scripts (`sales.py`, `coding.py`, `support.py`) ship in this repo, not on PyPI. Clone the repo first, install the SDK, and run from inside `examples/agentic_outcomes/`:
+
 ```bash
+git clone https://github.com/revenium/revenium-python-sdk.git
+cd revenium-python-sdk/examples/agentic_outcomes
+
 pip install revenium-python-sdk
 
 export REVENIUM_API_KEY=rev_sk_...
