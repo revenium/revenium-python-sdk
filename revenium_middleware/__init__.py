@@ -151,6 +151,9 @@ from ._core import (  # noqa: E402
     set_injected_metadata,
     clear_injected_metadata,
     merge_metadata,
+    idempotency_key,
+    get_idempotency_key,
+    set_idempotency_key,
     is_selective_metering_enabled,
 )
 
@@ -178,6 +181,9 @@ __all__ = [
     "set_injected_metadata",
     "clear_injected_metadata",
     "merge_metadata",
+    "idempotency_key",
+    "get_idempotency_key",
+    "set_idempotency_key",
     # Config exports
     "is_selective_metering_enabled",
     # Tool metering exports (from revenium_metering)

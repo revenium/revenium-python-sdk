@@ -18,6 +18,7 @@ from revenium_middleware import (
     shutdown_event,
     merge_metadata,
 )
+from revenium_middleware._core import submit_ai_event
 from revenium_middleware._core.config import is_selective_metering_enabled
 from revenium_middleware._core.context import is_inside_decorated_function
 from revenium_middleware._core.patch_registry import register_patch
@@ -259,7 +260,7 @@ def send_metering_data(
                 completion_args["extra_body"] = extra_body
 
             logger.debug(f"Sending metering data: {completion_args}")
-            result = client.ai.create_completion(**completion_args)
+            result = submit_ai_event("completion", completion_args)
             logger.debug(f"Metering call result: {result}")
 
         except Exception as e:

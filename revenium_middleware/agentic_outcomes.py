@@ -16,6 +16,7 @@ import logging
 import threading
 import time
 import urllib.parse
+import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -175,6 +176,8 @@ class AgenticOutcomeClient:
             prompts_truncated=payload.get("promptsTruncated"),
             error_reason=payload.get("errorReason"),
             extra_body=extra_body or None,
+            # Per-instance client; idempotency key generated inline (see FRONT-1208 spec exception).
+            extra_headers={"Idempotency-Key": str(uuid.uuid4())},
         )
         return payload
 

@@ -1,6 +1,7 @@
 from litellm.integrations.custom_logger import CustomLogger
 from revenium_middleware import client, run_async_in_thread
 from revenium_middleware._core.fields import merge_extra_body
+from revenium_middleware._core import submit_ai_event
 import logging
 
 logger = logging.getLogger("revenium_middleware.extension")
@@ -131,7 +132,7 @@ class MiddlewareHandler(CustomLogger):
 
         async def metering_call():
             try:
-                result = client.ai.create_completion(**completion_args, extra_body=extra_body)
+                result = submit_ai_event("completion", {**completion_args, "extra_body": extra_body})
                 logger.debug("Proxy metering call result: %s", result)
             except Exception as e:
                 logger.warning("Proxy metering call failed: %s", e)
@@ -224,7 +225,7 @@ class MiddlewareHandler(CustomLogger):
 
         async def metering_call():
             try:
-                result = client.ai.create_completion(**completion_args, extra_body=extra_body)
+                result = submit_ai_event("completion", {**completion_args, "extra_body": extra_body})
                 logger.debug("Result from create_completion (failure): %s", result)
             except Exception as e:
                 logger.error("Error logging failure event: %s", e)

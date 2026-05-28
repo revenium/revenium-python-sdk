@@ -6,6 +6,7 @@ from revenium_middleware._core.subscriber import extract_subscriber_from_metadat
 from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, merge_extra_body
 from revenium_middleware._core.config import is_selective_metering_enabled
 from revenium_middleware._core.context import is_inside_decorated_function
+from revenium_middleware._core import submit_ai_event
 from revenium_middleware._core.patch_registry import register_patch
 from .context import metadata_context
 from .hooks import execute_metadata_hooks
@@ -239,7 +240,7 @@ def handle_response(response, request_time_dt, usage_metadata, is_streaming):
             logger.debug("Calling client.ai.create_completion with args: %s", completion_args)
 
             # The client.ai.create_completion method is not async, so don't use await
-            result = client.ai.create_completion(**completion_args, extra_body=extra_body)
+            result = submit_ai_event("completion", {**completion_args, "extra_body": extra_body})
             logger.debug("Metering call result: %s", result)
         except Exception as e:
             if not shutdown_event.is_set():

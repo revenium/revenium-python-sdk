@@ -12,6 +12,7 @@ import uuid
 from typing import Dict, Any, Optional
 
 from revenium_middleware import client, run_async_in_thread, shutdown_event
+from revenium_middleware._core import submit_ai_event
 from revenium_middleware._core.fields import (
     extract_field_with_fallback as _core_extract_field_with_fallback,
     extract_org_and_product,
@@ -328,7 +329,7 @@ async def log_token_usage(
     )
 
     try:
-        result = client.ai.create_completion(**completion_args)
+        result = submit_ai_event("completion", completion_args)
         logger.debug("Metering call result: %s", result)
         logger.info(" REVENIUM SUCCESS: Metering call successful: %s", result.id)
     except Exception as e:
@@ -613,7 +614,7 @@ async def log_image_usage(
     logger.debug("Calling client.ai.create_image with args: %s", image_args)
 
     try:
-        result = client.ai.create_image(**image_args)
+        result = submit_ai_event("image", image_args)
         logger.debug("Image metering call result: %s", result)
         logger.info(" REVENIUM SUCCESS: Image metering call successful: %s", result.id)
     except Exception as e:
@@ -718,7 +719,7 @@ async def log_video_usage(
     logger.debug("Calling client.ai.create_video with args: %s", video_args)
 
     try:
-        result = client.ai.create_video(**video_args)
+        result = submit_ai_event("video", video_args)
         logger.debug("Video metering call result: %s", result)
         logger.info(" REVENIUM SUCCESS: Video metering call successful: %s", result.id)
     except Exception as e:

@@ -14,6 +14,7 @@ from revenium_middleware._core.fields import extract_org_and_product, extract_co
 from revenium_middleware._core.config import is_selective_metering_enabled, is_capture_prompts_enabled
 from revenium_middleware._core.context import is_inside_decorated_function
 from revenium_middleware._core.patch_registry import register_patch
+from revenium_middleware._core import submit_ai_event
 
 # Azure OpenAI support imports
 from .provider import Provider, detect_provider, get_provider_metadata, is_azure_provider
@@ -495,7 +496,7 @@ async def log_token_usage(
 
     try:
         # The client.ai.create_completion method is not async, so don't use await
-        result = client.ai.create_completion(**completion_args)
+        result = submit_ai_event("completion", completion_args)
         logger.debug("Metering call result: %s", result)
         logger.debug(f"✅ REVENIUM SUCCESS: Metering call successful: {result.id}")
     except Exception as e:
