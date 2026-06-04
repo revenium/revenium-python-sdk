@@ -165,14 +165,16 @@ def _handle_bedrock_request(args, kwargs, usage_metadata, request_time_dt, reque
     payload = create_bedrock_payload(messages, **bedrock_kwargs)
 
     # Invoke Bedrock
-    text, input_tokens, output_tokens = bedrock_invoke(model, payload)
+    text, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens = bedrock_invoke(model, payload)
 
     # Create Anthropic-compatible response
     response = create_anthropic_response(
         text=text,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
-        model=model
+        model=model,
+        cache_creation_tokens=cache_creation_tokens,
+        cache_read_tokens=cache_read_tokens
     )
 
     # Calculate timing
@@ -182,7 +184,8 @@ def _handle_bedrock_request(args, kwargs, usage_metadata, request_time_dt, reque
 
     # Create metering call for Bedrock (pass kwargs for vision detection)
     _create_bedrock_metering_call(
-        response, usage_metadata, request_time, response_time, request_duration, kwargs
+        response, usage_metadata, request_time, response_time, request_duration, kwargs,
+        cache_creation_tokens=cache_creation_tokens, cache_read_tokens=cache_read_tokens
     )
 
     return response
@@ -288,7 +291,7 @@ def _extract_trace_fields(usage_metadata, request_body=None):
     }
 
 
-def _create_bedrock_metering_call(response, usage_metadata, request_time, response_time, request_duration, request_kwargs=None):
+def _create_bedrock_metering_call(response, usage_metadata, request_time, response_time, request_duration, request_kwargs=None, cache_creation_tokens=0, cache_read_tokens=0):
     """Create a metering call for Bedrock usage."""
 
     # Get provider metadata
@@ -336,8 +339,8 @@ def _create_bedrock_metering_call(response, usage_metadata, request_time, respon
             meta = extract_common_metadata(usage_metadata)
 
             result = submit_ai_event("completion", {
-                "cache_creation_token_count": 0,
-                "cache_read_token_count": 0,
+                "cache_creation_token_count": cache_creation_tokens,
+                "cache_read_token_count": cache_read_tokens,
                 "input_token_cost": None,
                 "output_token_cost": None,
                 "total_cost": None,

@@ -169,7 +169,74 @@ def _model_id(model_name: str) -> str:
     return _MODEL_MAP.get(model_name, f"anthropic.{model_name}")
 
 
-def bedrock_invoke(model: str, payload: dict, region: Optional[str] = None) -> Tuple[str, int, int]:
+def _as_dict(value: Any) -> dict:
+    """Return value when it is a dict, otherwise an empty dict."""
+    return value if isinstance(value, dict) else {}
+
+
+def _token_count(value: Any) -> Optional[int]:
+    """Return a non-negative integer token count, or None for invalid values."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
+def _first_token_count(source: Any, keys: Tuple[str, ...]) -> Optional[int]:
+    """Return the first valid token count for any of the supplied keys."""
+    source = _as_dict(source)
+    for key in keys:
+        if key in source:
+            value = _token_count(source.get(key))
+            if value is not None:
+                return value
+    return None
+
+
+def _extract_cache_tokens(usage: Any) -> Tuple[Optional[int], Optional[int]]:
+    """Return (cache_creation_tokens, cache_read_tokens) from a Bedrock usage dict."""
+    cache_creation = _first_token_count(
+        usage,
+        (
+            "cacheWriteInputTokensCount",
+            "cacheWriteInputTokens",
+            "cache_write_input_tokens_count",
+            "cache_write_input_tokens",
+            "cache_creation_input_tokens_count",
+            "cache_creation_input_tokens",
+        )
+    )
+    cache_read = _first_token_count(
+        usage,
+        (
+            "cacheReadInputTokensCount",
+            "cacheReadInputTokens",
+            "cache_read_input_tokens_count",
+            "cache_read_input_tokens",
+        )
+    )
+    return cache_creation, cache_read
+
+
+def _extract_token_counts(usage: Any, metrics: Optional[Any] = None) -> Tuple[Optional[int], Optional[int]]:
+    """Return (input_tokens, output_tokens) from Bedrock usage and metrics blocks."""
+    usage = _as_dict(usage)
+    metrics = _as_dict(metrics)
+    input_tokens = _first_token_count(usage, ("inputTokens", "input_tokens", "prompt_tokens"))
+    if input_tokens is None:
+        input_tokens = _first_token_count(metrics, ("inputTokenCount",))
+
+    output_tokens = _first_token_count(usage, ("outputTokens", "output_tokens", "completion_tokens"))
+    if output_tokens is None:
+        output_tokens = _first_token_count(metrics, ("outputTokenCount",))
+
+    return input_tokens, output_tokens
+
+
+def bedrock_invoke(model: str, payload: dict, region: Optional[str] = None) -> Tuple[str, int, int, int, int]:
     """
     Invoke Bedrock model with Anthropic-compatible parameters.
 
@@ -179,7 +246,7 @@ def bedrock_invoke(model: str, payload: dict, region: Optional[str] = None) -> T
         region: AWS region (defaults to AWS_REGION env var or us-east-1)
 
     Returns:
-        Tuple of (text_content, input_tokens, output_tokens)
+        Tuple of (text_content, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens)
 
     Raises:
         BedrockValidationError: For invalid input parameters
@@ -225,22 +292,15 @@ def bedrock_invoke(model: str, payload: dict, region: Optional[str] = None) -> T
             if c.get("type") == "text"
         )
 
-        # Try multiple token field formats to find the right one
-        input_tokens = usage.get("inputTokens", 0)  # camelCase (AWS standard)
-        output_tokens = usage.get("outputTokens", 0)
-
-        # Try snake_case if camelCase returns 0
-        if input_tokens == 0 and output_tokens == 0:
-            input_tokens = usage.get("input_tokens", 0)
-            output_tokens = usage.get("output_tokens", 0)
-
-        # Try other possible field names
-        if input_tokens == 0 and output_tokens == 0:
-            input_tokens = usage.get("prompt_tokens", 0)
-            output_tokens = usage.get("completion_tokens", 0)
+        input_tokens, output_tokens = _extract_token_counts(usage)
+        cache_creation_tokens, cache_read_tokens = _extract_cache_tokens(usage)
+        input_tokens = input_tokens if input_tokens is not None else 0
+        output_tokens = output_tokens if output_tokens is not None else 0
+        cache_creation_tokens = cache_creation_tokens if cache_creation_tokens is not None else 0
+        cache_read_tokens = cache_read_tokens if cache_read_tokens is not None else 0
 
         logger.debug(f"Bedrock invoke successful: {input_tokens} input tokens, {output_tokens} output tokens")
-        return text, input_tokens, output_tokens
+        return text, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens
 
     except BedrockValidationError:
         # Re-raise validation errors as-is
@@ -267,6 +327,8 @@ class BedrockStreamIterator:
         self.accumulated_text = ""
         self.input_tokens = 0
         self.output_tokens = 0
+        self.cache_creation_tokens = 0
+        self.cache_read_tokens = 0
         self._stream = None
         self._started = False
 
@@ -314,7 +376,17 @@ class BedrockStreamIterator:
     def _process_stream(self, stream):
         """Process the Bedrock stream and yield text chunks."""
         for event in stream:
-            chunk = event.get("chunk")
+            if not hasattr(event, "get"):
+                continue
+
+            metadata = _as_dict(event.get("metadata"))
+            if metadata:
+                self._update_usage_from_blocks(
+                    metadata.get("usage") or {},
+                    metadata.get("metrics") or {}
+                )
+
+            chunk = _as_dict(event.get("chunk"))
             if not chunk:
                 continue
 
@@ -324,13 +396,25 @@ class BedrockStreamIterator:
 
             try:
                 chunk_data = json.loads(chunk_bytes.decode("utf-8"))
+                if not isinstance(chunk_data, dict):
+                    continue
+
                 logger.debug(f"Bedrock stream chunk: {chunk_data}")
 
                 chunk_type = chunk_data.get("type")
+                usage = _as_dict(chunk_data.get("usage"))
+                metrics = _as_dict(chunk_data.get("amazon-bedrock-invocationMetrics"))
+                if usage or metrics:
+                    self._update_usage_from_blocks(usage, metrics)
+
+                if chunk_type == "message_start":
+                    message_usage = _as_dict(_as_dict(chunk_data.get("message")).get("usage"))
+                    if message_usage:
+                        self._update_usage_from_blocks(message_usage)
 
                 # Handle content block delta (text chunk)
                 if chunk_type == "content_block_delta":
-                    delta = chunk_data.get("delta", {})
+                    delta = _as_dict(chunk_data.get("delta"))
                     text = delta.get("text", "")
                     if text:
                         self.accumulated_text += text
@@ -338,27 +422,14 @@ class BedrockStreamIterator:
 
                 # Handle message stop (final message with usage)
                 elif chunk_type == "message_stop":
-                    # Check for usage in the chunk data
-                    usage = chunk_data.get("usage", {})
-                    # Also check for Amazon Bedrock invocation metrics
-                    metrics = chunk_data.get("amazon-bedrock-invocationMetrics", {})
-
-                    # Try multiple token field formats
-                    self.input_tokens = (
-                        usage.get("inputTokens", 0) or
-                        usage.get("input_tokens", 0) or
-                        metrics.get("inputTokenCount", 0)
-                    )
-                    self.output_tokens = (
-                        usage.get("outputTokens", 0) or
-                        usage.get("output_tokens", 0) or
-                        metrics.get("outputTokenCount", 0)
-                    )
-
                     logger.debug(f"Bedrock streaming completed. Input tokens: {self.input_tokens}, Output tokens: {self.output_tokens}")
 
+                # Handle message delta usage-only updates.
+                elif chunk_type == "message_delta":
+                    logger.debug("Bedrock stream: message_delta")
+
                 # Handle other chunk types (content_block_start, etc.)
-                elif chunk_type in ["content_block_start", "message_start"]:
+                elif chunk_type == "content_block_start":
                     logger.debug(f"Bedrock stream: {chunk_type}")
 
             except json.JSONDecodeError as e:
@@ -366,6 +437,22 @@ class BedrockStreamIterator:
                 continue
 
         logger.debug(f"Bedrock streaming finished. Total text length: {len(self.accumulated_text)}")
+
+    def _update_usage_from_blocks(self, usage: Any, metrics: Optional[Any] = None):
+        """Update token counters from a stream usage block without resetting missing fields."""
+        usage = _as_dict(usage)
+        metrics = _as_dict(metrics)
+        input_tokens, output_tokens = _extract_token_counts(usage, metrics)
+        if input_tokens is not None:
+            self.input_tokens = input_tokens
+        if output_tokens is not None:
+            self.output_tokens = output_tokens
+
+        cache_creation_tokens, cache_read_tokens = _extract_cache_tokens(usage)
+        if cache_creation_tokens is not None:
+            self.cache_creation_tokens = cache_creation_tokens
+        if cache_read_tokens is not None:
+            self.cache_read_tokens = cache_read_tokens
 
 
 def bedrock_invoke_stream(model: str, payload: dict, region: Optional[str] = None) -> BedrockStreamIterator:
@@ -451,7 +538,8 @@ def create_bedrock_payload(messages: Union[list, List[Dict[str, Any]]], **kwargs
 
 
 def create_anthropic_response(text: str, input_tokens: int, output_tokens: int,
-                            model: str, request_id: Optional[str] = None):
+                            model: str, request_id: Optional[str] = None,
+                            cache_creation_tokens: int = 0, cache_read_tokens: int = 0):
     """
     Create an Anthropic-compatible response object.
 
@@ -461,6 +549,8 @@ def create_anthropic_response(text: str, input_tokens: int, output_tokens: int,
         output_tokens: Number of output tokens
         model: Model name
         request_id: Optional request ID
+        cache_creation_tokens: Number of cache creation input tokens (default 0)
+        cache_read_tokens: Number of cache read input tokens (default 0)
 
     Returns:
         Object that mimics Anthropic's Message response structure with both
@@ -510,26 +600,25 @@ def create_anthropic_response(text: str, input_tokens: int, output_tokens: int,
             self.text = text
 
     class Usage(HybridAccessMixin):
-        def __init__(self, input_tokens, output_tokens):
+        def __init__(self, input_tokens, output_tokens, cache_creation_tokens=0, cache_read_tokens=0):
             self.input_tokens = input_tokens
             self.output_tokens = output_tokens
             self.total_tokens = input_tokens + output_tokens
-            # Add cache token attributes for compatibility
-            self.cache_creation_input_tokens = 0
-            self.cache_read_input_tokens = 0
+            self.cache_creation_input_tokens = cache_creation_tokens
+            self.cache_read_input_tokens = cache_read_tokens
 
     class Message(HybridAccessMixin):
-        def __init__(self, text, input_tokens, output_tokens, model, request_id):
+        def __init__(self, text, input_tokens, output_tokens, model, request_id, cache_creation_tokens=0, cache_read_tokens=0):
             self.id = request_id or _generate_safe_id("msg_bedrock", text)
             self.type = "message"
             self.role = "assistant"
             self.model = model
             self.content = [TextBlock(text)]
-            self.usage = Usage(input_tokens, output_tokens)
+            self.usage = Usage(input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens)
             self.stop_reason = "end_turn"
             self.stop_sequence = None
 
-    return Message(text, input_tokens, output_tokens, model, request_id)
+    return Message(text, input_tokens, output_tokens, model, request_id, cache_creation_tokens, cache_read_tokens)
 
 
 class BedrockStreamWrapper:
@@ -558,6 +647,8 @@ class BedrockStreamWrapper:
         self.first_token_time = None
         self.request_start_time = time.time() * 1000  # Convert to milliseconds
         self.accumulated_text = ""
+        self.cache_creation_tokens = 0
+        self.cache_read_tokens = 0
 
     def __enter__(self):
         """Enter the context manager and initialize the stream."""
@@ -635,6 +726,8 @@ class BedrockStreamWrapper:
         # Get token counts from the stream iterator
         input_tokens = getattr(self.stream_iterator, 'input_tokens', 0)
         output_tokens = getattr(self.stream_iterator, 'output_tokens', 0)
+        self.cache_creation_tokens = getattr(self.stream_iterator, 'cache_creation_tokens', 0)
+        self.cache_read_tokens = getattr(self.stream_iterator, 'cache_read_tokens', 0)
 
         # Generate a response ID
         self.response_id = _generate_safe_id("msg_bedrock_stream", self.accumulated_text)
@@ -645,7 +738,9 @@ class BedrockStreamWrapper:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             model=self.model,
-            request_id=self.response_id
+            request_id=self.response_id,
+            cache_creation_tokens=self.cache_creation_tokens,
+            cache_read_tokens=self.cache_read_tokens
         )
 
     def _send_metering_data(self, request_duration: float):
@@ -707,8 +802,8 @@ class BedrockStreamWrapper:
                     meta = extract_common_metadata(self.usage_metadata)
 
                     result = submit_ai_event("completion", {
-                        "cache_creation_token_count": 0,
-                        "cache_read_token_count": 0,
+                        "cache_creation_token_count": self.cache_creation_tokens,
+                        "cache_read_token_count": self.cache_read_tokens,
                         "input_token_cost": None,
                         "output_token_cost": None,
                         "total_cost": None,

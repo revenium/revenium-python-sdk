@@ -206,12 +206,12 @@ class TestBedrockRequestHandler:
     @patch('revenium_middleware.anthropic.middleware.create_bedrock_payload')
     @patch('revenium_middleware.anthropic.middleware.create_anthropic_response')
     @patch('revenium_middleware.anthropic.middleware._create_bedrock_metering_call')
-    def test_handle_bedrock_request(self, mock_metering, mock_create_response, 
+    def test_handle_bedrock_request(self, mock_metering, mock_create_response,
                                    mock_create_payload, mock_bedrock_invoke):
         """Test _handle_bedrock_request function."""
         # Setup mocks
         mock_create_payload.return_value = {"messages": [{"role": "user", "content": "Hello"}]}
-        mock_bedrock_invoke.return_value = ("Hello from Bedrock!", 10, 5)
+        mock_bedrock_invoke.return_value = ("Hello from Bedrock!", 10, 5, 0, 0)
         mock_response = {
             "id": "bedrock-123",
             "model": "claude-3-sonnet-20240229",
@@ -228,13 +228,13 @@ class TestBedrockRequestHandler:
             "max_tokens": 100
         }
         usage_metadata = {"trace_id": "test-trace", "organization_id": "anthropic-python-bedrock"}
-        
+
         import datetime
         request_time_dt = datetime.datetime.now(datetime.timezone.utc)
         request_time = request_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        
+
         result = _handle_bedrock_request(args, kwargs, usage_metadata, request_time_dt, request_time)
-        
+
         # Verify all functions were called correctly
         # The kwargs should exclude 'messages' when passed to create_bedrock_payload
         expected_kwargs = {k: v for k, v in kwargs.items() if k != "messages"}
@@ -244,12 +244,72 @@ class TestBedrockRequestHandler:
             text="Hello from Bedrock!",
             input_tokens=10,
             output_tokens=5,
-            model="claude-3-sonnet-20240229"
+            model="claude-3-sonnet-20240229",
+            cache_creation_tokens=0,
+            cache_read_tokens=0
         )
         mock_metering.assert_called_once()
-        
+
         # Verify response is returned
         assert result == mock_response
+
+    @patch('revenium_middleware.anthropic.middleware.bedrock_invoke')
+    @patch('revenium_middleware.anthropic.middleware.create_bedrock_payload')
+    @patch('revenium_middleware.anthropic.middleware.create_anthropic_response')
+    @patch('revenium_middleware.anthropic.middleware._safe_run_async_in_thread')
+    @patch('revenium_middleware.anthropic.middleware._get_thread_safe_client')
+    @patch('revenium_middleware.anthropic.middleware.submit_ai_event')
+    def test_cache_tokens_flow_to_submit_ai_event(
+        self, mock_submit, mock_get_client, mock_safe_run,
+        mock_create_response, mock_create_payload, mock_bedrock_invoke
+    ):
+        """Regression test: cache token counts from bedrock_invoke flow to submit_ai_event payload.
+
+        Reverting middleware.py:339-340 back to hardcoded 0 must cause this test to fail.
+        """
+        import asyncio
+        import datetime
+
+        # Return a 5-tuple with non-zero cache values
+        mock_bedrock_invoke.return_value = ("Hello!", 10, 5, 100, 50)
+        mock_create_payload.return_value = {"messages": [{"role": "user", "content": "Hello"}]}
+
+        mock_response = MagicMock()
+        mock_response.id = "bedrock-cache-test-123"
+        mock_response.model = "claude-3-sonnet-20240229"
+        mock_response.usage.input_tokens = 10
+        mock_response.usage.output_tokens = 5
+        mock_response.usage.total_tokens = 15
+        mock_create_response.return_value = mock_response
+
+        # Execute the metering coroutine synchronously so submit_ai_event is called before assertions
+        def run_coro_sync(*args):
+            asyncio.run(args[0]())
+            return MagicMock()
+
+        mock_safe_run.side_effect = run_coro_sync
+        mock_get_client.return_value = MagicMock()
+
+        args = ()
+        kwargs = {
+            "model": "claude-3-sonnet-20240229",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 100,
+        }
+        usage_metadata = {"trace_id": "cache-flow-test"}
+
+        request_time_dt = datetime.datetime.now(datetime.timezone.utc)
+        request_time = request_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        with patch('revenium_middleware.shutdown_event') as mock_shutdown:
+            mock_shutdown.is_set.return_value = False
+            _handle_bedrock_request(args, kwargs, usage_metadata, request_time_dt, request_time)
+
+        # Assert submit_ai_event received the non-zero cache token counts
+        mock_submit.assert_called_once()
+        payload = mock_submit.call_args[0][1]
+        assert payload["cache_creation_token_count"] == 100
+        assert payload["cache_read_token_count"] == 50
 
 
 class TestBedrockStreamingIntegration:

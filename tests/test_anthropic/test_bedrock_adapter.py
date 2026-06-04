@@ -87,12 +87,14 @@ class TestBedrockInvoke:
         
         # Test the function
         payload = {"messages": [{"role": "user", "content": "Hello"}]}
-        text, input_tokens, output_tokens = bedrock_invoke("claude-3-sonnet-20240229", payload)
-        
+        text, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens = bedrock_invoke("claude-3-sonnet-20240229", payload)
+
         # Verify results
         assert text == "Hello, world!"
         assert input_tokens == 10
         assert output_tokens == 5
+        assert cache_creation_tokens == 0
+        assert cache_read_tokens == 0
         
         # Verify client was called correctly
         mock_client.invoke_model.assert_called_once_with(
@@ -125,11 +127,13 @@ class TestBedrockInvoke:
         mock_client.invoke_model.return_value = mock_response
         
         payload = {"messages": [{"role": "user", "content": "Hello"}]}
-        text, input_tokens, output_tokens = bedrock_invoke("claude-3-haiku-20240307", payload)
-        
+        text, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens = bedrock_invoke("claude-3-haiku-20240307", payload)
+
         assert text == "Hello, world!"  # Concatenated text blocks only
         assert input_tokens == 15
         assert output_tokens == 8
+        assert cache_creation_tokens == 0
+        assert cache_read_tokens == 0
 
     @patch('revenium_middleware.anthropic.bedrock_adapter.get_bedrock_client')
     def test_bedrock_invoke_error_handling(self, mock_get_client):
@@ -146,6 +150,61 @@ class TestBedrockInvoke:
             bedrock_invoke("claude-3-opus-20240229", payload)
         
         assert "AWS Error" in str(exc_info.value)
+
+    @patch('revenium_middleware.anthropic.bedrock_adapter.get_bedrock_client')
+    def test_bedrock_invoke_cache_tokens_extracted(self, mock_get_client):
+        """Test that cache token fields are extracted from Bedrock response usage block."""
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+
+        mock_response_body = {
+            "content": [{"type": "text", "text": "Cached response"}],
+            "usage": {
+                "inputTokens": 20,
+                "outputTokens": 10,
+                "cacheWriteInputTokensCount": 150,
+                "cacheReadInputTokensCount": 75,
+            }
+        }
+        mock_response = {"body": MagicMock()}
+        mock_response["body"].read.return_value = json.dumps(mock_response_body).encode()
+        mock_client.invoke_model.return_value = mock_response
+
+        payload = {"messages": [{"role": "user", "content": "Hello"}]}
+        text, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens = bedrock_invoke(
+            "claude-3-sonnet-20240229", payload
+        )
+
+        assert text == "Cached response"
+        assert input_tokens == 20
+        assert output_tokens == 10
+        assert cache_creation_tokens == 150
+        assert cache_read_tokens == 75
+
+    @patch('revenium_middleware.anthropic.bedrock_adapter.get_bedrock_client')
+    def test_bedrock_invoke_no_cache_tokens_defaults_to_zero(self, mock_get_client):
+        """Test that absent cache token fields in Bedrock response default to 0."""
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+
+        mock_response_body = {
+            "content": [{"type": "text", "text": "Non-caching response"}],
+            "usage": {
+                "inputTokens": 12,
+                "outputTokens": 6,
+            }
+        }
+        mock_response = {"body": MagicMock()}
+        mock_response["body"].read.return_value = json.dumps(mock_response_body).encode()
+        mock_client.invoke_model.return_value = mock_response
+
+        payload = {"messages": [{"role": "user", "content": "Hello"}]}
+        text, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens = bedrock_invoke(
+            "claude-3-sonnet-20240229", payload
+        )
+
+        assert cache_creation_tokens == 0
+        assert cache_read_tokens == 0
 
     @patch.dict('os.environ', {'AWS_REGION': 'us-west-2'})
     @patch('revenium_middleware.anthropic.bedrock_adapter.get_bedrock_client')
@@ -241,6 +300,14 @@ class TestResponseCreation:
 class TestBedrockStreamIterator:
     """Test BedrockStreamIterator functionality."""
 
+    @staticmethod
+    def _chunk_event(chunk_data):
+        return {"chunk": {"bytes": json.dumps(chunk_data).encode("utf-8")}}
+
+    @staticmethod
+    def _metadata_event(usage=None, metrics=None):
+        return {"metadata": {"usage": usage, "metrics": metrics}}
+
     def test_bedrock_stream_iterator_creation(self):
         """Test creating a BedrockStreamIterator."""
         model = "claude-3-haiku-20240307"
@@ -263,20 +330,10 @@ class TestBedrockStreamIterator:
         mock_client = MagicMock()
         mock_get_client.return_value = mock_client
 
-        # Create mock streaming response
-        class MockEvent:
-            def __init__(self, chunk_data):
-                self.chunk_data = chunk_data
-
-            def get(self, key):
-                if key == "chunk":
-                    return {"bytes": json.dumps(self.chunk_data).encode("utf-8")}
-                return None
-
         mock_events = [
-            MockEvent({"type": "content_block_delta", "delta": {"text": "Hello"}}),
-            MockEvent({"type": "content_block_delta", "delta": {"text": " world"}}),
-            MockEvent({"type": "message_stop", "usage": {"inputTokens": 10, "outputTokens": 5}})
+            self._chunk_event({"type": "content_block_delta", "delta": {"text": "Hello"}}),
+            self._chunk_event({"type": "content_block_delta", "delta": {"text": " world"}}),
+            self._chunk_event({"type": "message_stop", "usage": {"inputTokens": 10, "outputTokens": 5}})
         ]
 
         mock_response = {"body": iter(mock_events)}
@@ -291,6 +348,156 @@ class TestBedrockStreamIterator:
         assert iterator.accumulated_text == "Hello world"
         assert iterator.input_tokens == 10
         assert iterator.output_tokens == 5
+
+    def test_bedrock_stream_iterator_cache_tokens_from_message_stop(self):
+        """Test that BedrockStreamIterator extracts cache tokens from message_stop usage block."""
+        mock_events = [
+            self._chunk_event({"type": "content_block_delta", "delta": {"text": "Cached"}}),
+            self._chunk_event({
+                "type": "message_stop",
+                "usage": {
+                    "inputTokens": 30,
+                    "outputTokens": 12,
+                    "cacheWriteInputTokensCount": 200,
+                    "cacheReadInputTokensCount": 100,
+                }
+            }),
+        ]
+
+        iterator = BedrockStreamIterator("claude-3-haiku-20240307", {}, "us-east-1")
+        list(iterator._process_stream(iter(mock_events)))
+
+        assert iterator.cache_creation_tokens == 200
+        assert iterator.cache_read_tokens == 100
+        assert iterator.input_tokens == 30
+        assert iterator.output_tokens == 12
+
+    def test_bedrock_stream_iterator_cache_tokens_from_message_delta(self):
+        """Test usage is extracted from Anthropic/Bedrock message_delta stream events."""
+        mock_events = [
+            self._chunk_event({"type": "content_block_delta", "delta": {"text": "Cached"}}),
+            self._chunk_event({
+                "type": "message_delta",
+                "usage": {
+                    "output_tokens": 12,
+                    "cache_write_input_tokens_count": 200,
+                    "cache_read_input_tokens_count": 100,
+                }
+            }),
+            self._chunk_event({"type": "message_stop"}),
+        ]
+
+        iterator = BedrockStreamIterator("claude-3-haiku-20240307", {}, "us-east-1")
+        list(iterator._process_stream(iter(mock_events)))
+
+        assert iterator.cache_creation_tokens == 200
+        assert iterator.cache_read_tokens == 100
+        assert iterator.output_tokens == 12
+
+    def test_bedrock_stream_iterator_usage_from_message_start_message(self):
+        """Test usage is extracted from nested Anthropic message_start message usage."""
+        mock_events = [
+            self._chunk_event({
+                "type": "message_start",
+                "message": {
+                    "usage": {
+                        "input_tokens": 30,
+                        "cache_creation_input_tokens": 200,
+                        "cache_read_input_tokens": 100,
+                    }
+                }
+            }),
+            self._chunk_event({
+                "type": "message_delta",
+                "usage": {"output_tokens": 12}
+            }),
+        ]
+
+        iterator = BedrockStreamIterator("claude-3-haiku-20240307", {}, "us-east-1")
+        list(iterator._process_stream(iter(mock_events)))
+
+        assert iterator.cache_creation_tokens == 200
+        assert iterator.cache_read_tokens == 100
+        assert iterator.input_tokens == 30
+        assert iterator.output_tokens == 12
+
+    def test_bedrock_stream_iterator_cache_tokens_from_metadata_event(self):
+        """Test usage is extracted from Bedrock metadata stream events."""
+        mock_events = [
+            self._metadata_event({
+                "inputTokens": 30,
+                "outputTokens": 12,
+                "cacheWriteInputTokens": 200,
+                "cacheReadInputTokens": 100,
+            }),
+        ]
+
+        iterator = BedrockStreamIterator("claude-3-haiku-20240307", {}, "us-east-1")
+        list(iterator._process_stream(iter(mock_events)))
+
+        assert iterator.cache_creation_tokens == 200
+        assert iterator.cache_read_tokens == 100
+        assert iterator.input_tokens == 30
+        assert iterator.output_tokens == 12
+
+    def test_bedrock_stream_iterator_ignores_metadata_event_with_null_usage(self):
+        """Test null metadata usage blocks do not crash stream processing."""
+        iterator = BedrockStreamIterator("claude-3-haiku-20240307", {}, "us-east-1")
+        list(iterator._process_stream(iter([self._metadata_event(usage=None, metrics=None)])))
+
+        assert iterator.cache_creation_tokens == 0
+        assert iterator.cache_read_tokens == 0
+        assert iterator.input_tokens == 0
+        assert iterator.output_tokens == 0
+
+    def test_bedrock_stream_iterator_ignores_malformed_usage_blocks(self):
+        """Test malformed external usage payloads do not crash stream processing."""
+        mock_events = [
+            {"metadata": "not-a-dict"},
+            self._chunk_event({
+                "type": "message_delta",
+                "usage": "not-a-dict",
+                "amazon-bedrock-invocationMetrics": ["not", "a", "dict"],
+            }),
+            self._chunk_event({
+                "type": "message_start",
+                "message": {"usage": {"input_tokens": -1, "output_tokens": True}},
+            }),
+            self._chunk_event({
+                "type": "message_delta",
+                "usage": {"output_tokens": "12"},
+            }),
+        ]
+
+        iterator = BedrockStreamIterator("claude-3-haiku-20240307", {}, "us-east-1")
+        list(iterator._process_stream(iter(mock_events)))
+
+        assert iterator.input_tokens == 0
+        assert iterator.output_tokens == 12
+
+    def test_bedrock_stream_iterator_preserves_explicit_zero_usage_values(self):
+        """Test explicit zero token values overwrite previously parsed counters."""
+        mock_events = [
+            self._metadata_event({
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "cacheWriteInputTokens": 0,
+                "cacheReadInputTokens": 0,
+            }),
+        ]
+
+        iterator = BedrockStreamIterator("claude-3-haiku-20240307", {}, "us-east-1")
+        iterator.input_tokens = 30
+        iterator.output_tokens = 12
+        iterator.cache_creation_tokens = 200
+        iterator.cache_read_tokens = 100
+
+        list(iterator._process_stream(iter(mock_events)))
+
+        assert iterator.cache_creation_tokens == 0
+        assert iterator.cache_read_tokens == 0
+        assert iterator.input_tokens == 0
+        assert iterator.output_tokens == 0
 
 
 class TestBedrockInvokeStream:
@@ -433,6 +640,8 @@ class TestBedrockStreamWrapper:
         mock_iterator = MagicMock()
         mock_iterator.input_tokens = 15
         mock_iterator.output_tokens = 8
+        mock_iterator.cache_creation_tokens = 0
+        mock_iterator.cache_read_tokens = 0
         mock_bedrock_invoke_stream.return_value = mock_iterator
 
         wrapper = BedrockStreamWrapper(
