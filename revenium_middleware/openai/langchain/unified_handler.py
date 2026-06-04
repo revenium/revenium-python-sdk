@@ -217,18 +217,15 @@ class UnifiedReveniumCallbackHandler(AsyncCallbackHandler):
                 logger.debug(f"Found usage_metadata: {usage_data}")
 
         # Check for response_metadata with token_usage (LangChain v0.1+)
-        elif hasattr(response, 'response_metadata') and response.response_metadata:
-            if 'token_usage' in response.response_metadata:
-                usage_data = response.response_metadata['token_usage']
-                if self.enable_debug_logging:
-                    logger.debug(f"Found token_usage in response_metadata: {usage_data}")
-            elif 'usage' in response.response_metadata:
-                usage_data = response.response_metadata['usage']
-                if self.enable_debug_logging:
-                    logger.debug(f"Found usage in response_metadata: {usage_data}")
+        if not usage_data and hasattr(response, 'response_metadata') and response.response_metadata:
+            usage_data = self._extract_usage_from_response_metadata(
+                response.response_metadata
+            )
+            if usage_data and self.enable_debug_logging:
+                logger.debug(f"Found usage in response_metadata: {usage_data}")
 
         # Check for llm_output (older LangChain versions)
-        elif hasattr(response, 'llm_output') and response.llm_output:
+        if not usage_data and hasattr(response, 'llm_output') and response.llm_output:
             if 'token_usage' in response.llm_output:
                 usage_data = response.llm_output['token_usage']
                 if self.enable_debug_logging:
@@ -239,7 +236,7 @@ class UnifiedReveniumCallbackHandler(AsyncCallbackHandler):
                     logger.debug(f"Found usage in llm_output: {usage_data}")
 
         # For streaming responses, check if there's accumulated usage data
-        elif hasattr(response, 'content') and hasattr(response, 'additional_kwargs'):
+        if not usage_data and hasattr(response, 'content') and hasattr(response, 'additional_kwargs'):
             # This might be a streaming chunk with accumulated data
             if 'usage' in response.additional_kwargs:
                 usage_data = response.additional_kwargs['usage']
@@ -247,10 +244,16 @@ class UnifiedReveniumCallbackHandler(AsyncCallbackHandler):
                     logger.debug(f"Found usage in additional_kwargs: {usage_data}")
 
         # Last resort: check for any 'usage' attribute directly
-        elif hasattr(response, 'usage'):
+        if not usage_data and hasattr(response, 'usage'):
             usage_data = response.usage
             if self.enable_debug_logging:
                 logger.debug(f"Found direct usage attribute: {usage_data}")
+
+        # LLMResult often stores AIMessage usage on generations[0][0].message.
+        if not usage_data:
+            usage_data = self._extract_usage_from_generations(response)
+            if usage_data and self.enable_debug_logging:
+                logger.debug(f"Found usage in generation message: {usage_data}")
 
         if not usage_data and self.enable_debug_logging:
             logger.debug("No usage data found in response")
@@ -259,6 +262,44 @@ class UnifiedReveniumCallbackHandler(AsyncCallbackHandler):
                 logger.debug(f"Response dict: {response.__dict__}")
 
         return usage_data
+
+    def _extract_usage_from_response_metadata(
+        self, response_metadata: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(response_metadata, dict):
+            return None
+        if 'token_usage' in response_metadata:
+            return response_metadata['token_usage']
+        if 'usage' in response_metadata:
+            return response_metadata['usage']
+        return None
+
+    def _extract_usage_from_generations(self, response: Any) -> Optional[Dict[str, Any]]:
+        generations = getattr(response, 'generations', None)
+        if not generations:
+            return None
+
+        for generation_group in generations:
+            if isinstance(generation_group, (list, tuple)):
+                candidates = generation_group
+            else:
+                candidates = [generation_group]
+
+            for generation in candidates:
+                message = getattr(generation, 'message', None) or generation
+
+                usage_metadata = getattr(message, 'usage_metadata', None)
+                if usage_metadata:
+                    return usage_metadata
+
+                response_metadata = getattr(message, 'response_metadata', None)
+                usage_data = self._extract_usage_from_response_metadata(
+                    response_metadata
+                )
+                if usage_data:
+                    return usage_data
+
+        return None
 
     def _process_metering_call(self, usage_data: Dict[str, Any], run_info: Dict[str, Any]) -> None:
         """
@@ -316,20 +357,37 @@ class UnifiedReveniumCallbackHandler(AsyncCallbackHandler):
         """
         class MockResponse:
             def __init__(self, usage_data, model_name):
+                def has_usage_key(key):
+                    if isinstance(usage_data, dict):
+                        return key in usage_data
+                    return hasattr(usage_data, key)
+
+                def get_usage_value(key, default=0):
+                    if isinstance(usage_data, dict):
+                        return usage_data.get(key, default)
+                    return getattr(usage_data, key, default)
+
+                def detail_object(details):
+                    if not details:
+                        return None
+                    if isinstance(details, dict):
+                        return type('TokenDetails', (), details)()
+                    return details
+
                 # Set usage information in the format expected by middleware
-                if 'input_tokens' in usage_data:
+                if has_usage_key('input_tokens'):
                     # LangChain v0.2+ format
                     self.usage = type('Usage', (), {
-                        'prompt_tokens': usage_data.get('input_tokens', 0),
-                        'completion_tokens': usage_data.get('output_tokens', 0),
-                        'total_tokens': usage_data.get('total_tokens', 0)
+                        'prompt_tokens': get_usage_value('input_tokens', 0),
+                        'completion_tokens': get_usage_value('output_tokens', 0),
+                        'total_tokens': get_usage_value('total_tokens', 0)
                     })()
-                elif 'prompt_tokens' in usage_data:
+                elif has_usage_key('prompt_tokens'):
                     # OpenAI format
                     self.usage = type('Usage', (), {
-                        'prompt_tokens': usage_data.get('prompt_tokens', 0),
-                        'completion_tokens': usage_data.get('completion_tokens', 0),
-                        'total_tokens': usage_data.get('total_tokens', 0)
+                        'prompt_tokens': get_usage_value('prompt_tokens', 0),
+                        'completion_tokens': get_usage_value('completion_tokens', 0),
+                        'total_tokens': get_usage_value('total_tokens', 0)
                     })()
                 else:
                     # Fallback - create minimal usage
@@ -338,6 +396,27 @@ class UnifiedReveniumCallbackHandler(AsyncCallbackHandler):
                         'completion_tokens': 0,
                         'total_tokens': 0
                     })()
+
+                # Preserve provider-specific cache detail shapes for middleware.
+                for detail_name in (
+                    'prompt_tokens_details',
+                    'input_tokens_details',
+                    'input_token_details',
+                ):
+                    details = get_usage_value(detail_name, None)
+                    details = detail_object(details)
+                    if details is not None:
+                        setattr(self.usage, detail_name, details)
+
+                # Preserve Anthropic's native flat cache keys. A live
+                # ChatAnthropic LLMResult reports cache tokens here rather than
+                # under an `input_token_details` sub-object.
+                for flat_key in (
+                    'cache_creation_input_tokens',
+                    'cache_read_input_tokens',
+                ):
+                    if has_usage_key(flat_key):
+                        setattr(self.usage, flat_key, get_usage_value(flat_key, 0))
 
                 # Set model name
                 self.model = model_name

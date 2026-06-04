@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8] - 2026-06-04
+
+### Fixed
+- Prompt-cache token counts (cache reads and cache writes) are now correctly extracted and reported across providers instead of being metered as 0:
+  - OpenAI completions now report cached prompt tokens for both standard and streaming responses, with streaming cache token extraction unified across response shapes.
+  - Anthropic on AWS Bedrock now parses cache token counts from invoke and streaming usage events and propagates them to metering.
+  - The LangChain integration now recognizes Anthropic's native cache token fields (`cache_read_input_tokens` / `cache_creation_input_tokens`), so cache-aware metering works when using LangChain with Anthropic models.
+- The LangChain integration now finds token usage in more response shapes: usage stored on generation messages (`LLMResult.generations[..].message`) is picked up, usage lookups no longer stop at the first missing location, and object-style (non-dict) usage payloads are handled.
+
 ## [0.1.7] - 2026-05-28
 
 ### Added

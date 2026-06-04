@@ -2,6 +2,7 @@ import datetime
 import logging
 import os
 import uuid
+from numbers import Number
 from typing import Dict, Any, Optional, Tuple
 from enum import Enum
 
@@ -41,6 +42,73 @@ logger = logging.getLogger("revenium_middleware.extension")
 
 # Use centralized security configuration
 SENSITIVE_FIELDS = SecurityConfig.SENSITIVE_FIELDS
+
+
+def _get_value(source: Any, key: str, default: Any = None) -> Any:
+    """Read a value from either a dict-like or object-like SDK payload."""
+    if source is None:
+        return default
+    if isinstance(source, dict):
+        return source.get(key, default)
+    return getattr(source, key, default)
+
+
+def _coerce_int(value: Any, default: int = 0) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, Number):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return default
+    return default
+
+
+def _extract_cache_token_counts(usage: Any) -> Tuple[int, int]:
+    """
+    Return (cache_creation_token_count, cache_read_token_count).
+
+    OpenAI reports cached prompt/input tokens as cache reads. Anthropic-shaped
+    LangChain metadata reports read and creation counts separately.
+    """
+    input_token_details = _get_value(usage, "input_token_details")
+    cache_creation_token_count = _coerce_int(
+        _get_value(input_token_details, "cache_creation", 0)
+    )
+    cache_read_token_count = _coerce_int(
+        _get_value(input_token_details, "cache_read", 0)
+    )
+    if cache_creation_token_count or cache_read_token_count:
+        return cache_creation_token_count, cache_read_token_count
+
+    # Anthropic native usage shape: a live ChatAnthropic LLMResult exposes the
+    # raw `response_metadata.usage` block with these flat keys rather than the
+    # normalized `input_token_details` shape.
+    cache_creation_token_count = _coerce_int(
+        _get_value(usage, "cache_creation_input_tokens", 0)
+    )
+    cache_read_token_count = _coerce_int(
+        _get_value(usage, "cache_read_input_tokens", 0)
+    )
+    if cache_creation_token_count or cache_read_token_count:
+        return cache_creation_token_count, cache_read_token_count
+
+    input_tokens_details = _get_value(usage, "input_tokens_details")
+    cache_read_token_count = _coerce_int(
+        _get_value(input_tokens_details, "cached_tokens", 0)
+    )
+    if cache_read_token_count:
+        return 0, cache_read_token_count
+
+    prompt_details = _get_value(usage, "prompt_tokens_details")
+    cache_read_token_count = _coerce_int(
+        _get_value(prompt_details, "cached_tokens", 0)
+    )
+    return 0, cache_read_token_count
 
 
 def extract_prompt_data_if_enabled(
@@ -303,10 +371,10 @@ def extract_usage_data(response, operation_type: OperationType, request_time: st
             # Responses API doesn't have choices, use default
             stop_reason = "END"
 
-    # Extract cached tokens (only available for chat completions)
-    cached_tokens = 0
-    if operation_type == OperationType.CHAT and hasattr(response.usage, 'prompt_tokens_details'):
-        cached_tokens = getattr(response.usage.prompt_tokens_details, 'cached_tokens', 0)
+    # Extract provider-specific cache token details.
+    cache_creation_token_count, cache_read_token_count = _extract_cache_token_counts(
+        response.usage
+    )
 
     # Build unified usage data structure
     usage_data = {
@@ -321,8 +389,8 @@ def extract_usage_data(response, operation_type: OperationType, request_time: st
         "model_source": provider_metadata["model_source"],
         "is_streamed": False,  # Will be overridden for streaming
         "time_to_first_token": 0,  # Will be set by caller if applicable
-        "cache_creation_token_count": cached_tokens,
-        "cache_read_token_count": 0,
+        "cache_creation_token_count": cache_creation_token_count,
+        "cache_read_token_count": cache_read_token_count,
         "reasoning_token_count": 0,
         "request_time": request_time,
         "response_time": response_time,
@@ -379,6 +447,8 @@ async def log_token_usage(
         input_messages: Optional[str] = None,
         output_response: Optional[str] = None,
         prompts_truncated: Optional[bool] = None,
+        cache_creation_token_count: Optional[int] = None,
+        cache_read_token_count: Optional[int] = None,
 ) -> None:
     """Log token usage to Revenium."""
     if client is None:
@@ -403,9 +473,16 @@ async def log_token_usage(
 
     # Prepare arguments for create_completion
     # Build completion args, only including non-None values for optional fields
+    if cache_creation_token_count is None:
+        cache_creation_tokens = 0
+    else:
+        cache_creation_tokens = cache_creation_token_count
+    if cache_read_token_count is None:
+        cache_read_token_count = _coerce_int(cached_tokens)
+
     completion_args = {
-        "cache_creation_token_count": cached_tokens,
-        "cache_read_token_count": 0,
+        "cache_creation_token_count": cache_creation_tokens,
+        "cache_read_token_count": cache_read_token_count,
         "output_token_count": completion_tokens,
         "cost_type": "AI",
         "model": model,
@@ -634,6 +711,8 @@ def create_metering_call(
             completion_tokens=usage_data["output_token_count"],
             total_tokens=usage_data["total_token_count"],
             cached_tokens=usage_data["cache_creation_token_count"],
+            cache_creation_token_count=usage_data["cache_creation_token_count"],
+            cache_read_token_count=usage_data["cache_read_token_count"],
             stop_reason=usage_data["stop_reason"],
             request_time=usage_data["request_time"],
             response_time=usage_data["response_time"],
@@ -1044,17 +1123,17 @@ def handle_streaming_response(
             prompt_tokens = 0
             completion_tokens = 0
             total_tokens = 0
-            cached_tokens = 0
+            cache_creation_token_count = 0
+            cache_read_token_count = 0
 
             # First check if we have the final usage data from the special chunk
             if self.final_usage:
                 prompt_tokens = self.final_usage.prompt_tokens
                 completion_tokens = self.final_usage.completion_tokens
                 total_tokens = self.final_usage.total_tokens
-                # Check if we have cached tokens info
-                if hasattr(self.final_usage, 'prompt_tokens_details') and hasattr(
-                        self.final_usage.prompt_tokens_details, 'cached_tokens'):
-                    cached_tokens = self.final_usage.prompt_tokens_details.cached_tokens
+                cache_creation_token_count, cache_read_token_count = _extract_cache_token_counts(
+                    self.final_usage
+                )
                 logger.debug(
                     f"Using token usage from final chunk: prompt={prompt_tokens}, completion={completion_tokens}, total={total_tokens}")
             else:
@@ -1168,7 +1247,9 @@ def handle_streaming_response(
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         total_tokens=total_tokens,
-                        cached_tokens=cached_tokens,
+                        cached_tokens=0,
+                        cache_creation_token_count=cache_creation_token_count,
+                        cache_read_token_count=cache_read_token_count,
                         stop_reason=stop_reason,
                         request_time=self.request_time_dt.strftime(
                             "%Y-%m-%dT%H:%M:%SZ"
@@ -1359,12 +1440,17 @@ def handle_streaming_responses(stream, request_time_dt, usage_metadata,
             input_tokens = 0
             output_tokens = 0
             total_tokens = 0
+            cache_creation_token_count = 0
+            cache_read_token_count = 0
 
             # Get usage data from the final chunk or last chunk
             if self.final_usage:
                 input_tokens = self.final_usage.input_tokens
                 output_tokens = self.final_usage.output_tokens
                 total_tokens = self.final_usage.total_tokens
+                cache_creation_token_count, cache_read_token_count = _extract_cache_token_counts(
+                    self.final_usage
+                )
                 logger.debug(
                     f"Using token usage from Responses API stream final chunk: input={input_tokens}, "
                     f"output={output_tokens}, total={total_tokens}")
@@ -1373,6 +1459,9 @@ def handle_streaming_responses(stream, request_time_dt, usage_metadata,
                 input_tokens = self.last_chunk.usage.input_tokens
                 output_tokens = self.last_chunk.usage.output_tokens
                 total_tokens = self.last_chunk.usage.total_tokens
+                cache_creation_token_count, cache_read_token_count = _extract_cache_token_counts(
+                    self.last_chunk.usage
+                )
                 logger.debug(
                     f"Using token usage from Responses API last chunk: input={input_tokens}, "
                     f"output={output_tokens}, total={total_tokens}")
@@ -1463,6 +1552,8 @@ def handle_streaming_responses(stream, request_time_dt, usage_metadata,
                         completion_tokens=output_tokens,
                         total_tokens=total_tokens,
                         cached_tokens=0,
+                        cache_creation_token_count=cache_creation_token_count,
+                        cache_read_token_count=cache_read_token_count,
                         stop_reason="END",
                         request_time=self.request_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
                         response_time=response_time,
@@ -1541,23 +1632,10 @@ def _wrap_async_stream(stream, request_time_dt, usage_metadata, client_instance=
             if not self.chunks and not self.final_usage:
                 return
 
-            prompt_tokens = 0
-            completion_tokens = 0
-            cached_tokens = 0
+            if self.final_usage is None:
+                return
 
-            if self.final_usage:
-                prompt_tokens = getattr(self.final_usage, 'prompt_tokens', 0) or 0
-                completion_tokens = getattr(self.final_usage, 'completion_tokens', 0) or 0
-                if hasattr(self.final_usage, 'prompt_tokens_details') and self.final_usage.prompt_tokens_details:
-                    cached_tokens = getattr(self.final_usage.prompt_tokens_details, 'cached_tokens', 0) or 0
-
-            total_tokens = prompt_tokens + completion_tokens
             time_to_first_token = int((self.first_token_time - request_time_dt).total_seconds() * 1000) if self.first_token_time else 0
-
-            response_time_dt = datetime.datetime.now(datetime.timezone.utc)
-            request_time = request_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-            response_time = response_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-            request_duration = (response_time_dt - request_time_dt).total_seconds() * 1000
 
             try:
                 create_metering_call(
