@@ -32,11 +32,14 @@ TOOL_STEPS = (
 
 
 def pick_outcome(rng: random.Random, scenario: Scenario | None, job_idx: int) -> Outcome:
-    """Deterministic sales funnel: 12 converted deals per 100 leads."""
+    """Sales funnel: 12 converted deals + 6 unsuccessful per 100 leads; rest lost."""
     _ = rng, scenario
     num = job_idx + 1
-    if job_idx % 100 < 12:
+    bucket = job_idx % 100
+    if bucket < 12:
         return Outcome("CONVERTED", 300.00, f"ACME-2026-Q2-{num:03d}", "SUCCESS", "deal_closed")
+    if bucket < 18:
+        return Outcome("UNSUCCESSFUL", 0.0, f"ACME-2026-Q2-FAIL-{num:03d}", "FAILED", "deal_unsuccessful")
     return Outcome(None, 0.0, f"ACME-2026-Q2-LOST-{num:03d}", "SUCCESS", "deal_lost")
 
 
@@ -58,9 +61,10 @@ def build_summary(count: int, totals: dict[str, float], elapsed: float) -> list[
     total_ai = totals.get("ai", 0.0)
     total_tool = totals.get("tool", 0.0)
     converted = int(totals.get("CONVERTED", 0.0))
+    unsuccessful = int(totals.get("UNSUCCESSFUL", 0.0))
     return [
         "",
-        f"Jobs: {count}   Converted: {converted}   Unsuccessful: {count - converted}",
+        f"Jobs: {count}   Converted: {converted}   Unsuccessful: {unsuccessful}",
         f"Emitted: {count * len(LLM_STEPS)} completions + {count * len(TOOL_STEPS)} tool events + {count} outcomes",
         f"Per-job AI cost:   ${total_ai / count:>10,.2f}",
         f"Per-job tool cost: ${total_tool / count:>10,.2f}",

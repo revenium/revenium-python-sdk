@@ -28,7 +28,7 @@ SCENARIOS = (
         ("crm.lookup", "zendesk.ticket"),
     ),
 )
-OUTCOME_WEIGHTS = {"DEFLECTED": 0.80, "ESCALATED": 0.08, "CONVERTED": 0.12}
+OUTCOME_WEIGHTS = {"DEFLECTED": 0.58, "ESCALATED": 0.12, "CONVERTED": 0.20, "UNSUCCESSFUL": 0.10}
 UPSELL_VALUE_RANGE = (50.0, 300.0)
 LLM_STEPS = (
     LlmStep("classify", "claude-sonnet-4-5", "anthropic", 1200, 300, 800, 0.0014,
@@ -72,19 +72,26 @@ def pick_outcome(rng: random.Random, scenario: Scenario | None, job_idx: int) ->
     raw_key = scenario.key.upper()
     key_clean = raw_key[len("TICKET-"):] if raw_key.startswith("TICKET-") else raw_key
     reason = ""
-    if r < OUTCOME_WEIGHTS["DEFLECTED"]:
+    deflected = OUTCOME_WEIGHTS["DEFLECTED"]
+    escalated = deflected + OUTCOME_WEIGHTS["ESCALATED"]
+    converted = escalated + OUTCOME_WEIGHTS["CONVERTED"]
+    if r < deflected:
         vlo, vhi = scenario.value_range
         value = round(vlo + rng.random() * (vhi - vlo), 2)
         reason = rng.choice(OUTCOME_REASONS["DEFLECTED"])
         outcome = Outcome("DEFLECTED", value, f"TICKET-{key_clean}-{n:04d}", "SUCCESS", reason)
-    elif r < OUTCOME_WEIGHTS["DEFLECTED"] + OUTCOME_WEIGHTS["ESCALATED"]:
+    elif r < escalated:
+        # Escalations still deliver partial value (triage + context handed to a human).
+        esc_val = round(20 + rng.random() * 130, 2)
         reason = rng.choice(OUTCOME_REASONS["ESCALATED"])
-        outcome = Outcome("ESCALATED", 0.0, f"TICKET-{key_clean}-ESC-{n:04d}", "FAILED", reason)
-    else:
+        outcome = Outcome("ESCALATED", esc_val, f"TICKET-{key_clean}-ESC-{n:04d}", "SUCCESS", reason)
+    elif r < converted:
         ulo, uhi = UPSELL_VALUE_RANGE
         value = round(ulo + rng.random() * (uhi - ulo), 2)
         reason = rng.choice(OUTCOME_REASONS["CONVERTED"])
         outcome = Outcome("CONVERTED", value, f"TICKET-{key_clean}-UPSELL-{n:04d}", "SUCCESS", reason)
+    else:
+        outcome = Outcome("UNSUCCESSFUL", 0.0, f"TICKET-{key_clean}-FAIL-{n:04d}", "FAILED", "ticket_abandoned")
     return outcome
 
 
@@ -112,12 +119,13 @@ def build_summary(count: int, totals: dict[str, float], elapsed: float) -> list[
     deflected_count = int(totals.get("DEFLECTED", 0.0))
     escalated = int(totals.get("ESCALATED", 0.0))
     converted = int(totals.get("CONVERTED", 0.0))
+    unsuccessful = int(totals.get("UNSUCCESSFUL", 0.0))
     deflected = totals.get("deflected_human_cost_usd", 0.0)
     upsell = totals.get("upsell_value_usd", 0.0)
     total_cost = total_ai + total_tool
     return [
         "",
-        f"Tickets: {count}   DEFLECTED: {deflected_count}   ESCALATED: {escalated}   CONVERTED: {converted}",
+        f"Tickets: {count}   DEFLECTED: {deflected_count}   ESCALATED: {escalated}   CONVERTED: {converted}   UNSUCCESSFUL: {unsuccessful}",
         f"Deflection rate:    {(deflected_count / count) * 100:>5.1f}%",
         f"Total agent cost:   ${total_cost:>10,.2f}  (AI ${total_ai:.2f} + tools ${total_tool:.2f})",
         f"Total deflected:    ${deflected:>10,.2f}  (human-agent cost saved by autonomous deflection)",

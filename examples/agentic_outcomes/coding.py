@@ -38,7 +38,7 @@ SCENARIOS = (
         ("repo.search", "github.post_review"),
     ),
 )
-OUTCOME_WEIGHTS = {"CONVERTED": 0.72, "ESCALATED": 0.10, "CUSTOM": 0.18}
+OUTCOME_WEIGHTS = {"CONVERTED": 0.60, "ESCALATED": 0.12, "CUSTOM": 0.14, "UNSUCCESSFUL": 0.14}
 LLM_STEPS = (
     LlmStep("plan", "claude-sonnet-4-5", "anthropic", 1500, 600, 1200, 0.0028,
             agent_role="orchestrator",
@@ -75,15 +75,22 @@ def pick_outcome(rng: random.Random, scenario: Scenario | None, job_idx: int) ->
         raise ValueError("coding outcome selection requires a scenario")
     r = rng.random()
     n = job_idx + 11
-    if r < OUTCOME_WEIGHTS["CONVERTED"]:
+    converted = OUTCOME_WEIGHTS["CONVERTED"]
+    escalated = converted + OUTCOME_WEIGHTS["ESCALATED"]
+    cancelled = escalated + OUTCOME_WEIGHTS["CUSTOM"]
+    if r < converted:
         vlo, vhi = scenario.value_range
         return Outcome(
             "CONVERTED", round(vlo + rng.random() * (vhi - vlo), 2),
             f"{scenario.key.upper()}-{n:03d}", "SUCCESS", "task_completed_autonomously",
         )
-    if r < OUTCOME_WEIGHTS["CONVERTED"] + OUTCOME_WEIGHTS["ESCALATED"]:
-        return Outcome("ESCALATED", 0.0, f"{scenario.key.upper()}-ESC-{n:03d}", "FAILED", "human_takeover")
-    return Outcome("CUSTOM", 0.0, f"{scenario.key.upper()}-CXL-{n:03d}", "FAILED", "task_cancelled")
+    if r < escalated:
+        # Escalations still deliver partial value (triage + context handed to a human).
+        esc_val = round(40 + rng.random() * 260, 2)
+        return Outcome("ESCALATED", esc_val, f"{scenario.key.upper()}-ESC-{n:03d}", "SUCCESS", "human_takeover")
+    if r < cancelled:
+        return Outcome("CUSTOM", 0.0, f"{scenario.key.upper()}-CXL-{n:03d}", "CANCELLED", "task_cancelled")
+    return Outcome("UNSUCCESSFUL", 0.0, f"{scenario.key.upper()}-FAIL-{n:03d}", "FAILED", "task_failed")
 
 
 def build_metadata(scenario: Scenario | None, job_idx: int, n_llm: int, outcome: Outcome,
@@ -109,11 +116,12 @@ def build_summary(count: int, totals: dict[str, float], elapsed: float) -> list[
     converted = int(totals.get("CONVERTED", 0.0))
     escalated = int(totals.get("ESCALATED", 0.0))
     custom = int(totals.get("CUSTOM", 0.0))
+    unsuccessful = int(totals.get("UNSUCCESSFUL", 0.0))
     deflected = totals.get("deflected_cost_usd", 0.0)
     total_cost = total_ai + total_tool
     return [
         "",
-        f"Jobs: {count}   CONVERTED: {converted}   ESCALATED: {escalated}   CUSTOM: {custom}",
+        f"Jobs: {count}   CONVERTED: {converted}   ESCALATED: {escalated}   CUSTOM: {custom}   UNSUCCESSFUL: {unsuccessful}",
         f"Deflection rate:    {(converted / count) * 100:>5.1f}%",
         f"Total agent cost:   ${total_cost:>10,.2f}  (AI ${total_ai:.2f} + tools ${total_tool:.2f})",
         f"Total deflected:    ${deflected:>10,.2f}  (engineering cost saved by autonomous completion)",
