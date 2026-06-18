@@ -20,7 +20,7 @@ client.emit_tool_event({...})   # one per tool step — see common.py for payloa
 client.report_outcome("job-id", {
     "outcomeType": "CONVERTED",
     "outcomeValue": 4200.00,
-    "executionStatus": "COMPLETED",
+    "executionStatus": "SUCCESS",  # one of: SUCCESS, FAILED, CANCELLED
 })
 client.close()
 ```
@@ -39,7 +39,9 @@ The example scripts wrap this in a simulation engine — configurable timing, fa
 
 ## Run from the command line
 
-The scenario scripts (`sales.py`, `coding.py`, `support.py`) ship in this repo, not on PyPI. Clone the repo first, install the SDK, and run from inside `examples/agentic_outcomes/`:
+The example scripts (`sales.py`, `coding.py`, `support.py`) live in this
+[directory](https://github.com/revenium/revenium-python-sdk/tree/main/examples/agentic_outcomes),
+not on PyPI. Clone the repo, install the SDK, then run the loader.
 
 ```bash
 git clone https://github.com/revenium/revenium-python-sdk.git
@@ -48,8 +50,20 @@ cd revenium-python-sdk/examples/agentic_outcomes
 pip install revenium-python-sdk
 
 export REVENIUM_API_KEY=rev_sk_...
-export REVENIUM_API_BASE_URL=https://api.revenium.io  # optional — prod default
+# export REVENIUM_API_BASE_URL=https://api.revenium.io   # optional — prod default
+# export REVENIUM_TEAM_ID=...                            # optional
 
+# Recommended: load all three examples (sales + coding + support) in one go.
+./load-demo.sh
+```
+
+`load-demo.sh` builds a local virtualenv on first run and emits all three example
+workloads. To load just one: `./load-demo.sh sales` (or `coding`, `support`); `./load-demo.sh list`
+shows the available examples.
+
+### Run one example directly
+
+```bash
 python sales.py --count 5
 python coding.py --count 5
 python support.py --count 5

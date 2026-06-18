@@ -358,13 +358,20 @@ def _run_one_job(spec: ExampleSpec, item: JobPlan, job_base: datetime,
     failure_rng = random.Random(f"fail:{args.seed or 'default'}:{job_idx}")
     for step in llm_steps:
         task_type = step.task_type if scenario is None else f"{scenario.key}.{step.task_type}"
-        cost = step.cost_usd * args.value_scale * args.cost_scale
+        # Per-job variability: jitter tokens + duration so no two jobs are identical;
+        # cost tracks the token jitter (realistic) on top of the global cost/value scales.
+        # This is what makes P95/P99, outliers, anomalies, and the cost distribution real.
+        pt = max(1, int(step.prompt_tokens * job_rng.uniform(0.55, 1.75)))
+        rt = max(1, int(step.response_tokens * job_rng.uniform(0.55, 1.95)))
+        dur = max(50, int(step.duration_ms * job_rng.uniform(0.6, 1.85)))
+        tok_ratio = (pt + rt) / max(1, step.prompt_tokens + step.response_tokens)
+        cost = step.cost_usd * tok_ratio * args.value_scale * args.cost_scale
         failed = _failed(failure_rng, args.llm_failure_rate)
         timed_out = (not failed) and _failed(failure_rng, args.timeout_rate)
         step_agent = _agent_name(agent, step.agent_role, args.agent_role_suffixes)
         payload = send_completion(
-            model=step.model, provider=step.provider, prompt_tokens=step.prompt_tokens,
-            response_tokens=step.response_tokens, cost_usd=cost, duration_ms=step.duration_ms,
+            model=step.model, provider=step.provider, prompt_tokens=pt,
+            response_tokens=rt, cost_usd=cost, duration_ms=dur,
             subscriber=subscriber, trace_id=trace_id, task_type=task_type,
             agentic_job_id=job_id, agentic_job_name=job_name, agent=step_agent, agent_name=step_agent,
             organization_name=org_name, product_name=spec.product_name, squad_name=squad_name,
@@ -383,7 +390,7 @@ def _run_one_job(spec: ExampleSpec, item: JobPlan, job_base: datetime,
 
     tool_cost = 0.0
     for step in item.tool_steps:
-        cost = step.cost_usd * args.value_scale * args.cost_scale
+        cost = step.cost_usd * job_rng.uniform(0.6, 1.8) * args.value_scale * args.cost_scale
         failed = _failed(failure_rng, args.tool_failure_rate)
         step_agent = _agent_name(agent, step.agent_role, args.agent_role_suffixes)
         payload = send_tool_event(
@@ -404,7 +411,7 @@ def _run_one_job(spec: ExampleSpec, item: JobPlan, job_base: datetime,
     metadata_outcome = Outcome(outcome.outcome_type, scaled_value, outcome.deal_id, outcome.execution_status, outcome.reason)
     if outcome.outcome_type == "ESCALATED" and spec.escalation_tool:
         step = spec.escalation_tool
-        cost = step.cost_usd * args.value_scale * args.cost_scale
+        cost = step.cost_usd * job_rng.uniform(0.6, 1.8) * args.value_scale * args.cost_scale
         step_agent = _agent_name(agent, step.agent_role, args.agent_role_suffixes)
         payload = send_tool_event(
             step=step, cost_usd=cost, agent=step_agent, subscriber=subscriber,
