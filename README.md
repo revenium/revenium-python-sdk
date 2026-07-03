@@ -1021,7 +1021,7 @@ def free_feature(prompt: str) -> str:
 
 ## Tool Metering
 
-The `@meter_tool` decorator lets you meter arbitrary tool/function calls (web scrapers, database lookups, API fetchers, image generators, etc.) alongside your automatic LLM API metering. Available via `revenium_metering` v6.8.2+.
+The `@meter_tool` decorator lets you meter arbitrary tool/function calls (web scrapers, database lookups, API fetchers, image generators, etc.) alongside your automatic LLM API metering.
 
 ```python
 import os

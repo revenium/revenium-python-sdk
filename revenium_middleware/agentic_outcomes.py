@@ -5,7 +5,7 @@ Public surface:
 - AgenticOutcomeClient: emit_completion / emit_tool_event / report_outcome.
 
 Single-key contract: settings.api_key authenticates both metering (via the
-ReveniumMetering SDK) and the raw-HTTP fallback for endpoints the SDK does
+in-package ReveniumMetering client) and the raw-HTTP fallback for endpoints the SDK does
 not yet cover (/meter/v2/tool/events, /profitstream/v2/api/jobs/{id}/outcome).
 """
 
@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 import httpx
-from revenium_metering import ReveniumMetering
+from revenium_middleware._metering import ReveniumMetering
 
 logger = logging.getLogger(__name__)
 

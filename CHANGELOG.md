@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.10] - 2026-07-03
+
+### Changed
+- The SDK is now fully self-contained. The metering client that was previously installed as a separate `revenium-metering` package now ships inside `revenium-python-sdk`, so `pip install revenium-python-sdk` is all you need — no second Revenium package is pulled in. Public imports are unchanged: `from revenium_middleware import meter_tool, report_tool_call, configure` keeps working exactly as before.
+
 ## [0.1.9] - 2026-06-18
 
 ### Changed
