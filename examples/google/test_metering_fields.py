@@ -4,7 +4,6 @@ Direct Revenium metering API calls to verify new fields:
 - aspect_ratio on create_image
 - aspect_ratio on create_video
 """
-import os
 import uuid
 from datetime import datetime, timezone
 
@@ -14,12 +13,7 @@ try:
 except ImportError:
     pass
 
-from revenium_metering import ReveniumMetering
-
-client = ReveniumMetering(
-    api_key=os.getenv("REVENIUM_METERING_API_KEY"),
-    base_url=os.getenv("REVENIUM_METERING_BASE_URL"),
-)
+from revenium_middleware import client
 
 now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 results = {}

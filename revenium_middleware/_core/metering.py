@@ -7,7 +7,7 @@ import contextvars
 import atexit
 import signal
 from typing import Literal, Awaitable, Any, Optional, Callable
-from revenium_metering import ReveniumMetering
+from revenium_middleware._metering import ReveniumMetering
 from revenium_middleware._core.config import validate_api_key
 
 # Get the logger that was configured in __init__.py

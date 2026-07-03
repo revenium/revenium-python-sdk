@@ -157,8 +157,8 @@ from ._core import (  # noqa: E402
     is_selective_metering_enabled,
 )
 
-# Re-export tool metering utilities from revenium_metering (v6.8.2+)
-from revenium_metering import meter_tool, report_tool_call, configure  # noqa: E402
+# Re-export tool metering utilities from the in-package metering module (BACK-2151)
+from ._metering import meter_tool, report_tool_call, configure  # noqa: E402
 
 # Agentic-outcome client (used by examples/agentic_outcomes/ pack)
 from .agentic_outcomes import AgenticOutcomeClient, AgenticOutcomeSettings  # noqa: E402
@@ -186,7 +186,7 @@ __all__ = [
     "set_idempotency_key",
     # Config exports
     "is_selective_metering_enabled",
-    # Tool metering exports (from revenium_metering)
+    # Tool metering exports
     "meter_tool",
     "report_tool_call",
     "configure",
