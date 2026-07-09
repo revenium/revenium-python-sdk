@@ -14,6 +14,7 @@ from enum import Enum
 import wrapt
 from revenium_middleware import (
     client,
+    get_client,
     run_async_in_thread,
     shutdown_event,
     merge_metadata,
@@ -177,7 +178,7 @@ def send_metering_data(
         is_streaming: Whether this is a streaming response
         transaction_id: Transaction ID for tracking
     """
-    if client is None:
+    if get_client() is None:
         return  # metering disabled (no API key configured)
     async def metering_call():
         try:

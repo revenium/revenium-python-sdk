@@ -1,13 +1,43 @@
+import asyncio
 import datetime
 import logging
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, MagicMock
 
 import pytest
-import wrapt
 from freezegun import freeze_time
 
 from revenium_middleware import shutdown_event
 from revenium_middleware.anthropic.middleware import create_wrapper, _extract_organization_and_product_names
+
+
+def _middleware_fn(obj):
+    """Resolve the plain middleware function across wrapt versions.
+
+    Under wrapt <2.2 the module attribute left behind by
+    @wrapt.patch_function_wrapper is the patched FunctionWrapper — calling it
+    directly would invoke the real anthropic SDK method. The plain middleware
+    function is stored on its `_self_wrapper` attribute. Under wrapt >=2.2 the
+    module attribute is already the plain function.
+    """
+    return getattr(obj, "_self_wrapper", obj)
+
+
+create_wrapper = _middleware_fn(create_wrapper)
+
+
+def _run_metering_synchronously(mock_run_async):
+    """Make a patched revenium_middleware.run_async_in_thread execute the
+    metering coroutine synchronously in the test thread (instead of a
+    background thread) and return a fake thread handle, so the test can
+    assert on the metering call deterministically."""
+    mock_thread = MagicMock()
+
+    def _run(coroutine):
+        asyncio.run(coroutine)
+        return mock_thread
+
+    mock_run_async.side_effect = _run
+    return mock_thread
 
 
 class TestMiddleware:
@@ -24,17 +54,14 @@ class TestMiddleware:
         """Create a mock Anthropic response object."""
         mock_response = MagicMock()
         mock_response.id = "test-response-id"
-        mock_response.model = "gpt-4"
+        mock_response.model = "claude-3-5-sonnet-20241022"
+        mock_response.stop_reason = "end_turn"
 
-        # Set up usage attributes
-        mock_response.usage.prompt_tokens = 100
-        mock_response.usage.completion_tokens = 50
-        mock_response.usage.total_tokens = 150
-
-        # Set up choices with finish_reason
-        mock_choice = MagicMock()
-        mock_choice.finish_reason = "stop"
-        mock_response.choices = [mock_choice]
+        # Set up usage attributes (Anthropic naming)
+        mock_response.usage.input_tokens = 100
+        mock_response.usage.output_tokens = 50
+        mock_response.usage.cache_creation_input_tokens = 3
+        mock_response.usage.cache_read_input_tokens = 7
 
         return mock_response
 
@@ -43,226 +70,227 @@ class TestMiddleware:
         """Common test kwargs for Anthropic API calls."""
         return {
             "messages": [{"role": "user", "content": "Hello"}],
-            "model": "gpt-4",
+            "model": "claude-3-5-sonnet-20241022",
             "usage_metadata": {
                 "trace_id": "test-trace",
                 "task_id": "test-task",
                 "task_type": "test-type",
-                "subscriber_identity": "test-subscriber",
                 "organizationName": "AcmeCorp",
                 "subscription_id": "test-sub",
                 "productName": "customer-chatbot",
-                "source_id": "test-source",
-                "ai_provider_key_name": "test-key",
                 "agent": "test-agent"
             }
         }
 
     @freeze_time("2023-01-01T12:00:00Z")
-    @wrapt.decorator(enabled=False)
-    @patch("revenium_middleware.anthropic.middleware.run_async_in_thread")
-    @patch("revenium_middleware.anthropic.middleware.client")
-    def test_create_wrapper_basic(self, mock_run_async, mock_client, reset_state, mock_anthropic_response, test_kwargs,
-                                  caplog):
-        """Test the basic functionality of create_wrapper."""
-        # Set up mocks
+    @patch("revenium_middleware.anthropic.middleware.submit_ai_event")
+    @patch("revenium_middleware.run_async_in_thread")
+    def test_create_wrapper_basic(self, mock_run_async, mock_submit_ai_event, reset_state, mock_anthropic_response,
+                                  test_kwargs):
+        """Test the basic functionality of create_wrapper: the wrapped call is
+        forwarded without usage_metadata and exactly one metering event is
+        submitted with values derived from the response and metadata."""
         mock_wrapped = MagicMock(return_value=mock_anthropic_response)
-        mock_thread = MagicMock()
-        mock_run_async.return_value = mock_thread
-        mock_client.ai.create_completion = AsyncMock()
+        _run_metering_synchronously(mock_run_async)
 
-        # Call the wrapper - we need to pass the instance as the first argument
-        # The wrapper expects: wrapped, instance, args, kwargs
-        result = create_wrapper(mock_wrapped, MagicMock(), (), test_kwargs.copy())
+        # Call the wrapper - the plain middleware function expects:
+        # wrapped, instance, args, kwargs. instance=None keeps provider
+        # detection deterministic (defaults to ANTHROPIC).
+        result = create_wrapper(mock_wrapped, None, (), test_kwargs.copy())
 
-        # Assertions
-        assert result == mock_anthropic_response
+        # The wrapped call returns unchanged and usage_metadata is stripped
+        assert result is mock_anthropic_response
         mock_wrapped.assert_called_once_with(**{k: v for k, v in test_kwargs.items() if k != "usage_metadata"})
 
-        # Verify run_async_in_thread was called
+        # Metering happened exactly once, via submit_ai_event
         mock_run_async.assert_called_once()
-        mock_thread.join.assert_called_once_with(timeout=5.0)
+        mock_submit_ai_event.assert_called_once()
+        operation, payload = mock_submit_ai_event.call_args[0]
+        assert operation == "completion"
 
-        # Verify the metering call parameters
-        call_args = mock_run_async.call_args[0][0]
-        assert isinstance(call_args, object)  # This is a coroutine object
+        # Values derived from the response
+        assert payload["provider"] == "ANTHROPIC"
+        assert payload["model_source"] == "ANTHROPIC"
+        assert payload["model"] == "claude-3-5-sonnet-20241022"
+        assert payload["input_token_count"] == 100
+        assert payload["output_token_count"] == 50
+        assert payload["total_token_count"] == 150
+        assert payload["cache_creation_token_count"] == 3
+        assert payload["cache_read_token_count"] == 7
+        assert payload["stop_reason"] == "END"  # "end_turn" maps to END
+        assert payload["transaction_id"] == "test-response-id"
+        assert payload["cost_type"] == "AI"
+        assert payload["is_streamed"] is False
+        assert payload["middleware_source"] == "PYTHON"
 
-        # Verify expected parameters would be passed to create_completion
-        expected_call_params = {
-            "audio_token_count": 0,
-            "cached_token_count": 0,
-            "completion_token_count": 50,
-            "cost_type": "AI",
-            "model": "gpt-4",
-            "prompt_token_count": 100,
-            "provider": "ANTHROPIC",
-            "reasoning_token_count": 0,
-            "request_time": "2023-01-01T12:00:00Z",
-            "response_time": "2023-01-01T12:00:00Z",
-            "completion_start_time": "2023-01-01T12:00:00Z",
-            "request_duration": 0,  # 0 because time is frozen
-            "stop_reason": "END",
-            "total_token_count": 150,
-            "transaction_cost": 0,
-            "transaction_id": "test-response-id",
-            "trace_id": "test-trace",
-            "task_id": "test-task",
-            "task_type": "test-type",
-            "subscriber_identity": "test-subscriber",
-            "organization_name": "AcmeCorp",
-            "subscription_id": "test-sub",
-            "product_name": "customer-chatbot",
-            "source_id": "test-source",
-            "ai_provider_key_name": "test-key",
-            "agent": "test-agent"
-        }
+        # Timing under freeze_time: request and response coincide
+        assert payload["request_time"] == "2023-01-01T12:00:00Z"
+        assert payload["response_time"] == "2023-01-01T12:00:00Z"
+        assert payload["completion_start_time"] == "2023-01-01T12:00:00Z"
+        assert payload["request_duration"] == 0
 
-        # We can't directly check the coroutine's parameters, but we can verify logging
-        assert "Metering call to Revenium for completion test-response-id" in caplog.text
+        # usage_metadata fields flow through to the metering payload
+        assert payload["trace_id"] == "test-trace"
+        assert payload["task_type"] == "test-type"
+        assert payload["subscription_id"] == "test-sub"
+        assert payload["agent"] == "test-agent"
+        assert payload["organization_name"] == "AcmeCorp"
+        assert payload["product_name"] == "customer-chatbot"
 
     @freeze_time("2023-01-01T12:00:00Z")
-    @wrapt.decorator(enabled=False)
-    @patch("revenium_middleware.anthropic.middleware.run_async_in_thread")
-    @patch("revenium_middleware.anthropic.middleware.client")
-    def test_create_wrapper_no_metadata(self, mock_run_async, mock_client, reset_state, mock_anthropic_response):
-        """Test create_wrapper with no usage_metadata provided."""
-        # Set up mocks
+    @patch("revenium_middleware.anthropic.middleware.submit_ai_event")
+    @patch("revenium_middleware.run_async_in_thread")
+    def test_create_wrapper_no_metadata(self, mock_run_async, mock_submit_ai_event, reset_state,
+                                        mock_anthropic_response):
+        """Test create_wrapper with no usage_metadata provided: the call still
+        succeeds and is metered, with metadata-derived fields left unset."""
         mock_wrapped = MagicMock(return_value=mock_anthropic_response)
-        mock_thread = MagicMock()
-        mock_run_async.return_value = mock_thread
-        mock_client.ai.create_completion = AsyncMock()
+        _run_metering_synchronously(mock_run_async)
 
         # Test data without usage_metadata
         test_kwargs = {
             "messages": [{"role": "user", "content": "Hello"}],
-            "model": "gpt-4"
+            "model": "claude-3-5-sonnet-20241022"
         }
 
         # Call the wrapper
-        result = create_wrapper(mock_wrapped, MagicMock(), (), test_kwargs.copy())
+        result = create_wrapper(mock_wrapped, None, (), test_kwargs.copy())
 
         # Assertions
-        assert result == mock_anthropic_response
+        assert result is mock_anthropic_response
         mock_wrapped.assert_called_once_with(**test_kwargs)
         mock_run_async.assert_called_once()
 
+        mock_submit_ai_event.assert_called_once()
+        operation, payload = mock_submit_ai_event.call_args[0]
+        assert operation == "completion"
+        assert payload["input_token_count"] == 100
+        assert payload["output_token_count"] == 50
+        assert payload["transaction_id"] == "test-response-id"
+        assert payload["trace_id"] is None
+        assert payload["subscription_id"] is None
+        assert payload["organization_name"] is None
+        assert payload["product_name"] is None
+        assert payload["subscriber"] is None
+
     @freeze_time("2023-01-01T12:00:00Z")
-    @wrapt.decorator(enabled=False)
-    @patch("revenium_middleware.anthropic.middleware.run_async_in_thread")
-    @patch("revenium_middleware.anthropic.middleware.client")
-    def test_create_wrapper_during_shutdown(self, mock_run_async, mock_client, reset_state, mock_anthropic_response,
-                                            test_kwargs, caplog):
-        """Test create_wrapper behavior during shutdown."""
+    @patch("revenium_middleware.anthropic.middleware.submit_ai_event")
+    @patch("revenium_middleware.run_async_in_thread")
+    def test_create_wrapper_during_shutdown(self, mock_run_async, mock_submit_ai_event, reset_state,
+                                            mock_anthropic_response, test_kwargs, caplog):
+        """Test create_wrapper behavior during shutdown: the wrapped call still
+        returns normally but metering is skipped entirely."""
         caplog.set_level(logging.WARNING)
 
         # Set up mocks
         mock_wrapped = MagicMock(return_value=mock_anthropic_response)
-        mock_thread = MagicMock()
-        mock_run_async.return_value = mock_thread
 
         # Set shutdown event
         shutdown_event.set()
 
         # Call the wrapper
-        result = create_wrapper(mock_wrapped, MagicMock(), (), test_kwargs.copy())
+        result = create_wrapper(mock_wrapped, None, (), test_kwargs.copy())
 
-        # Assertions
-        assert result == mock_anthropic_response
+        # The caller is unaffected
+        assert result is mock_anthropic_response
         mock_wrapped.assert_called_once()
-        mock_run_async.assert_called_once()
 
-        # The async function should log a warning about skipping during shutdown
-        assert "Skipping metering call during shutdown" in caplog.text
+        # No metering thread is started and nothing is submitted
+        mock_run_async.assert_not_called()
+        mock_submit_ai_event.assert_not_called()
+
+        # The skip is logged as a warning
+        assert "Skipping async operation during shutdown" in caplog.text
 
     @freeze_time("2023-01-01T12:00:00Z")
-    @wrapt.decorator(enabled=False)
-    @patch("revenium_middleware.anthropic.middleware.run_async_in_thread")
-    @patch("revenium_middleware.anthropic.middleware.client")
-    def test_create_wrapper_metering_exception(self, mock_run_async, mock_client, reset_state, mock_anthropic_response,
-                                               test_kwargs, caplog):
-        """Test create_wrapper when the metering call raises an exception."""
+    @patch("revenium_middleware.anthropic.middleware.submit_ai_event")
+    @patch("revenium_middleware.run_async_in_thread")
+    def test_create_wrapper_metering_exception(self, mock_run_async, mock_submit_ai_event, reset_state,
+                                               mock_anthropic_response, test_kwargs, caplog):
+        """Test create_wrapper when the metering call raises an exception: the
+        exception is caught inside the metering coroutine and logged, and the
+        wrapped response is still returned to the caller."""
         caplog.set_level(logging.WARNING)
 
         # Set up mocks
         mock_wrapped = MagicMock(return_value=mock_anthropic_response)
-        mock_thread = MagicMock()
-        mock_run_async.return_value = mock_thread
+        _run_metering_synchronously(mock_run_async)
 
-        # Make the client raise an exception
-        mock_client.ai.create_completion = AsyncMock(side_effect=Exception("Test error"))
+        # Make the metering submission raise an exception
+        mock_submit_ai_event.side_effect = Exception("Test error")
 
-        # Call the wrapper
-        result = create_wrapper(mock_wrapped, MagicMock(), (), test_kwargs.copy())
+        # Call the wrapper - must not raise
+        result = create_wrapper(mock_wrapped, None, (), test_kwargs.copy())
 
-        # Assertions
-        assert result == mock_anthropic_response
+        # The caller still gets the wrapped response
+        assert result is mock_anthropic_response
         mock_wrapped.assert_called_once()
         mock_run_async.assert_called_once()
+        mock_submit_ai_event.assert_called_once()
 
-        # The exception should be caught and logged
+        # The exception is caught inside the metering coroutine and logged
         assert "Error in metering call: Test error" in caplog.text
 
     @freeze_time("2023-01-01T12:00:00Z")
-    @wrapt.decorator(enabled=False)
-    @patch("revenium_middleware.anthropic.middleware.run_async_in_thread")
-    @patch("revenium_middleware.anthropic.middleware.client")
-    def test_create_wrapper_no_choices(self, mock_run_async, mock_client, reset_state,
+    @patch("revenium_middleware.anthropic.middleware.submit_ai_event")
+    @patch("revenium_middleware.run_async_in_thread")
+    def test_create_wrapper_no_choices(self, mock_run_async, mock_submit_ai_event, reset_state,
                                        mock_anthropic_response, test_kwargs):
-        """Test create_wrapper when response has no choices."""
+        """Test create_wrapper when the response carries no usage data
+        (Anthropic responses have no `choices`; the analogous degenerate
+        response today is usage=None): the response is returned unchanged
+        and metering is skipped."""
         # Set up mocks
         mock_wrapped = MagicMock(return_value=mock_anthropic_response)
-        mock_thread = MagicMock()
-        mock_run_async.return_value = mock_thread
-        mock_client.ai.create_completion = AsyncMock()
+        _run_metering_synchronously(mock_run_async)
 
-        # Remove choices from response
-        mock_anthropic_response.choices = []
+        # Response without usage data
+        mock_anthropic_response.usage = None
 
         # Call the wrapper
-        result = create_wrapper(mock_wrapped, MagicMock(), (), test_kwargs.copy())
+        result = create_wrapper(mock_wrapped, None, (), test_kwargs.copy())
 
-        # Assertions
-        assert result == mock_anthropic_response
+        # The response is returned early, without any metering
+        assert result is mock_anthropic_response
         mock_wrapped.assert_called_once()
-        mock_run_async.assert_called_once()
-
-        # Should default to "END" when no choices
-        coroutine = mock_run_async.call_args[0][0]
-        assert isinstance(coroutine, object)
+        mock_run_async.assert_not_called()
+        mock_submit_ai_event.assert_not_called()
 
     @freeze_time("2023-01-01T12:00:00Z")
-    @wrapt.decorator(enabled=False)
     @patch("revenium_middleware.anthropic.middleware.datetime")
-    @patch("revenium_middleware.anthropic.middleware.run_async_in_thread")
-    @patch("revenium_middleware.anthropic.middleware.client")
-    def test_create_wrapper_request_duration(self, mock_run_async, mock_client, mock_datetime,
+    @patch("revenium_middleware.anthropic.middleware.submit_ai_event")
+    @patch("revenium_middleware.run_async_in_thread")
+    def test_create_wrapper_request_duration(self, mock_run_async, mock_submit_ai_event, mock_datetime,
                                              reset_state, mock_anthropic_response, test_kwargs):
-        """Test create_wrapper calculates request duration correctly."""
+        """Test create_wrapper calculates request duration correctly as the
+        elapsed wall-clock milliseconds between request and response."""
         # Set up mocks
         mock_wrapped = MagicMock(return_value=mock_anthropic_response)
-        mock_thread = MagicMock()
-        mock_run_async.return_value = mock_thread
-        mock_client.ai.create_completion = AsyncMock()
+        _run_metering_synchronously(mock_run_async)
 
-        # Mock datetime to simulate elapsed time
+        # Mock datetime to simulate 1 second elapsing between the request
+        # timestamp and the response timestamp
         request_time = datetime.datetime(2023, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
         response_time = datetime.datetime(2023, 1, 1, 12, 0, 1, tzinfo=datetime.timezone.utc)
 
-        mock_datetime.datetime.now.side_effect = [request_time, response_time]
         mock_datetime.timezone = datetime.timezone
-        mock_datetime.datetime = datetime.datetime
+        mock_datetime.datetime.now.side_effect = [request_time, response_time]
 
         # Call the wrapper
-        result = create_wrapper(mock_wrapped, MagicMock(), (), test_kwargs.copy())
+        result = create_wrapper(mock_wrapped, None, (), test_kwargs.copy())
 
         # Assertions
-        assert result == mock_anthropic_response
+        assert result is mock_anthropic_response
         mock_wrapped.assert_called_once()
         mock_run_async.assert_called_once()
 
         # Request duration should be 1000ms (1 second)
-        coroutine = mock_run_async.call_args[0][0]
-        assert isinstance(coroutine, object)
+        mock_submit_ai_event.assert_called_once()
+        payload = mock_submit_ai_event.call_args[0][1]
+        assert payload["request_time"] == "2023-01-01T12:00:00Z"
+        assert payload["response_time"] == "2023-01-01T12:00:01Z"
+        assert payload["request_duration"] == 1000
+        assert payload["time_to_first_token"] == 1000
 
 
 

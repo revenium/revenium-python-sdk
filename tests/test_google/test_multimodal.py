@@ -235,7 +235,7 @@ class TestImageMeteringCall:
     """Test create_image_metering_call helper."""
 
     @patch("revenium_middleware.google.common.utils.run_async_in_thread")
-    @patch("revenium_middleware.google.common.utils.client")
+    @patch("revenium_middleware.google.common.utils.get_client")
     def test_create_image_metering_call(self, mock_client, mock_run_async):
         from revenium_middleware.google.common.utils import create_image_metering_call
 
@@ -257,7 +257,7 @@ class TestImageMeteringCall:
         assert mock_run_async.called
 
     @patch("revenium_middleware.google.common.utils.run_async_in_thread")
-    @patch("revenium_middleware.google.common.utils.client")
+    @patch("revenium_middleware.google.common.utils.get_client")
     def test_create_image_metering_call_with_edit_subtype(self, mock_client, mock_run_async):
         from revenium_middleware.google.common.utils import create_image_metering_call
 
@@ -284,7 +284,7 @@ class TestVideoMeteringCall:
     """Test create_video_metering_call helper."""
 
     @patch("revenium_middleware.google.common.utils.run_async_in_thread")
-    @patch("revenium_middleware.google.common.utils.client")
+    @patch("revenium_middleware.google.common.utils.get_client")
     def test_create_video_metering_call(self, mock_client, mock_run_async):
         from revenium_middleware.google.common.utils import create_video_metering_call
 
@@ -305,7 +305,7 @@ class TestVideoMeteringCall:
         assert mock_run_async.called
 
     @patch("revenium_middleware.google.common.utils.run_async_in_thread")
-    @patch("revenium_middleware.google.common.utils.client")
+    @patch("revenium_middleware.google.common.utils.get_client")
     def test_create_video_metering_call_with_job_id(self, mock_client, mock_run_async):
         from revenium_middleware.google.common.utils import create_video_metering_call
 
@@ -331,8 +331,8 @@ class TestVideoMeteringCall:
 class TestLogImageUsage:
     """Test the async log_image_usage function."""
 
-    @patch("revenium_middleware._core.metering_submission.client")
-    @patch("revenium_middleware.google.common.utils.client")
+    @patch("revenium_middleware._core.metering.client")
+    @patch("revenium_middleware.google.common.utils.get_client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
     def test_log_image_usage_calls_create_image(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_image_usage
@@ -363,8 +363,8 @@ class TestLogImageUsage:
         assert call_kwargs["middleware_source"] == "python"
         assert call_kwargs["trace_id"] == "test-trace"
 
-    @patch("revenium_middleware._core.metering_submission.client")
-    @patch("revenium_middleware.google.common.utils.client")
+    @patch("revenium_middleware._core.metering.client")
+    @patch("revenium_middleware.google.common.utils.get_client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
     def test_log_image_usage_skips_during_shutdown(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_image_usage
@@ -384,8 +384,8 @@ class TestLogImageUsage:
 
         mock_metering_client.ai.create_image.assert_not_called()
 
-    @patch("revenium_middleware._core.metering_submission.client")
-    @patch("revenium_middleware.google.common.utils.client")
+    @patch("revenium_middleware._core.metering.client")
+    @patch("revenium_middleware.google.common.utils.get_client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
     def test_log_image_usage_passes_aspect_ratio(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_image_usage
@@ -417,8 +417,8 @@ class TestLogImageUsage:
 class TestLogVideoUsage:
     """Test the async log_video_usage function."""
 
-    @patch("revenium_middleware._core.metering_submission.client")
-    @patch("revenium_middleware.google.common.utils.client")
+    @patch("revenium_middleware._core.metering.client")
+    @patch("revenium_middleware.google.common.utils.get_client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
     def test_log_video_usage_calls_create_video(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_video_usage
@@ -454,8 +454,8 @@ class TestLogVideoUsage:
         assert call_kwargs["async_operation"] is True
         assert call_kwargs["trace_id"] == "vid-trace"
 
-    @patch("revenium_middleware._core.metering_submission.client")
-    @patch("revenium_middleware.google.common.utils.client")
+    @patch("revenium_middleware._core.metering.client")
+    @patch("revenium_middleware.google.common.utils.get_client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
     def test_log_video_usage_skips_during_shutdown(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_video_usage
@@ -474,8 +474,8 @@ class TestLogVideoUsage:
 
         mock_metering_client.ai.create_video.assert_not_called()
 
-    @patch("revenium_middleware._core.metering_submission.client")
-    @patch("revenium_middleware.google.common.utils.client")
+    @patch("revenium_middleware._core.metering.client")
+    @patch("revenium_middleware.google.common.utils.get_client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
     def test_log_video_usage_passes_aspect_ratio(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_video_usage
@@ -506,8 +506,8 @@ class TestLogVideoUsage:
 class TestHasVisionContentFlag:
     """Test that has_vision_content flag is passed through to completion args."""
 
-    @patch("revenium_middleware._core.metering_submission.client")
-    @patch("revenium_middleware.google.common.utils.client")
+    @patch("revenium_middleware._core.metering.client")
+    @patch("revenium_middleware.google.common.utils.get_client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
     def test_has_vision_content_in_completion_args(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_token_usage
@@ -535,8 +535,8 @@ class TestHasVisionContentFlag:
         call_kwargs = mock_metering_client.ai.create_completion.call_args[1]
         assert call_kwargs.get("has_vision_content") is True
 
-    @patch("revenium_middleware._core.metering_submission.client")
-    @patch("revenium_middleware.google.common.utils.client")
+    @patch("revenium_middleware._core.metering.client")
+    @patch("revenium_middleware.google.common.utils.get_client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
     def test_no_vision_content_flag_when_not_set(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_token_usage

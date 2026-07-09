@@ -1,12 +1,13 @@
 import wrapt
 import logging
 import datetime
-from revenium_middleware import client, run_async_in_thread, shutdown_event
+from revenium_middleware import client, get_client, run_async_in_thread, shutdown_event
 from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
 from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, merge_extra_body
 from revenium_middleware._core.config import is_selective_metering_enabled
 from revenium_middleware._core.context import is_inside_decorated_function
 from revenium_middleware._core import submit_ai_event
+from revenium_middleware._core.log_sanitize import sanitize_for_logging
 from revenium_middleware._core.patch_registry import register_patch
 from .context import metadata_context
 from .hooks import execute_metadata_hooks
@@ -35,7 +36,11 @@ if register_patch("litellm.completion"):
         logger.debug("Usage metadata (merged from context and kwargs, after hooks): {}".format(usage_metadata))
 
         request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-        logger.debug(f"Calling chat function with args: {args}, kwargs: {kwargs}")
+        logger.debug(
+            "Calling chat function with args: %s, kwargs: %s",
+            sanitize_for_logging(args),
+            sanitize_for_logging(kwargs),
+        )
 
         is_streaming = kwargs.get("stream", False)
         logger.debug(f"is_streaming: {is_streaming}")
@@ -58,20 +63,25 @@ def handle_streaming_response(generator, request_time_dt, usage_metadata):
     def wrapped_generator():
         nonlocal final_response
 
-        # Collect all chunks
-        for chunk in generator:
-            chunks.append(chunk)
-            yield chunk
-
-        # After all chunks are processed, construct the final response
-        if chunks:
-            for chunk in reversed(chunks):
-                if hasattr(chunk, 'usage') and chunk.usage is not None:
-                    final_response = chunk
-                    break
-            if final_response is None:
-                final_response = chunks[-1]
-            handle_response(final_response, request_time_dt, usage_metadata, True)
+        # The finally block also runs on GeneratorExit when the caller breaks
+        # out of the loop or abandons the generator, so partial
+        # usage from an interrupted stream is still metered.
+        try:
+            for chunk in generator:
+                chunks.append(chunk)
+                yield chunk
+        finally:
+            if chunks:
+                try:
+                    for chunk in reversed(chunks):
+                        if hasattr(chunk, 'usage') and chunk.usage is not None:
+                            final_response = chunk
+                            break
+                    if final_response is None:
+                        final_response = chunks[-1]
+                    handle_response(final_response, request_time_dt, usage_metadata, True)
+                except Exception as e:
+                    logger.warning("Error metering interrupted/completed stream: %s", e)
 
     return wrapped_generator()
 
@@ -81,7 +91,7 @@ def handle_response(response, request_time_dt, usage_metadata, is_streaming):
     Process a complete response (either streaming or non-streaming) and send metering data.
     Returns the original response.
     """
-    if client is None:
+    if get_client() is None:
         return response  # metering disabled (no API key configured)
 
     async def metering_call():

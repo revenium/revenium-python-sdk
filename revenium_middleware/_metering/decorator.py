@@ -8,6 +8,7 @@ Data flow: Python SDK -> Metering API (/v2/tool/events) -> Kafka -> Clickhouse
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
 import asyncio
@@ -24,28 +25,59 @@ __all__ = ["meter_tool", "report_tool_call", "configure"]
 
 F = TypeVar("F", bound=Callable[..., Any])
 
-# Global configuration (set via configure())
+# Global configuration (set via configure()); None falls back to the
+# REVENIUM_METERING_* environment variables.
 _metering_url: Optional[str] = None
 _api_key: Optional[str] = None
 
+_DEFAULT_BASE_URL = "https://api.revenium.ai"
+
 
 def configure(
-    metering_url: str = "http://localhost:8082",
-    api_key: str = "demo-key",
+    metering_url: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> None:
     """
-    Configure the metering client.
+    Configure tool metering explicitly.
+
+    Explicit values take precedence over the REVENIUM_METERING_BASE_URL /
+    REVENIUM_METERING_API_KEY environment variables; pass None to clear an
+    override and fall back to the environment. Calling configure() is
+    optional -- with the standard environment variables set, tool events are
+    delivered without it.
 
     Example:
-        import revenium_metering as revenium
-        revenium.configure(
-            metering_url="http://localhost:8082",
-            api_key="your-api-key",
+        from revenium_middleware import configure
+        configure(
+            metering_url="https://api.revenium.ai",
+            api_key="hak_your_api_key",
         )
     """
     global _metering_url, _api_key
     _metering_url = metering_url
     _api_key = api_key
+
+
+def _resolve_endpoint() -> "tuple[Optional[str], Optional[str]]":
+    """Resolve (events_url, api_key) for tool events.
+
+    Precedence: explicit configure() values > REVENIUM_METERING_* env vars.
+    Returns (None, None) when no API key is available anywhere -- tool
+    metering is then skipped instead of posting demo credentials to
+    localhost. The /meter prefix matches the main metering client's API
+    layout and is not duplicated when the base URL already carries it.
+    """
+    # Snapshot both overrides in a single statement so a concurrent
+    # configure() cannot yield a mismatched key/URL pair for one event.
+    url_override, key_override = _metering_url, _api_key
+    key = key_override or os.environ.get("REVENIUM_METERING_API_KEY")
+    if not key:
+        return None, None
+    base = url_override or os.environ.get("REVENIUM_METERING_BASE_URL") or _DEFAULT_BASE_URL
+    base = base.rstrip("/")
+    if not base.endswith("/meter"):
+        base = base + "/meter"
+    return f"{base}/v2/tool/events", key
 
 
 def _build_event_payload(
@@ -98,46 +130,57 @@ def _build_event_payload(
     return event_payload
 
 
-def _send_tool_event(
-    tool_id: str,
-    operation: Optional[str],
-    duration_ms: int,
-    success: bool,
-    error_message: Optional[str],
-    usage_metadata: Optional[Dict[str, Any]],
-    context: ReveniumContext,
-) -> None:
+def _dispatch_tool_event(**event_kwargs: Any) -> None:
     """
-    Send tool event to metering API via /v2/tool/events endpoint.
+    Schedule the tool event on the SDK's fire-and-forget metering thread.
 
-    This goes through the proper pipeline:
-    Metering API -> Kafka (hypercurrent.metering.tool-events) -> Clickhouse
+    Tool metering must never block the wrapped call -- the same guarantee
+    AI-completion metering provides by dispatching via run_async_in_thread.
+    The metering thread is joined during SDK shutdown, so events still flush
+    on process exit.
     """
-    url = _metering_url or "http://localhost:8082"
-    key = _api_key or "demo-key"
-
-    event_payload = _build_event_payload(
-        tool_id, operation, duration_ms, success, error_message, usage_metadata, context
-    )
-
     try:
-        with httpx.Client(timeout=5.0) as client:
-            response = client.post(
-                f"{url}/v2/tool/events",
-                headers={
-                    "x-api-key": key,
-                    "Content-Type": "application/json",
-                },
-                json=event_payload,
+        # Imported lazily: this module is part of revenium_middleware's import
+        # cycle, and by the time an event fires the package is fully loaded.
+        from revenium_middleware import run_async_in_thread, shutdown_event
+
+        if shutdown_event.is_set():
+            logger.warning("Skipping tool metering during shutdown")
+            return
+
+        # Resolve the endpoint NOW, not when the background coroutine runs:
+        # a configure() call racing the queued event must not change where or
+        # under which key this event is delivered.
+        url, key = _resolve_endpoint()
+        if url is None:
+            logger.warning(
+                "Tool metering skipped: no API key configured "
+                "(set REVENIUM_METERING_API_KEY or call configure())"
             )
-            response.raise_for_status()
-            logger.debug("[metered] %s:%s %dms", tool_id, operation or "execute", duration_ms)
+            return
+        coro = _send_tool_event_async(url, key, **event_kwargs)
     except Exception as e:
+        # Non-blocking - just log and continue
+        logger.warning("metering error: %s", e)
+        return
+
+    # From here on the coroutine exists but is not yet scheduled; every path
+    # that fails to hand it off must close() it, otherwise garbage collection
+    # emits a "coroutine was never awaited" RuntimeWarning.
+    try:
+        thread = run_async_in_thread(coro)
+        if thread is None:
+            # Not scheduled (e.g. shutdown won the race after our pre-check).
+            coro.close()
+    except Exception as e:
+        coro.close()
         # Non-blocking - just log and continue
         logger.warning("metering error: %s", e)
 
 
 async def _send_tool_event_async(
+    url: str,
+    key: str,
     tool_id: str,
     operation: Optional[str],
     duration_ms: int,
@@ -149,11 +192,9 @@ async def _send_tool_event_async(
     """
     Async version of _send_tool_event for use in async contexts.
 
-    Uses httpx.AsyncClient to avoid blocking the event loop.
+    Uses httpx.AsyncClient to avoid blocking the event loop. The endpoint and
+    key are resolved by the dispatcher at enqueue time and passed in.
     """
-    url = _metering_url or "http://localhost:8082"
-    key = _api_key or "demo-key"
-
     event_payload = _build_event_payload(
         tool_id, operation, duration_ms, success, error_message, usage_metadata, context
     )
@@ -161,16 +202,31 @@ async def _send_tool_event_async(
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.post(
-                f"{url}/v2/tool/events",
+                url,
                 headers={
                     "x-api-key": key,
                     "Content-Type": "application/json",
+                    # Dedupes redelivery (e.g. buffer replay after a network
+                    # drop the backend actually accepted) when supported;
+                    # harmless if the backend ignores it.
+                    "Idempotency-Key": event_payload["transactionId"],
                 },
                 json=event_payload,
             )
             response.raise_for_status()
             logger.debug("[metered] %s:%s %dms", tool_id, operation or "execute", duration_ms)
     except Exception as e:
+        try:
+            from revenium_middleware._core.metering_buffer import get_buffer, is_retryable_failure
+
+            if is_retryable_failure(e):
+                get_buffer().push(
+                    "tool", {"url": url, "key": key, "event_payload": event_payload}
+                )
+                logger.warning("metering error (event buffered for replay): %s", e)
+                return
+        except Exception as buffer_exc:  # buffering must never mask the original error
+            logger.warning("metering buffer error: %s", buffer_exc)
         # Non-blocking - just log and continue
         logger.warning("metering error: %s", e)
 
@@ -220,7 +276,7 @@ def report_tool_call(
         trace_id=trace_id,
         transaction_id=transaction_id,
     )
-    _send_tool_event(
+    _dispatch_tool_event(
         tool_id=tool_id,
         operation=operation,
         duration_ms=duration_ms,
@@ -322,7 +378,7 @@ def meter_tool(
                 duration_ms = int((time.perf_counter() - start_time) * 1000)
                 usage_metadata = _extract_output_fields(result, output_fields)
 
-                _send_tool_event(
+                _dispatch_tool_event(
                     tool_id=tool_id,
                     operation=operation,
                     duration_ms=duration_ms,
@@ -364,7 +420,7 @@ def meter_tool(
                 duration_ms = int((time.perf_counter() - start_time) * 1000)
                 usage_metadata = _extract_output_fields(result, output_fields)
 
-                await _send_tool_event_async(
+                _dispatch_tool_event(
                     tool_id=tool_id,
                     operation=operation,
                     duration_ms=duration_ms,

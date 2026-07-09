@@ -56,8 +56,9 @@ def mock_revenium_client():
 
     # Patch client in all modules that import it directly
     patches = [
+        # get_client() resolves through _core.metering.client, so patching it
+        # covers submit_ai_event and every provider guard.
         patch('revenium_middleware._core.metering.client', mock_client),
-        patch('revenium_middleware._core.metering_submission.client', mock_client),
         patch('revenium_middleware.client', mock_client),
     ]
 

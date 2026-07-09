@@ -5,7 +5,8 @@ import revenium_middleware as rm
 
 
 EXPECTED_ALL = {
-    "client", "run_async_in_thread", "shutdown_event",
+    "client", "get_buffer_stats", "get_client", "initialize_metering",
+    "run_async_in_thread", "shutdown_event",
     "revenium_meter", "revenium_metadata", "track_usage",
     "is_inside_decorated_function", "get_function_metadata",
     "set_decorated_context", "clear_decorated_context",

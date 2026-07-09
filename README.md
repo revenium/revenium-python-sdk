@@ -1223,6 +1223,44 @@ See [`examples/openai/openai_blocking_demo.py`](examples/openai/openai_blocking_
 |----------|-------------|
 | `REVENIUM_METERING_API_KEY` | Your Revenium API key (starts with `hak_` or `rev_`) |
 
+### Configuring After Import
+
+The metering client is normally built from the environment when
+`revenium_middleware` is first imported. If your credentials only become
+available later (a secrets-vault bootstrap, framework settings hooks, import
+ordering), you don't need to restart: as soon as `REVENIUM_METERING_API_KEY`
+appears in the environment, the next metered call picks it up automatically.
+You can also configure programmatically at any time:
+
+```python
+import revenium_middleware
+
+revenium_middleware.initialize_metering(
+    api_key="hak_your_key",                    # defaults to REVENIUM_METERING_API_KEY
+    base_url="https://api.revenium.ai",        # defaults to REVENIUM_METERING_BASE_URL
+)
+```
+
+`initialize_metering()` returns `True` when metering is enabled after the
+call; invoke it with no arguments to re-read the environment.
+
+### Delivery Resilience (Store-and-Forward)
+
+Metering events that still fail after the client's own retries (network
+outages, 5xx, rate limiting) are not lost: they are held in a bounded
+in-memory buffer and replayed automatically in the background every 30
+seconds, reusing each event's original `Idempotency-Key` so replays can
+never double-bill. Permanent failures (401/403/404/422) are never buffered.
+The buffer holds up to 1000 events (oldest evicted first) for at most 24
+hours, and is drained on graceful shutdown. Inspect it programmatically:
+
+```python
+from revenium_middleware import get_buffer_stats
+
+print(get_buffer_stats())
+# {'size': 0, 'max_size': 1000, 'total_buffered': 3, 'total_replayed': 3, ...}
+```
+
 ### Optional Environment Variables
 
 | Variable | Default | Description |
@@ -1241,6 +1279,8 @@ See [`examples/openai/openai_blocking_demo.py`](examples/openai/openai_blocking_
 | `REVENIUM_TRANSACTION_NAME` | - | Human-friendly operation name |
 | `REVENIUM_RETRY_NUMBER` | - | Retry attempt number |
 | `REVENIUM_BEDROCK_DISABLE` | - | Set to `1` to disable Bedrock auto-detection |
+| `REVENIUM_BUFFER_MAX_SIZE` | `1000` | Store-and-forward buffer capacity (oldest events evicted when full) |
+| `REVENIUM_BUFFER_FLUSH_INTERVAL` | `30` | Seconds between automatic replay attempts for buffered events |
 
 ### Provider-Specific Environment Variables
 

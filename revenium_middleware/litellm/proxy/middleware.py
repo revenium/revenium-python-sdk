@@ -1,5 +1,5 @@
 from litellm.integrations.custom_logger import CustomLogger
-from revenium_middleware import client, run_async_in_thread
+from revenium_middleware import client, get_client, run_async_in_thread
 from revenium_middleware._core.fields import merge_extra_body
 from revenium_middleware._core import submit_ai_event
 import logging
@@ -52,7 +52,7 @@ def _extract_agentic_job_from_headers(headers):
 
 class MiddlewareHandler(CustomLogger):
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
-        if client is None:
+        if get_client() is None:
             return  # metering disabled (no API key configured)
         # log: key, user, model, prompt, response, tokens, cost
         # Access kwargs passed to litellm.completion()
@@ -142,7 +142,7 @@ class MiddlewareHandler(CustomLogger):
         return
 
     async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
-        if client is None:
+        if get_client() is None:
             return  # metering disabled (no API key configured)
         # log: key, user, model, prompt, error, tokens, cost
         # Access kwargs passed to litellm.completion()
