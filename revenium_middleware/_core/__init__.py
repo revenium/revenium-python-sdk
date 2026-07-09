@@ -5,7 +5,8 @@ This subpackage contains the foundational components shared across all
 provider-specific middleware implementations.
 """
 
-from .metering import run_async_in_thread, shutdown_event, client
+from .metering import run_async_in_thread, shutdown_event, client, get_client, initialize_metering
+from .metering_buffer import get_buffer_stats
 from .metering_submission import submit_ai_event
 from .exceptions import BudgetExceededError
 from .enforcement import check_enforcement, is_circuit_breaker_enabled, stop_polling
@@ -50,6 +51,9 @@ from .trace_fields import (
 __all__ = [
     # Metering
     "client",
+    "get_client",
+    "initialize_metering",
+    "get_buffer_stats",
     "run_async_in_thread",
     "shutdown_event",
     "submit_ai_event",

@@ -7,7 +7,7 @@ from typing import Dict, Any, Optional, Tuple
 from enum import Enum
 
 import wrapt
-from revenium_middleware import client, run_async_in_thread, shutdown_event, merge_metadata
+from revenium_middleware import client, get_client, run_async_in_thread, shutdown_event, merge_metadata
 from revenium_middleware._core.enforcement import check_enforcement
 from revenium_middleware._core.exceptions import BudgetExceededError  # noqa: F401 — re-exported via openai.exceptions
 from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
@@ -16,12 +16,12 @@ from revenium_middleware._core.config import is_selective_metering_enabled, is_c
 from revenium_middleware._core.context import is_inside_decorated_function
 from revenium_middleware._core.patch_registry import register_patch
 from revenium_middleware._core import submit_ai_event
+from revenium_middleware._core.log_sanitize import sanitize_for_logging
 
 # Azure OpenAI support imports
 from .provider import Provider, detect_provider, get_provider_metadata, is_azure_provider
 from .azure_model_resolver import resolve_azure_model_name
 from .azure_config import get_azure_config
-from .config import Config, SecurityConfig
 from .exceptions import (
     ReveniumMiddlewareError, ValidationError, MeteringError,
     NetworkError, AuthenticationError, categorize_exception, handle_exception_safely
@@ -38,10 +38,6 @@ from .prompt_extractor import (
 )
 
 logger = logging.getLogger("revenium_middleware.extension")
-
-
-# Use centralized security configuration
-SENSITIVE_FIELDS = SecurityConfig.SENSITIVE_FIELDS
 
 
 def _get_value(source: Any, key: str, default: Any = None) -> Any:
@@ -159,38 +155,6 @@ def extract_prompt_data_if_enabled(
     )
 
     return system_prompt, input_messages, output_response, prompts_truncated
-
-
-def sanitize_for_logging(data: Any, max_depth: int = Config.MAX_SANITIZATION_DEPTH) -> Any:
-    """
-    Sanitize data for secure logging by redacting sensitive fields.
-
-    Args:
-        data: Data to sanitize (dict, list, or primitive)
-        max_depth: Maximum recursion depth to prevent infinite loops
-
-    Returns:
-        Sanitized data safe for logging
-    """
-    if max_depth <= 0:
-        return "[MAX_DEPTH_REACHED]"
-
-    if isinstance(data, dict):
-        sanitized = {}
-        for key, value in data.items():
-            key_lower = str(key).lower()
-            if any(sensitive in key_lower for sensitive in SENSITIVE_FIELDS):
-                sanitized[key] = "[REDACTED]"
-            else:
-                sanitized[key] = sanitize_for_logging(value, max_depth - 1)
-        return sanitized
-    elif isinstance(data, (list, tuple)):
-        return [sanitize_for_logging(item, max_depth - 1) for item in data]
-    elif isinstance(data, str) and len(data) > Config.MAX_LOG_STRING_LENGTH:
-        # Truncate very long strings that might contain sensitive data
-        return data[:Config.MAX_LOG_STRING_LENGTH] + "...[TRUNCATED]"
-    else:
-        return data
 
 
 class OperationType(str, Enum):
@@ -451,7 +415,7 @@ async def log_token_usage(
         cache_read_token_count: Optional[int] = None,
 ) -> None:
     """Log token usage to Revenium."""
-    if client is None:
+    if get_client() is None:
         return  # metering disabled (no API key configured)
     if shutdown_event.is_set():
         logger.warning("Skipping metering call during shutdown")
@@ -865,8 +829,9 @@ def embeddings_create_wrapper(wrapped, instance, args, kwargs):
     check_enforcement(usage_metadata)
 
     logger.debug(
-        f"Calling wrapped embeddings function with args: {args}, "
-        f"kwargs: {kwargs}"
+        "Calling wrapped embeddings function with args: %s, kwargs: %s",
+        sanitize_for_logging(args),
+        sanitize_for_logging(kwargs),
     )
 
     # Call the original OpenAI function
@@ -917,8 +882,12 @@ def create_wrapper(wrapped, instance, args, kwargs):
     # Check if this is a streaming request
     stream = kwargs.get('stream', False)
 
-    # If streaming, add stream_options to include usage information
+    # If streaming, add stream_options to include usage information. Remember
+    # whether the caller asked for usage themselves: the extra usage chunk the
+    # API appends is hidden from the caller unless they opted in.
+    caller_requested_usage = False
     if stream:
+        caller_requested_usage = bool((kwargs.get('stream_options') or {}).get('include_usage'))
         kwargs = dict(kwargs)
         if 'stream_options' not in kwargs:
             kwargs['stream_options'] = {}
@@ -955,7 +924,9 @@ def create_wrapper(wrapped, instance, args, kwargs):
     check_enforcement(usage_metadata)
 
     logger.debug(
-        f"Calling wrapped function with args: {args}, kwargs: {kwargs}"
+        "Calling wrapped function with args: %s, kwargs: %s",
+        sanitize_for_logging(args),
+        sanitize_for_logging(kwargs),
     )
 
     response = wrapped(*args, **kwargs)
@@ -975,7 +946,8 @@ def create_wrapper(wrapped, instance, args, kwargs):
             request_time_dt,
             usage_metadata,
             client_instance=getattr(instance, '_client', None),
-            request_body=request_body
+            request_body=request_body,
+            caller_requested_usage=caller_requested_usage
         )
     else:
         # For non-streaming responses (ChatCompletion)
@@ -995,12 +967,22 @@ def create_wrapper(wrapped, instance, args, kwargs):
         return response
 
 
+def _is_injected_usage_chunk(chunk, caller_requested_usage):
+    """The final empty-choices usage chunk only exists because the middleware
+    forced stream_options.include_usage; hide it from the caller unless they
+    asked for usage themselves."""
+    if caller_requested_usage:
+        return False
+    return not getattr(chunk, 'choices', None) and bool(getattr(chunk, 'usage', None))
+
+
 def handle_streaming_response(
     stream,
     request_time_dt,
     usage_metadata,
     client_instance: Optional[Any] = None,
-    request_body: Optional[Dict[str, Any]] = None
+    request_body: Optional[Dict[str, Any]] = None,
+    caller_requested_usage: bool = False
 ):
     """
     Handle streaming responses from OpenAI/Azure OpenAI.
@@ -1026,6 +1008,7 @@ def handle_streaming_response(
             # Store for Azure provider detection
             self.client_instance = client_instance
             self.request_body = request_body
+            self.caller_requested_usage = caller_requested_usage
             self._closed = False
             self._usage_logged = False
 
@@ -1036,18 +1019,24 @@ def handle_streaming_response(
             if self._closed:
                 raise StopIteration("Stream has been closed")
 
-            try:
-                chunk = next(self.stream)
-                self._process_chunk(chunk)
-                return chunk
-            except StopIteration:
-                self._finalize()
-                raise
-            except Exception as e:
-                # Ensure cleanup on any error
-                self._finalize()
-                logger.error(f"Error in streaming response: {e}")
-                raise
+            while True:
+                try:
+                    chunk = next(self.stream)
+                    self._process_chunk(chunk)
+                except StopIteration:
+                    self._finalize()
+                    raise
+                except Exception as e:
+                    # Ensure cleanup on any error
+                    self._finalize()
+                    logger.error(f"Error in streaming response: {e}")
+                    raise
+
+                if not self._injected_usage_chunk(chunk):
+                    return chunk
+
+        def _injected_usage_chunk(self, chunk):
+            return _is_injected_usage_chunk(chunk, self.caller_requested_usage)
 
         def __enter__(self):
             """Context manager entry."""
@@ -1056,6 +1045,18 @@ def handle_streaming_response(
         def __exit__(self, exc_type, exc_val, exc_tb):
             """Context manager exit with cleanup."""
             self._finalize()
+
+        def close(self):
+            """Close the stream, metering whatever was received so far."""
+            self._finalize()
+
+        def __del__(self):
+            # Last-resort finalize: a broken-out-of loop leaves the wrapper to
+            # the GC with no StopIteration/__exit__ ever firing.
+            try:
+                self._finalize()
+            except Exception:
+                pass
 
         def _finalize(self):
             """Finalize the stream and log usage if not already done."""
@@ -1309,7 +1310,11 @@ def responses_create_wrapper(wrapped, instance, args, kwargs):
     # Enforcement pre-call check — may raise BudgetExceededError
     check_enforcement(usage_metadata)
 
-    logger.debug(f"Calling wrapped responses function with args: {args}, kwargs: {kwargs}")
+    logger.debug(
+        "Calling wrapped responses function with args: %s, kwargs: %s",
+        sanitize_for_logging(args),
+        sanitize_for_logging(kwargs),
+    )
 
     # Call the original OpenAI function
     response = wrapped(*args, **kwargs)
@@ -1392,6 +1397,18 @@ def handle_streaming_responses(stream, request_time_dt, usage_metadata,
         def __exit__(self, exc_type, exc_val, exc_tb):
             """Context manager exit with cleanup."""
             self._finalize()
+
+        def close(self):
+            """Close the stream, metering whatever was received so far."""
+            self._finalize()
+
+        def __del__(self):
+            # Last-resort finalize: a broken-out-of loop leaves the wrapper to
+            # the GC with no StopIteration/__exit__ ever firing.
+            try:
+                self._finalize()
+            except Exception:
+                pass
 
         def _finalize(self):
             """Finalize the stream and log usage if not already done."""
@@ -1583,7 +1600,8 @@ def handle_streaming_responses(stream, request_time_dt, usage_metadata,
     return StreamResponseWrapper(iter(stream))
 
 
-def _wrap_async_stream(stream, request_time_dt, usage_metadata, client_instance=None, request_body=None):
+def _wrap_async_stream(stream, request_time_dt, usage_metadata, client_instance=None, request_body=None,
+                       caller_requested_usage=False):
     class AsyncStreamWrapper:
         def __init__(self, stream):
             self.stream = stream
@@ -1593,36 +1611,59 @@ def _wrap_async_stream(stream, request_time_dt, usage_metadata, client_instance=
             self.finish_reason = None
             self.final_usage = None
             self.first_token_time = None
+            self.caller_requested_usage = caller_requested_usage
             self._finalized = False
 
         def __aiter__(self):
             return self
 
         async def __anext__(self):
-            try:
-                chunk = await self.stream.__anext__()
-            except StopAsyncIteration:
-                self._finalize()
-                raise
+            while True:
+                try:
+                    chunk = await self.stream.__anext__()
+                except StopAsyncIteration:
+                    self._finalize()
+                    raise
 
-            if self.response_id is None and hasattr(chunk, 'id'):
-                self.response_id = chunk.id
-            if self.model is None and hasattr(chunk, 'model'):
-                self.model = chunk.model
-            if chunk.choices and chunk.choices[0].finish_reason:
-                self.finish_reason = chunk.choices[0].finish_reason
-            if hasattr(chunk, 'usage') and chunk.usage:
-                self.final_usage = chunk.usage
-            if self.first_token_time is None and chunk.choices and hasattr(chunk.choices[0], 'delta') and getattr(chunk.choices[0].delta, 'content', None):
-                self.first_token_time = datetime.datetime.now(datetime.timezone.utc)
-            self.chunks.append(chunk)
-            return chunk
+                if self.response_id is None and hasattr(chunk, 'id'):
+                    self.response_id = chunk.id
+                if self.model is None and hasattr(chunk, 'model'):
+                    self.model = chunk.model
+                if chunk.choices and chunk.choices[0].finish_reason:
+                    self.finish_reason = chunk.choices[0].finish_reason
+                if hasattr(chunk, 'usage') and chunk.usage:
+                    self.final_usage = chunk.usage
+                if self.first_token_time is None and chunk.choices and hasattr(chunk.choices[0], 'delta') and getattr(chunk.choices[0].delta, 'content', None):
+                    self.first_token_time = datetime.datetime.now(datetime.timezone.utc)
+                self.chunks.append(chunk)
+
+                if not self._injected_usage_chunk(chunk):
+                    return chunk
+
+        def _injected_usage_chunk(self, chunk):
+            return _is_injected_usage_chunk(chunk, self.caller_requested_usage)
 
         async def __aenter__(self):
             return self
 
         async def __aexit__(self, exc_type, exc_val, exc_tb):
             self._finalize()
+
+        async def aclose(self):
+            try:
+                if hasattr(self.stream, 'aclose'):
+                    await self.stream.aclose()
+            finally:
+                self._finalize()
+
+        def __del__(self):
+            # Last-resort finalize: an abandoned async iterator (break + GC)
+            # would otherwise never meter. _finalize only schedules
+            # the fire-and-forget metering thread, so it is safe here.
+            try:
+                self._finalize()
+            except Exception:
+                pass
 
         def _finalize(self):
             if self._finalized:
@@ -1633,7 +1674,13 @@ def _wrap_async_stream(stream, request_time_dt, usage_metadata, client_instance=
                 return
 
             if self.final_usage is None:
-                return
+                # Interrupted before the usage chunk arrived: meter the
+                # transaction with zero token counts rather than dropping it.
+                self.final_usage = type('Usage', (), {
+                    'prompt_tokens': 0,
+                    'completion_tokens': 0,
+                    'total_tokens': 0,
+                })()
 
             time_to_first_token = int((self.first_token_time - request_time_dt).total_seconds() * 1000) if self.first_token_time else 0
 
@@ -1683,7 +1730,9 @@ def async_create_wrapper(wrapped, instance, args, kwargs):
 
     stream = kwargs.get('stream', False)
 
+    caller_requested_usage = False
     if stream:
+        caller_requested_usage = bool((kwargs.get('stream_options') or {}).get('include_usage'))
         kwargs = dict(kwargs)
         if 'stream_options' not in kwargs:
             kwargs['stream_options'] = {}
@@ -1724,7 +1773,8 @@ def async_create_wrapper(wrapped, instance, args, kwargs):
                 request_time_dt,
                 usage_metadata,
                 client_instance=getattr(instance, '_client', None),
-                request_body=request_body
+                request_body=request_body,
+                caller_requested_usage=caller_requested_usage
             )
 
         create_metering_call(

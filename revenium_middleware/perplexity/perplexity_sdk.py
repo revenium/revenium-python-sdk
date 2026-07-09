@@ -10,6 +10,7 @@ from typing import Dict, Any
 import wrapt
 from revenium_middleware import (
     client,
+    get_client,
     run_async_in_thread,
     shutdown_event,
     merge_metadata,
@@ -155,7 +156,7 @@ async def send_perplexity_metering_data(
     This function extracts usage information from the Perplexity response
     and sends it to Revenium's metering API.
     """
-    if client is None:
+    if get_client() is None:
         return  # metering disabled (no API key configured)
     try:
         # Extract usage data from response

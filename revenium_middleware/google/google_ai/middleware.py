@@ -12,6 +12,7 @@ from typing import Dict, Any, Optional, Tuple
 
 import wrapt
 from revenium_middleware import run_async_in_thread
+from revenium_middleware._core.log_sanitize import sanitize_for_logging
 from revenium_middleware._core.config import is_selective_metering_enabled
 from revenium_middleware._core.context import is_inside_decorated_function
 from revenium_middleware._core.patch_registry import register_patch
@@ -198,7 +199,8 @@ if register_patch("google.genai.models.Models.generate_content"):
 
         request_time_dt = datetime.datetime.now(datetime.timezone.utc)
         logger.debug(
-            f"Calling wrapped generate_content function with args: {args}, kwargs: {kwargs}"
+            "Calling wrapped generate_content function with args: %s, kwargs: %s",
+            sanitize_for_logging(args), sanitize_for_logging(kwargs)
         )
 
         response = wrapped(*args, **kwargs)
@@ -264,7 +266,8 @@ if register_patch("google.genai.models.Models.embed_content"):
 
         request_time_dt = datetime.datetime.now(datetime.timezone.utc)
         logger.debug(
-            f"Calling wrapped embed_content function with args: {args}, kwargs: {kwargs}"
+            "Calling wrapped embed_content function with args: %s, kwargs: %s",
+            sanitize_for_logging(args), sanitize_for_logging(kwargs)
         )
 
         response = wrapped(*args, **kwargs)
@@ -306,7 +309,8 @@ if register_patch("google.genai.models.Models.generate_content_stream"):
 
         request_time_dt = datetime.datetime.now(datetime.timezone.utc)
         logger.debug(
-            f"Calling wrapped generate_content_stream function with args: {args}, kwargs: {kwargs}"
+            "Calling wrapped generate_content_stream function with args: %s, kwargs: %s",
+            sanitize_for_logging(args), sanitize_for_logging(kwargs)
         )
 
         stream = wrapped(*args, **kwargs)
@@ -399,6 +403,14 @@ def handle_streaming_response(
             if not self._usage_logged:
                 self._log_usage()
                 self._usage_logged = True
+
+        def __del__(self):
+            # Last-resort cleanup: a broken-out-of loop leaves the wrapper to
+            # the GC with no StopIteration/__exit__ ever firing.
+            try:
+                self.close()
+            except Exception:
+                pass
 
         def _handle_error(self, error: Exception):
             """Handle errors during streaming."""

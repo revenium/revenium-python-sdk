@@ -43,9 +43,15 @@ def mock_revenium_client():
     This prevents any real API calls to Revenium during testing.
     All metering calls will be intercepted and return a success response.
     """
-    with patch('revenium_middleware.client') as mock_client:
-        # Configure the mock to return success for all metering calls
-        mock_client.ai.create_completion.return_value = {'status': 'success'}
+    mock_client = MagicMock()
+    mock_client.ai.create_completion.return_value = {'status': 'success'}
+    # This local fixture SHADOWS the root conftest fixture of the same name
+    # for everything under tests/test_openai/, so it must patch the single
+    # source of truth (_core.metering.client, resolved via get_client()) --
+    # patching only the package re-export leaves the real client visible to
+    # the metering guards and silently skips submission.
+    with patch('revenium_middleware._core.metering.client', mock_client), \
+         patch('revenium_middleware.client', mock_client):
         yield mock_client
 
 

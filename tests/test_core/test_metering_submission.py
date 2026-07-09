@@ -15,7 +15,7 @@ def mock_client():
     mock.ai.create_image = MagicMock(return_value="image-result")
     mock.ai.create_video = MagicMock(return_value="video-result")
     mock.ai.create_audio = MagicMock(return_value="audio-result")
-    with patch("revenium_middleware._core.metering_submission.client", mock):
+    with patch("revenium_middleware._core.metering_submission.get_client", lambda: mock):
         yield mock
 
 
@@ -81,7 +81,7 @@ def test_unknown_operation_raises_value_error(mock_client):
 
 
 def test_returns_none_when_client_unconfigured():
-    with patch("revenium_middleware._core.metering_submission.client", None):
+    with patch("revenium_middleware._core.metering_submission.get_client", lambda: None):
         result = submit_ai_event("completion", {"x": 1})
     assert result is None
 

@@ -5,7 +5,7 @@ import uuid
 from typing import Any, Dict, Optional
 
 from revenium_middleware._core.context import get_idempotency_key
-from revenium_middleware._core.metering import client
+from revenium_middleware._core.metering import get_client
 
 
 _AI_OPERATIONS = frozenset({"completion", "image", "video", "audio"})
@@ -28,11 +28,14 @@ def submit_ai_event(
 
     Returns:
         Whatever client.ai.create_<operation> returns. Returns None when
-        the metering client is not configured (no API key).
+        the metering client is not configured (no API key), or when delivery
+        failed with a retryable error and the event was placed in the
+        store-and-forward buffer for automatic replay.
 
     Raises:
         ValueError: if operation is not one of the recognized AI operations.
     """
+    client = get_client()
     if client is None:
         return None
 
@@ -65,4 +68,15 @@ def submit_ai_event(
     }
 
     method = getattr(client.ai, f"create_{operation}")
-    return method(**merged_args)
+    try:
+        return method(**merged_args)
+    except Exception as exc:
+        from revenium_middleware._core.metering_buffer import get_buffer, is_retryable_failure
+
+        if is_retryable_failure(exc):
+            # Retries are exhausted inside the client; keep the event (with
+            # its frozen Idempotency-Key) for background replay instead of
+            # discarding it.
+            get_buffer().push("ai", {"operation": operation, "args": merged_args})
+            return None
+        raise

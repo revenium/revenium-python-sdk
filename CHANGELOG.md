@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-07-09
+
+### Added
+- Store-and-forward buffering for metering events. Events that fail delivery with a transient error (connection failures, timeouts, rate limiting, or server errors) are no longer dropped: they are held in a bounded in-memory buffer and automatically replayed in the background once the backend is reachable again. Replayed events keep their original `Idempotency-Key`, so the backend safely deduplicates any overlap. The buffer is tunable via `REVENIUM_BUFFER_MAX_SIZE` (default 1000 events, oldest evicted first) and `REVENIUM_BUFFER_FLUSH_INTERVAL` (default 30 seconds); buffered events expire after 24 hours. A new `get_buffer_stats()` helper exposes buffer counters for observability, and a best-effort final drain runs at process exit.
+- `initialize_metering(api_key=..., base_url=...)` for explicit programmatic (re)configuration of the metering client at runtime — useful for credential rotation or for configuring metering after import. Invalid keys raise immediately instead of failing silently.
+
+### Changed
+- Enforcement rule fetches now ride out transient failures (rate limits, server errors, connection errors) with exponential backoff capped at 8 seconds, honoring `Retry-After` headers. If retries are exhausted the SDK fails open and keeps the previously cached rules — an enforcement-refresh outage never blocks application traffic.
+- Tool metering (`meter_tool` / `report_tool_call`) now dispatches events fire-and-forget on a background thread. Decorated functions and manual reporting return immediately instead of blocking on the metering network round-trip.
+
+### Fixed
+- Anthropic: raw streaming via `client.messages.create(stream=True)` is now metered. Previously only the `client.messages.stream()` context-manager path produced metering events.
+- Streams abandoned before completion (early `break`, explicit `close()`, or garbage collection) now submit a metering event with the usage observed up to that point instead of silently dropping it. Applies to sync and async streams across providers.
+- OpenAI streaming: when the middleware injects `stream_options={"include_usage": true}` to obtain token usage, the synthetic final usage chunk is no longer surfaced to callers that did not request it — the visible chunk sequence now matches the raw SDK exactly.
+- Metering credentials set via environment variables after `revenium_middleware` is imported are now picked up on the next metering call; there is no longer an import-order requirement.
+- Tool metering honors `configure()` overrides and environment variables at dispatch time and uses the correct metering API path.
+- Anthropic on AWS Bedrock: the adapter now resolves the AWS region following boto3 conventions (client configuration, then `AWS_REGION`, then `AWS_DEFAULT_REGION`) instead of always defaulting to `us-east-1`.
+- Anthropic on AWS Bedrock: genuine API errors from Bedrock calls now propagate to the caller instead of being masked by an internal fallback path.
+- Streaming metering now reports `completion_start_time` as the arrival of the first stream event, improving time-to-first-token accuracy.
+- DEBUG-level logging no longer leaks prompt or message content and credentials: sensitive fields (API keys, authorization headers, tokens) are redacted and message content is summarized across provider integrations.
+
 ## [0.1.10] - 2026-07-03
 
 ### Changed

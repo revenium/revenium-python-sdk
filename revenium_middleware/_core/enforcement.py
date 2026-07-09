@@ -10,11 +10,13 @@ Opt-in via ``REVENIUM_CIRCUIT_BREAKER_ENABLED``. Disabled by default so the
 SDK stays no-op for callers who haven't enrolled in cost controls.
 """
 
+import datetime
 import json
 import logging
 import os
 import threading
 import time
+from email.utils import parsedate_to_datetime
 from typing import List, Optional, Tuple
 from urllib.parse import quote, urlparse
 
@@ -27,6 +29,14 @@ logger = logging.getLogger("revenium_middleware.extension")
 
 _DEFAULT_POLL_INTERVAL = 60      # seconds between background refreshes
 _CACHE_TTL = 120                  # seconds before a cached rule is considered stale
+
+# Retry posture for the rule fetch (fleet backoff consistency): transient
+# failures ride out a spike instead of leaving spend controls on stale
+# limits until the next poll interval.
+_FETCH_MAX_ATTEMPTS = 5
+_FETCH_BACKOFF_INITIAL = 0.5      # seconds; doubles per attempt
+_FETCH_BACKOFF_CAP = 8.0          # seconds; also clamps Retry-After
+_FETCH_RETRYABLE_STATUS = frozenset({408, 429})  # plus any 5xx
 _RULES_CACHE_FILENAME = "revenium_enforcement_rules.json"
 
 _cached_rules: List[dict] = []
@@ -142,6 +152,37 @@ def _persist_cache_to_disk(rules: list) -> None:
         logger.debug("Failed to write enforcement cache to %s", path, exc_info=True)
 
 
+def _sleep(seconds: float) -> bool:
+    """Backoff wait, interruptible by shutdown so the poller exits promptly.
+
+    Returns True when shutdown was signalled, so callers can abort their
+    retry loop instead of burning the remaining attempts with zero delay.
+    """
+    return _stop_event.wait(seconds)
+
+
+def _is_retryable_status(status_code: int) -> bool:
+    return status_code in _FETCH_RETRYABLE_STATUS or status_code >= 500
+
+
+def _retry_after_seconds(response: "httpx.Response") -> Optional[float]:
+    """Parse Retry-After (delta-seconds or HTTP-date), clamped to the cap."""
+    raw = response.headers.get("Retry-After")
+    if not raw:
+        return None
+    try:
+        delay = float(raw)
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(raw)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=datetime.timezone.utc)
+            delay = (when - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+        except Exception:
+            return None
+    return max(0.0, min(delay, _FETCH_BACKOFF_CAP))
+
+
 def _fetch_rules() -> Optional[list]:
     """Fetch current enforcement rules from the Revenium API.
 
@@ -170,29 +211,56 @@ def _fetch_rules() -> Optional[list]:
     # containing '/', '..', or '?' cannot retarget the request to a
     # different endpoint on the same origin.
     safe_team_id = quote(team_id, safe="")
-    try:
-        response = httpx.get(
-            f"{base_url}/v2/api/ai/enforcement-rules/{safe_team_id}",
-            headers={"x-api-key": api_key},
-            timeout=10,
-        )
-        # 204 No Content == no rules configured for this team; cache empty list
-        if response.status_code == 204:
-            return []
-        response.raise_for_status()
-        data = response.json()
-        # Server currently returns ``{"rules": [...], "compiledAt": ...}`` but
-        # accept a bare list too so a future schema change does not silently
-        # AttributeError its way into a stale cache.
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            return data.get("rules", [])
-        logger.warning("Unexpected enforcement response shape: %r", type(data).__name__)
-        return None
-    except Exception:
-        logger.debug("Failed to fetch enforcement rules, falling open", exc_info=True)
-        return None
+    url = f"{base_url}/v2/api/ai/enforcement-rules/{safe_team_id}"
+    for attempt in range(_FETCH_MAX_ATTEMPTS):
+        backoff = min(_FETCH_BACKOFF_INITIAL * (2 ** attempt), _FETCH_BACKOFF_CAP)
+        try:
+            response = httpx.get(url, headers={"x-api-key": api_key}, timeout=10)
+        except (httpx.TimeoutException, httpx.TransportError):
+            if attempt == _FETCH_MAX_ATTEMPTS - 1:
+                break
+            if _sleep(backoff):
+                break
+            continue
+        except Exception:
+            logger.debug("Failed to fetch enforcement rules, falling open", exc_info=True)
+            return None
+
+        if _is_retryable_status(response.status_code):
+            if attempt == _FETCH_MAX_ATTEMPTS - 1:
+                break
+            delay = _retry_after_seconds(response)
+            if _sleep(delay if delay is not None else backoff):
+                break
+            continue
+
+        try:
+            # 204 No Content == no rules configured for this team; cache empty list
+            if response.status_code == 204:
+                return []
+            response.raise_for_status()
+            data = response.json()
+            # Server currently returns ``{"rules": [...], "compiledAt": ...}`` but
+            # accept a bare list too so a future schema change does not silently
+            # AttributeError its way into a stale cache.
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                return data.get("rules", [])
+            logger.warning("Unexpected enforcement response shape: %r", type(data).__name__)
+            return None
+        except Exception:
+            logger.debug("Failed to fetch enforcement rules, falling open", exc_info=True)
+            return None
+
+    # Deliberate fail-open: an enforcement-refresh outage must never become a
+    # customer traffic outage. The caller preserves the previous cache and the
+    # next poll cycle tries again.
+    logger.warning(
+        "Enforcement rule fetch exhausted %d attempts; failing open on the previous cache",
+        _FETCH_MAX_ATTEMPTS,
+    )
+    return None
 
 
 def _refresh_cache() -> None:

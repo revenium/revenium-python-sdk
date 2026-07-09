@@ -10,7 +10,7 @@ import datetime
 import uuid
 from typing import Any, Dict
 
-from revenium_middleware import client, run_async_in_thread, shutdown_event
+from revenium_middleware import client, get_client, run_async_in_thread, shutdown_event
 from revenium_middleware._core import submit_ai_event
 from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
 from revenium_middleware._core.fields import (
@@ -268,7 +268,7 @@ def handle_metering(
     - audio -> client.ai.create_audio
     - generation/other -> client.ai.create_completion
     """
-    if client is None:
+    if get_client() is None:
         return  # metering disabled (no API key configured)
 
     async def metering_call():

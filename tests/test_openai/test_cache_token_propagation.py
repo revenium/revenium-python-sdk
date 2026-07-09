@@ -159,7 +159,7 @@ def test_extract_usage_data_does_not_sum_mutually_exclusive_cache_details():
     assert usage_data["cache_read_token_count"] == 22
 
 
-@patch("revenium_middleware.openai.middleware.client", object())
+@patch("revenium_middleware.openai.middleware.get_client", lambda: object())
 @patch("revenium_middleware.openai.middleware.submit_ai_event")
 @patch("revenium_middleware.openai.middleware.run_async_in_thread")
 def test_create_metering_call_forwards_cache_creation_and_read_counts(
@@ -180,7 +180,7 @@ def test_create_metering_call_forwards_cache_creation_and_read_counts(
     assert payload["cache_read_token_count"] == 55
 
 
-@patch("revenium_middleware.openai.middleware.client", object())
+@patch("revenium_middleware.openai.middleware.get_client", lambda: object())
 @patch("revenium_middleware.openai.middleware.submit_ai_event")
 def test_log_token_usage_legacy_cached_tokens_fall_back_to_cache_reads(mock_submit):
     mock_submit.return_value = SimpleNamespace(id="completion-legacy-cache-test")
@@ -206,7 +206,7 @@ def test_log_token_usage_legacy_cached_tokens_fall_back_to_cache_reads(mock_subm
     assert payload["cache_read_token_count"] == 42
 
 
-@patch("revenium_middleware.openai.middleware.client", object())
+@patch("revenium_middleware.openai.middleware.get_client", lambda: object())
 @patch("revenium_middleware.openai.middleware.submit_ai_event")
 def test_log_token_usage_explicit_zero_cache_read_overrides_legacy_cached_tokens(
     mock_submit,
@@ -235,7 +235,7 @@ def test_log_token_usage_explicit_zero_cache_read_overrides_legacy_cached_tokens
     assert payload["cache_read_token_count"] == 0
 
 
-@patch("revenium_middleware.openai.middleware.client", object())
+@patch("revenium_middleware.openai.middleware.get_client", lambda: object())
 @patch("revenium_middleware.openai.middleware.submit_ai_event")
 @patch("revenium_middleware.openai.middleware.run_async_in_thread")
 def test_sync_streaming_chat_forwards_openai_cached_tokens_as_reads(
@@ -253,14 +253,16 @@ def test_sync_streaming_chat_forwards_openai_cached_tokens_as_reads(
         {"trace_id": "stream-cache-test"},
     )
 
-    assert list(wrapped_stream) == [final_chunk]
+    # The middleware-injected usage chunk is hidden from the caller by default;
+    # its data still reaches metering below.
+    assert list(wrapped_stream) == []
     payload = mock_submit.call_args[0][1]
     assert payload["is_streamed"] is True
     assert payload["cache_creation_token_count"] == 0
     assert payload["cache_read_token_count"] == 66
 
 
-@patch("revenium_middleware.openai.middleware.client", object())
+@patch("revenium_middleware.openai.middleware.get_client", lambda: object())
 @patch("revenium_middleware.openai.middleware.submit_ai_event")
 @patch("revenium_middleware.openai.middleware.run_async_in_thread")
 def test_sync_streaming_chat_preserves_anthropic_shaped_cache_details(
@@ -282,14 +284,16 @@ def test_sync_streaming_chat_preserves_anthropic_shaped_cache_details(
         {"trace_id": "stream-anthropic-cache-test"},
     )
 
-    assert list(wrapped_stream) == [final_chunk]
+    # The middleware-injected usage chunk is hidden from the caller by default;
+    # its data still reaches metering below.
+    assert list(wrapped_stream) == []
     payload = mock_submit.call_args[0][1]
     assert payload["is_streamed"] is True
     assert payload["cache_creation_token_count"] == 12
     assert payload["cache_read_token_count"] == 34
 
 
-@patch("revenium_middleware.openai.middleware.client", object())
+@patch("revenium_middleware.openai.middleware.get_client", lambda: object())
 @patch("revenium_middleware.openai.middleware.submit_ai_event")
 @patch("revenium_middleware.openai.middleware.run_async_in_thread")
 def test_streaming_responses_api_forwards_cached_tokens_as_reads(
@@ -313,7 +317,7 @@ def test_streaming_responses_api_forwards_cached_tokens_as_reads(
     assert payload["cache_read_token_count"] == 77
 
 
-@patch("revenium_middleware.openai.middleware.client", object())
+@patch("revenium_middleware.openai.middleware.get_client", lambda: object())
 @patch("revenium_middleware.openai.middleware.submit_ai_event")
 @patch("revenium_middleware.openai.middleware.run_async_in_thread")
 def test_async_streaming_chat_preserves_openai_cached_tokens_as_reads(
@@ -339,7 +343,9 @@ def test_async_streaming_chat_preserves_openai_cached_tokens_as_reads(
             chunks.append(chunk)
         return chunks
 
-    assert asyncio.run(consume()) == [final_chunk]
+    # The middleware-injected usage chunk is hidden from the caller by default;
+    # its data still reaches metering below.
+    assert asyncio.run(consume()) == []
     payload = mock_submit.call_args[0][1]
     assert payload["is_streamed"] is True
     assert payload["cache_creation_token_count"] == 0
@@ -347,7 +353,7 @@ def test_async_streaming_chat_preserves_openai_cached_tokens_as_reads(
 
 
 @patch("revenium_middleware.openai.middleware.create_metering_call")
-def test_async_streaming_chat_without_final_usage_skips_metering(mock_create_metering):
+def test_async_streaming_chat_without_final_usage_meters_zero_counts(mock_create_metering):
     chunk = SimpleNamespace(
         id="chatcmpl-no-usage",
         model="gpt-4o-mini",
@@ -374,7 +380,13 @@ def test_async_streaming_chat_without_final_usage_skips_metering(mock_create_met
         return chunks
 
     assert asyncio.run(consume()) == [chunk]
-    mock_create_metering.assert_not_called()
+    # A stream that ends without a usage chunk is still metered (zero token
+    # counts) so the transaction is not silently invisible.
+    mock_create_metering.assert_called_once()
+    response_stub = mock_create_metering.call_args[0][0]
+    assert response_stub.usage.prompt_tokens == 0
+    assert response_stub.usage.completion_tokens == 0
+    assert mock_create_metering.call_args.kwargs["is_streamed"] is True
 
 
 def test_langchain_handler_extracts_usage_from_generation_message():

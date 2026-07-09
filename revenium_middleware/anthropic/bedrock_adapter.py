@@ -139,6 +139,16 @@ def _import_boto3():
 _client_cache: Dict[str, Any] = {}
 
 
+def _resolve_region(region: Optional[str]) -> str:
+    """Resolve the AWS region with the standard boto3/CLI precedence.
+
+    Matches the trace-metadata resolver (_core/trace_fields.py), so the region
+    a Bedrock call actually runs in agrees with the region recorded in the
+    metering payload.
+    """
+    return region or os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-east-1"
+
+
 def get_bedrock_client(region: str):
     """Get a cached boto3 bedrock-runtime client for the specified region."""
     if not isinstance(region, str) or not region.strip():
@@ -243,7 +253,7 @@ def bedrock_invoke(model: str, payload: dict, region: Optional[str] = None) -> T
     Args:
         model: Anthropic model name (e.g., "claude-3-sonnet-20240229")
         payload: Request payload in Anthropic format
-        region: AWS region (defaults to AWS_REGION env var or us-east-1)
+        region: AWS region (defaults to AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1)
 
     Returns:
         Tuple of (text_content, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens)
@@ -259,7 +269,7 @@ def bedrock_invoke(model: str, payload: dict, region: Optional[str] = None) -> T
     if not isinstance(payload, dict):
         raise BedrockValidationError(f"payload must be a dict, got {type(payload).__name__}")
 
-    region = region or os.getenv("AWS_REGION", "us-east-1")
+    region = _resolve_region(region)
     if not isinstance(region, str) or not region.strip():
         raise BedrockValidationError(f"region must be a non-empty string, got {type(region).__name__}")
 
@@ -323,7 +333,7 @@ class BedrockStreamIterator:
     def __init__(self, model: str, payload: dict, region: Optional[str] = None):
         self.model = model
         self.payload = payload
-        self.region = region or os.getenv("AWS_REGION", "us-east-1")
+        self.region = _resolve_region(region)
         self.accumulated_text = ""
         self.input_tokens = 0
         self.output_tokens = 0
@@ -462,7 +472,7 @@ def bedrock_invoke_stream(model: str, payload: dict, region: Optional[str] = Non
     Args:
         model: Anthropic model name (e.g., "claude-3-sonnet-20240229")
         payload: Request payload in Anthropic format
-        region: AWS region (defaults to AWS_REGION env var or us-east-1)
+        region: AWS region (defaults to AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1)
 
     Returns:
         BedrockStreamIterator: Iterator that yields text chunks and tracks token counts

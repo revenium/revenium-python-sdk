@@ -55,6 +55,73 @@ api_key = os.environ.get("REVENIUM_METERING_API_KEY")
 _base_url_raw = os.environ.get("REVENIUM_METERING_BASE_URL")
 client = _build_metering_client(api_key, _base_url_raw)
 
+# Remembers a malformed env key so the lazy path doesn't re-raise per call.
+_last_failed_key: Optional[str] = None
+
+
+def _sync_client_reexports(new_client: Optional[ReveniumMetering]) -> None:
+    """Point the well-known re-export attributes at ``new_client``.
+
+    Takes the client explicitly (rather than reading the module-level global)
+    so concurrent rebuilds cannot interleave and leave the re-exports pointing
+    at a different instance than the caller just assigned. Dynamic readers
+    (``revenium_middleware.client``, ``revenium_middleware._core.client``)
+    observe the new client. Modules that bound the name via
+    ``from revenium_middleware import client`` at import time keep their
+    snapshot -- code paths that matter resolve through ``get_client()``
+    instead.
+    """
+    import sys
+    for module_name in ("revenium_middleware", "revenium_middleware._core"):
+        module = sys.modules.get(module_name)
+        if module is not None and hasattr(module, "client"):
+            module.client = new_client
+
+
+def initialize_metering(api_key: Optional[str] = None, base_url: Optional[str] = None) -> bool:
+    """(Re)build the metering client from explicit values or the environment.
+
+    Call this when credentials only become available after the first
+    ``revenium_middleware`` import (vault/parameter-store bootstraps, framework
+    settings hooks) or to reconfigure at runtime. Explicit arguments take
+    precedence over ``REVENIUM_METERING_API_KEY`` / ``REVENIUM_METERING_BASE_URL``.
+
+    Returns True when metering is enabled after the call. Raises ``ValueError``
+    for a malformed API key -- explicit configuration fails loudly, unlike the
+    lazy ``get_client()`` path, which logs a warning and leaves metering
+    disabled (best-effort by design).
+    """
+    global client
+    key = api_key if api_key is not None else os.environ.get("REVENIUM_METERING_API_KEY")
+    url = base_url if base_url is not None else os.environ.get("REVENIUM_METERING_BASE_URL")
+    new_client = _build_metering_client(key, url)
+    client = new_client
+    _sync_client_reexports(new_client)
+    return new_client is not None
+
+
+def get_client() -> Optional[ReveniumMetering]:
+    """Return the metering client, retrying the environment when unset.
+
+    Covers env vars populated after import: as soon as
+    ``REVENIUM_METERING_API_KEY`` appears, the next metering event builds the
+    client instead of silently no-opping forever.
+
+    Best-effort by design: a malformed env key is logged once and metering
+    stays disabled, whereas the explicit ``initialize_metering()`` raises
+    ``ValueError`` so programmatic misconfiguration fails loudly.
+    """
+    global _last_failed_key
+    if client is None:
+        env_key = os.environ.get("REVENIUM_METERING_API_KEY")
+        if env_key and env_key != _last_failed_key:
+            try:
+                initialize_metering()
+            except ValueError as e:
+                logger.warning("Deferred metering initialization failed: %s", e)
+                _last_failed_key = env_key
+    return client
+
 _threads_lock = threading.Lock()
 active_threads = []
 shutdown_event = threading.Event()
@@ -77,6 +144,16 @@ def handle_exit(signum=None, frame=None):
         # Ensure the event is still set
         shutdown_event.set()
 
+
+    # Drain the store-and-forward buffer (bounded) before joining metering
+    # threads, so events that already exhausted retries get a final attempt.
+    try:
+        from revenium_middleware._core import metering_buffer
+
+        if metering_buffer._buffer is not None:
+            metering_buffer._buffer.flush(deadline_seconds=5.0)
+    except Exception as e:
+        logger.debug("Metering buffer drain during shutdown failed: %s", e)
 
     with _threads_lock:
         threads_to_join = list(active_threads)

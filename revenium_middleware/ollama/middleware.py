@@ -5,12 +5,13 @@ import types
 
 logger = logging.getLogger("revenium_middleware.extension")
 
-from revenium_middleware import client, run_async_in_thread, shutdown_event, merge_metadata
+from revenium_middleware import client, get_client, run_async_in_thread, shutdown_event, merge_metadata
 from revenium_middleware._core import submit_ai_event
 from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
 from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, merge_extra_body
 from revenium_middleware._core.config import is_selective_metering_enabled
 from revenium_middleware._core.context import is_inside_decorated_function
+from revenium_middleware._core.log_sanitize import sanitize_for_logging
 from revenium_middleware._core.patch_registry import register_patch
 from .trace_fields import (
     get_environment,
@@ -42,7 +43,11 @@ if register_patch("ollama.chat"):
         request_time_dt = datetime.datetime.now(datetime.timezone.utc)
         transaction_id = f"ollama-{request_time_dt.timestamp()}"
 
-        logger.debug(f"Calling chat function with args: {args}, kwargs: {kwargs}")
+        logger.debug(
+            "Calling chat function with args: %s, kwargs: %s",
+            sanitize_for_logging(args),
+            sanitize_for_logging(kwargs),
+        )
 
         response = wrapped(*args, **kwargs)
 
@@ -75,7 +80,11 @@ if register_patch("ollama.generate"):
         request_time_dt = datetime.datetime.now(datetime.timezone.utc)
         transaction_id = f"ollama-{request_time_dt.timestamp()}"
 
-        logger.debug(f"Calling generate function with args: {args}, kwargs: {kwargs}")
+        logger.debug(
+            "Calling generate function with args: %s, kwargs: %s",
+            sanitize_for_logging(args),
+            sanitize_for_logging(kwargs),
+        )
 
         response = wrapped(*args, **kwargs)
 
@@ -106,7 +115,11 @@ if register_patch("ollama.embed"):
         request_time_dt = datetime.datetime.now(datetime.timezone.utc)
         transaction_id = f"ollama-{request_time_dt.timestamp()}"
 
-        logger.debug(f"Calling embed function with args: {args}, kwargs: {kwargs}")
+        logger.debug(
+            "Calling embed function with args: %s, kwargs: %s",
+            sanitize_for_logging(args),
+            sanitize_for_logging(kwargs),
+        )
 
         response = wrapped(*args, **kwargs)
 
@@ -145,24 +158,40 @@ def handle_streaming_response(
     def wrapped_generator():
         nonlocal final_response
 
-        # Collect all chunks and add transaction ID to each
-        for chunk in generator:
-            chunks.append(chunk)
-            yield chunk
-
-        # After all chunks are processed, construct the final response
-        if chunks:
-            # The last chunk should contain the complete response data
-            final_response = chunks[-1]
-            handle_response(
-                final_response,
-                request_time_dt,
-                usage_metadata,
-                True,
-                transaction_id,
-                endpoint,
-                request_kwargs
-            )
+        # The finally block also runs on GeneratorExit when the caller breaks
+        # out of the loop or abandons the generator, so partial
+        # usage from an interrupted stream is still metered.
+        try:
+            for chunk in generator:
+                chunks.append(chunk)
+                yield chunk
+        finally:
+            if chunks:
+                try:
+                    # Prefer the chunk that carries token counts: Ollama only
+                    # populates prompt_eval_count/eval_count on the final
+                    # done=True chunk.
+                    for chunk in reversed(chunks):
+                        if getattr(chunk, 'done', False) or getattr(chunk, 'eval_count', None) is not None:
+                            final_response = chunk
+                            break
+                    if final_response is None:
+                        # Accepted tradeoff: Ollama does not expose token counts
+                        # on non-final chunks, so a stream interrupted before the
+                        # final chunk meters with zero counts to keep the
+                        # transaction visible.
+                        final_response = chunks[-1]
+                    handle_response(
+                        final_response,
+                        request_time_dt,
+                        usage_metadata,
+                        True,
+                        transaction_id,
+                        endpoint,
+                        request_kwargs
+                    )
+                except Exception as e:
+                    logger.warning("Error metering interrupted/completed stream: %s", e)
 
     return wrapped_generator()
 
@@ -189,7 +218,7 @@ def handle_response(
         endpoint: The endpoint being called ('chat', 'generate', etc.)
         request_kwargs: The request kwargs for operation type detection
     """
-    if client is None:
+    if get_client() is None:
         return  # metering disabled (no API key configured)
 
     async def metering_call():
@@ -327,7 +356,7 @@ def handle_embeddings_response(
         transaction_id: The transaction ID for this request
         request_kwargs: The request kwargs for operation type detection
     """
-    if client is None:
+    if get_client() is None:
         return  # metering disabled (no API key configured)
 
     async def metering_call():

@@ -19,6 +19,7 @@ import wrapt
 from revenium_middleware import run_async_in_thread
 from revenium_middleware._core.config import is_selective_metering_enabled
 from revenium_middleware._core.context import is_inside_decorated_function
+from revenium_middleware._core.log_sanitize import sanitize_for_logging
 from revenium_middleware._core.patch_registry import register_patch
 
 # Import common utilities and types
@@ -398,8 +399,8 @@ def generate_content_wrapper_impl(wrapped, instance, args, kwargs):
         return wrapped(*args, **kwargs)
 
     logger.debug("Enhanced Vertex AI generate_content wrapper called!")
-    logger.debug(f"Wrapper args: {args}")
-    logger.debug(f"Wrapper kwargs: {kwargs}")
+    logger.debug("Wrapper args: %s", sanitize_for_logging(args))
+    logger.debug("Wrapper kwargs: %s", sanitize_for_logging(kwargs))
     logger.debug(f"Instance type: {type(instance)}")
 
     # Extract usage metadata from instance or kwargs
@@ -494,7 +495,10 @@ def generate_content_wrapper_impl(wrapped, instance, args, kwargs):
     # Record request time
     request_time_dt = datetime.datetime.now(datetime.timezone.utc)
     logger.debug(
-        f"Calling wrapped Vertex AI generate_content function (streaming={is_streaming}) with args: {args}, kwargs: {kwargs}"
+        "Calling wrapped Vertex AI generate_content function (streaming=%s) with args: %s, kwargs: %s",
+        is_streaming,
+        sanitize_for_logging(args),
+        sanitize_for_logging(kwargs),
     )
 
     # Call the original Vertex AI function
@@ -595,7 +599,9 @@ if register_patch("vertexai.language_models.TextEmbeddingModel.get_embeddings"):
 
         request_time_dt = datetime.datetime.now(datetime.timezone.utc)
         logger.debug(
-            f"Calling wrapped Vertex AI get_embeddings function with args: {args}, kwargs: {kwargs}"
+            "Calling wrapped Vertex AI get_embeddings function with args: %s, kwargs: %s",
+            sanitize_for_logging(args),
+            sanitize_for_logging(kwargs),
         )
 
         response = wrapped(*args, **kwargs)
@@ -689,6 +695,14 @@ def handle_vertex_ai_streaming_response(
             if not self._usage_logged:
                 self._log_usage()
                 self._usage_logged = True
+
+        def __del__(self):
+            # Last-resort cleanup: a broken-out-of loop leaves the wrapper to
+            # the GC with no StopIteration/__exit__ ever firing.
+            try:
+                self.close()
+            except Exception:
+                pass
 
         def _handle_error(self, error: Exception):
             """Handle errors during streaming."""

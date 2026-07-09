@@ -18,7 +18,7 @@ def _find_deprecation_warning(mock_logger, field_name):
 @pytest.mark.unit
 class TestLegacyFieldNames:
 
-    @patch('revenium_middleware.ollama.middleware.client')
+    @patch('revenium_middleware.ollama.middleware.get_client')
     @patch('revenium_middleware.ollama.middleware.submit_ai_event')
     def test_legacy_organization_id_camelcase(self, mock_submit, mock_client, mock_ollama_chat_response):
         mock_client.ai.create_completion.return_value = {"status": "success"}
@@ -41,7 +41,7 @@ class TestLegacyFieldNames:
                 assert mock_submit.called
                 assert mock_submit.call_args[0][1]['organization_name'] == 'legacy-org-camel'
 
-    @patch('revenium_middleware.ollama.middleware.client')
+    @patch('revenium_middleware.ollama.middleware.get_client')
     @patch('revenium_middleware.ollama.middleware.submit_ai_event')
     def test_legacy_organization_id_snakecase(self, mock_submit, mock_client, mock_ollama_chat_response):
         mock_client.ai.create_completion.return_value = {"status": "success"}
@@ -64,7 +64,7 @@ class TestLegacyFieldNames:
                 assert mock_submit.called
                 assert mock_submit.call_args[0][1]['organization_name'] == 'legacy-org-snake'
 
-    @patch('revenium_middleware.ollama.middleware.client')
+    @patch('revenium_middleware.ollama.middleware.get_client')
     @patch('revenium_middleware.ollama.middleware.submit_ai_event')
     def test_legacy_product_id_camelcase(self, mock_submit, mock_client, mock_ollama_chat_response):
         mock_client.ai.create_completion.return_value = {"status": "success"}
@@ -87,7 +87,7 @@ class TestLegacyFieldNames:
                 assert mock_submit.called
                 assert mock_submit.call_args[0][1]['product_name'] == 'legacy-product-camel'
 
-    @patch('revenium_middleware.ollama.middleware.client')
+    @patch('revenium_middleware.ollama.middleware.get_client')
     @patch('revenium_middleware.ollama.middleware.submit_ai_event')
     def test_legacy_product_id_snakecase(self, mock_submit, mock_client, mock_ollama_chat_response):
         mock_client.ai.create_completion.return_value = {"status": "success"}
@@ -110,7 +110,7 @@ class TestLegacyFieldNames:
                 assert mock_submit.called
                 assert mock_submit.call_args[0][1]['product_name'] == 'legacy-product-snake'
 
-    @patch('revenium_middleware.ollama.middleware.client')
+    @patch('revenium_middleware.ollama.middleware.get_client')
     @patch('revenium_middleware.ollama.middleware.submit_ai_event')
     def test_new_fields_take_precedence_over_legacy(self, mock_submit, mock_client, mock_ollama_chat_response):
         mock_client.ai.create_completion.return_value = {"status": "success"}

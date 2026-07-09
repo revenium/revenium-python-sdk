@@ -138,6 +138,9 @@ logger.propagate = True
 # Existing imports like `from revenium_middleware import client` keep working.
 from ._core import (  # noqa: E402
     client,
+    get_buffer_stats,
+    get_client,
+    initialize_metering,
     run_async_in_thread,
     shutdown_event,
     revenium_meter,
@@ -166,6 +169,9 @@ from .agentic_outcomes import AgenticOutcomeClient, AgenticOutcomeSettings  # no
 __all__ = [
     # Metering exports
     "client",
+    "get_buffer_stats",
+    "get_client",
+    "initialize_metering",
     "run_async_in_thread",
     "shutdown_event",
     # Decorator exports

@@ -11,7 +11,7 @@ import os
 import uuid
 from typing import Dict, Any, Optional
 
-from revenium_middleware import client, run_async_in_thread, shutdown_event
+from revenium_middleware import client, get_client, run_async_in_thread, shutdown_event
 from revenium_middleware._core import submit_ai_event
 from revenium_middleware._core.fields import (
     extract_field_with_fallback as _core_extract_field_with_fallback,
@@ -114,7 +114,7 @@ async def log_token_usage(
         output_response: Output response text
         prompts_truncated: Whether any prompts were truncated
     """
-    if client is None:
+    if get_client() is None:
         return  # metering disabled (no API key configured)
     if shutdown_event.is_set():
         logger.warning("Skipping metering call during shutdown")
@@ -568,7 +568,7 @@ async def log_image_usage(
         style: Image style setting
         aspect_ratio: Aspect ratio (e.g., "16:9")
     """
-    if client is None:
+    if get_client() is None:
         return  # metering disabled (no API key configured)
     if shutdown_event.is_set():
         logger.warning("Skipping image metering call during shutdown")
@@ -672,7 +672,7 @@ async def log_video_usage(
         video_job_id: Job ID for async operations
         async_operation: Whether this was an async operation
     """
-    if client is None:
+    if get_client() is None:
         return  # metering disabled (no API key configured)
     if shutdown_event.is_set():
         logger.warning("Skipping video metering call during shutdown")

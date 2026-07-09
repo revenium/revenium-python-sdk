@@ -12,7 +12,7 @@ def mock_metering_client():
     """Patch the client used by the wrapper so we capture the kwargs."""
     mock = MagicMock()
     mock.ai.create_completion = MagicMock(return_value=MagicMock(id="metered-id-1"))
-    with patch("revenium_middleware._core.metering_submission.client", mock):
+    with patch("revenium_middleware._core.metering_submission.get_client", lambda: mock):
         yield mock
 
 
