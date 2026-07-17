@@ -122,7 +122,7 @@ def extract_google_ai_usage_data(
         stop_reason=stop_reason,
         request_time=request_time,
         response_time=response_time,
-        cache_creation_token_count=token_counts.cached_tokens,
+        cache_read_token_count=token_counts.cached_tokens,
     )
 
 

@@ -102,7 +102,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import openai
-import revenium_middleware_openai  # Auto-initializes on import
+import revenium_middleware.openai  # Auto-initializes on import
 
 client = openai.OpenAI()
 response = client.chat.completions.create(
@@ -242,7 +242,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import openai
-import revenium_middleware_openai  # Auto-initializes
+import revenium_middleware.openai  # Auto-initializes
 
 client = openai.OpenAI()
 
@@ -281,7 +281,7 @@ The middleware automatically detects Azure OpenAI when using `AzureOpenAI()` and
 
 ```python
 from openai import AzureOpenAI
-import revenium_middleware_openai
+import revenium_middleware.openai
 
 client = AzureOpenAI(
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
@@ -314,7 +314,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import anthropic
-import revenium_middleware_anthropic  # Auto-initializes
+import revenium_middleware.anthropic  # Auto-initializes
 
 client = anthropic.Anthropic()
 
@@ -349,7 +349,7 @@ The middleware provides complete AWS Bedrock integration with automatic detectio
 
 ```python
 import anthropic
-import revenium_middleware_anthropic
+import revenium_middleware.anthropic
 
 # Bedrock is automatically detected when AWS credentials are available
 # and base_url contains 'amazonaws.com'
@@ -418,7 +418,7 @@ pip install "revenium-python-sdk[google-vertex]"
 from dotenv import load_dotenv
 load_dotenv()
 
-import revenium_middleware_google
+import revenium_middleware.google
 from google import genai
 
 client = genai.Client()
@@ -439,7 +439,7 @@ print(response.text)
 from dotenv import load_dotenv
 load_dotenv()
 
-import revenium_middleware_google
+import revenium_middleware.google
 import vertexai
 from vertexai.generative_models import GenerativeModel
 
@@ -480,7 +480,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import ollama
-import revenium_middleware_ollama  # Auto-initializes
+import revenium_middleware.ollama  # Auto-initializes
 
 # Chat completion
 response = ollama.chat(
@@ -515,7 +515,7 @@ response = ollama.embed(model='nomic-embed-text', input=['Text 1', 'Text 2', 'Te
 
 ```python
 import openai
-import revenium_middleware_openai
+import revenium_middleware.openai
 
 openai.api_key = 'ollama'
 openai.base_url = 'http://localhost:11434/v1/'
@@ -543,7 +543,7 @@ Supports all LLM providers available through LiteLLM with two integration patter
 from dotenv import load_dotenv
 load_dotenv()
 
-import revenium_middleware_litellm_client.middleware  # Auto-initializes
+import revenium_middleware.litellm.client.middleware  # Auto-initializes
 import litellm
 import os
 
@@ -566,7 +566,7 @@ Add the callback to your LiteLLM `config.yaml` for server-side integration:
 
 ```yaml
 litellm_settings:
-  callbacks: ["revenium_middleware_litellm_proxy.middleware.proxy_handler_instance"]
+  callbacks: ["revenium_middleware.litellm.proxy.middleware.proxy_handler_instance"]
 ```
 
 When using the LiteLLM proxy, pass metadata via HTTP headers (`x-revenium-*`).
@@ -591,7 +591,7 @@ All decorators support static values, extraction from function arguments (`name_
 #### CrewAI Integration
 
 ```bash
-pip install "revenium-middleware-litellm[crewai]"
+pip install "revenium-python-sdk[litellm]" crewai
 ```
 
 Pre-built wrapper for tracking CrewAI agent executions. **Note:** CrewAI requires Python 3.12 or earlier.
@@ -615,7 +615,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from openai import OpenAI
-import revenium_middleware_perplexity  # Auto-patches OpenAI
+import revenium_middleware.perplexity  # Auto-patches OpenAI
 
 client = OpenAI(
     api_key=os.getenv("PERPLEXITY_API_KEY"),
@@ -633,7 +633,7 @@ response = client.chat.completions.create(
 
 ```python
 from perplexity import Perplexity
-import revenium_middleware_perplexity  # Auto-patches Perplexity
+import revenium_middleware.perplexity  # Auto-patches Perplexity
 
 client = Perplexity(api_key=os.getenv("PERPLEXITY_API_KEY"))
 
@@ -668,7 +668,7 @@ for chunk in stream:
 Supports image, video, and audio generation through fal.ai with automatic media type detection.
 
 ```python
-import revenium_middleware_fal  # Auto-activates
+import revenium_middleware.fal  # Auto-activates
 import fal_client
 
 result = fal_client.subscribe(
@@ -700,16 +700,23 @@ for image in result.get("images", []):
 
 Callback handler that automatically tracks LLM calls, chains, tools, and agent actions.
 
+```bash
+pip install "revenium-python-sdk[langchain]"
+```
+
+Wrap any LangChain LLM (or embeddings model) with `wrap()` — the Revenium callback handler is attached for you:
+
 ```python
 from langchain_openai import ChatOpenAI
-from revenium_middleware_langchain import ReveniumCallbackHandler
+from revenium_middleware.openai.langchain import wrap
 
-handler = ReveniumCallbackHandler(
-    trace_id="session-123",
-    agent_name="support_agent"
+llm = wrap(
+    ChatOpenAI(model="gpt-4o-mini"),
+    usage_metadata={
+        "trace_id": "session-123",
+        "agent": "support_agent",
+    },
 )
-
-llm = ChatOpenAI(model="gpt-4o-mini", callbacks=[handler])
 response = llm.invoke("Hello!")
 ```
 
@@ -720,13 +727,14 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 prompt = ChatPromptTemplate.from_template("Tell me a joke about {topic}")
-chain = prompt | llm | output_parser
+chain = prompt | llm | StrOutputParser()
 result = chain.invoke({"topic": "programming"})
 ```
 
 **With agents:**
 
 ```python
+from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 
@@ -736,39 +744,31 @@ def get_weather(city: str) -> str:
     return f"Sunny, 72F in {city}"
 
 agent = create_react_agent(llm, [get_weather])
-result = agent.invoke(
-    {"messages": [HumanMessage(content="Weather in NYC?")]},
-    config={"callbacks": [handler]}
-)
+result = agent.invoke({"messages": [HumanMessage(content="Weather in NYC?")]})
 ```
 
-**Async support:**
+**Async support:** the handler is async-native — wrap once and use `ainvoke`/`astream` directly:
 
 ```python
-from revenium_middleware_langchain import AsyncReveniumCallbackHandler
-
-handler = AsyncReveniumCallbackHandler(trace_id="async-session")
-llm = ChatOpenAI(model="gpt-4o-mini", callbacks=[handler])
+llm = wrap(ChatOpenAI(model="gpt-4o-mini"))
 response = await llm.ainvoke("Hello!")
 ```
 
 **Supported providers:** OpenAI, Anthropic, Google, AWS Bedrock, Azure OpenAI, Cohere, HuggingFace, Ollama. Provider is auto-detected from LangChain class name or model name prefix.
 
-**Programmatic configuration:**
+**Attaching to an existing LLM:** use `attach_to()` to add tracking in-place, with any of the standard metadata fields (see [Metadata Fields](#metadata-fields)):
 
 ```python
-from revenium_middleware_langchain import ReveniumCallbackHandler, ReveniumConfig, SubscriberConfig
+from revenium_middleware.openai.langchain import attach_to
 
-config = ReveniumConfig(
-    api_key="hak_your_api_key",
-    environment="production",
-    organization_name="my_org",
-    product_name="my_product",
-    subscriber=SubscriberConfig(id="user_123", email="user@example.com"),
-)
-
-handler = ReveniumCallbackHandler(config=config, trace_id="session-123")
+attach_to(llm, usage_metadata={
+    "organizationName": "my_org",
+    "productName": "my_product",
+    "subscriber": {"id": "user_123", "email": "user@example.com"},
+})
 ```
+
+Credentials come from the standard environment variables (`REVENIUM_METERING_API_KEY`, `REVENIUM_METERING_BASE_URL`) or `revenium_middleware.configure()`.
 
 ---
 
@@ -1086,7 +1086,7 @@ Each field has a maximum length of **50,000 characters**. If exceeded, it's trun
 import os
 os.environ["REVENIUM_CAPTURE_PROMPTS"] = "true"
 
-import revenium_middleware_openai
+import revenium_middleware.openai
 from openai import OpenAI
 
 client = OpenAI()
@@ -1323,7 +1323,7 @@ print(get_buffer_stats())
 
 **Force direct Anthropic API:** Set `REVENIUM_BEDROCK_DISABLE=1` to disable Bedrock auto-detection.
 
-**Check initialization status:** Use `revenium_middleware_<provider>.is_initialized()` to verify setup.
+**Check initialization status (Anthropic):** Use `revenium_middleware.anthropic.is_initialized()` to verify setup.
 
 ---
 

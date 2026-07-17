@@ -474,3 +474,279 @@ class TestBedrockStreamingIntegration:
         # Verify result is wrapped in StreamWrapper
         assert result is not None
         # The result should be a StreamWrapper instance wrapping the mock_stream
+
+
+class TestAsyncBedrockAttribution:
+    """Bedrock-routed async calls must carry AWS provider metadata.
+
+    The async wrapper serves Bedrock clients natively (no re-routing), so
+    the only Bedrock-specific behaviour is attribution: detection must run
+    and the detected provider must reach the metering payload.
+    """
+
+    @staticmethod
+    def _wrapper():
+        import revenium_middleware.anthropic.middleware as mw
+        # wrapt < 2.2 leaves the patched name as a FunctionWrapper.
+        return getattr(mw.async_create_wrapper, "_self_wrapper", mw.async_create_wrapper)
+
+    @staticmethod
+    def _run_metering_inline(fn):
+        import asyncio
+        import threading
+        thread = threading.Thread(target=lambda: asyncio.run(fn()))
+        thread.start()
+        thread.join()
+        return thread
+
+    def _make_response(self):
+        response = MagicMock()
+        response.id = "msg_async_bedrock"
+        response.model = "claude-3-5-sonnet-20241022"
+        response.stop_reason = "end_turn"
+        response.usage.input_tokens = 10
+        response.usage.output_tokens = 5
+        response.usage.cache_creation_input_tokens = 0
+        response.usage.cache_read_input_tokens = 0
+        return response
+
+    def _run_create(self, mock_detect_value, kwargs=None):
+        import asyncio
+        import revenium_middleware.anthropic.middleware as mw
+
+        response = self._make_response()
+
+        async def wrapped(*a, **k):
+            return response
+
+        payloads = []
+        with patch.object(mw, 'detect_provider', return_value=mock_detect_value), \
+                patch.object(mw, 'submit_ai_event',
+                             side_effect=lambda op, args: payloads.append(args)), \
+                patch.object(mw, '_safe_run_async_in_thread',
+                             side_effect=self._run_metering_inline):
+            wrapper = self._wrapper()
+            instance = MagicMock()
+            result = asyncio.run(wrapper(
+                wrapped, instance, (),
+                {"model": "claude-3-5-sonnet-20241022",
+                 "messages": [{"role": "user", "content": "hi"}],
+                 "max_tokens": 16, **(kwargs or {})}))
+
+        assert result is response
+        assert len(payloads) == 1
+        return payloads[0]
+
+    def test_async_bedrock_create_emits_aws_provider(self):
+        payload = self._run_create(Provider.BEDROCK)
+        assert payload["provider"] == "AWS"
+        assert payload["model_source"] == "ANTHROPIC"
+
+    def test_async_direct_anthropic_create_unchanged(self):
+        payload = self._run_create(Provider.ANTHROPIC)
+        assert payload["provider"] == "ANTHROPIC"
+
+    def test_async_bedrock_emits_exactly_once(self):
+        payload = self._run_create(Provider.BEDROCK)
+        assert payload["input_token_count"] == 10
+        assert payload["output_token_count"] == 5
+
+    def test_async_bedrock_disable_env_forces_anthropic(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_BEDROCK_DISABLE", "1")
+        payload = self._run_create(Provider.BEDROCK)
+        assert payload["provider"] == "ANTHROPIC"
+
+    def test_async_bedrock_raw_stream_finalizes_with_detected_provider(self):
+        import asyncio
+        import revenium_middleware.anthropic.middleware as mw
+
+        class FakeAsyncStream:
+            def __init__(self):
+                self._events = iter([MagicMock(type="message_stop")])
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self._events)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        async def wrapped(*a, **k):
+            return FakeAsyncStream()
+
+        with patch.object(mw, 'detect_provider', return_value=Provider.BEDROCK), \
+                patch.object(mw, '_meter_raw_stream') as mock_meter:
+            wrapper = self._wrapper()
+
+            async def consume():
+                stream = await wrapper(
+                    wrapped, MagicMock(), (),
+                    {"model": "claude-3-5-sonnet-20241022",
+                     "messages": [{"role": "user", "content": "hi"}],
+                     "max_tokens": 16, "stream": True})
+                async for _ in stream:
+                    pass
+
+            asyncio.run(consume())
+
+        assert mock_meter.call_count == 1
+        assert mock_meter.call_args[0][5] == Provider.BEDROCK
+
+
+class TestBedrockTransportLoad:
+    """Overhead and surge behaviour of the transport-layer patch."""
+
+    @staticmethod
+    def _fresh_response(operation):
+        from test_anthropic.test_bedrock_transport import (
+            converse_response,
+            converse_stream_response,
+            invoke_model_response,
+            invoke_stream_response,
+        )
+        factory = {
+            "InvokeModel": invoke_model_response,
+            "Converse": converse_response,
+            "InvokeModelWithResponseStream": invoke_stream_response,
+            "ConverseStream": converse_stream_response,
+        }[operation]
+        return factory()
+
+    @staticmethod
+    def _consume(operation, result):
+        if operation == "InvokeModelWithResponseStream":
+            list(result["body"])
+        elif operation == "ConverseStream":
+            list(result["stream"])
+
+    def _run_calls(self, bt, operation, count, request_id=None):
+        from test_anthropic.test_bedrock_transport import make_instance
+
+        instance = make_instance()
+        for index in range(count):
+            response = self._fresh_response(operation)
+            if request_id is not None:
+                response["ResponseMetadata"]["RequestId"] = f"{request_id}-{index}"
+            result = bt._make_api_call_wrapper(
+                lambda *a, **k: response, instance,
+                (operation, {"modelId":
+                             "us.anthropic.claude-3-5-sonnet-20241022-v2:0"}), {})
+            self._consume(operation, result)
+
+    def test_bedrock_transport_overhead_benchmark(self, monkeypatch, capsys):
+        import statistics
+        import time
+        import tracemalloc
+
+        from revenium_middleware.anthropic import bedrock_transport as bt
+
+        operations = ["InvokeModel", "Converse",
+                      "InvokeModelWithResponseStream", "ConverseStream"]
+        calls_per_op = 1000
+        report = {}
+
+        for enabled in (False, True):
+            monkeypatch.setenv("REVENIUM_BEDROCK_TRANSPORT", "1" if enabled else "0")
+            with patch.object(bt, "_emit_completion") as mock_emit:
+                tracemalloc.start()
+                for operation in operations:
+                    latencies = []
+                    started = time.perf_counter()
+                    for _ in range(calls_per_op):
+                        call_start = time.perf_counter()
+                        response = self._fresh_response(operation)
+                        result = bt._make_api_call_wrapper(
+                            lambda *a, **k: response,
+                            self._instance(), (operation, {
+                                "modelId":
+                                "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+                            }), {})
+                        self._consume(operation, result)
+                        latencies.append(time.perf_counter() - call_start)
+                    elapsed = time.perf_counter() - started
+                    latencies.sort()
+                    report[(operation, enabled)] = {
+                        "p50_us": latencies[len(latencies) // 2] * 1e6,
+                        "p95_us": latencies[int(len(latencies) * 0.95)] * 1e6,
+                        "throughput_cps": calls_per_op / elapsed,
+                    }
+                _, peak = tracemalloc.get_traced_memory()
+                tracemalloc.stop()
+                report[("peak_memory_kb", enabled)] = peak / 1024
+
+                expected = len(operations) * calls_per_op if enabled else 0
+                assert mock_emit.call_count == expected
+
+        for operation in operations:
+            off = report[(operation, False)]
+            on = report[(operation, True)]
+            print(f"{operation}: off p50={off['p50_us']:.1f}us p95={off['p95_us']:.1f}us "
+                  f"tput={off['throughput_cps']:.0f}/s | on p50={on['p50_us']:.1f}us "
+                  f"p95={on['p95_us']:.1f}us tput={on['throughput_cps']:.0f}/s")
+        print(f"peak memory: off={report[('peak_memory_kb', False)]:.0f}KB "
+              f"on={report[('peak_memory_kb', True)]:.0f}KB")
+
+        out = capsys.readouterr().out
+        assert "p95" in out  # evidence emitted for the review attachment
+        with capsys.disabled():
+            print("\n" + out, end="")
+
+    @staticmethod
+    def _instance():
+        from test_anthropic.test_bedrock_transport import make_instance
+        return make_instance()
+
+    def test_bedrock_transport_concurrent_burst(self, monkeypatch):
+        import asyncio
+        import itertools
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        from revenium_middleware.anthropic import bedrock_transport as bt
+
+        monkeypatch.setenv("REVENIUM_BEDROCK_TRANSPORT", "1")
+
+        emitted = []
+        lock = threading.Lock()
+
+        def record(**kwargs):
+            with lock:
+                emitted.append(kwargs["transaction_id"])
+
+        operations = itertools.cycle([
+            "InvokeModel", "Converse",
+            "InvokeModelWithResponseStream", "ConverseStream",
+        ])
+        sync_jobs = [(next(operations), f"burst-{i}") for i in range(80)]
+        async_jobs = [(next(operations), f"burst-async-{i}") for i in range(40)]
+
+        def one_call(operation, request_id):
+            response = self._fresh_response(operation)
+            response["ResponseMetadata"]["RequestId"] = request_id
+            result = bt._make_api_call_wrapper(
+                lambda *a, **k: response, self._instance(),
+                (operation, {"modelId":
+                             "us.anthropic.claude-3-5-sonnet-20241022-v2:0"}), {})
+            self._consume(operation, result)
+
+        with patch.object(bt, "_emit_completion", side_effect=record):
+            with ThreadPoolExecutor(max_workers=16) as executor:
+                futures = [executor.submit(one_call, op, rid)
+                           for op, rid in sync_jobs]
+                for future in futures:
+                    future.result()
+
+            async def async_burst():
+                await asyncio.gather(*[
+                    asyncio.to_thread(one_call, op, rid)
+                    for op, rid in async_jobs
+                ])
+
+            asyncio.run(async_burst())
+
+        total = len(sync_jobs) + len(async_jobs)
+        assert len(emitted) == total  # zero missing, zero duplicated
+        assert len(set(emitted)) == total  # unique request-derived IDs
+        assert threading.active_count() < 20  # workers returned to idle

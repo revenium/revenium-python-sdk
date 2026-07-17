@@ -106,12 +106,21 @@ def handle_response(response, request_time_dt, usage_metadata, is_streaming):
         # Extract token counts from LiteLLM response
         prompt_tokens = getattr(response.usage, 'prompt_tokens', 0)
         completion_tokens = getattr(response.usage, 'completion_tokens', 0)
-        cached_tokens = getattr(response.usage, 'cached_tokens', 0)
+        # OpenAI-style responses report cache reads under
+        # prompt_tokens_details; LiteLLM's Anthropic passthrough exposes
+        # them as top-level cache_read/cache_creation_input_tokens.
+        prompt_details = getattr(response.usage, 'prompt_tokens_details', None)
+        cache_read_tokens = getattr(prompt_details, 'cached_tokens', 0) or 0
+        if not cache_read_tokens:
+            cache_read_tokens = getattr(response.usage, 'cache_read_input_tokens', 0) or 0
+        cache_creation_tokens = getattr(response.usage, 'cache_creation_input_tokens', 0) or 0
         total_tokens = prompt_tokens + completion_tokens
 
         logger.debug(
-            "LiteLLM completion token usage - prompt: %d, completion: %d, cached: %d, total: %d",
-            prompt_tokens, completion_tokens, cached_tokens, total_tokens
+            "LiteLLM completion token usage - prompt: %d, completion: %d, "
+            "cache read: %d, cache creation: %d, total: %d",
+            prompt_tokens, completion_tokens, cache_read_tokens,
+            cache_creation_tokens, total_tokens
         )
 
         finish_reason = getattr(response, 'finish_reason', None)
@@ -141,8 +150,8 @@ def handle_response(response, request_time_dt, usage_metadata, is_streaming):
             extra_body = merge_extra_body(None, agentic_fields)
 
             completion_args = {
-                "cache_creation_token_count": cached_tokens,
-                "cache_read_token_count": 0,
+                "cache_creation_token_count": cache_creation_tokens,
+                "cache_read_token_count": cache_read_tokens,
                 "input_token_cost": None,
                 "output_token_cost": None,
                 "total_cost": None,

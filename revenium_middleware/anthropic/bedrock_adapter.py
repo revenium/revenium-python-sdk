@@ -19,6 +19,8 @@ import threading
 
 from typing import Dict, Any, Optional, Tuple, Generator, Iterator, Union, List
 
+from revenium_middleware.anthropic.bedrock_transport import suppress_transport_metering
+
 logger = logging.getLogger("revenium_middleware.extension")
 
 
@@ -175,8 +177,24 @@ def get_bedrock_client(region: str):
 
 
 def _model_id(model_name: str) -> str:
-    """Map Anthropic model name to Bedrock model ID."""
-    return _MODEL_MAP.get(model_name, f"anthropic.{model_name}")
+    """Map Anthropic model name to Bedrock model ID.
+
+    Resolution order: known aliases win, already-qualified Bedrock IDs and
+    ARNs pass through byte-for-byte, and only bare names receive the
+    ``anthropic.`` fallback. Unmapped IDs without a provider segment must be
+    fully qualified by the caller -- the adapter does not infer a provider
+    for an arbitrary ``<region>.<name>``.
+    """
+    mapped = _MODEL_MAP.get(model_name)
+    if mapped is not None:
+        return mapped
+    if (
+        model_name.startswith("arn:")
+        or "anthropic." in model_name
+        or "amazon." in model_name
+    ):
+        return model_name
+    return f"anthropic.{model_name}"
 
 
 def _as_dict(value: Any) -> dict:
@@ -279,12 +297,14 @@ def bedrock_invoke(model: str, payload: dict, region: Optional[str] = None) -> T
 
         logger.debug(f"Invoking Bedrock model {model_id} in region {region}")
 
-        # Make the API call
-        resp = client.invoke_model(
-            modelId=model_id,
-            body=json.dumps(payload),
-            accept="application/json"
-        )
+        # Make the API call. Marked internal so the transport-layer patch
+        # does not emit a second completion for this invocation.
+        with suppress_transport_metering():
+            resp = client.invoke_model(
+                modelId=model_id,
+                body=json.dumps(payload),
+                accept="application/json"
+            )
 
         # Parse response
         try:
@@ -363,12 +383,14 @@ class BedrockStreamIterator:
 
             logger.debug(f"Starting Bedrock streaming for model {model_id} in region {self.region}")
 
-            # Make the streaming API call
-            resp = client.invoke_model_with_response_stream(
-                modelId=model_id,
-                body=json.dumps(self.payload),
-                accept="application/json"
-            )
+            # Make the streaming API call. Marked internal so the
+            # transport-layer patch does not emit a second completion.
+            with suppress_transport_metering():
+                resp = client.invoke_model_with_response_stream(
+                    modelId=model_id,
+                    body=json.dumps(self.payload),
+                    accept="application/json"
+                )
 
             # Process the streaming response
             stream = resp.get("body")

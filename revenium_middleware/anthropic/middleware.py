@@ -838,6 +838,18 @@ if register_patch("anthropic.resources.messages.messages.AsyncMessages.create"):
 
         usage_metadata, request_time, request_time_dt = extract_usage_metadata_and_timing(kwargs, "async_create")
 
+        # Bedrock-routed async clients (e.g. AsyncAnthropicBedrock) go through
+        # this same wrapper; detect the provider like the sync path does so
+        # AWS usage is not attributed to direct Anthropic. Async Bedrock calls
+        # are served natively by the anthropic SDK, so only the metering
+        # attribution changes -- there is no async re-routing.
+        if os.getenv("REVENIUM_BEDROCK_DISABLE") == "1":
+            detected_provider = Provider.ANTHROPIC
+        else:
+            client_instance = getattr(instance, '_client', None) if instance else None
+            detected_provider = detect_provider(client=client_instance,
+                                                base_url=kwargs.get('base_url', None))
+
         request_kwargs = dict(kwargs)
 
         async def _async_create():
@@ -847,7 +859,7 @@ if register_patch("anthropic.resources.messages.messages.AsyncMessages.create"):
                 # Raw-stream form: response is anthropic.AsyncStream (no .usage/.id).
                 def _finalize_stream(final_state):
                     _meter_raw_stream(final_state, usage_metadata, request_kwargs,
-                                      request_time, request_time_dt, Provider.ANTHROPIC)
+                                      request_time, request_time_dt, detected_provider)
 
                 return AsyncRawStreamMeteringWrapper(response, StreamUsageState(), _finalize_stream)
 
@@ -882,7 +894,7 @@ if register_patch("anthropic.resources.messages.messages.AsyncMessages.create"):
                 extract_prompt_data_if_enabled(request_kwargs, response=response)
             )
 
-            provider_metadata = get_provider_metadata(Provider.ANTHROPIC)
+            provider_metadata = get_provider_metadata(detected_provider)
 
             async def metering_call():
                 try:
