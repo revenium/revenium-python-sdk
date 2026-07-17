@@ -98,7 +98,7 @@ async def log_token_usage(
         prompt_tokens: Number of input tokens
         completion_tokens: Number of output tokens
         total_tokens: Total token count
-        cached_tokens: Number of cached tokens used
+        cached_tokens: Number of tokens read from the context cache
         stop_reason: Reason the generation stopped
         request_time: ISO timestamp of request start
         response_time: ISO timestamp of response completion
@@ -128,8 +128,10 @@ async def log_token_usage(
 
     # Prepare arguments for create_completion (using snake_case for Python client library)
     completion_args = {
-        "cache_creation_token_count": cached_tokens,
-        "cache_read_token_count": 0,
+        # Gemini's cachedContentTokenCount counts tokens read from the
+        # context cache, so it belongs in the cache-read field.
+        "cache_creation_token_count": 0,
+        "cache_read_token_count": cached_tokens,
         "input_token_cost": None,  # Let backend calculate from model pricing
         "output_token_cost": None,  # Let backend calculate from model pricing
         "total_cost": None,  # Let backend calculate from model pricing
@@ -388,7 +390,7 @@ def create_metering_call(
             prompt_tokens=usage_data.input_token_count,  # These are positional parameters
             completion_tokens=usage_data.output_token_count,  # These are positional parameters
             total_tokens=usage_data.total_token_count,  # These are positional parameters
-            cached_tokens=usage_data.cache_creation_token_count,
+            cached_tokens=usage_data.cache_read_token_count,
             stop_reason=usage_data.stop_reason,
             request_time=usage_data.request_time,
             response_time=usage_data.response_time,
@@ -997,5 +999,5 @@ def create_usage_data(
         stop_reason=stop_reason,
         request_time=request_time,
         response_time=response_time,
-        cache_creation_token_count=token_counts.cached_tokens,
+        cache_read_token_count=token_counts.cached_tokens,
     )

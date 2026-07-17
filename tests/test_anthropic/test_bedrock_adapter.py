@@ -39,6 +39,66 @@ class TestModelMapping:
         assert _model_id("claude-4-future") == "anthropic.claude-4-future"
         assert _model_id("custom-model") == "anthropic.custom-model"
 
+    def test_qualified_regional_id_passes_through_unchanged(self):
+        """A fully qualified inference-profile ID is preserved byte-for-byte."""
+        model = "us.anthropic.claude-opus-4-5-20251101-v1:0"
+        assert _model_id(model) == model
+
+    def test_qualified_global_id_passes_through_unchanged(self):
+        model = "global.anthropic.claude-opus-4-8"
+        assert _model_id(model) == model
+
+    def test_qualified_non_anthropic_id_passes_through_unchanged(self):
+        """Already-qualified IDs from other families are not rewritten."""
+        model = "us.amazon.nova-micro-v1:0"
+        assert _model_id(model) == model
+
+    def test_arn_passes_through_unchanged(self):
+        arn = (
+            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/"
+            "us.anthropic.claude-opus-4-5-20251101-v1:0"
+        )
+        assert _model_id(arn) == arn
+
+    def test_arn_without_provider_segment_passes_through_unchanged(self):
+        """An ARN whose path has no provider substring exercises the arn:
+        branch in isolation."""
+        arn = (
+            "arn:aws:bedrock:us-east-1:123456789012:"
+            "application-inference-profile/profile-id"
+        )
+        assert _model_id(arn) == arn
+
+    def test_unmapped_regional_bare_name_takes_anthropic_fallback(self):
+        """Unmapped IDs without a provider segment get the bare-name fallback.
+
+        Callers must fully qualify unmapped regional or non-Anthropic IDs;
+        the adapter does not infer a provider segment for them.
+        """
+        assert _model_id("eu.new-model") == "anthropic.eu.new-model"
+
+    def test_no_result_repeats_a_provider_prefix(self):
+        cases = [
+            "claude-opus-4-7",
+            "us.claude-opus-4-7",
+            "eu.claude-opus-4-7",
+            "au.claude-opus-4-7",
+            "global.claude-opus-4-7",
+            "claude-3-opus-20240229",
+            "claude-3-haiku-20240307",
+            "us.anthropic.claude-opus-4-5-20251101-v1:0",
+            "global.anthropic.claude-opus-4-8",
+            "us.amazon.nova-micro-v1:0",
+            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/"
+            "us.anthropic.claude-opus-4-5-20251101-v1:0",
+            "claude-4-future",
+            "eu.new-model",
+        ]
+        for model in cases:
+            result = _model_id(model)
+            assert result.count("anthropic.") <= 1, (model, result)
+            assert result.count("amazon.") <= 1, (model, result)
+
 
 class TestBoto3Import:
     """Test boto3 import handling."""

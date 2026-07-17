@@ -21,6 +21,13 @@ logger = logging.getLogger("revenium_middleware.anthropic.init")
 # Import provider detection (no SDK dependency)
 from .provider import Provider, detect_provider, get_provider_metadata, is_bedrock_provider
 
+# Bedrock transport metering (no anthropic-SDK dependency; botocore is lazy).
+# Opt-in canary: patches botocore only when REVENIUM_BEDROCK_TRANSPORT=1.
+from . import bedrock_transport
+from .bedrock_transport import activate_bedrock_transport, suppress_transport_metering
+
+bedrock_transport.activate_if_enabled()
+
 # Conditionally import middleware (requires anthropic SDK)
 try:
     import anthropic  # noqa: F401
@@ -100,6 +107,10 @@ __all__ = [
     "detect_provider",
     "get_provider_metadata",
     "is_bedrock_provider",
+
+    # Bedrock transport metering (opt-in canary)
+    "activate_bedrock_transport",
+    "suppress_transport_metering",
 
     # Initialization control
     "initialize",

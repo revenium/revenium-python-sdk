@@ -79,3 +79,54 @@ class TestOptionalDependencies:
         # For now, just test that the env var can be read
         import os
         assert os.getenv("REVENIUM_BEDROCK_DISABLE") == "1"
+
+
+class TestBedrockTransportOptionality:
+    """The transport canary must never burden non-Bedrock installations."""
+
+    def test_transport_module_imports_without_botocore(self, monkeypatch):
+        import importlib
+        import sys
+
+        monkeypatch.setitem(sys.modules, "botocore", None)
+        monkeypatch.setitem(sys.modules, "botocore.client", None)
+
+        from revenium_middleware.anthropic import bedrock_transport
+        reloaded = importlib.reload(bedrock_transport)  # no botocore at import
+
+        assert callable(reloaded.activate_bedrock_transport)
+
+    def test_activation_without_botocore_gives_actionable_message(self, monkeypatch):
+        import sys
+
+        from revenium_middleware.anthropic import bedrock_transport
+
+        monkeypatch.setitem(sys.modules, "botocore", None)
+        monkeypatch.setitem(sys.modules, "botocore.client", None)
+
+        with pytest.raises(ImportError) as excinfo:
+            bedrock_transport.activate_bedrock_transport()
+
+        assert "pip install revenium-python-sdk" in str(excinfo.value)
+
+    def test_flag_states(self, monkeypatch):
+        from revenium_middleware.anthropic import bedrock_transport
+
+        monkeypatch.delenv("REVENIUM_BEDROCK_TRANSPORT", raising=False)
+        assert bedrock_transport.is_transport_enabled() is False
+
+        monkeypatch.setenv("REVENIUM_BEDROCK_TRANSPORT", "1")
+        assert bedrock_transport.is_transport_enabled() is True
+
+        monkeypatch.setenv("REVENIUM_BEDROCK_TRANSPORT", "true")
+        assert bedrock_transport.is_transport_enabled() is True
+
+        # Kill switch: same variable, re-read at call time.
+        monkeypatch.setenv("REVENIUM_BEDROCK_TRANSPORT", "0")
+        assert bedrock_transport.is_transport_enabled() is False
+
+    def test_import_time_activation_defaults_off(self, monkeypatch):
+        from revenium_middleware.anthropic import bedrock_transport
+
+        monkeypatch.delenv("REVENIUM_BEDROCK_TRANSPORT", raising=False)
+        assert bedrock_transport.activate_if_enabled() is False

@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-17
+
+### Added
+- Opt-in transport-level metering for AWS Bedrock (canary). Setting `REVENIUM_BEDROCK_TRANSPORT=1` meters raw `boto3.client("bedrock-runtime")` usage — `invoke_model`, `invoke_model_with_response_stream`, `converse`, and `converse_stream` — for Anthropic Claude models with no application code changes. Each physical invocation produces exactly one completion attributed to AWS, streaming calls report time-to-first-token from the first event, and the AWS response request ID is used as the transaction identity so provider retries can never double-bill. The same variable acts as a runtime kill switch (it is re-read on every call). Calls made internally by the SDK's own Bedrock integration are automatically excluded from transport metering, so nothing is double-counted. Disabled by default; requires boto3.
+
+### Fixed
+- Async Anthropic clients routed through AWS Bedrock (`AsyncAnthropicBedrock`) are now attributed to AWS in usage reports instead of direct Anthropic.
+- Fully qualified Bedrock model IDs and inference-profile identifiers (e.g. `us.anthropic.claude-...`, ARNs) are now preserved byte-for-byte instead of being double-prefixed into invalid IDs. Known short aliases keep resolving as before, and bare model names still receive the `anthropic.` prefix.
+- LiteLLM: cached prompt tokens are now read from the correct field of the response and reported as cache reads. Previously the count was always zero and, when present, would have been misclassified as cache writes. Anthropic-style cache fields surfaced through LiteLLM are also propagated.
+- Google Gemini and Vertex AI: `cachedContentTokenCount` is now reported as cache reads instead of cache creation, so cache-heavy Gemini workloads are costed correctly.
+- README code samples now use the package's real import paths (`import revenium_middleware.openai` and friends). The previously documented underscore module names belong to retired standalone packages and fail under this bundle. The LangChain section was rewritten around the bundled API (`wrap`/`attach_to`).
+
 ## [0.2.0] - 2026-07-09
 
 ### Added
