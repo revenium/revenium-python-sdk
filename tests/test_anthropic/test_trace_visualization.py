@@ -17,8 +17,8 @@ import revenium_middleware.anthropic.middleware  # noqa: F401
 from revenium_middleware.anthropic.trace_fields import (
     get_environment, get_region, get_credential_alias,
     get_trace_type, get_trace_name, get_parent_transaction_id,
-    get_transaction_name, get_retry_number, detect_operation_type,
-    validate_trace_type, validate_trace_name
+    get_transaction_name, get_retry_number, get_ticket_id,
+    detect_operation_type, validate_trace_type, validate_trace_name
 )
 
 
@@ -110,6 +110,22 @@ class TestTraceFieldCapture:
         finally:
             if original is not None:
                 os.environ['REVENIUM_RETRY_NUMBER'] = original
+
+
+class TestTicketIdCapture:
+    """Test ticketId capture (FRONT-1545)."""
+
+    def test_env_var_fallback(self):
+        with patch.dict(os.environ, {'REVENIUM_TICKET_ID': 'JIRA-77'}):
+            assert get_ticket_id({}) == 'JIRA-77'
+
+    def test_metadata_takes_precedence(self):
+        with patch.dict(os.environ, {'REVENIUM_TICKET_ID': 'ENV-1'}):
+            assert get_ticket_id({'ticketId': 'META-1'}) == 'META-1'
+
+    def test_none_when_unset(self):
+        with patch.dict(os.environ, {}, clear=True):
+            assert get_ticket_id() is None
 
 
 class TestTraceValidation:

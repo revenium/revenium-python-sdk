@@ -12,7 +12,7 @@ Tests cover:
 
 import pytest
 import asyncio
-from revenium_middleware.litellm.client.decorators import track_agent, track_task
+from revenium_middleware.litellm.client.decorators import track_agent, track_task, track_job
 from revenium_middleware.litellm.client.context import metadata_context
 
 
@@ -181,6 +181,117 @@ class TestTrackTask:
         task = MyTask("custom_task")
         result = task.execute()
         assert result == {"task_type": "custom_task"}
+
+
+class TestTrackJob:
+    """Test suite for track_job decorator (BACK-777 Part 1.6)."""
+
+    def setup_method(self):
+        metadata_context.clear()
+
+    def teardown_method(self):
+        metadata_context.clear()
+
+    def test_static_all_fields_sync(self):
+        @track_job(job_id="loan-app-12345", name="Process Loan", type="loan_processing", version="1.2.0")
+        def process():
+            return metadata_context.get()
+
+        result = process()
+        assert result["agentic_job_id"] == "loan-app-12345"
+        assert result["agentic_job_name"] == "Process Loan"
+        assert result["agentic_job_type"] == "loan_processing"
+        assert result["agentic_job_version"] == "1.2.0"
+
+    def test_static_job_id_only(self):
+        @track_job(job_id="job-1")
+        def process():
+            return metadata_context.get()
+
+        result = process()
+        assert result["agentic_job_id"] == "job-1"
+        assert "agentic_job_name" not in result
+        assert "agentic_job_type" not in result
+        assert "agentic_job_version" not in result
+
+    @pytest.mark.asyncio
+    async def test_static_async(self):
+        @track_job(job_id="job-async", type="support")
+        async def process():
+            return metadata_context.get()
+
+        result = await process()
+        assert result["agentic_job_id"] == "job-async"
+        assert result["agentic_job_type"] == "support"
+
+    def test_dynamic_extraction_from_args(self):
+        @track_job(job_id_from_arg="job_id", type_from_arg="job_type")
+        def process(job_id, job_type, data):
+            return metadata_context.get()
+
+        result = process("loan-77", "loan_processing", {"x": 1})
+        assert result["agentic_job_id"] == "loan-77"
+        assert result["agentic_job_type"] == "loan_processing"
+
+    def test_dynamic_none_job_id_raises(self):
+        @track_job(job_id_from_arg="job_id")
+        def process(job_id, data):
+            return metadata_context.get()
+
+        with pytest.raises(ValueError, match="job_id"):
+            process(None, {"x": 1})
+
+    def test_dynamic_none_type_is_omitted(self):
+        @track_job(job_id_from_arg="job_id", type_from_arg="job_type")
+        def process(job_id, job_type):
+            return metadata_context.get()
+
+        result = process("job-9", None)
+        assert result["agentic_job_id"] == "job-9"
+        assert "agentic_job_type" not in result
+
+    def test_dynamic_extraction_through_kwargs_catch_all(self):
+        @track_job(job_id_from_arg="job_id")
+        def process(**kw):
+            return metadata_context.get()
+
+        result = process(job_id="j-1")
+        assert result["agentic_job_id"] == "j-1"
+
+    def test_dynamic_none_through_kwargs_catch_all_raises(self):
+        @track_job(job_id_from_arg="job_id")
+        def process(**kw):
+            return metadata_context.get()
+
+        with pytest.raises(ValueError, match="job_id"):
+            process(job_id=None)
+
+    def test_context_restored_after_call(self):
+        @track_job(job_id="scoped-job")
+        def process():
+            return metadata_context.get()
+
+        process()
+        assert "agentic_job_id" not in metadata_context.get()
+
+    def test_requires_exactly_one_job_id_source(self):
+        with pytest.raises(ValueError):
+            track_job()
+        with pytest.raises(ValueError):
+            track_job(job_id="a", job_id_from_arg="b")
+
+    def test_type_sources_mutually_exclusive(self):
+        with pytest.raises(ValueError):
+            track_job(job_id="a", type="t", type_from_arg="job_type")
+
+    def test_metadata_context_passthrough_for_job_fields(self):
+        # Ticket AC 1.7: MetadataContext is field-agnostic — job fields flow with no
+        # changes to the context manager itself.
+        with metadata_context.set(agentic_job_id="ctx-77", agentic_job_type="support"):
+            current = metadata_context.get()
+            assert current["agentic_job_id"] == "ctx-77"
+            assert current["agentic_job_type"] == "support"
+        assert "agentic_job_id" not in metadata_context.get()
 
 
 class TestNestedDecorators:

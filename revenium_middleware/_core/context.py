@@ -30,6 +30,12 @@ _idempotency_key_context: contextvars.ContextVar[Optional[str]] = contextvars.Co
     'revenium_idempotency_key', default=None
 )
 
+# Context variable holding agentic job fields (wire-name keys) for the current scope.
+# This is the seam the public JobContext (BACK-777 Phase 2) builds on.
+_agentic_job_context: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
+    'revenium_agentic_job', default=None
+)
+
 
 def is_inside_decorated_function() -> bool:
     """
@@ -172,3 +178,41 @@ def idempotency_key(key: str) -> Iterator[None]:
     finally:
         _idempotency_key_context.reset(token)
 
+
+def get_agentic_job_fields() -> Optional[Dict[str, Any]]:
+    """Return the agentic job fields set on the current context, or None.
+
+    Keys are wire names (``agenticJobId``, ``agenticJobName``, ``agenticJobType``,
+    ``agenticJobVersion``) — the same keys ``extract_agentic_job_fields`` emits,
+    so the fallback merge in ``_core/fields.py`` is key-aligned.
+    """
+    return _agentic_job_context.get()
+
+
+def set_agentic_job_fields(
+    job_id: Optional[str] = None,
+    name: Optional[str] = None,
+    type: Optional[str] = None,
+    version: Optional[str] = None,
+) -> contextvars.Token:
+    """Set agentic job fields on the current context. Returns a Token for reset().
+
+    Maps snake-case arguments to wire-name keys, omitting Nones. Callers own the
+    token and must reset it (``_agentic_job_context.reset(token)``) when the scope
+    ends — the JobContext context manager in Phase 2 does this on exit.
+
+    Raises:
+        ValueError: if no field is provided.
+    """
+    fields: Dict[str, Any] = {}
+    if job_id is not None:
+        fields["agenticJobId"] = job_id
+    if name is not None:
+        fields["agenticJobName"] = name
+    if type is not None:
+        fields["agenticJobType"] = type
+    if version is not None:
+        fields["agenticJobVersion"] = version
+    if not fields:
+        raise ValueError("set_agentic_job_fields requires at least one field")
+    return _agentic_job_context.set(fields)

@@ -100,6 +100,7 @@ class AIResource(SyncAPIResource):
         region: str | NotGiven = NOT_GIVEN,
         retry_number: int | NotGiven = NOT_GIVEN,
         trace_name: str | NotGiven = NOT_GIVEN,
+        ticket_id: str | NotGiven = NOT_GIVEN,
         trace_type: str | NotGiven = NOT_GIVEN,
         transaction_name: str | NotGiven = NOT_GIVEN,
         system_prompt: str | NotGiven = NOT_GIVEN,
@@ -225,6 +226,8 @@ class AIResource(SyncAPIResource):
 
           trace_name: Human-readable label for this trace instance (max 256 chars)
 
+          ticket_id: External ticket or issue ID (e.g. Jira, Linear) for cost attribution per ticket (max 256 chars)
+
           trace_type: Categorical identifier for grouping workflows (alphanumeric, hyphens,
               underscores; max 128 chars)
 
@@ -286,6 +289,7 @@ class AIResource(SyncAPIResource):
                     "region": region,
                     "retry_number": retry_number,
                     "trace_name": trace_name,
+                    "ticket_id": ticket_id,
                     "trace_type": trace_type,
                     "transaction_name": transaction_name,
                     "system_prompt": system_prompt,
@@ -985,6 +989,7 @@ class AsyncAIResource(AsyncAPIResource):
         region: str | NotGiven = NOT_GIVEN,
         retry_number: int | NotGiven = NOT_GIVEN,
         trace_name: str | NotGiven = NOT_GIVEN,
+        ticket_id: str | NotGiven = NOT_GIVEN,
         trace_type: str | NotGiven = NOT_GIVEN,
         transaction_name: str | NotGiven = NOT_GIVEN,
         system_prompt: str | NotGiven = NOT_GIVEN,
@@ -1110,6 +1115,8 @@ class AsyncAIResource(AsyncAPIResource):
 
           trace_name: Human-readable label for this trace instance (max 256 chars)
 
+          ticket_id: External ticket or issue ID (e.g. Jira, Linear) for cost attribution per ticket (max 256 chars)
+
           trace_type: Categorical identifier for grouping workflows (alphanumeric, hyphens,
               underscores; max 128 chars)
 
@@ -1171,6 +1178,7 @@ class AsyncAIResource(AsyncAPIResource):
                     "region": region,
                     "retry_number": retry_number,
                     "trace_name": trace_name,
+                    "ticket_id": ticket_id,
                     "trace_type": trace_type,
                     "transaction_name": transaction_name,
                     "system_prompt": system_prompt,

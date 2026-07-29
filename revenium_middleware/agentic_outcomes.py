@@ -12,18 +12,15 @@ not yet cover (/meter/v2/tool/events, /profitstream/v2/api/jobs/{id}/outcome).
 from __future__ import annotations
 
 import json
-import logging
 import threading
-import time
 import urllib.parse
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 import httpx
+from revenium_middleware._core import outcomes as _outcomes
 from revenium_middleware._metering import ReveniumMetering
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -187,7 +184,16 @@ class AgenticOutcomeClient:
         if dry_run:
             _print_dry_run("POST", self.settings.tool_url, payload)
             return payload
-        self._post_with_retry(self.settings.tool_url, params=None, body=payload)
+        _outcomes.post_with_retry(
+            self.http_client,
+            self.settings.tool_url,
+            params=None,
+            body=payload,
+            api_key=self.settings.api_key,
+            retry_attempts=self.settings.outcome_retry_attempts,
+            retry_initial_seconds=self.settings.outcome_retry_initial_seconds,
+            retry_max_seconds=self.settings.outcome_retry_max_seconds,
+        )
         return payload
 
     # ------------------------------------------------------------------ jobs+outcomes
@@ -218,12 +224,27 @@ class AgenticOutcomeClient:
         team_id = self._get_team_id()
         params = {"teamId": team_id} if team_id else None
         # 409 Conflict is acceptable (idempotent re-runs of the same agenticJobId).
-        self._post_with_retry(url, params=params, body=body, accept_409=True, api_key=self._outcome_key())
+        _outcomes.post_with_retry(
+            self.http_client,
+            url,
+            params=params,
+            body=body,
+            api_key=self._outcome_key(),
+            accept_409=True,
+            retry_attempts=self.settings.outcome_retry_attempts,
+            retry_initial_seconds=self.settings.outcome_retry_initial_seconds,
+            retry_max_seconds=self.settings.outcome_retry_max_seconds,
+        )
         return body
 
     def report_outcome(
         self, agentic_job_id: str, payload: Dict[str, Any], *, dry_run: bool = False
     ) -> None:
+        """Report the terminal outcome for a job.
+
+        Raises OutcomeAlreadyReportedError when the job already has an outcome
+        (backend 409 with structured amendment guidance).
+        """
         safe_id = urllib.parse.quote(agentic_job_id, safe="")
         url = (
             f"{self.settings.profitstream_base_url.rstrip('/')}"
@@ -236,10 +257,26 @@ class AgenticOutcomeClient:
         params = {"teamId": team_id} if team_id else None
         # 404 transient: metric ingestion creates the Job asynchronously; a fresh
         # outcome can race ahead until Kafka catches up.
-        self._post_with_retry(url, params=params, body=payload, retry_on_404=True, api_key=self._outcome_key())
+        _outcomes.post_with_retry(
+            self.http_client,
+            url,
+            params=params,
+            body=payload,
+            api_key=self._outcome_key(),
+            retry_on_404=True,
+            raise_typed_on_409=True,
+            retry_attempts=self.settings.outcome_retry_attempts,
+            retry_initial_seconds=self.settings.outcome_retry_initial_seconds,
+            retry_max_seconds=self.settings.outcome_retry_max_seconds,
+        )
 
     def _outcome_key(self) -> str:
-        return self.settings.outcome_api_key or self.settings.api_key
+        # Job/outcome control requires a write-scope key (rev_sk_); a metering
+        # key (rev_mk_) is rejected here so callers fail fast client-side
+        # instead of on a backend 403. Metering paths keep using api_key as-is.
+        return _outcomes.validate_outcome_key(
+            self.settings.outcome_api_key or self.settings.api_key
+        )
 
     def _get_team_id(self) -> str:
         if self.settings.team_id:
@@ -247,103 +284,20 @@ class AgenticOutcomeClient:
         if self._resolved_team_id:
             return self._resolved_team_id
 
-        # Automatic resolution via key-prefix (format: rev_[ms]k_TENANTID_...) and
-        # the ProfitStream teams API.
-        key = self._outcome_key()
-        parts = key.split("_")
-        if len(parts) < 3:
-            logger.warning(
-                "Could not infer team ID: API key does not match expected "
-                "rev_[ms]k_TENANTID_... format. Outcome calls may target the wrong team."
-            )
-            return ""
-        tenant_id = parts[2]
-
-        url = f"{self.settings.profitstream_base_url.rstrip('/')}/profitstream/v2/api/teams"
-        try:
-            response = self.http_client.get(
-                url,
-                headers=_headers(key),
-                params={"tenantId": tenant_id},
-                timeout=10.0,
-            )
-            response.raise_for_status()
-            data = response.json()
-            teams = data.get("_embedded", {}).get("teamResourceList", [])
-            if teams:
-                self._resolved_team_id = teams[0].get("id", "")
-                return self._resolved_team_id or ""
-            logger.warning("No teams returned for tenantId=%s; outcome calls may fail.", tenant_id)
-        except httpx.HTTPError as exc:
-            logger.warning(
-                "Failed to resolve team ID for tenantId=%s: %s. Outcome calls may target the wrong team.",
-                tenant_id, exc,
-            )
-        return ""
-
-    # ------------------------------------------------------------------ shared retry
-
-    def _post_with_retry(
-        self,
-        url: str,
-        *,
-        params: Optional[Dict[str, str]],
-        body: Dict[str, Any],
-        retry_on_404: bool = False,
-        accept_409: bool = False,
-        api_key: Optional[str] = None,
-    ) -> None:
-        attempts = max(1, self.settings.outcome_retry_attempts)
-        retryable = {429, 502, 503, 504}
-        if retry_on_404:
-            retryable.add(404)
-        key = api_key or self.settings.api_key
-        response: Optional[httpx.Response] = None
-        for attempt in range(attempts):
-            response = self.http_client.post(
-                url,
-                headers=_headers(key),
-                params=params,
-                json=body,
-                timeout=30.0,
-            )
-            if response.status_code in (200, 201):
-                return
-            if accept_409 and response.status_code == 409:
-                return
-            if response.status_code in retryable and attempt < attempts - 1:
-                delay = self._get_retry_delay(response, attempt)
-                time.sleep(delay)
-                continue
-            response.raise_for_status()
-
-    def _get_retry_delay(self, response: httpx.Response, attempt: int) -> float:
-        """Calculate retry delay honoring Retry-After with a max cap."""
-        retry_after_header = response.headers.get("Retry-After")
-        server_retry_after: Optional[float] = None
-        if retry_after_header:
-            try:
-                server_retry_after = float(retry_after_header)
-            except (TypeError, ValueError):
-                server_retry_after = None
-
-        if server_retry_after and server_retry_after > 0:
-            # Honor server hint with a 1s buffer, but never exceed the configured
-            # max — protects callers from unbounded blocking sleeps.
-            return min(server_retry_after + 1.0, self.settings.outcome_retry_max_seconds)
-
-        return min(
-            self.settings.outcome_retry_initial_seconds * (2 ** attempt),
-            self.settings.outcome_retry_max_seconds,
+        # Delegate auto-resolution (key-prefix + ProfitStream teams API) to the
+        # shared transport. use_env=False preserves this client's historical
+        # chain: settings.team_id > cached auto-resolution — REVENIUM_TEAM_ID
+        # is already folded into settings by the examples-pack loader.
+        resolved = _outcomes.resolve_team_id(
+            "",
+            self._outcome_key(),
+            self.http_client,
+            self.settings.profitstream_base_url,
+            use_env=False,
         )
-
-
-def _headers(api_key: str) -> Dict[str, str]:
-    return {
-        "x-api-key": api_key,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
+        if resolved:
+            self._resolved_team_id = resolved
+        return resolved
 
 
 def _print_dry_run(method: str, url: str, payload: Dict[str, Any]) -> None:

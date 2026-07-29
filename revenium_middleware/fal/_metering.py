@@ -29,6 +29,7 @@ from .trace_fields import (
     get_parent_transaction_id,
     get_transaction_name,
     get_retry_number,
+    get_ticket_id,
     detect_media_type,
     normalize_model_name,
 )
@@ -329,6 +330,7 @@ def handle_metering(
             else:
                 completion_args = {
                     **common,
+                    "ticket_id": get_ticket_id(usage_metadata),
                     "input_token_count": 0,
                     "output_token_count": 1,
                     "total_token_count": 1,

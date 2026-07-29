@@ -193,6 +193,7 @@ def _emit_completion(
         "trace_name": (usage_metadata.get("trace_name")
                        or usage_metadata.get("traceName")
                        or core_trace_fields.get_trace_name()),
+        "ticket_id": core_trace_fields.get_ticket_id(usage_metadata),
         "parent_transaction_id": (usage_metadata.get("parent_transaction_id")
                                   or usage_metadata.get("parentTransactionId")
                                   or core_trace_fields.get_parent_transaction_id()),

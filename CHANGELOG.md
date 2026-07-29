@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-07-29
+
+### Added
+- Agentic job tracking with `JobContext`. Wrapping a unit of agent work in `with JobContext("loan-app-12345", type="loan_processing") as job:` meters every AI call made inside the block against that job — across all supported providers, with no per-call changes — and `job.report_outcome(...)` records the business result (`SUCCESS`, `FAILED`, or `CANCELLED`, plus an outcome type, value, and currency) so dashboards can show revenue impact next to AI spend. `async with` behaves identically. If an unhandled exception escapes the block before an outcome was reported, the job is automatically recorded as `FAILED` with the error details in metadata and the original exception is re-raised untouched. Nested contexts are treated as separate jobs, and exiting an inner context restores the outer job's fields.
+- Outcome amendments and history. Business results change after the fact, so recorded outcomes can now be corrected instead of duplicated: `JobContext.attach("sales-lead-8842")` returns a lightweight handle to an existing job — usable from a different process than the one that ran it — whose `amend_outcome(reason=..., ...)` updates the stored outcome, while `get_outcome_history()` returns the full amendment trail in order. A dedicated exception family makes each failure mode explicit and catchable through the shared `OutcomeReportingError` base: `OutcomeAlreadyReportedError` (job already has an outcome — amend instead), `OutcomeNotReportedError` (nothing to amend yet), and `OutcomeAmendConflictError` (a concurrent amendment won the optimistic lock).
+- Agentic job fields without a context manager, for code that cannot wrap its work in a block: the `@track_job()` decorator for LiteLLM (static values or extraction from function arguments), per-call `usage_metadata={"agentic_job_id": ...}`, or the process-wide `REVENIUM_AGENTIC_JOB_ID`, `REVENIUM_AGENTIC_JOB_NAME`, `REVENIUM_AGENTIC_JOB_TYPE`, and `REVENIUM_AGENTIC_JOB_VERSION` environment variables.
+- Job outcome reporting for CrewAI. `ReveniumCrewWrapper` accepts `agentic_job_id`, `agentic_job_name`, `agentic_job_type`, and `agentic_job_version`, tying every LLM call the crew makes to a single job, and exposes `report_job_outcome()` and `amend_job_outcome()` for the business result.
+- `ticket_id` trace field, threaded through metering for every provider integration (OpenAI, Anthropic including AWS Bedrock, Google Gemini and Vertex AI, Ollama, LiteLLM, Perplexity, and fal.ai). Set it per call via `usage_metadata={"ticket_id": "JIRA-123"}` or process-wide via `REVENIUM_TICKET_ID` to attribute AI cost to an individual ticket or issue.
+- Tunable blocking behavior for outcome calls. Outcome reporting, amendment, and history retrieval are synchronous HTTP requests with retries; `retry_attempts`, `retry_initial_seconds`, and `retry_max_seconds` bound how long they may block, and are accepted by the `JobContext` constructor, `JobContext.attach()`, `get_outcome_history()`, and the CrewAI wrapper's outcome helpers.
+
+### Changed
+- The agentic outcomes API (reporting, amending, and reading job outcomes) requires a write-scope API key (`rev_sk_`). Metering keys (`rev_mk_`) meter completions and tool events only; the SDK now rejects them client-side with a clear error before any HTTP request is made, instead of surfacing a server-side authorization failure. Key resolution order is explicit `api_key=`, then `REVENIUM_OUTCOME_API_KEY`, then `REVENIUM_METERING_API_KEY`. The outcomes API base URL is configurable via `REVENIUM_PROFITSTREAM_BASE_URL`.
+- Team resolution for outcome reporting follows explicit `team_id=`, then `REVENIUM_TEAM_ID`, then automatic resolution from the API key, raising `OutcomeReportingError` if none of those yields a team.
+
 ## [0.3.0] - 2026-07-17
 
 ### Added

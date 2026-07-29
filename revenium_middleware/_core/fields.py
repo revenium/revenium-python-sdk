@@ -1,7 +1,11 @@
 import logging
+import os
 import threading
 import warnings
 from typing import Any, Dict, Mapping, Optional, Set, Tuple
+
+from .config import Config
+from .context import get_agentic_job_fields
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +21,13 @@ AGENTIC_JOB_FIELD_MAP = {
     "agenticJobName": ("agentic_job_name", "agenticJobName"),
     "agenticJobType": ("agentic_job_type", "agenticJobType"),
     "agenticJobVersion": ("agentic_job_version", "agenticJobVersion"),
+}
+
+_AGENTIC_JOB_ENV_MAP = {
+    "agenticJobId": Config.ENV_REVENIUM_AGENTIC_JOB_ID,
+    "agenticJobName": Config.ENV_REVENIUM_AGENTIC_JOB_NAME,
+    "agenticJobType": Config.ENV_REVENIUM_AGENTIC_JOB_TYPE,
+    "agenticJobVersion": Config.ENV_REVENIUM_AGENTIC_JOB_VERSION,
 }
 
 
@@ -96,13 +107,25 @@ def extract_common_metadata(source: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def extract_agentic_job_fields(source: Mapping[str, Any]) -> Dict[str, Any]:
+    """Resolve agentic job fields with per-field precedence:
+
+    explicit source metadata (snake then camel alias) > job contextvar >
+    ``REVENIUM_AGENTIC_JOB_*`` env var. Each field resolves independently.
+    """
+    context_fields = get_agentic_job_fields() or {}
     result = {}
     for wire_name, aliases in AGENTIC_JOB_FIELD_MAP.items():
+        value = None
         for alias in aliases:
             value = source.get(alias)
             if value is not None:
-                result[wire_name] = value
                 break
+        if value is None:
+            value = context_fields.get(wire_name)
+        if value is None:
+            value = os.getenv(_AGENTIC_JOB_ENV_MAP[wire_name]) or None
+        if value is not None:
+            result[wire_name] = value
     return result
 
 

@@ -214,6 +214,9 @@ class AICreateCompletionParams(TypedDict, total=False):
     trace_name: Annotated[str, PropertyInfo(alias="traceName")]
     """Human-readable label for this trace instance (max 256 chars)"""
 
+    ticket_id: Annotated[str, PropertyInfo(alias="ticketId")]
+    """External ticket or issue ID (e.g. Jira, Linear) for cost attribution per ticket (max 256 chars)"""
+
     trace_type: Annotated[str, PropertyInfo(alias="traceType")]
     """Categorical identifier for grouping workflows (alphanumeric, hyphens, underscores; max 128 chars)"""
 

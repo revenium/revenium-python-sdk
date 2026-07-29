@@ -166,6 +166,16 @@ from ._metering import meter_tool, report_tool_call, configure  # noqa: E402
 # Agentic-outcome client (used by examples/agentic_outcomes/ pack)
 from .agentic_outcomes import AgenticOutcomeClient, AgenticOutcomeSettings  # noqa: E402
 
+# Public job-context surface (BACK-777)
+from .job_context import JobContext  # noqa: E402
+from .job_history import JobOutcomeAmendment, get_outcome_history  # noqa: E402
+from ._core.exceptions import (  # noqa: E402
+    OutcomeAlreadyReportedError,
+    OutcomeAmendConflictError,
+    OutcomeNotReportedError,
+    OutcomeReportingError,
+)
+
 __all__ = [
     # Metering exports
     "client",
@@ -199,4 +209,13 @@ __all__ = [
     # Agentic-outcome exports
     "AgenticOutcomeClient",
     "AgenticOutcomeSettings",
+    # Job-context exports (BACK-777)
+    "JobContext",
+    "OutcomeReportingError",
+    "OutcomeAlreadyReportedError",
+    # Outcome amendment / history exports (BACK-777 Phase 3)
+    "get_outcome_history",
+    "JobOutcomeAmendment",
+    "OutcomeNotReportedError",
+    "OutcomeAmendConflictError",
 ]

@@ -33,10 +33,12 @@ ENV_REVENIUM_TRACE_NAME = Config.ENV_REVENIUM_TRACE_NAME
 ENV_REVENIUM_PARENT_TRANSACTION_ID = Config.ENV_REVENIUM_PARENT_TRANSACTION_ID
 ENV_REVENIUM_TRANSACTION_NAME = Config.ENV_REVENIUM_TRANSACTION_NAME
 ENV_REVENIUM_RETRY_NUMBER = Config.ENV_REVENIUM_RETRY_NUMBER
+ENV_REVENIUM_TICKET_ID = Config.ENV_REVENIUM_TICKET_ID
 
 # Validation constants
 TRACE_TYPE_MAX_LENGTH = 128
 TRACE_NAME_MAX_LENGTH = 256
+TICKET_ID_MAX_LENGTH = 256
 TRACE_TYPE_PATTERN = re.compile(r'^[a-zA-Z0-9_-]+$')
 
 
@@ -181,6 +183,33 @@ def get_transaction_name(usage_metadata: Optional[Dict[str, Any]] = None) -> Opt
     return None
 
 
+def get_ticket_id(usage_metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """
+    Get ticket ID from usage metadata or environment variables.
+
+    Checks in order:
+    1. ticketId / ticket_id from usage_metadata
+    2. REVENIUM_TICKET_ID env var
+
+    Args:
+        usage_metadata: Optional metadata dictionary
+
+    Returns:
+        Validated ticket ID (truncated if needed) or None if not set
+    """
+    ticket_id = None
+    if usage_metadata:
+        ticket_id = (
+            usage_metadata.get('ticketId') or
+            usage_metadata.get('ticket_id')
+        )
+    if not ticket_id:
+        ticket_id = os.getenv(ENV_REVENIUM_TICKET_ID)
+    if ticket_id:
+        return validate_ticket_id(ticket_id)
+    return None
+
+
 def get_retry_number() -> int:
     """
     Get retry number from environment variables.
@@ -263,3 +292,32 @@ def validate_trace_name(trace_name: str) -> Optional[str]:
         return trace_name[:TRACE_NAME_MAX_LENGTH]
 
     return trace_name
+
+
+def validate_ticket_id(ticket_id: str) -> Optional[str]:
+    """
+    Validate ticket ID length and truncate if needed.
+
+    Rules:
+    - Maximum 256 characters
+    - Truncates with warning if too long
+
+    Args:
+        ticket_id: Ticket ID to validate
+
+    Returns:
+        Valid ticket ID (truncated if needed) or None if empty
+    """
+    if not ticket_id:
+        return None
+
+    if len(ticket_id) > TICKET_ID_MAX_LENGTH:
+        logger.warning(
+            f"ticketId exceeds maximum length of "
+            f"{TICKET_ID_MAX_LENGTH} characters. "
+            f"Truncating from {len(ticket_id)} to "
+            f"{TICKET_ID_MAX_LENGTH} characters."
+        )
+        return ticket_id[:TICKET_ID_MAX_LENGTH]
+
+    return ticket_id

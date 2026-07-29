@@ -236,6 +236,11 @@ def handle_response(response, request_time_dt, usage_metadata, is_streaming):
                 if trace_name:
                     completion_args["trace_name"] = trace_name
 
+            # Ticket ID field (FRONT-1545)
+            ticket_id = trace_fields.get_ticket_id(usage_metadata)
+            if ticket_id:
+                completion_args["ticket_id"] = ticket_id
+
             # Parent transaction ID field
             parent_transaction_id = (
                 usage_metadata.get("parent_transaction_id") or

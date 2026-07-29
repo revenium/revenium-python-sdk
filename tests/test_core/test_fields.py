@@ -1,4 +1,6 @@
 import logging
+import os
+from unittest.mock import patch
 
 import pytest
 
@@ -9,6 +11,11 @@ from revenium_middleware._core.fields import (
     extract_org_and_product,
     extract_with_aliases,
     merge_extra_body,
+)
+from revenium_middleware._core.context import (
+    get_agentic_job_fields,
+    set_agentic_job_fields,
+    _agentic_job_context,
 )
 
 
@@ -279,3 +286,82 @@ class TestMergeExtraBody:
         existing = {"key": "val"}
         merge_extra_body(existing, {"new_key": "new_val"})
         assert "new_key" not in existing
+
+
+class TestAgenticJobFieldResolution:
+    """Per-field precedence: explicit metadata > contextvar > env var (BACK-777 Part 1)."""
+
+    def setup_method(self):
+        self._token = None
+
+    def teardown_method(self):
+        if self._token is not None:
+            _agentic_job_context.reset(self._token)
+
+    def test_explicit_metadata_wins_over_context_and_env(self):
+        self._token = set_agentic_job_fields(job_id="ctx-job")
+        with patch.dict(os.environ, {"REVENIUM_AGENTIC_JOB_ID": "env-job"}):
+            result = extract_agentic_job_fields({"agentic_job_id": "meta-job"})
+        assert result["agenticJobId"] == "meta-job"
+
+    def test_camel_case_metadata_wins_too(self):
+        self._token = set_agentic_job_fields(job_id="ctx-job")
+        result = extract_agentic_job_fields({"agenticJobId": "meta-job"})
+        assert result["agenticJobId"] == "meta-job"
+
+    def test_contextvar_fallback_when_metadata_missing(self):
+        self._token = set_agentic_job_fields(job_id="ctx-job", type="loan_processing")
+        with patch.dict(os.environ, {"REVENIUM_AGENTIC_JOB_ID": "env-job"}):
+            result = extract_agentic_job_fields({})
+        assert result["agenticJobId"] == "ctx-job"
+        assert result["agenticJobType"] == "loan_processing"
+
+    def test_env_fallback_when_metadata_and_context_missing(self):
+        env = {
+            "REVENIUM_AGENTIC_JOB_ID": "env-job",
+            "REVENIUM_AGENTIC_JOB_NAME": "Env Job",
+            "REVENIUM_AGENTIC_JOB_TYPE": "env_type",
+            "REVENIUM_AGENTIC_JOB_VERSION": "9.9.9",
+        }
+        with patch.dict(os.environ, env):
+            result = extract_agentic_job_fields({})
+        assert result == {
+            "agenticJobId": "env-job",
+            "agenticJobName": "Env Job",
+            "agenticJobType": "env_type",
+            "agenticJobVersion": "9.9.9",
+        }
+
+    def test_per_field_independence(self):
+        # id from metadata, name from context, type from env — each field resolves alone
+        self._token = set_agentic_job_fields(name="Ctx Name")
+        with patch.dict(os.environ, {"REVENIUM_AGENTIC_JOB_TYPE": "env_type"}):
+            result = extract_agentic_job_fields({"agentic_job_id": "meta-job"})
+        assert result == {
+            "agenticJobId": "meta-job",
+            "agenticJobName": "Ctx Name",
+            "agenticJobType": "env_type",
+        }
+
+    def test_empty_env_var_treated_as_unset(self):
+        with patch.dict(os.environ, {"REVENIUM_AGENTIC_JOB_ID": ""}):
+            assert extract_agentic_job_fields({}) == {}
+
+    def test_empty_when_nothing_set(self):
+        with patch.dict(os.environ, {}, clear=True):
+            assert extract_agentic_job_fields({}) == {}
+
+    def test_token_reset_restores_previous_context(self):
+        outer = set_agentic_job_fields(job_id="outer")
+        try:
+            inner = set_agentic_job_fields(job_id="inner")
+            assert get_agentic_job_fields() == {"agenticJobId": "inner"}
+            _agentic_job_context.reset(inner)
+            assert get_agentic_job_fields() == {"agenticJobId": "outer"}
+        finally:
+            _agentic_job_context.reset(outer)
+
+    def test_set_agentic_job_fields_requires_a_field(self):
+        import pytest
+        with pytest.raises(ValueError):
+            set_agentic_job_fields()
