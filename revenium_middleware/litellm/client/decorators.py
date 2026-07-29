@@ -7,6 +7,7 @@ into LiteLLM completion calls. Decorators work with both sync and async function
 Available decorators:
     - track_agent: Set agent metadata
     - track_task: Set task_type metadata
+    - track_job: Set agentic job metadata (id, name, type, version)
     - track_trace: Set trace_id metadata
     - track_organization: Set organization_name metadata
     - track_subscription: Set subscription_id metadata
@@ -37,7 +38,7 @@ Example:
 
 import functools
 import inspect
-from typing import Callable, Optional
+from typing import Any, Callable, Dict, Optional
 from .context import metadata_context
 
 
@@ -220,6 +221,113 @@ def track_task(
 
             return sync_wrapper
     
+    return decorator
+
+
+def track_job(
+    job_id: Optional[str] = None,
+    *,
+    name: Optional[str] = None,
+    type: Optional[str] = None,
+    version: Optional[str] = None,
+    job_id_from_arg: Optional[str] = None,
+    type_from_arg: Optional[str] = None
+) -> Callable:
+    """
+    Decorator to automatically inject agentic job metadata into LiteLLM calls.
+
+    Sets the agentic job fields in the metadata context for the duration of the
+    decorated function so every completion inside inherits them. Supports static
+    values and dynamic extraction from function arguments.
+
+    Works with both sync and async functions.
+
+    Args:
+        job_id: Static job instance ID. Mutually exclusive with job_id_from_arg.
+        name: Static human-readable job name.
+        type: Static job type category. Mutually exclusive with type_from_arg.
+        version: Static job version.
+        job_id_from_arg: Name of function argument to use as the job ID.
+        type_from_arg: Name of function argument to use as the job type.
+
+    Returns:
+        Decorated function that sets agentic job metadata
+
+    Raises:
+        ValueError: If job_id and job_id_from_arg are both given or both missing,
+                    or if type and type_from_arg are both given.
+
+    Example:
+        >>> @track_job(job_id="loan-app-12345", name="Process Loan", type="loan_processing", version="1.2.0")
+        >>> def process_loan():
+        ...     return litellm.completion(...)
+        >>>
+        >>> # Dynamic extraction from arguments
+        >>> @track_job(job_id_from_arg="job_id", type_from_arg="job_type")
+        >>> def process(job_id, job_type, data):
+        ...     return litellm.completion(...)
+    """
+    if (job_id is None) == (job_id_from_arg is None):
+        raise ValueError("Must specify exactly one of: job_id, job_id_from_arg")
+    if type is not None and type_from_arg is not None:
+        raise ValueError("Can only specify one of: type, type_from_arg")
+
+    def decorator(func: Callable) -> Callable:
+        is_async = inspect.iscoroutinefunction(func)
+
+        def _raw_arg(arg_name: str, args: tuple, kwargs: dict, field_name: str) -> Any:
+            """Resolve a dynamic argument's raw value, without stringification."""
+            # Check the call-site kwargs first (mirrors _get_value) — signature
+            # binding files keyword args under a **kwargs catch-all parameter's
+            # name, which would hide them from the bound-arguments lookup below.
+            if arg_name in kwargs:
+                return kwargs[arg_name]
+            try:
+                bound = inspect.signature(func).bind(*args, **kwargs)
+                bound.apply_defaults()
+            except TypeError:
+                bound = None
+            if bound is not None and arg_name in bound.arguments:
+                return bound.arguments[arg_name]
+            raise ValueError(f"Argument '{arg_name}' not found in function call for {field_name}")
+
+        def _job_metadata(args: tuple, kwargs: dict) -> Dict[str, Any]:
+            resolved_job_id = job_id
+            if job_id_from_arg is not None:
+                raw_job_id = _raw_arg(job_id_from_arg, args, kwargs, "job_id")
+                if raw_job_id is None:
+                    raise ValueError(
+                        f"job_id argument '{job_id_from_arg}' is None — a job id is required"
+                    )
+                resolved_job_id = str(raw_job_id)
+            metadata: Dict[str, Any] = {"agentic_job_id": resolved_job_id}
+            if name is not None:
+                metadata["agentic_job_name"] = name
+            resolved_type = type
+            if type_from_arg is not None:
+                raw_type = _raw_arg(type_from_arg, args, kwargs, "job_type")
+                resolved_type = str(raw_type) if raw_type is not None else None
+            if resolved_type is not None:
+                metadata["agentic_job_type"] = resolved_type
+            if version is not None:
+                metadata["agentic_job_version"] = version
+            return metadata
+
+        if is_async:
+            @functools.wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                with metadata_context.set(**_job_metadata(args, kwargs)):
+                    return await func(*args, **kwargs)
+
+            return async_wrapper
+        else:
+            @functools.wraps(func)
+            def sync_wrapper(*args, **kwargs):
+                with metadata_context.set(**_job_metadata(args, kwargs)):
+                    return func(*args, **kwargs)
+
+            return sync_wrapper
+
     return decorator
 
 
@@ -902,6 +1010,7 @@ def _get_quality_score(
 __all__ = [
     'track_agent',
     'track_task',
+    'track_job',
     'track_trace',
     'track_organization',
     'track_subscription',

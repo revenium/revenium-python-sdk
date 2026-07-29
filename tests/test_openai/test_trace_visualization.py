@@ -19,7 +19,8 @@ from revenium_middleware.openai.trace_fields import (
     get_environment, get_region, get_credential_alias,
     get_trace_type, get_trace_name, get_parent_transaction_id,
     get_transaction_name, get_retry_number, detect_operation_type,
-    validate_trace_type, validate_trace_name
+    validate_trace_type, validate_trace_name,
+    get_ticket_id, validate_ticket_id
 )
 
 
@@ -118,6 +119,53 @@ class TestTraceFieldCapture:
             assert get_parent_transaction_id() is None
             assert get_transaction_name() is None
             assert get_retry_number() == 0  # Defaults to 0
+
+
+class TestTicketIdCapture:
+    """Test ticketId capture, validation, and serialization (FRONT-1545)."""
+
+    def test_metadata_camel_case(self):
+        with patch.dict(os.environ, {}, clear=True):
+            assert get_ticket_id({'ticketId': 'JIRA-123'}) == 'JIRA-123'
+
+    def test_metadata_snake_case(self):
+        with patch.dict(os.environ, {}, clear=True):
+            assert get_ticket_id({'ticket_id': 'LINEAR-42'}) == 'LINEAR-42'
+
+    def test_metadata_takes_precedence_over_env(self):
+        with patch.dict(os.environ, {'REVENIUM_TICKET_ID': 'ENV-1'}):
+            assert get_ticket_id({'ticketId': 'META-1'}) == 'META-1'
+
+    def test_env_var_fallback(self):
+        with patch.dict(os.environ, {'REVENIUM_TICKET_ID': 'ENV-1'}):
+            assert get_ticket_id({}) == 'ENV-1'
+            assert get_ticket_id() == 'ENV-1'
+
+    def test_truncated_at_256_chars_with_warning(self, caplog):
+        import logging
+        long_id = 'T' * 300
+        with patch.dict(os.environ, {}, clear=True):
+            with caplog.at_level(logging.WARNING,
+                                 logger='revenium_middleware._core.trace_fields'):
+                result = get_ticket_id({'ticketId': long_id})
+        assert result == 'T' * 256
+        assert 'ticketId' in caplog.text
+
+    def test_none_when_unset(self):
+        with patch.dict(os.environ, {}, clear=True):
+            assert get_ticket_id() is None
+            assert get_ticket_id({}) is None
+
+    def test_validate_empty_returns_none(self):
+        assert validate_ticket_id('') is None
+
+    def test_serialized_as_camelcase_ticket_id(self):
+        from revenium_middleware._metering._utils import maybe_transform
+        from revenium_middleware._metering.types.ai_create_completion_params import (
+            AICreateCompletionParams,
+        )
+        body = maybe_transform({'ticket_id': 'JIRA-123'}, AICreateCompletionParams)
+        assert body['ticketId'] == 'JIRA-123'
 
 
 class TestTraceValidation:

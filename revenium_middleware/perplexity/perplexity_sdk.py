@@ -35,7 +35,8 @@ from .trace_fields import (
     get_trace_name,
     get_parent_transaction_id,
     get_transaction_name,
-    get_retry_number
+    get_retry_number,
+    get_ticket_id
 )
 from .middleware import (
     OperationType,
@@ -188,6 +189,8 @@ async def send_perplexity_metering_data(
 
         # Build trace fields
         trace_fields = build_trace_fields()
+        if ticket_id := get_ticket_id(usage_metadata):
+            trace_fields["ticket_id"] = ticket_id
 
         # Detect operation type (native Perplexity SDK only supports chat)
         operation_type = OperationType.CHAT

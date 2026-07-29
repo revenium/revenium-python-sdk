@@ -2,6 +2,8 @@
 Tests for trace visualization fields.
 """
 import os
+from unittest.mock import patch
+
 import pytest
 from revenium_middleware.perplexity.trace_fields import (
     get_environment,
@@ -12,6 +14,7 @@ from revenium_middleware.perplexity.trace_fields import (
     get_parent_transaction_id,
     get_transaction_name,
     get_retry_number,
+    get_ticket_id,
     validate_trace_type,
     validate_trace_name
 )
@@ -64,6 +67,23 @@ class TestTraceFieldExtraction:
         """Test retry number extraction."""
         monkeypatch.setenv("REVENIUM_RETRY_NUMBER", "3")
         assert get_retry_number() == 3
+
+
+@pytest.mark.unit
+class TestTicketIdCapture:
+    """Test ticketId capture (FRONT-1545)."""
+
+    def test_env_var_fallback(self):
+        with patch.dict(os.environ, {'REVENIUM_TICKET_ID': 'JIRA-77'}):
+            assert get_ticket_id({}) == 'JIRA-77'
+
+    def test_metadata_takes_precedence(self):
+        with patch.dict(os.environ, {'REVENIUM_TICKET_ID': 'ENV-1'}):
+            assert get_ticket_id({'ticketId': 'META-1'}) == 'META-1'
+
+    def test_none_when_unset(self):
+        with patch.dict(os.environ, {}, clear=True):
+            assert get_ticket_id() is None
 
 
 @pytest.mark.unit

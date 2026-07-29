@@ -41,3 +41,45 @@ class BudgetExceededError(Exception):
 # `except ReveniumCostLimitExceeded:` continues to catch the new exception
 # unchanged. Plan to remove in a future major release.
 ReveniumCostLimitExceeded = BudgetExceededError
+
+
+class OutcomeReportingError(Exception):
+    """Raised when an agentic job outcome cannot be reported.
+
+    Base of the outcome exception family (BACK-777). Configuration failures
+    (unresolvable team_id, missing API key) raise this class directly;
+    backend-state conditions raise the subclasses.
+    """
+
+
+class OutcomeAlreadyReportedError(OutcomeReportingError):
+    """The job already has an outcome (backend 409 with amendment guidance).
+
+    Callers can inspect ``reported_at`` / ``amendment_count`` and decide to
+    amend (``amend_outcome``, BACK-777 Phase 3).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        reported_at: Optional[str] = None,
+        amendment_count: Optional[int] = None,
+    ):
+        super().__init__(message)
+        self.reported_at = reported_at
+        self.amendment_count = amendment_count
+
+
+class OutcomeNotReportedError(OutcomeReportingError):
+    """Amendment attempted on a job with no outcome yet (backend 422).
+
+    Report the initial outcome with ``report_outcome`` first.
+    """
+
+
+class OutcomeAmendConflictError(OutcomeReportingError):
+    """Concurrent amendment changed the outcome row (backend 409, optimistic lock).
+
+    Retryable by the caller: refetch the current state (``get_outcome_history``)
+    and re-issue the amendment. The SDK does not auto-retry.
+    """

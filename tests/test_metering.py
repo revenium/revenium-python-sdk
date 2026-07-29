@@ -74,3 +74,33 @@ class TestMetering:
             # Thread should have been joined
             assert "Shutdown initiated" in caplog.text or "SHUTDOWN" in caplog.text
             assert "Shutdown complete" in caplog.text or "COMPLETE" in caplog.text
+
+
+class TestCreateCompletionTicketId:
+    """Regression tests for ticket_id support in create_completion (FRONT-1545)."""
+
+    def test_create_completion_accepts_ticket_id(self):
+        """create_completion must accept ticket_id and send it as ticketId in the body."""
+        from revenium_middleware._metering import ReveniumMetering
+
+        client = ReveniumMetering(api_key="test-key")
+        with patch.object(client.ai, "_post") as mock_post:
+            client.ai.create_completion(
+                completion_start_time="2026-07-21T00:00:00Z",
+                cost_type="AI",
+                input_token_count=10,
+                is_streamed=False,
+                model="gpt-test",
+                output_token_count=5,
+                provider="OPENAI",
+                request_duration=100,
+                request_time="2026-07-21T00:00:00Z",
+                response_time="2026-07-21T00:00:01Z",
+                stop_reason="END",
+                total_token_count=15,
+                transaction_id="txn-123",
+                ticket_id="JIRA-123",
+            )
+
+        body = mock_post.call_args.kwargs["body"]
+        assert body["ticketId"] == "JIRA-123"

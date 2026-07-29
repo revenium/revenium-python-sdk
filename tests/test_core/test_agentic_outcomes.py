@@ -465,3 +465,59 @@ def test_get_team_id_uses_outcome_api_key_for_teams_lookup():
     # Tenant ID parsed from the outcome key, not the metering key.
     assert seen["params"]["tenantId"] == "tenantSK"
     client.close()
+
+
+# ---------------------------------------------------------------------------
+# Outcomes require a write-scope key: a metering key must fail client-side
+# before any HTTP call, matching JobContext._resolve_api_key.
+# ---------------------------------------------------------------------------
+def test_report_outcome_rejects_metering_key_before_http():
+    calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        return httpx.Response(200, json={})
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.Client(transport=transport)
+    settings = _settings(api_key="rev_mk_TENANT_abc", outcome_api_key=None)
+    client = AgenticOutcomeClient(settings, http_client=http)
+    with pytest.raises(ValueError, match="write-scope"):
+        client.report_outcome("job-1", {"executionStatus": "SUCCESS"})
+    assert calls == []
+    client.close()
+
+
+def test_create_job_rejects_metering_key_before_http():
+    calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        return httpx.Response(200, json={})
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.Client(transport=transport)
+    settings = _settings(api_key="rev_mk_TENANT_abc", outcome_api_key=None)
+    client = AgenticOutcomeClient(settings, http_client=http)
+    with pytest.raises(ValueError, match="write-scope"):
+        client.create_job("job-1")
+    assert calls == []
+    client.close()
+
+
+def test_metering_paths_still_accept_a_metering_key():
+    # emit_tool_event authenticates with settings.api_key, not the outcome key —
+    # a metering key must keep working there.
+    seen = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["x_api_key"] = req.headers.get("x-api-key")
+        return httpx.Response(200, json={})
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.Client(transport=transport)
+    settings = _settings(api_key="rev_mk_TENANT_abc", outcome_api_key=None)
+    client = AgenticOutcomeClient(settings, http_client=http)
+    client.emit_tool_event({"transactionId": "tx-mk"})
+    assert seen["x_api_key"] == "rev_mk_TENANT_abc"
+    client.close()

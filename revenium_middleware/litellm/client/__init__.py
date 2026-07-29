@@ -34,6 +34,7 @@ from .validation import UsageMetadata, Subscriber, SubscriberCredential, PYDANTI
 from .decorators import (
     track_agent,
     track_task,
+    track_job,
     track_trace,
     track_organization,
     track_subscription,
@@ -68,6 +69,7 @@ __all__ = [
     'PYDANTIC_AVAILABLE',
     'track_agent',
     'track_task',
+    'track_job',
     'track_trace',
     'track_organization',
     'track_subscription',

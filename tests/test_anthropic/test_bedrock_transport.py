@@ -462,6 +462,7 @@ class TestReviewRegressions:
         import revenium_middleware
 
         monkeypatch.setenv("REVENIUM_ENVIRONMENT", "staging")
+        monkeypatch.setenv("REVENIUM_TICKET_ID", "JIRA-77")
         payloads = []
         with patch("revenium_middleware._core.submit_ai_event",
                    side_effect=lambda op, args: payloads.append(args)), \
@@ -472,6 +473,8 @@ class TestReviewRegressions:
         args = payloads[0]
         for field in ("environment", "credential_alias", "trace_type",
                       "trace_name", "parent_transaction_id",
-                      "transaction_name", "retry_number", "operation_subtype"):
+                      "transaction_name", "retry_number", "operation_subtype",
+                      "ticket_id"):
             assert field in args
         assert args["environment"] == "staging"
+        assert args["ticket_id"] == "JIRA-77"

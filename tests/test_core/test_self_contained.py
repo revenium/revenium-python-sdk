@@ -16,6 +16,11 @@ EXPECTED_ALL = {
     "is_selective_metering_enabled",
     "meter_tool", "report_tool_call", "configure",
     "AgenticOutcomeClient", "AgenticOutcomeSettings",
+    # BACK-777: public job-context surface
+    "JobContext", "OutcomeReportingError", "OutcomeAlreadyReportedError",
+    # BACK-777 Phase 3: amendments + history
+    "get_outcome_history", "JobOutcomeAmendment",
+    "OutcomeNotReportedError", "OutcomeAmendConflictError",
 }
 
 

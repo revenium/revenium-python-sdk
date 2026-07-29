@@ -28,6 +28,7 @@ Example:
 import uuid
 import logging
 from typing import List, Optional, Dict, Any
+from ....job_context import JobContext
 from ..context import metadata_context
 
 logger = logging.getLogger("revenium_middleware.crewai")
@@ -101,17 +102,28 @@ class ReveniumCrewWrapper:
     - Unique trace_id for each crew execution
     - Agent role for each agent interaction
     - Task type for each task execution
-    
+    - Optional agentic job fields (agentic_job_id/name/type/version) for
+      Revenium's agentic outcomes API
+
     All metadata is automatically injected into LiteLLM calls via the
     context API, eliminating the need for manual monkey-patching.
-    
+
+    When constructed with an ``agentic_job_id``, the wrapper can also report
+    or amend the job's business outcome via ``report_job_outcome`` and
+    ``amend_job_outcome`` (requires a write-scope ``rev_sk_`` API key).
+
     Attributes:
         organization_id: Customer or department ID
         subscription_id: Billing plan reference
         product_id: Product or feature identifier
         trace_id: Unique identifier for this crew execution (auto-generated)
+        agentic_job_id: Optional agentic job identifier for outcome reporting
+        agentic_job_name: Optional human-readable agentic job name
+        agentic_job_type: Optional agentic job type/category
+        agentic_job_version: Optional agentic job version
+        team_id: Optional Revenium team ID used for outcome reporting
     """
-    
+
     def __init__(
         self,
         agents: List[Any],
@@ -120,13 +132,18 @@ class ReveniumCrewWrapper:
         subscription_id: str,
         product_id: str,
         trace_id: Optional[str] = None,
+        agentic_job_id: Optional[str] = None,
+        agentic_job_name: Optional[str] = None,
+        agentic_job_type: Optional[str] = None,
+        agentic_job_version: Optional[str] = None,
+        team_id: Optional[str] = None,
         process: Optional[Any] = None,
         verbose: bool = False,
         **crew_kwargs
     ):
         """
         Initialize the Revenium-wrapped Crew.
-        
+
         Args:
             agents: List of CrewAI Agent objects
             tasks: List of CrewAI Task objects
@@ -135,10 +152,19 @@ class ReveniumCrewWrapper:
             product_id: Your product or feature making the AI call
             trace_id: Optional unique identifier for this execution. If not provided,
                      a UUID will be generated automatically.
+            agentic_job_id: Optional agentic job identifier. When set, it is
+                     injected into metering metadata and enables
+                     report_job_outcome/amend_job_outcome.
+            agentic_job_name: Optional human-readable name for the agentic job.
+            agentic_job_type: Optional agentic job type/category (e.g.
+                     "customer_support").
+            agentic_job_version: Optional version string for the agentic job.
+            team_id: Optional Revenium team ID used when reporting or amending
+                     the job outcome (falls back to REVENIUM_TEAM_ID).
             process: Optional CrewAI process type (sequential, hierarchical, etc.)
             verbose: Whether to enable verbose logging
             **crew_kwargs: Additional arguments to pass to Crew constructor
-        
+
         Example:
             >>> crew = ReveniumCrewWrapper(
             ...     agents=[agent1, agent2],
@@ -146,7 +172,16 @@ class ReveniumCrewWrapper:
             ...     organization_id="AcmeCorp",
             ...     subscription_id="82764738",
             ...     product_id="Platinum",
+            ...     agentic_job_id="support-456",
+            ...     agentic_job_type="customer_support",
+            ...     agentic_job_version="2.0",
             ...     verbose=True
+            ... )
+            >>> result = crew.kickoff()
+            >>> crew.report_job_outcome(
+            ...     execution_status="SUCCESS",
+            ...     outcome_type="DEFLECTED",
+            ...     outcome_value=25.0,
             ... )
         """
         if not CREWAI_AVAILABLE:
@@ -159,7 +194,12 @@ class ReveniumCrewWrapper:
         self.subscription_id = subscription_id
         self.product_id = product_id
         self.trace_id = trace_id or str(uuid.uuid4())
-        
+        self.agentic_job_id = agentic_job_id
+        self.agentic_job_name = agentic_job_name
+        self.agentic_job_type = agentic_job_type
+        self.agentic_job_version = agentic_job_version
+        self.team_id = team_id
+
         # Store agents and tasks for metadata extraction
         self._agents = agents
         self._tasks = tasks
@@ -181,6 +221,24 @@ class ReveniumCrewWrapper:
             f"Initialized Revenium Crew wrapper with trace_id: {self.trace_id}"
         )
 
+    def _execution_metadata(self) -> Dict[str, Any]:
+        """Build the metadata dict injected for every crew execution."""
+        metadata: Dict[str, Any] = {
+            "organization_id": self.organization_id,
+            "subscription_id": self.subscription_id,
+            "product_id": self.product_id,
+            "trace_id": self.trace_id,
+        }
+        if self.agentic_job_id is not None:
+            metadata["agentic_job_id"] = self.agentic_job_id
+        if self.agentic_job_name is not None:
+            metadata["agentic_job_name"] = self.agentic_job_name
+        if self.agentic_job_type is not None:
+            metadata["agentic_job_type"] = self.agentic_job_type
+        if self.agentic_job_version is not None:
+            metadata["agentic_job_version"] = self.agentic_job_version
+        return metadata
+
     def kickoff(self, inputs: Optional[Dict[str, Any]] = None):
         """
         Execute the crew with Revenium metadata tracking.
@@ -193,12 +251,7 @@ class ReveniumCrewWrapper:
         """
         # Set base metadata for the entire crew execution
         # This will be picked up by the middleware for all LiteLLM calls
-        with metadata_context.set(
-            organization_id=self.organization_id,
-            subscription_id=self.subscription_id,
-            product_id=self.product_id,
-            trace_id=self.trace_id
-        ):
+        with metadata_context.set(**self._execution_metadata()):
             logger.debug(f"Starting crew execution with trace_id: {self.trace_id}")
 
             # Setup task-level metadata (version-aware: monkey-patching or callbacks)
@@ -221,12 +274,7 @@ class ReveniumCrewWrapper:
             The result from the crew execution
         """
         # Set base metadata for the entire crew execution
-        with metadata_context.set(
-            organization_id=self.organization_id,
-            subscription_id=self.subscription_id,
-            product_id=self.product_id,
-            trace_id=self.trace_id
-        ):
+        with metadata_context.set(**self._execution_metadata()):
             logger.debug(f"Starting async crew execution with trace_id: {self.trace_id}")
 
             # Setup task-level metadata (version-aware: monkey-patching or callbacks)
@@ -254,12 +302,7 @@ class ReveniumCrewWrapper:
             The result from the training
         """
         # Set base metadata for the entire training session
-        with metadata_context.set(
-            organization_id=self.organization_id,
-            subscription_id=self.subscription_id,
-            product_id=self.product_id,
-            trace_id=self.trace_id
-        ):
+        with metadata_context.set(**self._execution_metadata()):
             logger.debug(f"Starting crew training with trace_id: {self.trace_id}")
 
             # Setup task-level metadata (version-aware: monkey-patching or callbacks)
@@ -273,6 +316,90 @@ class ReveniumCrewWrapper:
             finally:
                 # Clean up any monkey-patches
                 self._unpatch_task_execution()
+
+    def report_job_outcome(
+        self,
+        execution_status: str,
+        *,
+        team_id: Optional[str] = None,
+        api_key: Optional[str] = None,
+        http_client: Optional[Any] = None,
+        retry_attempts: Optional[int] = None,
+        retry_initial_seconds: Optional[float] = None,
+        retry_max_seconds: Optional[float] = None,
+        **outcome_kwargs: Any,
+    ) -> None:
+        """Report the business outcome for this crew's agentic job.
+
+        Requires the wrapper to have been constructed with agentic_job_id, and
+        a write-scope API key (rev_sk_) — see JobContext.report_outcome.
+
+        The retry knobs govern the outcome POST's transient-error retry; omit
+        them for the default bounded schedule.
+        """
+        handle = self._job_handle(
+            team_id=team_id, api_key=api_key, http_client=http_client,
+            retry_attempts=retry_attempts,
+            retry_initial_seconds=retry_initial_seconds,
+            retry_max_seconds=retry_max_seconds,
+        )
+        try:
+            handle.report_outcome(execution_status, **outcome_kwargs)
+        finally:
+            handle.close()
+
+    def amend_job_outcome(
+        self,
+        reason: str,
+        *,
+        team_id: Optional[str] = None,
+        api_key: Optional[str] = None,
+        http_client: Optional[Any] = None,
+        retry_attempts: Optional[int] = None,
+        retry_initial_seconds: Optional[float] = None,
+        retry_max_seconds: Optional[float] = None,
+        **amend_kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Amend a previously-reported outcome for this crew's agentic job.
+
+        The retry knobs govern the amendment PATCH's retry (429 only, since
+        PATCH-amend is not idempotent); omit them for the default schedule.
+        """
+        handle = self._job_handle(
+            team_id=team_id, api_key=api_key, http_client=http_client,
+            retry_attempts=retry_attempts,
+            retry_initial_seconds=retry_initial_seconds,
+            retry_max_seconds=retry_max_seconds,
+        )
+        try:
+            return handle.amend_outcome(reason, **amend_kwargs)
+        finally:
+            handle.close()
+
+    def _job_handle(
+        self,
+        *,
+        team_id: Optional[str],
+        api_key: Optional[str],
+        http_client: Optional[Any],
+        retry_attempts: Optional[int] = None,
+        retry_initial_seconds: Optional[float] = None,
+        retry_max_seconds: Optional[float] = None,
+    ) -> JobContext:
+        if not self.agentic_job_id:
+            raise ValueError(
+                "report_job_outcome/amend_job_outcome require agentic_job_id "
+                "on the ReveniumCrewWrapper constructor"
+            )
+        return JobContext.attach(
+            job_id=self.agentic_job_id,
+            team_id=team_id or self.team_id,
+            api_key=api_key,
+            http_client=http_client,
+            retry_attempts=retry_attempts,
+            retry_initial_seconds=retry_initial_seconds,
+            retry_max_seconds=retry_max_seconds,
+        )
 
     def _setup_task_callbacks(self):
         """

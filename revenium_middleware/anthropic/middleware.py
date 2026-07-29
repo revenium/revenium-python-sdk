@@ -29,8 +29,8 @@ from revenium_middleware._core.patch_registry import register_patch
 from .trace_fields import (
     get_environment, get_region, get_credential_alias,
     get_trace_type, get_trace_name, get_parent_transaction_id,
-    get_transaction_name, get_retry_number, detect_operation_type,
-    detect_vision_content
+    get_transaction_name, get_retry_number, get_ticket_id,
+    detect_operation_type, detect_vision_content
 )
 
 # Import configuration and prompt capture utilities
@@ -250,6 +250,7 @@ def _extract_trace_fields(usage_metadata, request_body=None):
         usage_metadata.get('trace_name') or
         get_trace_name()
     )
+    ticket_id = get_ticket_id(usage_metadata)
     parent_transaction_id = (
         usage_metadata.get('parentTransactionId') or
         usage_metadata.get('parent_transaction_id') or
@@ -283,6 +284,7 @@ def _extract_trace_fields(usage_metadata, request_body=None):
         'credential_alias': credential_alias,
         'trace_type': trace_type,
         'trace_name': trace_name,
+        'ticket_id': ticket_id,
         'parent_transaction_id': parent_transaction_id,
         'transaction_name': transaction_name,
         'retry_number': retry_number,
@@ -375,6 +377,7 @@ def _create_bedrock_metering_call(response, usage_metadata, request_time, respon
                 "credential_alias": trace_fields.get('credential_alias'),
                 "trace_type": trace_fields.get('trace_type'),
                 "trace_name": trace_fields.get('trace_name'),
+                "ticket_id": trace_fields.get('ticket_id'),
                 "parent_transaction_id": trace_fields.get('parent_transaction_id'),
                 "transaction_name": trace_fields.get('transaction_name'),
                 "retry_number": trace_fields.get('retry_number'),
@@ -587,6 +590,7 @@ def _meter_raw_stream(state, usage_metadata, request_kwargs, request_time, reque
                 "credential_alias": trace_fields.get('credential_alias'),
                 "trace_type": trace_fields.get('trace_type'),
                 "trace_name": trace_fields.get('trace_name'),
+                "ticket_id": trace_fields.get('ticket_id'),
                 "parent_transaction_id": trace_fields.get('parent_transaction_id'),
                 "transaction_name": trace_fields.get('transaction_name'),
                 "retry_number": trace_fields.get('retry_number'),
@@ -785,6 +789,7 @@ if register_patch("anthropic.resources.messages.messages.Messages.create"):
                     "credential_alias": trace_fields.get('credential_alias'),
                     "trace_type": trace_fields.get('trace_type'),
                     "trace_name": trace_fields.get('trace_name'),
+                    "ticket_id": trace_fields.get('ticket_id'),
                     "parent_transaction_id": trace_fields.get('parent_transaction_id'),
                     "transaction_name": trace_fields.get('transaction_name'),
                     "retry_number": trace_fields.get('retry_number'),
@@ -957,6 +962,7 @@ if register_patch("anthropic.resources.messages.messages.AsyncMessages.create"):
                         "credential_alias": trace_fields.get('credential_alias'),
                         "trace_type": trace_fields.get('trace_type'),
                         "trace_name": trace_fields.get('trace_name'),
+                        "ticket_id": trace_fields.get('ticket_id'),
                         "parent_transaction_id": trace_fields.get('parent_transaction_id'),
                         "transaction_name": trace_fields.get('transaction_name'),
                         "retry_number": trace_fields.get('retry_number'),
@@ -1159,6 +1165,7 @@ if register_patch("anthropic.resources.messages.messages.Messages.stream"):
                                 "credential_alias": trace_fields.get('credential_alias'),
                                 "trace_type": trace_fields.get('trace_type'),
                                 "trace_name": trace_fields.get('trace_name'),
+                                "ticket_id": trace_fields.get('ticket_id'),
                                 "parent_transaction_id": trace_fields.get('parent_transaction_id'),
                                 "transaction_name": trace_fields.get('transaction_name'),
                                 "retry_number": trace_fields.get('retry_number'),

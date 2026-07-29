@@ -119,6 +119,70 @@ print(response.choices[0].message.content)
 
 Emit per-agent terminal outcomes (`CONVERTED`, `DEFLECTED`, `ESCALATED`) alongside completion and tool-event records, so dashboards show business value next to AI cost.
 
+> **You need a write-scope key (`rev_sk_`) to use the agentic outcomes API.** Metering keys (`rev_mk_`) can only meter completions and tool events — they cannot report, amend, or read job outcomes, and the SDK rejects them client-side before any HTTP request is made. Key resolution: explicit `api_key=` > `REVENIUM_OUTCOME_API_KEY` > `REVENIUM_METERING_API_KEY`.
+
+### JobContext
+
+`JobContext` is the recommended high-level API: every AI call made inside the block is automatically metered against the job (all provider middlewares pick the job fields up from context), and the job's business outcome is reported when the work is done.
+
+```python
+from revenium_middleware import JobContext
+
+with JobContext("loan-app-12345", type="loan_processing", version="2.1") as job:
+    response = client.chat.completions.create(...)  # metered against the job automatically
+    job.report_outcome(
+        execution_status="SUCCESS",  # SUCCESS | FAILED | CANCELLED
+        outcome_type="CONVERTED",
+        outcome_value=500.0,
+        outcome_currency="USD",
+    )
+```
+
+- **Async:** `async with JobContext(...) as job:` works identically.
+- **Auto-FAILED:** if an unhandled exception escapes the block before an outcome was reported, the context automatically reports `execution_status="FAILED"` (error message and class in metadata) and always re-raises the original exception.
+- **Blocking:** outcome calls are synchronous HTTP requests with retries; tune how long they may block with the `retry_attempts`, `retry_initial_seconds`, and `retry_max_seconds` arguments, accepted by the `JobContext` constructor, `JobContext.attach()`, `get_outcome_history()`, and the CrewAI wrapper's `report_job_outcome`/`amend_job_outcome`.
+- **Team resolution:** explicit `team_id=` > `REVENIUM_TEAM_ID` > automatic resolution from the API key; `OutcomeReportingError` is raised if none of these yields a team.
+- **Nesting:** a nested `JobContext` is a different job (replace, not merge); exiting the inner context restores the outer job's fields.
+
+To tag AI calls with job fields without a context manager, use per-call `usage_metadata={"agentic_job_id": ...}`, the `@track_job` decorator (LiteLLM), or the process-wide `REVENIUM_AGENTIC_JOB_*` environment variables — see [Optional Environment Variables](#optional-environment-variables).
+
+### Amending an Outcome
+
+Outcomes are amendable: when the business result changes after the fact, amend the recorded outcome instead of re-reporting it. `JobContext.attach()` returns a lightweight handle to an existing job — it is not entered as a context manager and does not touch AI-call scoping — so amendments work from a different process than the one that ran the job.
+
+```python
+from revenium_middleware import JobContext, get_outcome_history
+
+# Two weeks after the agent converted the lead at $500,
+# the customer expands to the annual plan.
+job = JobContext.attach("sales-lead-8842")
+job.amend_outcome(
+    reason="Customer expanded to the annual plan after the initial conversion",
+    outcome_value=750.0,
+)
+job.close()
+
+history = get_outcome_history("sales-lead-8842")
+# List[JobOutcomeAmendment], ordered by amendment_sequence (1 = the initial report)
+```
+
+`amend_outcome()` takes a mandatory non-blank `reason` plus the same optional fields as `report_outcome()` (`execution_status`, `outcome_type`, `outcome_value`, `outcome_currency`, `metadata`, `reported_by`), and returns the updated job as a dict.
+
+### Outcome Exceptions
+
+All outcome exceptions are importable from `revenium_middleware` and share the `OutcomeReportingError` base, so `except OutcomeReportingError:` catches the whole family:
+
+| Exception | Raised when | What to do |
+|-----------|-------------|------------|
+| `OutcomeReportingError` | Base class — configuration failures (no API key available, unresolvable `team_id`) | Fix the key / team configuration |
+| `OutcomeAlreadyReportedError` | Re-reporting a job that already has an outcome (backend 409) | Amend with `amend_outcome()` instead; the exception carries `reported_at` and `amendment_count` |
+| `OutcomeNotReportedError` | Amending a job that has no outcome yet (backend 422) | Call `report_outcome()` first |
+| `OutcomeAmendConflictError` | A concurrent amendment changed the outcome (backend 409, optimistic lock) | Refetch with `get_outcome_history()` and retry — the SDK does not auto-retry |
+
+### Low-Level Client
+
+For manual control over every metric (one `emit_completion` per LLM call, one `emit_tool_event` per tool/step), use `AgenticOutcomeClient` directly:
+
 ```python
 from revenium_middleware.agentic_outcomes import AgenticOutcomeClient, AgenticOutcomeSettings
 
@@ -585,8 +649,9 @@ LiteLLM provides additional tracking decorators beyond the standard `@revenium_m
 | `@track_product()` | Track product-specific usage |
 | `@track_subscriber()` | Identify end users |
 | `@track_quality()` | Track response quality scores |
+| `@track_job()` | Inject agentic job fields for cost/ROI correlation, e.g. `@track_job(job_id="loan-app-12345", type="loan_processing")` |
 
-All decorators support static values, extraction from function arguments (`name_from_arg`), or extraction from object attributes (`name_from_attr`).
+The tracking decorators above support static values, extraction from function arguments (`name_from_arg`), or extraction from object attributes (`name_from_attr`); `@track_job` supports static values and argument extraction (`job_id_from_arg`, `type_from_arg`) but has no attribute variant.
 
 #### CrewAI Integration
 
@@ -595,6 +660,35 @@ pip install "revenium-python-sdk[litellm]" crewai
 ```
 
 Pre-built wrapper for tracking CrewAI agent executions. **Note:** CrewAI requires Python 3.12 or earlier.
+
+**Job outcome tracking:** pass the `agentic_job_*` kwargs to tie every LLM call in the crew to one agentic job, then report (or later amend) the job's business outcome. Requires a write-scope key (`rev_sk_`) — see [Agentic Outcomes](#agentic-outcomes-outcome-based-metering).
+
+```python
+from revenium_middleware.litellm.client.integrations.crewai import ReveniumCrewWrapper
+
+crew = ReveniumCrewWrapper(
+    agents=[support_agent],
+    tasks=[triage_task],
+    organization_id="AcmeCorp",
+    subscription_id="82764738",
+    product_id="Platinum",
+    agentic_job_id="support-ticket-456",
+    agentic_job_name="Support Ticket Triage",
+    agentic_job_type="customer_support",
+    agentic_job_version="2.0",
+)
+result = crew.kickoff()
+
+crew.report_job_outcome(
+    execution_status="SUCCESS",
+    outcome_type="DEFLECTED",
+    outcome_value=25.0,
+)
+
+# Later, if the business result changes:
+# crew.amend_job_outcome(reason="Ticket reopened and escalated to a human agent",
+#                        outcome_type="ESCALATED", outcome_value=0.0)
+```
 
 **LiteLLM environment variables:**
 - `LITELLM_PROXY_URL` - Your LiteLLM proxy URL
@@ -838,6 +932,7 @@ Enhanced observability fields for tracking AI operations across environments, re
 | `parent_transaction_id` | `REVENIUM_PARENT_TRANSACTION_ID` | Parent transaction ID | Link child operations to parents across microservices |
 | `transaction_name` | `REVENIUM_TRANSACTION_NAME` | Human-friendly operation name | Label operations (e.g., `"Generate Response"`, `"Analyze Sentiment"`) |
 | `retry_number` | `REVENIUM_RETRY_NUMBER` | Retry attempt number (0 = first attempt) | Track retry attempts for failed operations |
+| `ticket_id` | `REVENIUM_TICKET_ID` | External ticket or issue ID (e.g., Jira, Linear) (max 256 chars) | Attribute AI costs to individual tickets or issues |
 
 **Note:** `operation_type` (e.g., `CHAT`, `EMBED`, `TOOL_CALL`) and `operation_subtype` (e.g., `function_call`, `streaming`) are automatically detected by the middleware and cannot be overridden.
 
@@ -865,7 +960,8 @@ response = client.chat.completions.create(
         "trace_type": "customer-support",
         "trace_name": "Support Chat Session",
         "transaction_name": "Generate Response",
-        "parent_transaction_id": "parent-txn-123"
+        "parent_transaction_id": "parent-txn-123",
+        "ticket_id": "JIRA-123"
     }
 )
 ```
@@ -1269,7 +1365,7 @@ print(get_buffer_stats())
 | `REVENIUM_LOG_LEVEL` | `INFO` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
 | `REVENIUM_CAPTURE_PROMPTS` | `false` | Enable prompt capture |
 | `REVENIUM_SELECTIVE_METERING` | `false` | Only meter `@revenium_meter` decorated functions |
-| `REVENIUM_TEAM_ID` | - | Team ID for cost lookups |
+| `REVENIUM_TEAM_ID` | - | Team ID for cost lookups and outcome reporting (JobContext team resolution) |
 | `REVENIUM_ENVIRONMENT` | - | Deployment environment (auto-detects from `ENVIRONMENT`, `DEPLOYMENT_ENV`) |
 | `REVENIUM_REGION` | - | Cloud region (auto-detects from `AWS_REGION`, `AZURE_REGION`, `GCP_REGION`) |
 | `REVENIUM_CREDENTIAL_ALIAS` | - | Human-readable API key name |
@@ -1278,9 +1374,17 @@ print(get_buffer_stats())
 | `REVENIUM_PARENT_TRANSACTION_ID` | - | Parent transaction ID for distributed tracing |
 | `REVENIUM_TRANSACTION_NAME` | - | Human-friendly operation name |
 | `REVENIUM_RETRY_NUMBER` | - | Retry attempt number |
+| `REVENIUM_AGENTIC_JOB_ID` | - | Agentic job instance ID attached to all completions in the process (triggers backend job auto-creation) |
+| `REVENIUM_AGENTIC_JOB_NAME` | - | Human-readable agentic job name |
+| `REVENIUM_AGENTIC_JOB_TYPE` | - | Agentic job type category |
+| `REVENIUM_AGENTIC_JOB_VERSION` | - | Agentic job version |
+| `REVENIUM_OUTCOME_API_KEY` | - | Write-scope key (`rev_sk_`) for the agentic outcomes API (report/amend/history); falls back to `REVENIUM_METERING_API_KEY` |
+| `REVENIUM_PROFITSTREAM_BASE_URL` | `https://api.revenium.io` | Agentic outcomes API base URL |
 | `REVENIUM_BEDROCK_DISABLE` | - | Set to `1` to disable Bedrock auto-detection |
 | `REVENIUM_BUFFER_MAX_SIZE` | `1000` | Store-and-forward buffer capacity (oldest events evicted when full) |
 | `REVENIUM_BUFFER_FLUSH_INTERVAL` | `30` | Seconds between automatic replay attempts for buffered events |
+
+Per-call `usage_metadata` values take precedence over the `REVENIUM_AGENTIC_JOB_*` environment variables, and the LiteLLM proxy path sources job fields from `x-revenium-*` headers only — these process-level env fallbacks do not apply to proxied traffic.
 
 ### Provider-Specific Environment Variables
 
