@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-08-05
+
+### Added
+- Griptape framework integration, available as the `griptape` extra. Install with `pip install "revenium-python-sdk[griptape,<provider>]"` and import drivers from `revenium_middleware.griptape`. The universal `ReveniumDriver` auto-detects the provider from the model name (OpenAI, Anthropic, Ollama, or anything else via LiteLLM) and wraps the matching Griptape prompt driver with metering; `ReveniumEmbeddingDriver` does the same for embeddings, and provider-specific drivers are available for direct control. This replaces the standalone `revenium-griptape` package; all driver class names are unchanged. Requires Python 3.10+.
+
+### Changed
+- Every optional extra is now installed in a clean, isolated environment as part of the test suite run on each change, so a dependency that stops resolving is caught before release.
+
 ## [0.4.0] - 2026-07-29
 
 ### Added

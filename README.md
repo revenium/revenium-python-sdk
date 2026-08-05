@@ -39,6 +39,7 @@ The official Revenium Python SDK — unified AI metering middleware for deeply a
 | Perplexity (Native SDK) | `perplexity-native` | `pip install revenium-python-sdk[perplexity-native]` |
 | fal.ai | `fal` | `pip install revenium-python-sdk[fal]` |
 | LangChain | `langchain` | `pip install revenium-python-sdk[langchain]` |
+| Griptape | `griptape` | `pip install revenium-python-sdk[griptape]` |
 
 ## Feature Matrix
 
@@ -54,6 +55,7 @@ The official Revenium Python SDK — unified AI metering middleware for deeply a
 | Terminal Summary | Yes | Yes | Yes | Yes | Yes | - | - |
 | Azure / Bedrock | Azure | Bedrock | Vertex AI | - | All | - | - |
 | LangChain Integration | Yes | - | - | - | - | - | - |
+| Griptape Integration | Yes | Yes | - | Yes | Yes | - | - |
 | CrewAI Integration | - | - | - | - | Yes | - | - |
 | Proxy Mode | - | - | - | - | Yes | - | - |
 
@@ -863,6 +865,49 @@ attach_to(llm, usage_metadata={
 ```
 
 Credentials come from the standard environment variables (`REVENIUM_METERING_API_KEY`, `REVENIUM_METERING_BASE_URL`) or `revenium_middleware.configure()`.
+
+---
+
+### Griptape
+
+Metered prompt and embedding drivers for [Griptape](https://github.com/griptape-ai/griptape) applications. Requires Python 3.10+.
+
+```bash
+pip install "revenium-python-sdk[griptape,openai]"     # OpenAI
+pip install "revenium-python-sdk[griptape,anthropic]"  # Anthropic
+pip install "revenium-python-sdk[griptape,ollama]"     # Ollama
+pip install "revenium-python-sdk[griptape,litellm,litellm-proxy]"  # 100+ providers via LiteLLM
+```
+
+`ReveniumDriver` auto-detects the provider from the model name (`gpt-*` → OpenAI, `claude-*` → Anthropic, `llama`/`mistral`/... → Ollama, anything else → LiteLLM) and wraps the matching Griptape prompt driver with Revenium metering:
+
+```python
+import os
+from griptape.structures import Agent
+from revenium_middleware.griptape import ReveniumDriver
+
+os.environ["REVENIUM_METERING_API_KEY"] = "your_revenium_key"
+
+agent = Agent(prompt_driver=ReveniumDriver(
+    model="gpt-4o-mini",
+    usage_metadata={"task_type": "demo"},
+))
+agent.run("Hello!")
+```
+
+Force a provider with `force_provider="litellm"`, or wrap an existing driver with `ReveniumDriver(base_driver=...)`.
+
+**Embeddings:**
+
+```python
+from revenium_middleware.griptape import ReveniumEmbeddingDriver
+
+driver = ReveniumEmbeddingDriver(model="text-embedding-3-large")
+```
+
+**Provider-specific drivers:** for direct control, use `ReveniumOpenAiDriver`, `ReveniumAnthropicDriver`, `ReveniumOllamaDriver`, `ReveniumLiteLLMDriver` or `ReveniumOpenAiEmbeddingDriver` — each subclasses the corresponding Griptape driver and accepts a `usage_metadata` dict (see [Metadata Fields](#metadata-fields)).
+
+**Migrating from `revenium-griptape`:** the standalone package is deprecated — install the `griptape` extra and change `from revenium_griptape import ReveniumDriver` to `from revenium_middleware.griptape import ReveniumDriver`. All driver class names are unchanged. One behaviour difference: the old package called `load_dotenv()` automatically at import time; the SDK never mutates your environment on import, so if you keep credentials in a `.env` file, call `load_dotenv()` yourself before creating a driver.
 
 ---
 
