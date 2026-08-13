@@ -31,8 +31,9 @@ try:
         create_vertex_ai_metering_call,
         handle_vertex_ai_streaming_response,
     )
-except ImportError:
-    logger.debug("Vertex AI SDK (vertexai) not available, middleware not loaded")
+except ImportError as e:
+    from revenium_middleware._core.load_diagnostics import log_middleware_load_failure
+    log_middleware_load_failure("Vertex AI", e, required_packages=("vertexai",))
     middleware = None  # type: ignore
     extract_vertex_ai_usage_data = None  # type: ignore
     extract_vertex_ai_generation_tokens = None  # type: ignore

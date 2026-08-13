@@ -160,6 +160,16 @@ from ._core import (  # noqa: E402
     is_selective_metering_enabled,
 )
 
+# Metering error visibility (BACK-778): status counters + failure callbacks
+from ._core.metering_status import (  # noqa: E402
+    MeteringErrorEvent,
+    MeteringStatus,
+    get_metering_status,
+    on_metering_error,
+    remove_metering_error_callback,
+    reset_metering_status,
+)
+
 # Re-export tool metering utilities from the in-package metering module (BACK-2151)
 from ._metering import meter_tool, report_tool_call, configure  # noqa: E402
 
@@ -202,6 +212,13 @@ __all__ = [
     "set_idempotency_key",
     # Config exports
     "is_selective_metering_enabled",
+    # Metering error visibility exports (BACK-778)
+    "MeteringErrorEvent",
+    "MeteringStatus",
+    "get_metering_status",
+    "on_metering_error",
+    "remove_metering_error_callback",
+    "reset_metering_status",
     # Tool metering exports
     "meter_tool",
     "report_tool_call",

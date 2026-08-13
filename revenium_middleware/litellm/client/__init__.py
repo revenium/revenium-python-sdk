@@ -53,8 +53,9 @@ from .hooks import (
 try:
     import litellm as _litellm  # noqa: F401
     from .middleware import completion_wrapper
-except ImportError:
-    logger.debug("LiteLLM SDK (litellm) not available, middleware not loaded")
+except ImportError as e:
+    from revenium_middleware._core.load_diagnostics import log_middleware_load_failure
+    log_middleware_load_failure("LiteLLM", e, required_packages=("litellm",))
     completion_wrapper = None  # type: ignore
 
 __version__ = "0.2.0"

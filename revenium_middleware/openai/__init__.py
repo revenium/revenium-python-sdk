@@ -11,6 +11,7 @@ Usage:
 import logging
 
 from revenium_middleware._core.exceptions import BudgetExceededError, ReveniumCostLimitExceeded
+from revenium_middleware._core.load_diagnostics import log_middleware_load_failure
 
 logger = logging.getLogger(__name__)
 
@@ -18,8 +19,8 @@ logger = logging.getLogger(__name__)
 try:
     import wrapt  # noqa: F401
     from .middleware import create_wrapper
-except ImportError:
-    logger.debug("OpenAI middleware dependencies not available, middleware not loaded")
+except ImportError as e:
+    log_middleware_load_failure("OpenAI", e, required_packages=("openai",))
     create_wrapper = None  # type: ignore
 
 __all__ = ["create_wrapper", "BudgetExceededError", "ReveniumCostLimitExceeded"]

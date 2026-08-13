@@ -76,7 +76,7 @@ class AIResource(SyncAPIResource):
         mediation_latency: int | NotGiven = NOT_GIVEN,
         middleware_source: str | NotGiven = NOT_GIVEN,
         model_source: str | NotGiven = NOT_GIVEN,
-        operation_type: Literal["CHAT", "GENERATE", "EMBED", "CLASSIFY", "SUMMARIZE", "TRANSLATE", "TOOL_CALL", "RERANK", "SEARCH", "MODERATION", "VISION", "TRANSFORM", "GUARDRAIL", "OTHER"]
+        operation_type: Literal["CHAT", "GENERATE", "EMBED", "CLASSIFY", "SUMMARIZE", "TRANSLATE", "TOOL_CALL", "RERANK", "SEARCH", "MODERATION", "VISION", "TRANSFORM", "GUARDRAIL", "AUDIO", "VIDEO", "IMAGE", "OTHER"]
         | NotGiven = NOT_GIVEN,
         organization_id: str | NotGiven = NOT_GIVEN,  # DEPRECATED: Use organization_name
         output_token_cost: float | NotGiven = NOT_GIVEN,
@@ -101,6 +101,19 @@ class AIResource(SyncAPIResource):
         retry_number: int | NotGiven = NOT_GIVEN,
         trace_name: str | NotGiven = NOT_GIVEN,
         ticket_id: str | NotGiven = NOT_GIVEN,
+        skill_invocation_trigger: str | NotGiven = NOT_GIVEN,
+        skill_kind: str | NotGiven = NOT_GIVEN,
+        skill_marketplace_name: str | NotGiven = NOT_GIVEN,
+        skill_name: str | NotGiven = NOT_GIVEN,
+        skill_plugin_name: str | NotGiven = NOT_GIVEN,
+        skill_source: str | NotGiven = NOT_GIVEN,
+        agentic_job_id: str | NotGiven = NOT_GIVEN,
+        agentic_job_name: str | NotGiven = NOT_GIVEN,
+        agentic_job_type: str | NotGiven = NOT_GIVEN,
+        agentic_job_version: str | NotGiven = NOT_GIVEN,
+        squad_id: str | NotGiven = NOT_GIVEN,
+        squad_name: str | NotGiven = NOT_GIVEN,
+        squad_role: str | NotGiven = NOT_GIVEN,
         trace_type: str | NotGiven = NOT_GIVEN,
         transaction_name: str | NotGiven = NOT_GIVEN,
         system_prompt: str | NotGiven = NOT_GIVEN,
@@ -228,6 +241,35 @@ class AIResource(SyncAPIResource):
 
           ticket_id: External ticket or issue ID (e.g. Jira, Linear) for cost attribution per ticket (max 256 chars)
 
+          skill_invocation_trigger: What triggered the skill invocation (max 32 chars; common
+              values: user-slash, claude-proactive, nested-skill)
+
+          skill_kind: The kind of skill that produced this AI call (accepted value: workflow;
+              omit otherwise)
+
+          skill_marketplace_name: Name of the marketplace the skill was installed from (max 256 chars)
+
+          skill_name: Name of the skill that produced this AI call (max 256 chars)
+
+          skill_plugin_name: Name of the plugin that provides the skill (max 256 chars)
+
+          skill_source: Where the skill was loaded from - accepted values: bundled,
+              projectSettings, userSettings, plugin (case-sensitive)
+
+          agentic_job_id: Unique identifier of the agentic job this call belongs to
+
+          agentic_job_name: Human-readable name of the agentic job
+
+          agentic_job_type: Categorical type of the agentic job
+
+          agentic_job_version: Version of the agentic job definition
+
+          squad_id: Unique identifier of the squad (agent team) that produced this call
+
+          squad_name: Human-readable name of the squad
+
+          squad_role: Role of the agent within the squad
+
           trace_type: Categorical identifier for grouping workflows (alphanumeric, hyphens,
               underscores; max 128 chars)
 
@@ -290,6 +332,19 @@ class AIResource(SyncAPIResource):
                     "retry_number": retry_number,
                     "trace_name": trace_name,
                     "ticket_id": ticket_id,
+                    "skill_invocation_trigger": skill_invocation_trigger,
+                    "skill_kind": skill_kind,
+                    "skill_marketplace_name": skill_marketplace_name,
+                    "skill_name": skill_name,
+                    "skill_plugin_name": skill_plugin_name,
+                    "skill_source": skill_source,
+                    "agentic_job_id": agentic_job_id,
+                    "agentic_job_name": agentic_job_name,
+                    "agentic_job_type": agentic_job_type,
+                    "agentic_job_version": agentic_job_version,
+                    "squad_id": squad_id,
+                    "squad_name": squad_name,
+                    "squad_role": squad_role,
                     "trace_type": trace_type,
                     "transaction_name": transaction_name,
                     "system_prompt": system_prompt,
@@ -348,6 +403,19 @@ class AIResource(SyncAPIResource):
         trace_id: str | NotGiven = NOT_GIVEN,
         trace_type: str | NotGiven = NOT_GIVEN,
         trace_name: str | NotGiven = NOT_GIVEN,
+        ticket_id: str | NotGiven = NOT_GIVEN,
+        agentic_job_id: str | NotGiven = NOT_GIVEN,
+        agentic_job_name: str | NotGiven = NOT_GIVEN,
+        agentic_job_type: str | NotGiven = NOT_GIVEN,
+        agentic_job_version: str | NotGiven = NOT_GIVEN,
+        squad_id: str | NotGiven = NOT_GIVEN,
+        squad_name: str | NotGiven = NOT_GIVEN,
+        squad_role: str | NotGiven = NOT_GIVEN,
+        operation_type: Literal["CHAT", "GENERATE", "EMBED", "CLASSIFY", "SUMMARIZE", "TRANSLATE", "TOOL_CALL", "RERANK", "SEARCH", "MODERATION", "VISION", "TRANSFORM", "GUARDRAIL", "AUDIO", "VIDEO", "IMAGE", "OTHER"]
+        | NotGiven = NOT_GIVEN,
+        input_messages: str | NotGiven = NOT_GIVEN,
+        output_response: str | NotGiven = NOT_GIVEN,
+        prompts_truncated: bool | NotGiven = NOT_GIVEN,
         parent_transaction_id: str | NotGiven = NOT_GIVEN,
         transaction_name: str | NotGiven = NOT_GIVEN,
         task_type: str | NotGiven = NOT_GIVEN,
@@ -445,6 +513,30 @@ class AIResource(SyncAPIResource):
 
           trace_name: Human-readable label for this trace instance
 
+          ticket_id: External ticket or issue ID (e.g. Jira, Linear) for cost attribution per ticket (max 256 chars)
+
+          agentic_job_id: Unique identifier of the agentic job this call belongs to
+
+          agentic_job_name: Human-readable name of the agentic job
+
+          agentic_job_type: Categorical type of the agentic job
+
+          agentic_job_version: Version of the agentic job definition
+
+          squad_id: Unique identifier of the squad (agent team) that produced this call
+
+          squad_name: Human-readable name of the squad
+
+          squad_role: Role of the agent within the squad
+
+          operation_type: The type of operation performed
+
+          input_messages: JSON string of input messages from the request (truncated to 50,000 characters if longer)
+
+          output_response: The output response content (truncated to 50,000 characters if longer)
+
+          prompts_truncated: Indicates if any prompt or response field was truncated due to length limits
+
           parent_transaction_id: Link to parent transaction for distributed tracing
 
           transaction_name: Human-friendly name for this operation
@@ -515,6 +607,18 @@ class AIResource(SyncAPIResource):
                     "trace_id": trace_id,
                     "trace_type": trace_type,
                     "trace_name": trace_name,
+                    "ticket_id": ticket_id,
+                    "agentic_job_id": agentic_job_id,
+                    "agentic_job_name": agentic_job_name,
+                    "agentic_job_type": agentic_job_type,
+                    "agentic_job_version": agentic_job_version,
+                    "squad_id": squad_id,
+                    "squad_name": squad_name,
+                    "squad_role": squad_role,
+                    "operation_type": operation_type,
+                    "input_messages": input_messages,
+                    "output_response": output_response,
+                    "prompts_truncated": prompts_truncated,
                     "parent_transaction_id": parent_transaction_id,
                     "transaction_name": transaction_name,
                     "task_type": task_type,
@@ -549,6 +653,7 @@ class AIResource(SyncAPIResource):
         credit_rate: float | NotGiven = NOT_GIVEN,
         fps: int | NotGiven = NOT_GIVEN,
         resolution: str | NotGiven = NOT_GIVEN,
+        aspect_ratio: str | NotGiven = NOT_GIVEN,
         video_job_id: str | NotGiven = NOT_GIVEN,
         async_operation: bool | NotGiven = NOT_GIVEN,
         operation_subtype: str | NotGiven = NOT_GIVEN,
@@ -568,6 +673,19 @@ class AIResource(SyncAPIResource):
         trace_id: str | NotGiven = NOT_GIVEN,
         trace_type: str | NotGiven = NOT_GIVEN,
         trace_name: str | NotGiven = NOT_GIVEN,
+        ticket_id: str | NotGiven = NOT_GIVEN,
+        agentic_job_id: str | NotGiven = NOT_GIVEN,
+        agentic_job_name: str | NotGiven = NOT_GIVEN,
+        agentic_job_type: str | NotGiven = NOT_GIVEN,
+        agentic_job_version: str | NotGiven = NOT_GIVEN,
+        squad_id: str | NotGiven = NOT_GIVEN,
+        squad_name: str | NotGiven = NOT_GIVEN,
+        squad_role: str | NotGiven = NOT_GIVEN,
+        operation_type: Literal["CHAT", "GENERATE", "EMBED", "CLASSIFY", "SUMMARIZE", "TRANSLATE", "TOOL_CALL", "RERANK", "SEARCH", "MODERATION", "VISION", "TRANSFORM", "GUARDRAIL", "AUDIO", "VIDEO", "IMAGE", "OTHER"]
+        | NotGiven = NOT_GIVEN,
+        input_messages: str | NotGiven = NOT_GIVEN,
+        output_response: str | NotGiven = NOT_GIVEN,
+        prompts_truncated: bool | NotGiven = NOT_GIVEN,
         parent_transaction_id: str | NotGiven = NOT_GIVEN,
         transaction_name: str | NotGiven = NOT_GIVEN,
         task_type: str | NotGiven = NOT_GIVEN,
@@ -613,6 +731,8 @@ class AIResource(SyncAPIResource):
 
           resolution: Video resolution (e.g., '1080p', '720p', '4K')
 
+          aspect_ratio: Aspect ratio of the generated media (e.g., '16:9')
+
           video_job_id: Unique identifier for the video generation job
 
           async_operation: Whether this was an asynchronous video generation operation
@@ -646,6 +766,30 @@ class AIResource(SyncAPIResource):
           trace_type: Categorical identifier for grouping workflows
 
           trace_name: Human-readable label for this trace instance
+
+          ticket_id: External ticket or issue ID (e.g. Jira, Linear) for cost attribution per ticket (max 256 chars)
+
+          agentic_job_id: Unique identifier of the agentic job this call belongs to
+
+          agentic_job_name: Human-readable name of the agentic job
+
+          agentic_job_type: Categorical type of the agentic job
+
+          agentic_job_version: Version of the agentic job definition
+
+          squad_id: Unique identifier of the squad (agent team) that produced this call
+
+          squad_name: Human-readable name of the squad
+
+          squad_role: Role of the agent within the squad
+
+          operation_type: The type of operation performed
+
+          input_messages: JSON string of input messages from the request (truncated to 50,000 characters if longer)
+
+          output_response: The output response content (truncated to 50,000 characters if longer)
+
+          prompts_truncated: Indicates if any prompt or response field was truncated due to length limits
 
           parent_transaction_id: Link to parent transaction for distributed tracing
 
@@ -691,6 +835,7 @@ class AIResource(SyncAPIResource):
                     "credit_rate": credit_rate,
                     "fps": fps,
                     "resolution": resolution,
+                    "aspect_ratio": aspect_ratio,
                     "video_job_id": video_job_id,
                     "async_operation": async_operation,
                     "operation_subtype": operation_subtype,
@@ -708,6 +853,18 @@ class AIResource(SyncAPIResource):
                     "trace_id": trace_id,
                     "trace_type": trace_type,
                     "trace_name": trace_name,
+                    "ticket_id": ticket_id,
+                    "agentic_job_id": agentic_job_id,
+                    "agentic_job_name": agentic_job_name,
+                    "agentic_job_type": agentic_job_type,
+                    "agentic_job_version": agentic_job_version,
+                    "squad_id": squad_id,
+                    "squad_name": squad_name,
+                    "squad_role": squad_role,
+                    "operation_type": operation_type,
+                    "input_messages": input_messages,
+                    "output_response": output_response,
+                    "prompts_truncated": prompts_truncated,
                     "parent_transaction_id": parent_transaction_id,
                     "transaction_name": transaction_name,
                     "task_type": task_type,
@@ -739,6 +896,7 @@ class AIResource(SyncAPIResource):
         requested_image_count: int,
         actual_image_count: int,
         resolution: str | NotGiven = NOT_GIVEN,
+        aspect_ratio: str | NotGiven = NOT_GIVEN,
         quality: str | NotGiven = NOT_GIVEN,
         style: str | NotGiven = NOT_GIVEN,
         format: str | NotGiven = NOT_GIVEN,
@@ -760,6 +918,19 @@ class AIResource(SyncAPIResource):
         trace_id: str | NotGiven = NOT_GIVEN,
         trace_type: str | NotGiven = NOT_GIVEN,
         trace_name: str | NotGiven = NOT_GIVEN,
+        ticket_id: str | NotGiven = NOT_GIVEN,
+        agentic_job_id: str | NotGiven = NOT_GIVEN,
+        agentic_job_name: str | NotGiven = NOT_GIVEN,
+        agentic_job_type: str | NotGiven = NOT_GIVEN,
+        agentic_job_version: str | NotGiven = NOT_GIVEN,
+        squad_id: str | NotGiven = NOT_GIVEN,
+        squad_name: str | NotGiven = NOT_GIVEN,
+        squad_role: str | NotGiven = NOT_GIVEN,
+        operation_type: Literal["CHAT", "GENERATE", "EMBED", "CLASSIFY", "SUMMARIZE", "TRANSLATE", "TOOL_CALL", "RERANK", "SEARCH", "MODERATION", "VISION", "TRANSFORM", "GUARDRAIL", "AUDIO", "VIDEO", "IMAGE", "OTHER"]
+        | NotGiven = NOT_GIVEN,
+        input_messages: str | NotGiven = NOT_GIVEN,
+        output_response: str | NotGiven = NOT_GIVEN,
+        prompts_truncated: bool | NotGiven = NOT_GIVEN,
         parent_transaction_id: str | NotGiven = NOT_GIVEN,
         transaction_name: str | NotGiven = NOT_GIVEN,
         task_type: str | NotGiven = NOT_GIVEN,
@@ -799,6 +970,8 @@ class AIResource(SyncAPIResource):
 
           resolution: Image resolution (e.g., '1024x1024', '1792x1024', '512x512')
 
+          aspect_ratio: Aspect ratio of the generated media (e.g., '16:9')
+
           quality: Image quality setting (e.g., 'standard', 'hd')
 
           style: Image style (e.g., 'vivid', 'natural')
@@ -836,6 +1009,30 @@ class AIResource(SyncAPIResource):
           trace_type: Categorical identifier for grouping workflows
 
           trace_name: Human-readable label for this trace instance
+
+          ticket_id: External ticket or issue ID (e.g. Jira, Linear) for cost attribution per ticket (max 256 chars)
+
+          agentic_job_id: Unique identifier of the agentic job this call belongs to
+
+          agentic_job_name: Human-readable name of the agentic job
+
+          agentic_job_type: Categorical type of the agentic job
+
+          agentic_job_version: Version of the agentic job definition
+
+          squad_id: Unique identifier of the squad (agent team) that produced this call
+
+          squad_name: Human-readable name of the squad
+
+          squad_role: Role of the agent within the squad
+
+          operation_type: The type of operation performed
+
+          input_messages: JSON string of input messages from the request (truncated to 50,000 characters if longer)
+
+          output_response: The output response content (truncated to 50,000 characters if longer)
+
+          prompts_truncated: Indicates if any prompt or response field was truncated due to length limits
 
           parent_transaction_id: Link to parent transaction for distributed tracing
 
@@ -878,6 +1075,7 @@ class AIResource(SyncAPIResource):
                     "requested_image_count": requested_image_count,
                     "actual_image_count": actual_image_count,
                     "resolution": resolution,
+                    "aspect_ratio": aspect_ratio,
                     "quality": quality,
                     "style": style,
                     "format": format,
@@ -897,6 +1095,18 @@ class AIResource(SyncAPIResource):
                     "trace_id": trace_id,
                     "trace_type": trace_type,
                     "trace_name": trace_name,
+                    "ticket_id": ticket_id,
+                    "agentic_job_id": agentic_job_id,
+                    "agentic_job_name": agentic_job_name,
+                    "agentic_job_type": agentic_job_type,
+                    "agentic_job_version": agentic_job_version,
+                    "squad_id": squad_id,
+                    "squad_name": squad_name,
+                    "squad_role": squad_role,
+                    "operation_type": operation_type,
+                    "input_messages": input_messages,
+                    "output_response": output_response,
+                    "prompts_truncated": prompts_truncated,
                     "parent_transaction_id": parent_transaction_id,
                     "transaction_name": transaction_name,
                     "task_type": task_type,
@@ -965,7 +1175,7 @@ class AsyncAIResource(AsyncAPIResource):
         mediation_latency: int | NotGiven = NOT_GIVEN,
         middleware_source: str | NotGiven = NOT_GIVEN,
         model_source: str | NotGiven = NOT_GIVEN,
-        operation_type: Literal["CHAT", "GENERATE", "EMBED", "CLASSIFY", "SUMMARIZE", "TRANSLATE", "TOOL_CALL", "RERANK", "SEARCH", "MODERATION", "VISION", "TRANSFORM", "GUARDRAIL", "OTHER"]
+        operation_type: Literal["CHAT", "GENERATE", "EMBED", "CLASSIFY", "SUMMARIZE", "TRANSLATE", "TOOL_CALL", "RERANK", "SEARCH", "MODERATION", "VISION", "TRANSFORM", "GUARDRAIL", "AUDIO", "VIDEO", "IMAGE", "OTHER"]
         | NotGiven = NOT_GIVEN,
         organization_id: str | NotGiven = NOT_GIVEN,  # DEPRECATED: Use organization_name
         output_token_cost: float | NotGiven = NOT_GIVEN,
@@ -990,6 +1200,19 @@ class AsyncAIResource(AsyncAPIResource):
         retry_number: int | NotGiven = NOT_GIVEN,
         trace_name: str | NotGiven = NOT_GIVEN,
         ticket_id: str | NotGiven = NOT_GIVEN,
+        skill_invocation_trigger: str | NotGiven = NOT_GIVEN,
+        skill_kind: str | NotGiven = NOT_GIVEN,
+        skill_marketplace_name: str | NotGiven = NOT_GIVEN,
+        skill_name: str | NotGiven = NOT_GIVEN,
+        skill_plugin_name: str | NotGiven = NOT_GIVEN,
+        skill_source: str | NotGiven = NOT_GIVEN,
+        agentic_job_id: str | NotGiven = NOT_GIVEN,
+        agentic_job_name: str | NotGiven = NOT_GIVEN,
+        agentic_job_type: str | NotGiven = NOT_GIVEN,
+        agentic_job_version: str | NotGiven = NOT_GIVEN,
+        squad_id: str | NotGiven = NOT_GIVEN,
+        squad_name: str | NotGiven = NOT_GIVEN,
+        squad_role: str | NotGiven = NOT_GIVEN,
         trace_type: str | NotGiven = NOT_GIVEN,
         transaction_name: str | NotGiven = NOT_GIVEN,
         system_prompt: str | NotGiven = NOT_GIVEN,
@@ -1117,6 +1340,35 @@ class AsyncAIResource(AsyncAPIResource):
 
           ticket_id: External ticket or issue ID (e.g. Jira, Linear) for cost attribution per ticket (max 256 chars)
 
+          skill_invocation_trigger: What triggered the skill invocation (max 32 chars; common
+              values: user-slash, claude-proactive, nested-skill)
+
+          skill_kind: The kind of skill that produced this AI call (accepted value: workflow;
+              omit otherwise)
+
+          skill_marketplace_name: Name of the marketplace the skill was installed from (max 256 chars)
+
+          skill_name: Name of the skill that produced this AI call (max 256 chars)
+
+          skill_plugin_name: Name of the plugin that provides the skill (max 256 chars)
+
+          skill_source: Where the skill was loaded from - accepted values: bundled,
+              projectSettings, userSettings, plugin (case-sensitive)
+
+          agentic_job_id: Unique identifier of the agentic job this call belongs to
+
+          agentic_job_name: Human-readable name of the agentic job
+
+          agentic_job_type: Categorical type of the agentic job
+
+          agentic_job_version: Version of the agentic job definition
+
+          squad_id: Unique identifier of the squad (agent team) that produced this call
+
+          squad_name: Human-readable name of the squad
+
+          squad_role: Role of the agent within the squad
+
           trace_type: Categorical identifier for grouping workflows (alphanumeric, hyphens,
               underscores; max 128 chars)
 
@@ -1179,6 +1431,19 @@ class AsyncAIResource(AsyncAPIResource):
                     "retry_number": retry_number,
                     "trace_name": trace_name,
                     "ticket_id": ticket_id,
+                    "skill_invocation_trigger": skill_invocation_trigger,
+                    "skill_kind": skill_kind,
+                    "skill_marketplace_name": skill_marketplace_name,
+                    "skill_name": skill_name,
+                    "skill_plugin_name": skill_plugin_name,
+                    "skill_source": skill_source,
+                    "agentic_job_id": agentic_job_id,
+                    "agentic_job_name": agentic_job_name,
+                    "agentic_job_type": agentic_job_type,
+                    "agentic_job_version": agentic_job_version,
+                    "squad_id": squad_id,
+                    "squad_name": squad_name,
+                    "squad_role": squad_role,
                     "trace_type": trace_type,
                     "transaction_name": transaction_name,
                     "system_prompt": system_prompt,
@@ -1237,6 +1502,19 @@ class AsyncAIResource(AsyncAPIResource):
         trace_id: str | NotGiven = NOT_GIVEN,
         trace_type: str | NotGiven = NOT_GIVEN,
         trace_name: str | NotGiven = NOT_GIVEN,
+        ticket_id: str | NotGiven = NOT_GIVEN,
+        agentic_job_id: str | NotGiven = NOT_GIVEN,
+        agentic_job_name: str | NotGiven = NOT_GIVEN,
+        agentic_job_type: str | NotGiven = NOT_GIVEN,
+        agentic_job_version: str | NotGiven = NOT_GIVEN,
+        squad_id: str | NotGiven = NOT_GIVEN,
+        squad_name: str | NotGiven = NOT_GIVEN,
+        squad_role: str | NotGiven = NOT_GIVEN,
+        operation_type: Literal["CHAT", "GENERATE", "EMBED", "CLASSIFY", "SUMMARIZE", "TRANSLATE", "TOOL_CALL", "RERANK", "SEARCH", "MODERATION", "VISION", "TRANSFORM", "GUARDRAIL", "AUDIO", "VIDEO", "IMAGE", "OTHER"]
+        | NotGiven = NOT_GIVEN,
+        input_messages: str | NotGiven = NOT_GIVEN,
+        output_response: str | NotGiven = NOT_GIVEN,
+        prompts_truncated: bool | NotGiven = NOT_GIVEN,
         parent_transaction_id: str | NotGiven = NOT_GIVEN,
         transaction_name: str | NotGiven = NOT_GIVEN,
         task_type: str | NotGiven = NOT_GIVEN,
@@ -1334,6 +1612,30 @@ class AsyncAIResource(AsyncAPIResource):
 
           trace_name: Human-readable label for this trace instance
 
+          ticket_id: External ticket or issue ID (e.g. Jira, Linear) for cost attribution per ticket (max 256 chars)
+
+          agentic_job_id: Unique identifier of the agentic job this call belongs to
+
+          agentic_job_name: Human-readable name of the agentic job
+
+          agentic_job_type: Categorical type of the agentic job
+
+          agentic_job_version: Version of the agentic job definition
+
+          squad_id: Unique identifier of the squad (agent team) that produced this call
+
+          squad_name: Human-readable name of the squad
+
+          squad_role: Role of the agent within the squad
+
+          operation_type: The type of operation performed
+
+          input_messages: JSON string of input messages from the request (truncated to 50,000 characters if longer)
+
+          output_response: The output response content (truncated to 50,000 characters if longer)
+
+          prompts_truncated: Indicates if any prompt or response field was truncated due to length limits
+
           parent_transaction_id: Link to parent transaction for distributed tracing
 
           transaction_name: Human-friendly name for this operation
@@ -1404,6 +1706,18 @@ class AsyncAIResource(AsyncAPIResource):
                     "trace_id": trace_id,
                     "trace_type": trace_type,
                     "trace_name": trace_name,
+                    "ticket_id": ticket_id,
+                    "agentic_job_id": agentic_job_id,
+                    "agentic_job_name": agentic_job_name,
+                    "agentic_job_type": agentic_job_type,
+                    "agentic_job_version": agentic_job_version,
+                    "squad_id": squad_id,
+                    "squad_name": squad_name,
+                    "squad_role": squad_role,
+                    "operation_type": operation_type,
+                    "input_messages": input_messages,
+                    "output_response": output_response,
+                    "prompts_truncated": prompts_truncated,
                     "parent_transaction_id": parent_transaction_id,
                     "transaction_name": transaction_name,
                     "task_type": task_type,
@@ -1438,6 +1752,7 @@ class AsyncAIResource(AsyncAPIResource):
         credit_rate: float | NotGiven = NOT_GIVEN,
         fps: int | NotGiven = NOT_GIVEN,
         resolution: str | NotGiven = NOT_GIVEN,
+        aspect_ratio: str | NotGiven = NOT_GIVEN,
         video_job_id: str | NotGiven = NOT_GIVEN,
         async_operation: bool | NotGiven = NOT_GIVEN,
         operation_subtype: str | NotGiven = NOT_GIVEN,
@@ -1457,6 +1772,19 @@ class AsyncAIResource(AsyncAPIResource):
         trace_id: str | NotGiven = NOT_GIVEN,
         trace_type: str | NotGiven = NOT_GIVEN,
         trace_name: str | NotGiven = NOT_GIVEN,
+        ticket_id: str | NotGiven = NOT_GIVEN,
+        agentic_job_id: str | NotGiven = NOT_GIVEN,
+        agentic_job_name: str | NotGiven = NOT_GIVEN,
+        agentic_job_type: str | NotGiven = NOT_GIVEN,
+        agentic_job_version: str | NotGiven = NOT_GIVEN,
+        squad_id: str | NotGiven = NOT_GIVEN,
+        squad_name: str | NotGiven = NOT_GIVEN,
+        squad_role: str | NotGiven = NOT_GIVEN,
+        operation_type: Literal["CHAT", "GENERATE", "EMBED", "CLASSIFY", "SUMMARIZE", "TRANSLATE", "TOOL_CALL", "RERANK", "SEARCH", "MODERATION", "VISION", "TRANSFORM", "GUARDRAIL", "AUDIO", "VIDEO", "IMAGE", "OTHER"]
+        | NotGiven = NOT_GIVEN,
+        input_messages: str | NotGiven = NOT_GIVEN,
+        output_response: str | NotGiven = NOT_GIVEN,
+        prompts_truncated: bool | NotGiven = NOT_GIVEN,
         parent_transaction_id: str | NotGiven = NOT_GIVEN,
         transaction_name: str | NotGiven = NOT_GIVEN,
         task_type: str | NotGiven = NOT_GIVEN,
@@ -1502,6 +1830,8 @@ class AsyncAIResource(AsyncAPIResource):
 
           resolution: Video resolution (e.g., '1080p', '720p', '4K')
 
+          aspect_ratio: Aspect ratio of the generated media (e.g., '16:9')
+
           video_job_id: Unique identifier for the video generation job
 
           async_operation: Whether this was an asynchronous video generation operation
@@ -1535,6 +1865,30 @@ class AsyncAIResource(AsyncAPIResource):
           trace_type: Categorical identifier for grouping workflows
 
           trace_name: Human-readable label for this trace instance
+
+          ticket_id: External ticket or issue ID (e.g. Jira, Linear) for cost attribution per ticket (max 256 chars)
+
+          agentic_job_id: Unique identifier of the agentic job this call belongs to
+
+          agentic_job_name: Human-readable name of the agentic job
+
+          agentic_job_type: Categorical type of the agentic job
+
+          agentic_job_version: Version of the agentic job definition
+
+          squad_id: Unique identifier of the squad (agent team) that produced this call
+
+          squad_name: Human-readable name of the squad
+
+          squad_role: Role of the agent within the squad
+
+          operation_type: The type of operation performed
+
+          input_messages: JSON string of input messages from the request (truncated to 50,000 characters if longer)
+
+          output_response: The output response content (truncated to 50,000 characters if longer)
+
+          prompts_truncated: Indicates if any prompt or response field was truncated due to length limits
 
           parent_transaction_id: Link to parent transaction for distributed tracing
 
@@ -1580,6 +1934,7 @@ class AsyncAIResource(AsyncAPIResource):
                     "credit_rate": credit_rate,
                     "fps": fps,
                     "resolution": resolution,
+                    "aspect_ratio": aspect_ratio,
                     "video_job_id": video_job_id,
                     "async_operation": async_operation,
                     "operation_subtype": operation_subtype,
@@ -1597,6 +1952,18 @@ class AsyncAIResource(AsyncAPIResource):
                     "trace_id": trace_id,
                     "trace_type": trace_type,
                     "trace_name": trace_name,
+                    "ticket_id": ticket_id,
+                    "agentic_job_id": agentic_job_id,
+                    "agentic_job_name": agentic_job_name,
+                    "agentic_job_type": agentic_job_type,
+                    "agentic_job_version": agentic_job_version,
+                    "squad_id": squad_id,
+                    "squad_name": squad_name,
+                    "squad_role": squad_role,
+                    "operation_type": operation_type,
+                    "input_messages": input_messages,
+                    "output_response": output_response,
+                    "prompts_truncated": prompts_truncated,
                     "parent_transaction_id": parent_transaction_id,
                     "transaction_name": transaction_name,
                     "task_type": task_type,
@@ -1628,6 +1995,7 @@ class AsyncAIResource(AsyncAPIResource):
         requested_image_count: int,
         actual_image_count: int,
         resolution: str | NotGiven = NOT_GIVEN,
+        aspect_ratio: str | NotGiven = NOT_GIVEN,
         quality: str | NotGiven = NOT_GIVEN,
         style: str | NotGiven = NOT_GIVEN,
         format: str | NotGiven = NOT_GIVEN,
@@ -1649,6 +2017,19 @@ class AsyncAIResource(AsyncAPIResource):
         trace_id: str | NotGiven = NOT_GIVEN,
         trace_type: str | NotGiven = NOT_GIVEN,
         trace_name: str | NotGiven = NOT_GIVEN,
+        ticket_id: str | NotGiven = NOT_GIVEN,
+        agentic_job_id: str | NotGiven = NOT_GIVEN,
+        agentic_job_name: str | NotGiven = NOT_GIVEN,
+        agentic_job_type: str | NotGiven = NOT_GIVEN,
+        agentic_job_version: str | NotGiven = NOT_GIVEN,
+        squad_id: str | NotGiven = NOT_GIVEN,
+        squad_name: str | NotGiven = NOT_GIVEN,
+        squad_role: str | NotGiven = NOT_GIVEN,
+        operation_type: Literal["CHAT", "GENERATE", "EMBED", "CLASSIFY", "SUMMARIZE", "TRANSLATE", "TOOL_CALL", "RERANK", "SEARCH", "MODERATION", "VISION", "TRANSFORM", "GUARDRAIL", "AUDIO", "VIDEO", "IMAGE", "OTHER"]
+        | NotGiven = NOT_GIVEN,
+        input_messages: str | NotGiven = NOT_GIVEN,
+        output_response: str | NotGiven = NOT_GIVEN,
+        prompts_truncated: bool | NotGiven = NOT_GIVEN,
         parent_transaction_id: str | NotGiven = NOT_GIVEN,
         transaction_name: str | NotGiven = NOT_GIVEN,
         task_type: str | NotGiven = NOT_GIVEN,
@@ -1688,6 +2069,8 @@ class AsyncAIResource(AsyncAPIResource):
 
           resolution: Image resolution (e.g., '1024x1024', '1792x1024', '512x512')
 
+          aspect_ratio: Aspect ratio of the generated media (e.g., '16:9')
+
           quality: Image quality setting (e.g., 'standard', 'hd')
 
           style: Image style (e.g., 'vivid', 'natural')
@@ -1725,6 +2108,30 @@ class AsyncAIResource(AsyncAPIResource):
           trace_type: Categorical identifier for grouping workflows
 
           trace_name: Human-readable label for this trace instance
+
+          ticket_id: External ticket or issue ID (e.g. Jira, Linear) for cost attribution per ticket (max 256 chars)
+
+          agentic_job_id: Unique identifier of the agentic job this call belongs to
+
+          agentic_job_name: Human-readable name of the agentic job
+
+          agentic_job_type: Categorical type of the agentic job
+
+          agentic_job_version: Version of the agentic job definition
+
+          squad_id: Unique identifier of the squad (agent team) that produced this call
+
+          squad_name: Human-readable name of the squad
+
+          squad_role: Role of the agent within the squad
+
+          operation_type: The type of operation performed
+
+          input_messages: JSON string of input messages from the request (truncated to 50,000 characters if longer)
+
+          output_response: The output response content (truncated to 50,000 characters if longer)
+
+          prompts_truncated: Indicates if any prompt or response field was truncated due to length limits
 
           parent_transaction_id: Link to parent transaction for distributed tracing
 
@@ -1767,6 +2174,7 @@ class AsyncAIResource(AsyncAPIResource):
                     "requested_image_count": requested_image_count,
                     "actual_image_count": actual_image_count,
                     "resolution": resolution,
+                    "aspect_ratio": aspect_ratio,
                     "quality": quality,
                     "style": style,
                     "format": format,
@@ -1786,6 +2194,18 @@ class AsyncAIResource(AsyncAPIResource):
                     "trace_id": trace_id,
                     "trace_type": trace_type,
                     "trace_name": trace_name,
+                    "ticket_id": ticket_id,
+                    "agentic_job_id": agentic_job_id,
+                    "agentic_job_name": agentic_job_name,
+                    "agentic_job_type": agentic_job_type,
+                    "agentic_job_version": agentic_job_version,
+                    "squad_id": squad_id,
+                    "squad_name": squad_name,
+                    "squad_role": squad_role,
+                    "operation_type": operation_type,
+                    "input_messages": input_messages,
+                    "output_response": output_response,
+                    "prompts_truncated": prompts_truncated,
                     "parent_transaction_id": parent_transaction_id,
                     "transaction_name": transaction_name,
                     "task_type": task_type,

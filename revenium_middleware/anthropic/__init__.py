@@ -33,8 +33,9 @@ try:
     import anthropic  # noqa: F401
     from . import middleware
     from .middleware import create_wrapper, usage_context
-except ImportError:
-    logger.debug("Anthropic SDK (anthropic) not available, middleware not loaded")
+except ImportError as e:
+    from revenium_middleware._core.load_diagnostics import log_middleware_load_failure
+    log_middleware_load_failure("Anthropic", e, required_packages=("anthropic",))
     middleware = None  # type: ignore
     create_wrapper = None  # type: ignore
     usage_context = None  # type: ignore

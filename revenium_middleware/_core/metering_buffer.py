@@ -13,9 +13,14 @@ import os
 import threading
 import time
 from collections import deque
-from typing import Any, Callable, Deque, Dict, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import httpx
+
+from revenium_middleware._core.metering_status import (
+    record_metering_error,
+    record_metering_success,
+)
 
 logger = logging.getLogger("revenium_middleware")
 
@@ -196,12 +201,18 @@ class MeteringBuffer:
         """
         sent = expired = discarded = 0
         started = time.monotonic()
+        # Status recording is deferred until _flush_lock is released:
+        # record_metering_error() runs subscriber callbacks synchronously, and
+        # a callback that calls back into this buffer would self-deadlock on
+        # the non-reentrant lock.
+        deferred_outcomes: List[Optional[Tuple[BaseException, str]]] = []
 
         with self._flush_lock:
             while True:
                 if deadline_seconds is not None and time.monotonic() - started >= deadline_seconds:
                     break
 
+                expired_kind: Optional[str] = None
                 with self._lock:
                     if not self._events:
                         break
@@ -210,7 +221,19 @@ class MeteringBuffer:
                         self._events.popleft()
                         self._total_expired += 1
                         expired += 1
-                        continue
+                        expired_kind = event.kind
+                if expired_kind is not None:
+                    # Expiry is a terminal failure with no delivery exception
+                    # in hand; synthesize one so status counters and
+                    # on_metering_error subscribers still get the signal.
+                    deferred_outcomes.append((
+                        TimeoutError(
+                            f"buffered {expired_kind} metering event expired after "
+                            f"{self._max_age_seconds:.0f}s without successful replay"
+                        ),
+                        expired_kind,
+                    ))
+                    continue
 
                 # Cap each replay call so a single slow network call cannot
                 # blow through the flush deadline (e.g. the shutdown budget).
@@ -232,16 +255,23 @@ class MeteringBuffer:
                     # Only count the discard if the event is still at the
                     # front; a concurrent push at capacity may have evicted
                     # (and counted) it already.
+                    discarded_here = False
                     with self._lock:
                         if self._events and self._events[0] is event:
                             self._events.popleft()
                             self._total_discarded += 1
                             discarded += 1
+                            discarded_here = True
+                    if discarded_here:
+                        # Terminal failure: the event is gone for good, so
+                        # surface it to status counters and subscribers.
+                        deferred_outcomes.append((exc, event.kind))
                     logger.debug("Discarded buffered event after permanent failure: %s", exc)
                     continue
 
                 # Same identity guard: only count the replay if we actually
                 # popped this event (not concurrently evicted-and-counted).
+                replayed_here = False
                 with self._lock:
                     if self._events and self._events[0] is event:
                         self._events.popleft()
@@ -249,6 +279,16 @@ class MeteringBuffer:
                         if len(self._events) < self._max_size:
                             self._was_full = False
                         sent += 1
+                        replayed_here = True
+                if replayed_here:
+                    deferred_outcomes.append(None)
+
+        for outcome in deferred_outcomes:
+            if outcome is None:
+                record_metering_success()
+            else:
+                error, kind = outcome
+                record_metering_error(error, operation=kind)
 
         remaining = self.stats()["size"]
         if sent or expired or discarded:

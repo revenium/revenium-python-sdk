@@ -575,7 +575,7 @@ def handle_streaming_response(
                 )
 
             except Exception as e:
-                logger.warning("Metering error: %s", e)
+                logger.error("Metering error: %s", e)
 
     return StreamWrapper(stream)
 

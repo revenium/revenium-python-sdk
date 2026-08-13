@@ -84,7 +84,8 @@ try:
 
     logger.info("Google AI SDK middleware activated")
 except ImportError as e:
-    logger.debug("Google AI SDK (google-genai) not available: %s", e)
+    from revenium_middleware._core.load_diagnostics import log_middleware_load_failure
+    log_middleware_load_failure("Google AI", e, required_packages=("google.genai",))
 
 try:
     # Try to import Vertex AI SDK and activate middleware
@@ -98,7 +99,8 @@ try:
 
     logger.info("Vertex AI SDK middleware activated")
 except ImportError as e:
-    logger.debug("Vertex AI SDK (vertexai) not available: %s", e)
+    from revenium_middleware._core.load_diagnostics import log_middleware_load_failure
+    log_middleware_load_failure("Vertex AI", e, required_packages=("vertexai",))
 
 active_sdks = []
 if "google.genai" in globals():

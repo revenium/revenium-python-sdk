@@ -25,6 +25,8 @@ class AICreateAudioParams(TypedDict, total=False):
     response_time: Required[Annotated[str, PropertyInfo(alias="responseTime")]]
     """The timestamp when the AI audio operation finished (ISO 8601 format)"""
 
+    # Optional in the published spec; kept Required client-side: the SDK generates
+    # a transaction ID on every path and it anchors idempotency and dedup.
     transaction_id: Required[Annotated[str, PropertyInfo(alias="transactionId")]]
     """The unique identifier of the audio transaction"""
 
@@ -81,6 +83,9 @@ class AICreateAudioParams(TypedDict, total=False):
     target_language: Annotated[str, PropertyInfo(alias="targetLanguage")]
     """Target language for translation operations"""
 
+    # Undocumented in the current published spec -- likely renamed to 'realtime'
+    # server-side. Keep sending the old name until the rename is confirmed;
+    # do not rename on spec evidence alone.
     is_realtime: Annotated[bool, PropertyInfo(alias="isRealtime")]
     """Whether this is a real-time/streaming audio operation"""
 
@@ -107,9 +112,13 @@ class AICreateAudioParams(TypedDict, total=False):
     subscriber: Subscriber
     """The subscriber metadata"""
 
+    # Undocumented in the current published spec but still accepted and sent;
+    # keep until the backend confirms its fate. Never removed on spec evidence alone.
     subscriber_email: Annotated[str, PropertyInfo(alias="subscriberEmail")]
     """The email address of the subscriber"""
 
+    # Undocumented in the current published spec but still accepted and sent;
+    # keep until the backend confirms its fate. Never removed on spec evidence alone.
     subscriber_id: Annotated[str, PropertyInfo(alias="subscriberId")]
     """Unique identifier for the subscriber"""
 
@@ -123,6 +132,8 @@ class AICreateAudioParams(TypedDict, total=False):
     Example: "AcmeCorp", "Engineering-Dept"
     """
 
+    # Undocumented in the current published spec; deprecated in favor of the
+    # *_name variant but still accepted. Keep until removal is confirmed server-side.
     organization_id: Annotated[str, PropertyInfo(alias="organizationId")]
     """
     DEPRECATED: Use organization_name instead. This field will be removed in a future version.
@@ -136,6 +147,8 @@ class AICreateAudioParams(TypedDict, total=False):
     Example: "chatbot", "email-assistant"
     """
 
+    # Undocumented in the current published spec; deprecated in favor of the
+    # *_name variant but still accepted. Keep until removal is confirmed server-side.
     product_id: Annotated[str, PropertyInfo(alias="productId")]
     """
     DEPRECATED: Use product_name instead. This field will be removed in a future version.
@@ -151,6 +164,45 @@ class AICreateAudioParams(TypedDict, total=False):
 
     trace_name: Annotated[str, PropertyInfo(alias="traceName")]
     """Human-readable label for this trace instance"""
+
+    ticket_id: Annotated[str, PropertyInfo(alias="ticketId")]
+    """External ticket or issue ID (e.g. Jira, Linear) for cost attribution per ticket (max 256 chars)"""
+
+    agentic_job_id: Annotated[str, PropertyInfo(alias="agenticJobId")]
+    """Unique identifier of the agentic job this call belongs to"""
+
+    agentic_job_name: Annotated[str, PropertyInfo(alias="agenticJobName")]
+    """Human-readable name of the agentic job"""
+
+    agentic_job_type: Annotated[str, PropertyInfo(alias="agenticJobType")]
+    """Categorical type of the agentic job"""
+
+    agentic_job_version: Annotated[str, PropertyInfo(alias="agenticJobVersion")]
+    """Version of the agentic job definition"""
+
+    squad_id: Annotated[str, PropertyInfo(alias="squadId")]
+    """Unique identifier of the squad (agent team) that produced this call"""
+
+    squad_name: Annotated[str, PropertyInfo(alias="squadName")]
+    """Human-readable name of the squad"""
+
+    squad_role: Annotated[str, PropertyInfo(alias="squadRole")]
+    """Role of the agent within the squad"""
+
+    operation_type: Annotated[
+        Literal["CHAT", "GENERATE", "EMBED", "CLASSIFY", "SUMMARIZE", "TRANSLATE", "TOOL_CALL", "RERANK", "SEARCH", "MODERATION", "VISION", "TRANSFORM", "GUARDRAIL", "AUDIO", "VIDEO", "IMAGE", "OTHER"],
+        PropertyInfo(alias="operationType"),
+    ]
+    """The type of operation performed"""
+
+    input_messages: Annotated[str, PropertyInfo(alias="inputMessages")]
+    """JSON string of input messages from the request (truncated to 50,000 characters if longer)"""
+
+    output_response: Annotated[str, PropertyInfo(alias="outputResponse")]
+    """The output response content (truncated to 50,000 characters if longer)"""
+
+    prompts_truncated: Annotated[bool, PropertyInfo(alias="promptsTruncated")]
+    """Indicates if any prompt or response field was truncated due to length limits"""
 
     parent_transaction_id: Annotated[str, PropertyInfo(alias="parentTransactionId")]
     """Link to parent transaction for distributed tracing"""
@@ -179,6 +231,8 @@ class AICreateAudioParams(TypedDict, total=False):
     model_source: Annotated[str, PropertyInfo(alias="modelSource")]
     """The source of the AI model used"""
 
+    # Undocumented in the current published spec but still accepted and sent;
+    # keep until the backend confirms its fate. Never removed on spec evidence alone.
     credential_alias: Annotated[str, PropertyInfo(alias="credentialAlias")]
     """Human-readable name for the API key being used"""
 

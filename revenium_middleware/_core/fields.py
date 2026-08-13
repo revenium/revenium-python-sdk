@@ -30,6 +30,26 @@ _AGENTIC_JOB_ENV_MAP = {
     "agenticJobVersion": Config.ENV_REVENIUM_AGENTIC_JOB_VERSION,
 }
 
+# Keys are the typed snake_case params on create_completion; values are the
+# accepted usage_metadata aliases in precedence order.
+SKILL_FIELD_MAP = {
+    "skill_invocation_trigger": ("skill_invocation_trigger", "skillInvocationTrigger"),
+    "skill_kind": ("skill_kind", "skillKind"),
+    "skill_marketplace_name": ("skill_marketplace_name", "skillMarketplaceName"),
+    "skill_name": ("skill_name", "skillName"),
+    "skill_plugin_name": ("skill_plugin_name", "skillPluginName"),
+    "skill_source": ("skill_source", "skillSource"),
+}
+
+_SKILL_ENV_MAP = {
+    "skill_invocation_trigger": Config.ENV_REVENIUM_SKILL_INVOCATION_TRIGGER,
+    "skill_kind": Config.ENV_REVENIUM_SKILL_KIND,
+    "skill_marketplace_name": Config.ENV_REVENIUM_SKILL_MARKETPLACE_NAME,
+    "skill_name": Config.ENV_REVENIUM_SKILL_NAME,
+    "skill_plugin_name": Config.ENV_REVENIUM_SKILL_PLUGIN_NAME,
+    "skill_source": Config.ENV_REVENIUM_SKILL_SOURCE,
+}
+
 
 def extract_field_with_fallback(
     source: Mapping[str, Any],
@@ -126,6 +146,28 @@ def extract_agentic_job_fields(source: Mapping[str, Any]) -> Dict[str, Any]:
             value = os.getenv(_AGENTIC_JOB_ENV_MAP[wire_name]) or None
         if value is not None:
             result[wire_name] = value
+    return result
+
+
+def extract_skill_fields(source: Mapping[str, Any]) -> Dict[str, Any]:
+    """Resolve skill attribution fields with per-field precedence:
+
+    explicit source metadata (snake then camel alias) >
+    ``REVENIUM_SKILL_*`` env var. Each field resolves independently and
+    absent fields are omitted entirely (never emitted as None). Returns
+    snake_case keys matching the typed create_completion parameters.
+    """
+    result = {}
+    for param_name, aliases in SKILL_FIELD_MAP.items():
+        value = None
+        for alias in aliases:
+            value = source.get(alias)
+            if value is not None:
+                break
+        if value is None:
+            value = os.getenv(_SKILL_ENV_MAP[param_name]) or None
+        if value is not None:
+            result[param_name] = value
     return result
 
 

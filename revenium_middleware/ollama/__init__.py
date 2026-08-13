@@ -15,8 +15,9 @@ logger = logging.getLogger(__name__)
 try:
     import ollama as _ollama  # noqa: F401
     from .middleware import chat_wrapper, generate_wrapper, embed_wrapper
-except ImportError:
-    logger.debug("Ollama SDK (ollama) not available, middleware not loaded")
+except ImportError as e:
+    from revenium_middleware._core.load_diagnostics import log_middleware_load_failure
+    log_middleware_load_failure("Ollama", e, required_packages=("ollama",))
     chat_wrapper = None  # type: ignore
     generate_wrapper = None  # type: ignore
     embed_wrapper = None  # type: ignore

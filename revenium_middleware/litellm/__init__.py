@@ -14,8 +14,9 @@ try:
     import litellm as _litellm  # noqa: F401
     from . import client
     from . import proxy
-except ImportError:
-    logger.debug("LiteLLM SDK (litellm) not available, middleware not loaded")
+except ImportError as e:
+    from revenium_middleware._core.load_diagnostics import log_middleware_load_failure
+    log_middleware_load_failure("LiteLLM", e, required_packages=("litellm",))
     client = None  # type: ignore
     proxy = None  # type: ignore
 

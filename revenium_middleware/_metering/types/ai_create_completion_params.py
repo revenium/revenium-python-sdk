@@ -13,12 +13,16 @@ class AICreateCompletionParams(TypedDict, total=False):
     completion_start_time: Required[Annotated[str, PropertyInfo(alias="completionStartTime")]]
     """Time to first token for streaming requests"""
 
+    # Optional in the published spec; kept Required client-side: the SDK supplies
+    # this on every call, and relaxing it would weaken a real client-side invariant.
     cost_type: Required[Annotated[Literal["AI"], PropertyInfo(alias="costType")]]
     """Cost type for the completion"""
 
     input_token_count: Required[Annotated[int, PropertyInfo(alias="inputTokenCount")]]
     """The count of consumed input tokens"""
 
+    # Optional in the published spec; kept Required client-side: the SDK supplies
+    # this on every call, and relaxing it would weaken a real client-side invariant.
     is_streamed: Required[Annotated[bool, PropertyInfo(alias="isStreamed")]]
     """Indicates if the completion was streamed"""
 
@@ -56,6 +60,8 @@ class AICreateCompletionParams(TypedDict, total=False):
     total_token_count: Required[Annotated[int, PropertyInfo(alias="totalTokenCount")]]
     """The total number of tokens"""
 
+    # Optional in the published spec; kept Required client-side: the SDK generates
+    # a transaction ID on every path and it anchors idempotency and dedup.
     transaction_id: Required[Annotated[str, PropertyInfo(alias="transactionId")]]
     """The unique identifier of the LLM completion transaction"""
 
@@ -98,7 +104,7 @@ class AICreateCompletionParams(TypedDict, total=False):
     """The source of the AI model used for the completion"""
 
     operation_type: Annotated[
-        Literal["CHAT", "GENERATE", "EMBED", "CLASSIFY", "SUMMARIZE", "TRANSLATE", "TOOL_CALL", "RERANK", "SEARCH", "MODERATION", "VISION", "TRANSFORM", "GUARDRAIL", "OTHER"],
+        Literal["CHAT", "GENERATE", "EMBED", "CLASSIFY", "SUMMARIZE", "TRANSLATE", "TOOL_CALL", "RERANK", "SEARCH", "MODERATION", "VISION", "TRANSFORM", "GUARDRAIL", "AUDIO", "VIDEO", "IMAGE", "OTHER"],
         PropertyInfo(alias="operationType"),
     ]
     """The type of operation performed"""
@@ -113,6 +119,8 @@ class AICreateCompletionParams(TypedDict, total=False):
     for the entire organization broken down by subscriber.
     """
 
+    # Undocumented in the current published spec; deprecated in favor of the
+    # *_name variant but still accepted. Keep until removal is confirmed server-side.
     organization_id: Annotated[str, PropertyInfo(alias="organizationId")]
     """
     DEPRECATED: Use organization_name instead. This field will be removed in a future version.
@@ -139,6 +147,8 @@ class AICreateCompletionParams(TypedDict, total=False):
     a NAME (e.g., "chatbot", "email-assistant", "code-analyzer"), not an ID.
     """
 
+    # Undocumented in the current published spec; deprecated in favor of the
+    # *_name variant but still accepted. Keep until removal is confirmed server-side.
     product_id: Annotated[str, PropertyInfo(alias="productId")]
     """
     DEPRECATED: Use product_name instead. This field will be removed in a future version.
@@ -193,6 +203,8 @@ class AICreateCompletionParams(TypedDict, total=False):
     trace_id: Annotated[str, PropertyInfo(alias="traceId")]
     """Trace multiple LLM calls belonging to same overall request"""
 
+    # Undocumented in the current published spec but still accepted and sent;
+    # keep until the backend confirms its fate. Never removed on spec evidence alone.
     credential_alias: Annotated[str, PropertyInfo(alias="credentialAlias")]
     """Human-readable name for the API key being used"""
 
@@ -216,6 +228,45 @@ class AICreateCompletionParams(TypedDict, total=False):
 
     ticket_id: Annotated[str, PropertyInfo(alias="ticketId")]
     """External ticket or issue ID (e.g. Jira, Linear) for cost attribution per ticket (max 256 chars)"""
+
+    skill_invocation_trigger: Annotated[str, PropertyInfo(alias="skillInvocationTrigger")]
+    """What triggered the skill invocation (max 32 chars; common values: user-slash, claude-proactive, nested-skill)"""
+
+    skill_kind: Annotated[str, PropertyInfo(alias="skillKind")]
+    """The kind of skill that produced this AI call (accepted value: workflow; omit otherwise)"""
+
+    skill_marketplace_name: Annotated[str, PropertyInfo(alias="skillMarketplaceName")]
+    """Name of the marketplace the skill was installed from (max 256 chars)"""
+
+    skill_name: Annotated[str, PropertyInfo(alias="skillName")]
+    """Name of the skill that produced this AI call (max 256 chars)"""
+
+    skill_plugin_name: Annotated[str, PropertyInfo(alias="skillPluginName")]
+    """Name of the plugin that provides the skill (max 256 chars)"""
+
+    skill_source: Annotated[str, PropertyInfo(alias="skillSource")]
+    """Where the skill was loaded from - accepted values: bundled, projectSettings, userSettings, plugin (case-sensitive)"""
+
+    agentic_job_id: Annotated[str, PropertyInfo(alias="agenticJobId")]
+    """Unique identifier of the agentic job this call belongs to"""
+
+    agentic_job_name: Annotated[str, PropertyInfo(alias="agenticJobName")]
+    """Human-readable name of the agentic job"""
+
+    agentic_job_type: Annotated[str, PropertyInfo(alias="agenticJobType")]
+    """Categorical type of the agentic job"""
+
+    agentic_job_version: Annotated[str, PropertyInfo(alias="agenticJobVersion")]
+    """Version of the agentic job definition"""
+
+    squad_id: Annotated[str, PropertyInfo(alias="squadId")]
+    """Unique identifier of the squad (agent team) that produced this call"""
+
+    squad_name: Annotated[str, PropertyInfo(alias="squadName")]
+    """Human-readable name of the squad"""
+
+    squad_role: Annotated[str, PropertyInfo(alias="squadRole")]
+    """Role of the agent within the squad"""
 
     trace_type: Annotated[str, PropertyInfo(alias="traceType")]
     """Categorical identifier for grouping workflows (alphanumeric, hyphens, underscores; max 128 chars)"""

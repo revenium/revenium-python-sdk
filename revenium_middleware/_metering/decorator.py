@@ -21,6 +21,13 @@ import httpx
 from .context import ReveniumContext, get_context
 from ._utils._logs import logger
 
+# Safe at module level despite this file's import cycle with the top-level
+# package: metering_status is a leaf submodule with only stdlib dependencies.
+from revenium_middleware._core.metering_status import (
+    record_metering_error,
+    record_metering_success,
+)
+
 __all__ = ["meter_tool", "report_tool_call", "configure"]
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -160,8 +167,9 @@ def _dispatch_tool_event(**event_kwargs: Any) -> None:
             return
         coro = _send_tool_event_async(url, key, **event_kwargs)
     except Exception as e:
+        record_metering_error(e, operation="tool")
         # Non-blocking - just log and continue
-        logger.warning("metering error: %s", e)
+        logger.error("metering error: %s", e)
         return
 
     # From here on the coroutine exists but is not yet scheduled; every path
@@ -174,8 +182,9 @@ def _dispatch_tool_event(**event_kwargs: Any) -> None:
             coro.close()
     except Exception as e:
         coro.close()
+        record_metering_error(e, operation="tool")
         # Non-blocking - just log and continue
-        logger.warning("metering error: %s", e)
+        logger.error("metering error: %s", e)
 
 
 async def _send_tool_event_async(
@@ -214,8 +223,10 @@ async def _send_tool_event_async(
                 json=event_payload,
             )
             response.raise_for_status()
+            record_metering_success()
             logger.debug("[metered] %s:%s %dms", tool_id, operation or "execute", duration_ms)
     except Exception as e:
+        record_metering_error(e, operation="tool")
         try:
             from revenium_middleware._core.metering_buffer import get_buffer, is_retryable_failure
 
@@ -223,12 +234,12 @@ async def _send_tool_event_async(
                 get_buffer().push(
                     "tool", {"url": url, "key": key, "event_payload": event_payload}
                 )
-                logger.warning("metering error (event buffered for replay): %s", e)
+                logger.error("metering error (event buffered for replay): %s", e)
                 return
         except Exception as buffer_exc:  # buffering must never mask the original error
             logger.warning("metering buffer error: %s", buffer_exc)
         # Non-blocking - just log and continue
-        logger.warning("metering error: %s", e)
+        logger.error("metering error: %s", e)
 
 
 def report_tool_call(

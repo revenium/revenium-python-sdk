@@ -286,6 +286,10 @@ def handle_metering(
             agentic_fields = extract_agentic_job_fields(usage_metadata)
             extra_body = merge_extra_body(None, agentic_fields)
 
+            # Omit-if-unset: an explicit null would reach the wire, unlike
+            # the NotGiven default of the typed client methods.
+            ticket_id = get_ticket_id(usage_metadata)
+
             logger.debug(
                 "Metering fal.ai call - application: %s, media_type: %s",
                 application, media_type,
@@ -303,6 +307,8 @@ def handle_metering(
                     "operation_subtype": "generation",
                     "extra_body": extra_body,
                 }
+                if ticket_id:
+                    image_args["ticket_id"] = ticket_id
                 metering_result = submit_ai_event("image", image_args)
             elif media_type == "video":
                 video_fields = extract_video_fields(result, arguments)
@@ -316,6 +322,8 @@ def handle_metering(
                     "operation_subtype": "generation",
                     "extra_body": extra_body,
                 }
+                if ticket_id:
+                    video_args["ticket_id"] = ticket_id
                 metering_result = submit_ai_event("video", video_args)
             elif media_type == "audio":
                 audio_fields = extract_audio_fields(result, arguments)
@@ -326,11 +334,12 @@ def handle_metering(
                     "operation_subtype": audio_fields.get("operation_subtype"),
                     "extra_body": extra_body,
                 }
+                if ticket_id:
+                    audio_args["ticket_id"] = ticket_id
                 metering_result = submit_ai_event("audio", audio_args)
             else:
                 completion_args = {
                     **common,
-                    "ticket_id": get_ticket_id(usage_metadata),
                     "input_token_count": 0,
                     "output_token_count": 1,
                     "total_token_count": 1,
@@ -343,15 +352,15 @@ def handle_metering(
                     "cache_read_token_count": 0,
                     "extra_body": extra_body,
                 }
+                if ticket_id:
+                    completion_args["ticket_id"] = ticket_id
                 metering_result = submit_ai_event("completion", completion_args)
 
             logger.debug("Metering call result: %s", metering_result)
 
         except Exception as e:
             if not shutdown_event.is_set():
-                logger.warning("Error in metering call: %s", str(e))
-                import traceback
-                logger.warning("Traceback: %s", traceback.format_exc())
+                logger.error("Error in metering call: %s", str(e), exc_info=True)
 
     thread = run_async_in_thread(metering_call())
     logger.debug("Metering thread started: %s", thread)

@@ -117,6 +117,52 @@ print(response.choices[0].message.content)
 
 ---
 
+## Metering Error Visibility
+
+Metering runs in background threads and never raises into your code path — a
+metering failure will never break your AI calls. To make failures observable
+anyway, the SDK provides two mechanisms:
+
+**Subscribe to failures** with a callback:
+
+```python
+import revenium_middleware
+
+@revenium_middleware.on_metering_error
+def alert_on_metering_failure(event):
+    # event.error      -- the exception (e.g. an HTTP 401/500 from Revenium)
+    # event.operation  -- "completion", "image", "tool", ... (may be None)
+    # event.timestamp  -- UTC datetime of the failure
+    my_monitoring.notify(f"Revenium metering failed: {event.error}")
+```
+
+Callbacks run on the background metering thread; exceptions they raise are
+suppressed and logged, so they can never disrupt your application.
+
+Authentication headers (`x-api-key`, `authorization`) on any HTTP
+request/response attached to the exception are redacted before the error is
+exposed to callbacks or `last_error`.
+
+**Poll the status counters:**
+
+```python
+status = revenium_middleware.get_metering_status()
+print(status.success_count)   # events delivered successfully
+print(status.error_count)     # delivery failures
+print(status.last_error)      # most recent exception, or None
+print(status.last_error_at)   # UTC datetime of the most recent failure
+```
+
+`reset_metering_status()` zeroes the counters and clears registered
+callbacks; `remove_metering_error_callback(cb)` unsubscribes a single one.
+
+Failures are also logged at **ERROR** level on the `revenium_middleware`
+logger, including HTTP 4xx/5xx responses, a missing
+`REVENIUM_METERING_API_KEY`, and a provider middleware that fails to import
+when the provider's SDK is installed.
+
+---
+
 ## Agentic Outcomes (Outcome-Based Metering)
 
 Emit per-agent terminal outcomes (`CONVERTED`, `DEFLECTED`, `ESCALATED`) alongside completion and tool-event records, so dashboards show business value next to AI cost.
@@ -978,6 +1024,12 @@ Enhanced observability fields for tracking AI operations across environments, re
 | `transaction_name` | `REVENIUM_TRANSACTION_NAME` | Human-friendly operation name | Label operations (e.g., `"Generate Response"`, `"Analyze Sentiment"`) |
 | `retry_number` | `REVENIUM_RETRY_NUMBER` | Retry attempt number (0 = first attempt) | Track retry attempts for failed operations |
 | `ticket_id` | `REVENIUM_TICKET_ID` | External ticket or issue ID (e.g., Jira, Linear) (max 256 chars) | Attribute AI costs to individual tickets or issues |
+| `skill_name` | `REVENIUM_SKILL_NAME` | Name of the agent skill that produced the call (max 256 chars) | Attribute AI costs to the skill that generated them |
+| `skill_source` | `REVENIUM_SKILL_SOURCE` | Where the skill was loaded from — accepted values: `bundled`, `projectSettings`, `userSettings`, `plugin` (case-sensitive) | Classify skill origin in the shared skill catalog |
+| `skill_kind` | `REVENIUM_SKILL_KIND` | Kind of skill invoked — accepted value: `workflow` (omit otherwise) | Distinguish workflow skills in reporting |
+| `skill_plugin_name` | `REVENIUM_SKILL_PLUGIN_NAME` | Plugin providing the skill, when `skill_source` is `plugin` (max 256 chars) | Attribute costs to a specific plugin |
+| `skill_marketplace_name` | `REVENIUM_SKILL_MARKETPLACE_NAME` | Marketplace the skill or plugin was installed from (max 256 chars) | Track marketplace-sourced skill usage |
+| `skill_invocation_trigger` | `REVENIUM_SKILL_INVOCATION_TRIGGER` | What triggered the skill (max 32 chars; common values: `user-slash`, `claude-proactive`, `nested-skill`) | Separate user-invoked from proactive skill usage |
 
 **Note:** `operation_type` (e.g., `CHAT`, `EMBED`, `TOOL_CALL`) and `operation_subtype` (e.g., `function_call`, `streaming`) are automatically detected by the middleware and cannot be overridden.
 
