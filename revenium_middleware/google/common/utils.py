@@ -613,6 +613,11 @@ async def log_image_usage(
     # Add common metadata
     image_args.update(_build_common_metadata_args(usage_metadata))
 
+    # Ticket ID field
+    ticket_id = trace_fields.get_ticket_id(usage_metadata)
+    if ticket_id:
+        image_args["ticket_id"] = ticket_id
+
     agentic_fields = extract_agentic_job_fields(usage_metadata)
     extra_body = merge_extra_body(image_args.get("extra_body"), agentic_fields)
     if extra_body:
@@ -717,6 +722,11 @@ async def log_video_usage(
 
     # Add common metadata
     video_args.update(_build_common_metadata_args(usage_metadata))
+
+    # Ticket ID field
+    ticket_id = trace_fields.get_ticket_id(usage_metadata)
+    if ticket_id:
+        video_args["ticket_id"] = ticket_id
 
     agentic_fields = extract_agentic_job_fields(usage_metadata)
     extra_body = merge_extra_body(video_args.get("extra_body"), agentic_fields)

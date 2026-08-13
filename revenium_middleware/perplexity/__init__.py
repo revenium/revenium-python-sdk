@@ -62,8 +62,14 @@ try:
     import wrapt  # noqa: F401
     from .middleware import create_wrapper
     from .perplexity_sdk import perplexity_create_wrapper
-except ImportError:
-    logger.debug("Perplexity middleware dependencies not available, middleware not loaded")
+except ImportError as e:
+    # The Perplexity middleware has no provider-SDK gate (it only needs wrapt
+    # and the core package), so a load failure is always unexpected breakage.
+    logger.error(
+        "Revenium Perplexity middleware could not load: %s. "
+        "Metering will NOT be active for Perplexity calls.",
+        e,
+    )
     create_wrapper = None  # type: ignore
     perplexity_create_wrapper = None  # type: ignore
 
@@ -71,7 +77,12 @@ except ImportError:
 try:
     from revenium_middleware import revenium_metadata, revenium_meter
     _decorators_available = True
-except ImportError:
+except ImportError as e:
+    logger.error(
+        "Revenium core decorators could not load: %s. "
+        "revenium_meter/revenium_metadata will NOT be available.",
+        e,
+    )
     _decorators_available = False
     revenium_metadata = None  # type: ignore
     revenium_meter = None  # type: ignore

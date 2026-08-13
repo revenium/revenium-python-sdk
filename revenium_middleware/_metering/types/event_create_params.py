@@ -21,6 +21,8 @@ class EventCreateParams(TypedDict, total=False):
     relevant data source.
     """
 
+    # Optional in the published spec; kept Required client-side: the SDK supplies
+    # this on every call, and relaxing it would weaken a real client-side invariant.
     source_type: Required[
         Annotated[
             Literal[

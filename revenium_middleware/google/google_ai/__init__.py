@@ -31,8 +31,9 @@ try:
         create_google_ai_metering_call,
         handle_streaming_response,
     )
-except ImportError:
-    logger.debug("Google AI SDK (google-genai) not available, middleware not loaded")
+except ImportError as e:
+    from revenium_middleware._core.load_diagnostics import log_middleware_load_failure
+    log_middleware_load_failure("Google AI", e, required_packages=("google.genai",))
     middleware = None  # type: ignore
     extract_google_ai_usage_data = None  # type: ignore
     create_google_ai_metering_call = None  # type: ignore

@@ -18,6 +18,11 @@ from revenium_middleware._core.metering_buffer import (
     MeteringBuffer,
     is_retryable_failure,
 )
+from revenium_middleware._core.metering_status import (
+    get_metering_status,
+    on_metering_error,
+    reset_metering_status,
+)
 from revenium_middleware._metering._exceptions import (
     APIConnectionError,
     APIStatusError,
@@ -467,6 +472,87 @@ class TestToolReplayPath:
         call = calls[0]
         assert call["url"] == "https://frozen.example/meter/v2/tool/events"
         assert call["headers"]["x-api-key"] == "hak_frozen"
+
+
+@pytest.fixture()
+def clean_metering_status():
+    """Isolate the global metering status counters and callbacks."""
+    reset_metering_status()
+    yield
+    reset_metering_status()
+
+
+class TestMeteringStatusIntegration:
+    """flush() must feed the metering status counters and error subscribers."""
+
+    def test_replay_success_records_metering_success(self, clean_metering_status):
+        buf = make_buffer(replay_fn=RecordingReplayer())
+        buf.push("ai", {"seq": 0})
+
+        buf.flush()
+
+        assert get_metering_status().success_count == 1
+
+    def test_permanent_discard_records_metering_error(self, clean_metering_status):
+        exc = make_status_error(422)
+        buf = make_buffer(replay_fn=RecordingReplayer(failures={0: exc}))
+        buf.push("tool", {"seq": 0})
+        received = []
+        on_metering_error(received.append)
+
+        buf.flush()
+
+        status = get_metering_status()
+        assert status.error_count == 1
+        assert status.last_error is exc
+        assert len(received) == 1
+        assert received[0].operation == "tool"
+        assert received[0].error is exc
+
+    def test_expired_event_records_metering_error(self, clean_metering_status):
+        clock = {"now": 1_000_000.0}
+        buf = make_buffer(replay_fn=RecordingReplayer(),
+                          now_fn=lambda: clock["now"], max_age_seconds=3600)
+        buf.push("ai", {"seq": "old"})
+        clock["now"] += 3601
+        received = []
+        on_metering_error(received.append)
+
+        buf.flush()
+
+        assert get_metering_status().error_count == 1
+        assert len(received) == 1
+        assert received[0].operation == "ai"
+
+    def test_error_callback_may_touch_buffer_without_deadlock(self, clean_metering_status):
+        # Subscriber callbacks run synchronously from flush(); recording
+        # status while _flush_lock is held would self-deadlock any callback
+        # that calls back into the buffer.
+        exc = make_status_error(422)
+        buf = make_buffer(replay_fn=RecordingReplayer(failures={0: exc}))
+        buf.push("ai", {"seq": 0})
+        reentered = []
+        on_metering_error(lambda event: reentered.append(buf.flush(deadline_seconds=0.05)))
+
+        t = threading.Thread(target=buf.flush, daemon=True)
+        t.start()
+        t.join(timeout=5.0)
+
+        assert not t.is_alive(), "flush() deadlocked when an error callback re-entered the buffer"
+        assert len(reentered) == 1
+
+    def test_retryable_flush_failure_records_nothing(self, clean_metering_status):
+        # The event stays buffered for the next cycle: neither a success nor
+        # a terminal error, so counters must not move.
+        buf = make_buffer(replay_fn=RecordingReplayer(
+            failures={0: make_status_error(503)}))
+        buf.push("ai", {"seq": 0})
+
+        buf.flush()
+
+        status = get_metering_status()
+        assert status.success_count == 0
+        assert status.error_count == 0
 
 
 def test_tiny_deadline_strictly_bounds_per_call_timeout():

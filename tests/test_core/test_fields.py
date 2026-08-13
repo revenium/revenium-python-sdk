@@ -365,3 +365,69 @@ class TestAgenticJobFieldResolution:
         import pytest
         with pytest.raises(ValueError):
             set_agentic_job_fields()
+
+
+class TestExtractSkillFields:
+    """Skill attribution resolver: usage_metadata snake > camel alias > env."""
+
+    _ALL_SNAKE = {
+        "skill_invocation_trigger": "manual",
+        "skill_kind": "workflow",
+        "skill_marketplace_name": "acme-marketplace",
+        "skill_name": "summarize-docs",
+        "skill_plugin_name": "docs-plugin",
+        "skill_source": "marketplace",
+    }
+
+    def _extract(self, source):
+        from revenium_middleware._core.fields import extract_skill_fields
+
+        return extract_skill_fields(source)
+
+    def test_snake_case_keys(self):
+        assert self._extract(dict(self._ALL_SNAKE)) == self._ALL_SNAKE
+
+    def test_camel_case_aliases(self):
+        source = {
+            "skillInvocationTrigger": "manual",
+            "skillKind": "workflow",
+            "skillMarketplaceName": "acme-marketplace",
+            "skillName": "summarize-docs",
+            "skillPluginName": "docs-plugin",
+            "skillSource": "marketplace",
+        }
+        assert self._extract(source) == self._ALL_SNAKE
+
+    def test_snake_takes_precedence_over_camel(self):
+        source = {"skill_name": "snake-wins", "skillName": "camel-loses"}
+        assert self._extract(source) == {"skill_name": "snake-wins"}
+
+    def test_env_var_fallback(self):
+        env = {
+            "REVENIUM_SKILL_INVOCATION_TRIGGER": "manual",
+            "REVENIUM_SKILL_KIND": "workflow",
+            "REVENIUM_SKILL_MARKETPLACE_NAME": "acme-marketplace",
+            "REVENIUM_SKILL_NAME": "summarize-docs",
+            "REVENIUM_SKILL_PLUGIN_NAME": "docs-plugin",
+            "REVENIUM_SKILL_SOURCE": "marketplace",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            assert self._extract({}) == self._ALL_SNAKE
+
+    def test_metadata_beats_env(self):
+        with patch.dict(os.environ, {"REVENIUM_SKILL_NAME": "env-name"}):
+            assert self._extract({"skillName": "meta-name"}) == {"skill_name": "meta-name"}
+
+    def test_fields_resolve_independently(self):
+        with patch.dict(os.environ, {"REVENIUM_SKILL_SOURCE": "env-source"}):
+            result = self._extract({"skill_name": "meta-name"})
+        assert result == {"skill_name": "meta-name", "skill_source": "env-source"}
+
+    def test_missing_fields_omitted(self):
+        result = self._extract({"skill_name": "only-name"})
+        assert result == {"skill_name": "only-name"}
+        assert "skill_kind" not in result
+
+    def test_empty_dict_when_no_skill_fields(self):
+        with patch.dict(os.environ, {}, clear=True):
+            assert self._extract({}) == {}

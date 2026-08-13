@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-08-13
+
+### Added
+- Agentic job and squad attribution as first-class typed parameters. `agentic_job_id`, `agentic_job_name`, `agentic_job_type`, `agentic_job_version`, `squad_id`, `squad_name`, and `squad_role` are now typed, documented parameters on all four AI metering endpoints (completions, audio, image, video) instead of requiring the `extra_body` escape hatch. Existing `extra_body` callers keep working unchanged.
+- The media metering endpoints (audio, image, video) now accept `operation_type` and the prompt-capture fields (`input_messages`, `output_response`, `prompts_truncated`), matching the completion endpoint.
+- Ticket attribution on media metering events. The `ticket_id` trace field (set per call via `usage_metadata={"ticket_id": ...}` or process-wide via `REVENIUM_TICKET_ID`) is now sent on audio, image, and video metering events, matching the existing completion behavior. Previously a configured ticket ID was silently dropped on every media event; fal.ai and Google media calls now carry it end to end.
+- Skill attribution on completion metering events. Six new optional fields — `skill_name`, `skill_kind`, `skill_source`, `skill_plugin_name`, `skill_marketplace_name`, and `skill_invocation_trigger` — attribute AI usage to the skill that produced it. Set them per call via `usage_metadata` (snake_case or camelCase) or process-wide via the `REVENIUM_SKILL_*` environment variables; each field resolves independently and unset fields are omitted. Wired into the OpenAI middleware; other providers will follow once the field semantics are confirmed against a released backend.
+- Metering error visibility. Metering is fire-and-forget by design — a delivery failure never interrupts your AI calls — which previously meant failures were only visible as easily-missed log lines. Two new mechanisms make them observable: `revenium_middleware.on_metering_error(callback)` invokes your callback with the exception, the operation type, and a timestamp every time a metering event fails to deliver, and `revenium_middleware.get_metering_status()` returns running success/error counters plus the most recent error. Callbacks run on the background metering thread and can never raise into your application.
+
+### Changed
+- Metering delivery failures (including HTTP 4xx/5xx responses from Revenium) are now logged at ERROR level instead of WARNING, across all providers and for tool events.
+- A missing `REVENIUM_METERING_API_KEY` now logs a clear ERROR at initialization stating that metering is disabled, instead of a quiet warning.
+- When a provider's SDK is installed but the Revenium middleware for it fails to import (for example a missing or conflicting dependency), the failure is now logged at ERROR level with the underlying import error, instead of a DEBUG line that hid the problem. Providers whose SDK is not installed continue to be skipped quietly.
+
 ## [0.5.0] - 2026-08-05
 
 ### Added
@@ -194,4 +208,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tool metering via `meter_tool` decorator and `report_tool_call`
 - Selective metering via `REVENIUM_SELECTIVE_METERING` environment variable
 - Configurable logging with `REVENIUM_LOG_LEVEL`
+
 

@@ -135,7 +135,7 @@ class MiddlewareHandler(CustomLogger):
                 result = submit_ai_event("completion", {**completion_args, "extra_body": extra_body})
                 logger.debug("Proxy metering call result: %s", result)
             except Exception as e:
-                logger.warning("Proxy metering call failed: %s", e)
+                logger.error("Proxy metering call failed: %s", e)
 
         run_async_in_thread(metering_call())
 

@@ -21,6 +21,9 @@ EXPECTED_ALL = {
     # BACK-777 Phase 3: amendments + history
     "get_outcome_history", "JobOutcomeAmendment",
     "OutcomeNotReportedError", "OutcomeAmendConflictError",
+    # Metering error visibility (BACK-778)
+    "MeteringErrorEvent", "MeteringStatus", "get_metering_status",
+    "on_metering_error", "remove_metering_error_callback", "reset_metering_status",
 }
 
 

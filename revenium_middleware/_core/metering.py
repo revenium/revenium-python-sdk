@@ -22,7 +22,8 @@ def _build_metering_client(
 ) -> Optional[ReveniumMetering]:
     """Construct a ReveniumMetering client from raw env-var inputs.
 
-    Returns ``None`` when the API key is missing/empty (logs a warning).
+    Returns ``None`` when the API key is missing/empty (logs an error --
+    metering silently disabled is the failure mode this SDK must surface).
     Raises ``ValueError`` when the API key is present but malformed.
     Falls back to the library default when ``base_url_raw`` is set but not
     a valid http(s) URL.
@@ -40,7 +41,10 @@ def _build_metering_client(
             )
 
     if not api_key:
-        logger.warning("Metering API key not set -- metering is disabled")
+        logger.error(
+            "REVENIUM_METERING_API_KEY environment variable is not set. "
+            "Metering is disabled and no usage data will be sent to Revenium."
+        )
         return None
 
     validate_api_key(api_key)
@@ -86,10 +90,11 @@ def initialize_metering(api_key: Optional[str] = None, base_url: Optional[str] =
     settings hooks) or to reconfigure at runtime. Explicit arguments take
     precedence over ``REVENIUM_METERING_API_KEY`` / ``REVENIUM_METERING_BASE_URL``.
 
-    Returns True when metering is enabled after the call. Raises ``ValueError``
-    for a malformed API key -- explicit configuration fails loudly, unlike the
-    lazy ``get_client()`` path, which logs a warning and leaves metering
-    disabled (best-effort by design).
+    Returns True when metering is enabled after the call; a missing/empty key
+    logs an ERROR and leaves metering disabled. Raises ``ValueError`` for a
+    malformed API key -- explicit configuration fails loudly, unlike the lazy
+    ``get_client()`` path, which logs a warning once for a malformed env key
+    and leaves metering disabled.
     """
     global client
     key = api_key if api_key is not None else os.environ.get("REVENIUM_METERING_API_KEY")
@@ -107,8 +112,9 @@ def get_client() -> Optional[ReveniumMetering]:
     ``REVENIUM_METERING_API_KEY`` appears, the next metering event builds the
     client instead of silently no-opping forever.
 
-    Best-effort by design: a malformed env key is logged once and metering
-    stays disabled, whereas the explicit ``initialize_metering()`` raises
+    A missing/unset key is logged at ERROR level by the build path; a
+    malformed env key is logged once as a warning and metering stays
+    disabled, whereas the explicit ``initialize_metering()`` raises
     ``ValueError`` so programmatic misconfiguration fails loudly.
     """
     global _last_failed_key
@@ -240,8 +246,10 @@ class MeteringThread(threading.Thread):
             # Log errors unless it's during shutdown
             if not shutdown_event.is_set():
                 self.error = e
+                from revenium_middleware._core.metering_status import record_metering_error
+                record_metering_error(e)
                 # Use exc_info=True to include traceback in the log
-                logger.warning(f"Error in metering thread {self.name}: {str(e)}", exc_info=True)
+                logger.error(f"Error in metering thread {self.name}: {str(e)}", exc_info=True)
             else:
                 logger.debug(f"Exception ignored in metering thread {self.name} during shutdown: {str(e)}")
         finally:

@@ -11,7 +11,7 @@ from revenium_middleware import client, get_client, run_async_in_thread, shutdow
 from revenium_middleware._core.enforcement import check_enforcement
 from revenium_middleware._core.exceptions import BudgetExceededError  # noqa: F401 — re-exported via openai.exceptions
 from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
-from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, merge_extra_body
+from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, extract_skill_fields, merge_extra_body
 from revenium_middleware._core.config import is_selective_metering_enabled, is_capture_prompts_enabled
 from revenium_middleware._core.context import is_inside_decorated_function
 from revenium_middleware._core.patch_registry import register_patch
@@ -491,6 +491,11 @@ async def log_token_usage(
     agentic_fields = extract_agentic_job_fields(usage_metadata)
     if agentic_fields:
         completion_args["extra_body"] = merge_extra_body(completion_args.get("extra_body"), agentic_fields)
+
+    # Skill attribution fields are first-class typed params, not extra_body
+    skill_fields = extract_skill_fields(usage_metadata)
+    if skill_fields:
+        completion_args.update(skill_fields)
 
     # Add trace visualization fields only if they have values
     if environment:
@@ -1712,7 +1717,7 @@ def _wrap_async_stream(stream, request_time_dt, usage_metadata, client_instance=
                     request_body=request_body
                 )
             except Exception as e:
-                logger.warning("Async stream metering error: %s", e)
+                logger.error("Async stream metering error: %s", e)
 
     return AsyncStreamWrapper(stream)
 

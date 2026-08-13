@@ -1,11 +1,18 @@
 """Centralized submission of AI metering events with Idempotency-Key injection."""
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any, Dict, Optional
 
 from revenium_middleware._core.context import get_idempotency_key
 from revenium_middleware._core.metering import get_client
+from revenium_middleware._core.metering_status import (
+    record_metering_error,
+    record_metering_success,
+)
+
+logger = logging.getLogger("revenium_middleware")
 
 
 _AI_OPERATIONS = frozenset({"completion", "image", "video", "audio"})
@@ -69,14 +76,26 @@ def submit_ai_event(
 
     method = getattr(client.ai, f"create_{operation}")
     try:
-        return method(**merged_args)
+        result = method(**merged_args)
     except Exception as exc:
         from revenium_middleware._core.metering_buffer import get_buffer, is_retryable_failure
 
+        record_metering_error(exc, operation=operation)
         if is_retryable_failure(exc):
             # Retries are exhausted inside the client; keep the event (with
             # its frozen Idempotency-Key) for background replay instead of
             # discarding it.
+            logger.error(
+                "Metering %s event delivery failed (%s); "
+                "event buffered for automatic retry",
+                operation,
+                exc,
+            )
             get_buffer().push("ai", {"operation": operation, "args": merged_args})
             return None
+        logger.error(
+            "Metering %s event delivery failed permanently: %s", operation, exc
+        )
         raise
+    record_metering_success()
+    return result

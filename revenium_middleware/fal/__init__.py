@@ -21,8 +21,9 @@ try:
         subscribe_async_wrapper,
         stream_async_wrapper,
     )
-except ImportError:
-    logger.debug("fal-client SDK (fal_client) not available, middleware not loaded")
+except ImportError as e:
+    from revenium_middleware._core.load_diagnostics import log_middleware_load_failure
+    log_middleware_load_failure("fal", e, required_packages=("fal_client",))
     run_wrapper = None  # type: ignore
     subscribe_wrapper = None  # type: ignore
     stream_wrapper = None  # type: ignore

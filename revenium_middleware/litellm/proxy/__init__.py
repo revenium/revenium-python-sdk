@@ -14,8 +14,9 @@ logger = logging.getLogger(__name__)
 try:
     import litellm  # noqa: F401
     from .middleware import MiddlewareHandler, proxy_handler_instance
-except ImportError:
-    logger.debug("LiteLLM SDK (litellm) not available, proxy middleware not loaded")
+except ImportError as e:
+    from revenium_middleware._core.load_diagnostics import log_middleware_load_failure
+    log_middleware_load_failure("LiteLLM proxy", e, required_packages=("litellm",))
     MiddlewareHandler = None  # type: ignore
     proxy_handler_instance = None  # type: ignore
 
