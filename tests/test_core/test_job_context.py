@@ -85,6 +85,26 @@ class TestReportOutcome:
         assert json.loads(body["metadata"]) == {"notes": "approved"}
         assert body["reportedBy"] == "orchestrator"
 
+    def test_outcome_reason_sent_as_its_own_field(self):
+        http, calls = _recording_client()
+        with patch.dict(os.environ, ENV):
+            with JobContext(job_id="loan-1", http_client=http) as job:
+                job.report_outcome(
+                    execution_status="FAILED",
+                    outcome_reason="Applicant withdrew before underwriting",
+                )
+        body = json.loads(calls[0].content)
+        assert body["outcomeReason"] == "Applicant withdrew before underwriting"
+        # The prescribed field, not a metadata key.
+        assert "metadata" not in body
+
+    def test_outcome_reason_omitted_when_not_passed(self):
+        http, calls = _recording_client()
+        with patch.dict(os.environ, ENV):
+            with JobContext(job_id="loan-1", http_client=http) as job:
+                job.report_outcome(execution_status="SUCCESS")
+        assert "outcomeReason" not in json.loads(calls[0].content)
+
     def test_invalid_execution_status_rejected(self):
         with patch.dict(os.environ, ENV):
             with JobContext(job_id="j1") as job:
@@ -156,6 +176,23 @@ class TestAutoFailed:
         meta = json.loads(body["metadata"])
         assert meta["error"] == "boom"
         assert meta["errorType"] == "RuntimeError"
+        # The failure explanation also rides the prescribed first-class field,
+        # so history rows do not come back with outcome_reason=None.
+        assert body["outcomeReason"] == "boom"
+
+    def test_auto_report_truncates_an_oversized_exception_message(self):
+        """The ingest API rejects outcomeReason over 2048 chars with a 400 —
+        the safety net must degrade to a truncated reason, never lose the
+        whole outcome to validation."""
+        http, calls = _recording_client()
+        with patch.dict(os.environ, ENV):
+            with pytest.raises(RuntimeError):
+                with JobContext(job_id="j1", http_client=http):
+                    raise RuntimeError("x" * 5000)
+        body = json.loads(calls[0].content)
+        assert len(body["outcomeReason"]) == 2048
+        # metadata keeps the full text (no size constraint on that field)
+        assert len(json.loads(body["metadata"])["error"]) == 5000
 
     def test_no_auto_report_when_outcome_already_reported(self):
         http, calls = _recording_client()
@@ -244,7 +281,18 @@ class TestAutoFailed:
         assert len(calls) == 1
         body = json.loads(calls[0].content)
         assert body["executionStatus"] == "FAILED"
+        assert body["outcomeReason"] == "boom"
         assert extract_agentic_job_fields({}) == {}
+
+    @pytest.mark.asyncio
+    async def test_async_auto_report_truncates_an_oversized_exception_message(self):
+        http, calls = _recording_client()
+        with patch.dict(os.environ, ENV):
+            with pytest.raises(RuntimeError):
+                async with JobContext(job_id="j1", http_client=http):
+                    raise RuntimeError("y" * 5000)
+        body = json.loads(calls[0].content)
+        assert len(body["outcomeReason"]) == 2048
 
     def test_reentering_active_instance_raises(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -288,6 +336,26 @@ class TestAmendOutcome:
         assert seen["body"]["outcomeValue"] == 750.0
         assert json.loads(seen["body"]["metadata"]) == {"expansion_event": "upsell_q2"}
         assert result["outcomeAmendmentCount"] == 2
+
+    def test_outcome_reason_omitted_vs_cleared(self):
+        """Omitting leaves the stored reason untouched; "" clears it."""
+        bodies = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            bodies.append(json.loads(req.content))
+            return httpx.Response(200, json={})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.dict(os.environ, ENV):
+            handle = JobContext.attach(job_id="loan-1", http_client=http)
+            handle.amend_outcome(reason="Audit pass, outcome unchanged")
+            handle.amend_outcome(reason="Reason no longer applies", outcome_reason="")
+            handle.amend_outcome(reason="Chargeback", outcome_reason="Payment reversed")
+        assert "outcomeReason" not in bodies[0]
+        assert bodies[1]["outcomeReason"] == ""
+        assert bodies[2]["outcomeReason"] == "Payment reversed"
+        # reason (amendment audit trail) stays independent of outcomeReason.
+        assert bodies[1]["reason"] == "Reason no longer applies"
 
     def test_blank_reason_rejected_before_http(self):
         http, calls = _recording_client()

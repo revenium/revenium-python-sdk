@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 
 import httpx
 import pytest
@@ -156,6 +157,41 @@ def test_create_job_treats_409_as_idempotent_success():
     # Should NOT raise — re-runs of the same agenticJobId are idempotent.
     body = client.create_job("job-456", name="re-run")
     assert body["agenticJobId"] == "job-456"
+    client.close()
+
+
+def test_report_outcome_passes_outcome_reason_through():
+    seen = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(200, json={})
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.Client(transport=transport)
+    client = AgenticOutcomeClient(_settings(), http_client=http)
+    client.report_outcome(
+        "job-fail",
+        {"executionStatus": "FAILED", "outcomeReason": "Customer unreachable"},
+    )
+    assert seen["body"]["outcomeReason"] == "Customer unreachable"
+    client.close()
+
+
+def test_create_job_never_sends_outcome_reason():
+    """outcomeReason is readOnly on the job resource — job create must not send it."""
+    seen = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(200, json={})
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.Client(transport=transport)
+    client = AgenticOutcomeClient(_settings(), http_client=http)
+    body = client.create_job("job-1", name="run", type="agent", version="1.0", environment="demo")
+    assert "outcomeReason" not in body
+    assert "outcomeReason" not in seen["body"]
     client.close()
 
 

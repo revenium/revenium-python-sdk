@@ -18,6 +18,9 @@ from revenium_middleware._core.fields import (
     extract_org_and_product,
     extract_common_metadata,
     extract_agentic_job_fields,
+    extract_media_lineage_fields,
+    extract_service_tier_fields,
+    extract_effort_field,
     merge_extra_body,
 )
 
@@ -236,6 +239,14 @@ async def log_token_usage(
     ticket_id = trace_fields.get_ticket_id(usage_metadata)
     if ticket_id:
         completion_args["ticket_id"] = ticket_id
+
+    # Service tier and pricing fields
+    completion_args.update(
+        extract_service_tier_fields(usage_metadata, "completion")
+    )
+
+    # Reasoning effort level (caller-supplied, forwarded verbatim)
+    completion_args.update(extract_effort_field(usage_metadata))
 
     # Parent transaction ID field
     parent_transaction_id = (
@@ -618,6 +629,11 @@ async def log_image_usage(
     if ticket_id:
         image_args["ticket_id"] = ticket_id
 
+    # Media lineage fields (source attribution for edit-and-regenerate flows)
+    image_args.update(extract_media_lineage_fields(usage_metadata))
+    # Service tier and pricing fields
+    image_args.update(extract_service_tier_fields(usage_metadata, "image"))
+
     agentic_fields = extract_agentic_job_fields(usage_metadata)
     extra_body = merge_extra_body(image_args.get("extra_body"), agentic_fields)
     if extra_body:
@@ -727,6 +743,11 @@ async def log_video_usage(
     ticket_id = trace_fields.get_ticket_id(usage_metadata)
     if ticket_id:
         video_args["ticket_id"] = ticket_id
+
+    # Media lineage fields (source attribution for edit-and-regenerate flows)
+    video_args.update(extract_media_lineage_fields(usage_metadata))
+    # Service tier and pricing fields
+    video_args.update(extract_service_tier_fields(usage_metadata, "video"))
 
     agentic_fields = extract_agentic_job_fields(usage_metadata)
     extra_body = merge_extra_body(video_args.get("extra_body"), agentic_fields)

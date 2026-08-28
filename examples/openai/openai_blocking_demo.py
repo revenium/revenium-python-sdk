@@ -1,7 +1,7 @@
 """
 End-to-end demo for Revenium cost-controls / circuit breaker on OpenAI.
 
-When ``REVENIUM_CIRCUIT_BREAKER_ENABLED=true`` and a budget rule on the
+When ``REVENIUM_CIRCUIT_BREAKER_ENABLED=true`` and a cost control on the
 configured team trips, the second call raises ``BudgetExceededError``
 *before* the outbound OpenAI request — no spend, no rate-limit hit.
 
@@ -11,11 +11,11 @@ Pre-requisites
 
        pip install 'revenium-python-sdk[openai]'
 
-2. Create a budget rule on the team configured below with a hard limit low
+2. Create a cost control on the team configured below with a hard limit low
    enough to trip after the first request. Sample::
 
        curl -X POST -H "x-api-key: $REVENIUM_METERING_API_KEY" \\
-         "$REVENIUM_ENFORCEMENT_BASE_URL/v2/api/ai/budget-rules" \\
+         "$REVENIUM_ENFORCEMENT_BASE_URL/v2/api/ai/cost-controls" \\
          -d '{"name":"unified-sdk-blocking-demo","metricType":"TOTAL_COST",
               "windowType":"DAILY","hardLimit":"0.01","action":"BLOCK"}'
 

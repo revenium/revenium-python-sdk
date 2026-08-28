@@ -65,6 +65,44 @@ def test_report_outcome_preserves_sub_dollar_value(common, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# outcomeReason is the prescribed home for a failure explanation — it must reach
+# the payload as its own field, and stay absent when there is nothing to explain.
+# ---------------------------------------------------------------------------
+def test_report_outcome_sends_outcome_reason_as_its_own_field(common, monkeypatch):
+    captured = {}
+
+    class FakeClient:
+        def report_outcome(self, job_id, payload):
+            captured["payload"] = payload
+
+    monkeypatch.setattr(common, "_client", lambda: FakeClient())
+    outcome = common.Outcome("UNSUCCESSFUL", 0.0, "FAIL-1", "FAILED", "task_failed")
+    common.report_outcome(
+        outcome=outcome, value=0.0, reported_by="ai-pipe",
+        agentic_job_id="job-fail", metadata=None, timestamp=None, dry_run=False,
+        outcome_reason="task_failed",
+    )
+    assert captured["payload"]["outcomeReason"] == "task_failed"
+    assert "metadata" not in captured["payload"]
+
+
+def test_report_outcome_omits_outcome_reason_when_absent(common, monkeypatch):
+    captured = {}
+
+    class FakeClient:
+        def report_outcome(self, job_id, payload):
+            captured["payload"] = payload
+
+    monkeypatch.setattr(common, "_client", lambda: FakeClient())
+    outcome = common.Outcome("CONVERTED", 1.0, "DEAL-1", "SUCCESS", "deal_closed")
+    common.report_outcome(
+        outcome=outcome, value=1.0, reported_by="ai-pipe",
+        agentic_job_id="job-ok", metadata=None, timestamp=None, dry_run=False,
+    )
+    assert "outcomeReason" not in captured["payload"]
+
+
+# ---------------------------------------------------------------------------
 # Fix #2: spec.build_summary must be invoked by run_example.
 # ---------------------------------------------------------------------------
 def test_run_example_invokes_spec_build_summary(common, monkeypatch, capsys):

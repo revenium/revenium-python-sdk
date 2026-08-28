@@ -67,14 +67,21 @@ class AIResource(SyncAPIResource):
         total_token_count: int,
         transaction_id: str,
         agent: str | NotGiven = NOT_GIVEN,
+        billing_skipped: bool | NotGiven = NOT_GIVEN,
+        cache_creation1h_token_count: int | NotGiven = NOT_GIVEN,
+        cache_creation5m_token_count: int | NotGiven = NOT_GIVEN,
         cache_creation_token_cost: float | NotGiven = NOT_GIVEN,
         cache_creation_token_count: int | NotGiven = NOT_GIVEN,
         cache_read_token_cost: float | NotGiven = NOT_GIVEN,
         cache_read_token_count: int | NotGiven = NOT_GIVEN,
+        coding_assistant_account_uuid: str | NotGiven = NOT_GIVEN,
+        effort: str | NotGiven = NOT_GIVEN,
+        error_code: int | NotGiven = NOT_GIVEN,
         error_reason: str | NotGiven = NOT_GIVEN,
         input_token_cost: float | NotGiven = NOT_GIVEN,
         mediation_latency: int | NotGiven = NOT_GIVEN,
         middleware_source: str | NotGiven = NOT_GIVEN,
+        model_host: str | NotGiven = NOT_GIVEN,
         model_source: str | NotGiven = NOT_GIVEN,
         operation_type: Literal["CHAT", "GENERATE", "EMBED", "CLASSIFY", "SUMMARIZE", "TRANSLATE", "TOOL_CALL", "RERANK", "SEARCH", "MODERATION", "VISION", "TRANSFORM", "GUARDRAIL", "AUDIO", "VIDEO", "IMAGE", "OTHER"]
         | NotGiven = NOT_GIVEN,
@@ -85,7 +92,17 @@ class AIResource(SyncAPIResource):
         product_name: str | NotGiven = NOT_GIVEN,
         reasoning_token_count: int | NotGiven = NOT_GIVEN,
         response_quality_score: float | NotGiven = NOT_GIVEN,
+        skip_reason: Literal[
+            "FREE_TIER",
+            "RATE_LIMITED",
+            "QUOTA_EXCEEDED",
+            "CONTENT_POLICY_VIOLATION",
+            "CAPACITY_UNAVAILABLE",
+            "SERVICE_UNAVAILABLE",
+        ]
+        | NotGiven = NOT_GIVEN,
         subscriber: ai_create_completion_params.Subscriber | NotGiven = NOT_GIVEN,
+        subscriber_email_source: str | NotGiven = NOT_GIVEN,
         subscription_id: str | NotGiven = NOT_GIVEN,
         system_fingerprint: str | NotGiven = NOT_GIVEN,
         task_type: str | NotGiven = NOT_GIVEN,
@@ -120,6 +137,11 @@ class AIResource(SyncAPIResource):
         input_messages: str | NotGiven = NOT_GIVEN,
         output_response: str | NotGiven = NOT_GIVEN,
         prompts_truncated: bool | NotGiven = NOT_GIVEN,
+        actual_service_tier: str | NotGiven = NOT_GIVEN,
+        requested_service_tier: str | NotGiven = NOT_GIVEN,
+        pricing_tier: Literal["STANDARD", "BATCH"] | NotGiven = NOT_GIVEN,
+        subscription_tier: str | NotGiven = NOT_GIVEN,
+        cost_multiplier: float | NotGiven = NOT_GIVEN,
         # Use the following arguments if you need to pass additional parameters to the API that aren't available via kwargs.
         # The extra values given here take precedence over values defined on the client or passed to this method.
         extra_headers: Headers | None = None,
@@ -160,6 +182,16 @@ class AIResource(SyncAPIResource):
 
           agent: The AI agent that is making the request
 
+          billing_skipped: If true, backend returns $0 cost
+
+          cache_creation1h_token_count: The number of cached creation tokens written with a 1 hour TTL. This is a
+              breakdown of cache_creation_token_count, which remains the aggregate across
+              every TTL.
+
+          cache_creation5m_token_count: The number of cached creation tokens written with a 5 minute TTL. This is a
+              breakdown of cache_creation_token_count, which remains the aggregate across
+              every TTL.
+
           cache_creation_token_cost: The cache creation token cost associated with the LLM completion. Note that if
               you send a valuefor this parameter in your request, it will override Revenium's
               automatic calculation of tokencost by AI model.
@@ -172,6 +204,17 @@ class AIResource(SyncAPIResource):
 
           cache_read_token_count: The number of cached read tokens in the completion
 
+          coding_assistant_account_uuid: Unique identifier of the coding assistant account that produced this
+              completion. Caller-supplied attribution: the middleware cannot infer it, so it
+              is read from usage_metadata.
+
+          effort: The reasoning effort level requested of the model. Free-form string, not
+              an enum: the value is passed through unchanged -- it is not lowercased or
+              otherwise coerced -- and the backend validates it (at most 16 characters
+              matching ^[A-Za-z0-9_-]+$).
+
+          error_code: HTTP error code if the operation failed
+
           error_reason: The details of the error that occurred during the LLM completion
 
           input_token_cost: The input token cost associated with the LLM completion
@@ -179,6 +222,9 @@ class AIResource(SyncAPIResource):
           mediation_latency: The latency, in milliseconds, of latency by an AI or API gateway
 
           middleware_source: The source middleware or SDK that generated this AI completion request
+
+          model_host: The infrastructure that billed this coding assistant invocation (e.g.
+              'bedrock', 'foundry', 'vertex', 'anthropic'), as reported by the client.
 
           model_source: The source of the AI model used for the completion
 
@@ -201,7 +247,15 @@ class AIResource(SyncAPIResource):
 
           response_quality_score: The quality score of the response
 
+          skip_reason: Reason why billing was skipped. The completions endpoint accepts its own
+              member set; it is not the same list the audio, video and image endpoints
+              accept.
+
           subscriber: The subscriber metadata
+
+          subscriber_email_source: How the subscriber email attribute was sourced client-side (e.g.
+              'cli-flag', 'env', 'custom-env', 'git', 'manual'). Diagnostic provenance
+              metadata only, not the email itself.
 
           subscription_id: Unique identifier of the subscription from your own system that you wish to use
               to correlate usage between Revenium & your application.
@@ -275,6 +329,16 @@ class AIResource(SyncAPIResource):
 
           transaction_name: Human-friendly name for this operation
 
+          actual_service_tier: The service tier the provider actually used
+
+          requested_service_tier: The service tier requested by your application
+
+          pricing_tier: The pricing tier this completion is billed at
+
+          subscription_tier: The subscription tier in effect for this completion
+
+          cost_multiplier: Multiplier applied to the calculated cost of this completion
+
           extra_headers: Send extra headers
 
           extra_query: Add additional query parameters to the request
@@ -301,14 +365,21 @@ class AIResource(SyncAPIResource):
                     "total_token_count": total_token_count,
                     "transaction_id": transaction_id,
                     "agent": agent,
+                    "billing_skipped": billing_skipped,
+                    "cache_creation1h_token_count": cache_creation1h_token_count,
+                    "cache_creation5m_token_count": cache_creation5m_token_count,
                     "cache_creation_token_cost": cache_creation_token_cost,
                     "cache_creation_token_count": cache_creation_token_count,
                     "cache_read_token_cost": cache_read_token_cost,
                     "cache_read_token_count": cache_read_token_count,
+                    "coding_assistant_account_uuid": coding_assistant_account_uuid,
+                    "effort": effort,
+                    "error_code": error_code,
                     "error_reason": error_reason,
                     "input_token_cost": input_token_cost,
                     "mediation_latency": mediation_latency,
                     "middleware_source": middleware_source,
+                    "model_host": model_host,
                     "model_source": model_source,
                     "operation_type": operation_type,
                     "organization_name": organization_name if organization_name is not NOT_GIVEN else organization_id,
@@ -316,7 +387,9 @@ class AIResource(SyncAPIResource):
                     "product_name": product_name if product_name is not NOT_GIVEN else product_id,
                     "reasoning_token_count": reasoning_token_count,
                     "response_quality_score": response_quality_score,
+                    "skip_reason": skip_reason,
                     "subscriber": subscriber,
+                    "subscriber_email_source": subscriber_email_source,
                     "subscription_id": subscription_id,
                     "system_fingerprint": system_fingerprint,
                     "task_type": task_type,
@@ -351,6 +424,11 @@ class AIResource(SyncAPIResource):
                     "input_messages": input_messages,
                     "output_response": output_response,
                     "prompts_truncated": prompts_truncated,
+                    "actual_service_tier": actual_service_tier,
+                    "requested_service_tier": requested_service_tier,
+                    "pricing_tier": pricing_tier,
+                    "subscription_tier": subscription_tier,
+                    "cost_multiplier": cost_multiplier,
                 },
                 ai_create_completion_params.AICreateCompletionParams,
             ),
@@ -426,6 +504,10 @@ class AIResource(SyncAPIResource):
         middleware_source: str | NotGiven = NOT_GIVEN,
         model_source: str | NotGiven = NOT_GIVEN,
         credential_alias: str | NotGiven = NOT_GIVEN,
+        actual_service_tier: str | NotGiven = NOT_GIVEN,
+        requested_service_tier: str | NotGiven = NOT_GIVEN,
+        pricing_tier: Literal["STANDARD", "BATCH"] | NotGiven = NOT_GIVEN,
+        cost_type: Literal["AI"] | NotGiven = NOT_GIVEN,
         # Use the following arguments if you need to pass additional parameters to the API that aren't available via kwargs.
         # The extra values given here take precedence over values defined on the client or passed to this method.
         extra_headers: Headers | None = None,
@@ -557,6 +639,14 @@ class AIResource(SyncAPIResource):
 
           credential_alias: Human-readable name for the API key being used
 
+          actual_service_tier: The service tier the provider actually used
+
+          requested_service_tier: The service tier requested by your application
+
+          pricing_tier: The pricing tier this audio operation is billed at
+
+          cost_type: Cost type for the audio operation
+
           extra_headers: Send extra headers
 
           extra_query: Add additional query parameters to the request
@@ -629,6 +719,10 @@ class AIResource(SyncAPIResource):
                     "middleware_source": middleware_source,
                     "model_source": model_source,
                     "credential_alias": credential_alias,
+                    "actual_service_tier": actual_service_tier,
+                    "requested_service_tier": requested_service_tier,
+                    "pricing_tier": pricing_tier,
+                    "cost_type": cost_type,
                 },
                 ai_create_audio_params.AICreateAudioParams,
             ),
@@ -656,7 +750,11 @@ class AIResource(SyncAPIResource):
         aspect_ratio: str | NotGiven = NOT_GIVEN,
         video_job_id: str | NotGiven = NOT_GIVEN,
         async_operation: bool | NotGiven = NOT_GIVEN,
+        completion_status: Literal["SUCCESS", "PARTIAL_TIMEOUT", "FAILED"] | NotGiven = NOT_GIVEN,
+        source_transaction_id: str | NotGiven = NOT_GIVEN,
         operation_subtype: str | NotGiven = NOT_GIVEN,
+        billing_unit: Literal["PER_IMAGE", "PER_MINUTE", "PER_SECOND", "PER_CHARACTER", "PER_TOKEN", "CREDITS"]
+        | NotGiven = NOT_GIVEN,
         total_cost: float | NotGiven = NOT_GIVEN,
         error_reason: str | NotGiven = NOT_GIVEN,
         error_code: int | NotGiven = NOT_GIVEN,
@@ -696,6 +794,11 @@ class AIResource(SyncAPIResource):
         middleware_source: str | NotGiven = NOT_GIVEN,
         model_source: str | NotGiven = NOT_GIVEN,
         credential_alias: str | NotGiven = NOT_GIVEN,
+        actual_service_tier: str | NotGiven = NOT_GIVEN,
+        requested_service_tier: str | NotGiven = NOT_GIVEN,
+        pricing_tier: Literal["STANDARD", "BATCH"] | NotGiven = NOT_GIVEN,
+        priority_tier: str | NotGiven = NOT_GIVEN,
+        cost_type: Literal["AI"] | NotGiven = NOT_GIVEN,
         # Use the following arguments if you need to pass additional parameters to the API that aren't available via kwargs.
         # The extra values given here take precedence over values defined on the client or passed to this method.
         extra_headers: Headers | None = None,
@@ -737,7 +840,13 @@ class AIResource(SyncAPIResource):
 
           async_operation: Whether this was an asynchronous video generation operation
 
+          completion_status: Terminal status of the video generation job
+
+          source_transaction_id: Transaction ID of the source video this operation derives from (edit-and-regenerate lineage)
+
           operation_subtype: Technical classification of the video operation (e.g., 'generation', 'editing')
+
+          billing_unit: How this operation should be billed
 
           total_cost: The total cost in USD for this video operation (overrides automatic calculation)
 
@@ -811,6 +920,16 @@ class AIResource(SyncAPIResource):
 
           credential_alias: Human-readable name for the API key being used
 
+          actual_service_tier: The service tier the provider actually used
+
+          requested_service_tier: The service tier requested by your application
+
+          pricing_tier: The pricing tier this video operation is billed at
+
+          priority_tier: The priority tier this video operation was queued at
+
+          cost_type: Cost type for the video operation
+
           extra_headers: Send extra headers
 
           extra_query: Add additional query parameters to the request
@@ -838,7 +957,10 @@ class AIResource(SyncAPIResource):
                     "aspect_ratio": aspect_ratio,
                     "video_job_id": video_job_id,
                     "async_operation": async_operation,
+                    "completion_status": completion_status,
+                    "source_transaction_id": source_transaction_id,
                     "operation_subtype": operation_subtype,
+                    "billing_unit": billing_unit,
                     "total_cost": total_cost,
                     "error_reason": error_reason,
                     "error_code": error_code,
@@ -875,6 +997,11 @@ class AIResource(SyncAPIResource):
                     "middleware_source": middleware_source,
                     "model_source": model_source,
                     "credential_alias": credential_alias,
+                    "actual_service_tier": actual_service_tier,
+                    "requested_service_tier": requested_service_tier,
+                    "pricing_tier": pricing_tier,
+                    "priority_tier": priority_tier,
+                    "cost_type": cost_type,
                 },
                 ai_create_video_params.AICreateVideoParams,
             ),
@@ -901,7 +1028,11 @@ class AIResource(SyncAPIResource):
         style: str | NotGiven = NOT_GIVEN,
         format: str | NotGiven = NOT_GIVEN,
         revised_prompt_provided: bool | NotGiven = NOT_GIVEN,
+        source_image_provided: bool | NotGiven = NOT_GIVEN,
+        source_transaction_id: str | NotGiven = NOT_GIVEN,
         operation_subtype: str | NotGiven = NOT_GIVEN,
+        billing_unit: Literal["PER_IMAGE", "PER_MINUTE", "PER_SECOND", "PER_CHARACTER", "PER_TOKEN", "CREDITS"]
+        | NotGiven = NOT_GIVEN,
         total_cost: float | NotGiven = NOT_GIVEN,
         error_reason: str | NotGiven = NOT_GIVEN,
         error_code: int | NotGiven = NOT_GIVEN,
@@ -941,6 +1072,11 @@ class AIResource(SyncAPIResource):
         middleware_source: str | NotGiven = NOT_GIVEN,
         model_source: str | NotGiven = NOT_GIVEN,
         credential_alias: str | NotGiven = NOT_GIVEN,
+        actual_service_tier: str | NotGiven = NOT_GIVEN,
+        requested_service_tier: str | NotGiven = NOT_GIVEN,
+        pricing_tier: Literal["STANDARD", "BATCH"] | NotGiven = NOT_GIVEN,
+        priority_tier: str | NotGiven = NOT_GIVEN,
+        cost_type: Literal["AI"] | NotGiven = NOT_GIVEN,
         # Use the following arguments if you need to pass additional parameters to the API that aren't available via kwargs.
         # The extra values given here take precedence over values defined on the client or passed to this method.
         extra_headers: Headers | None = None,
@@ -980,7 +1116,13 @@ class AIResource(SyncAPIResource):
 
           revised_prompt_provided: Whether the AI provider returned a revised/improved version of the prompt
 
+          source_image_provided: Whether the caller supplied a source image (edit and variation operations)
+
+          source_transaction_id: Transaction ID of the source image this operation derives from (edit-and-regenerate lineage)
+
           operation_subtype: Technical classification of the image operation (e.g., 'generation', 'edit', 'variation')
+
+          billing_unit: How this operation should be billed
 
           total_cost: The total cost in USD for this image operation (overrides automatic calculation)
 
@@ -1054,6 +1196,16 @@ class AIResource(SyncAPIResource):
 
           credential_alias: Human-readable name for the API key being used
 
+          actual_service_tier: The service tier the provider actually used
+
+          requested_service_tier: The service tier requested by your application
+
+          pricing_tier: The pricing tier this image operation is billed at
+
+          priority_tier: The priority tier this image operation was queued at
+
+          cost_type: Cost type for the image operation
+
           extra_headers: Send extra headers
 
           extra_query: Add additional query parameters to the request
@@ -1080,7 +1232,10 @@ class AIResource(SyncAPIResource):
                     "style": style,
                     "format": format,
                     "revised_prompt_provided": revised_prompt_provided,
+                    "source_image_provided": source_image_provided,
+                    "source_transaction_id": source_transaction_id,
                     "operation_subtype": operation_subtype,
+                    "billing_unit": billing_unit,
                     "total_cost": total_cost,
                     "error_reason": error_reason,
                     "error_code": error_code,
@@ -1117,6 +1272,11 @@ class AIResource(SyncAPIResource):
                     "middleware_source": middleware_source,
                     "model_source": model_source,
                     "credential_alias": credential_alias,
+                    "actual_service_tier": actual_service_tier,
+                    "requested_service_tier": requested_service_tier,
+                    "pricing_tier": pricing_tier,
+                    "priority_tier": priority_tier,
+                    "cost_type": cost_type,
                 },
                 ai_create_image_params.AICreateImageParams,
             ),
@@ -1166,14 +1326,21 @@ class AsyncAIResource(AsyncAPIResource):
         total_token_count: int,
         transaction_id: str,
         agent: str | NotGiven = NOT_GIVEN,
+        billing_skipped: bool | NotGiven = NOT_GIVEN,
+        cache_creation1h_token_count: int | NotGiven = NOT_GIVEN,
+        cache_creation5m_token_count: int | NotGiven = NOT_GIVEN,
         cache_creation_token_cost: float | NotGiven = NOT_GIVEN,
         cache_creation_token_count: int | NotGiven = NOT_GIVEN,
         cache_read_token_cost: float | NotGiven = NOT_GIVEN,
         cache_read_token_count: int | NotGiven = NOT_GIVEN,
+        coding_assistant_account_uuid: str | NotGiven = NOT_GIVEN,
+        effort: str | NotGiven = NOT_GIVEN,
+        error_code: int | NotGiven = NOT_GIVEN,
         error_reason: str | NotGiven = NOT_GIVEN,
         input_token_cost: float | NotGiven = NOT_GIVEN,
         mediation_latency: int | NotGiven = NOT_GIVEN,
         middleware_source: str | NotGiven = NOT_GIVEN,
+        model_host: str | NotGiven = NOT_GIVEN,
         model_source: str | NotGiven = NOT_GIVEN,
         operation_type: Literal["CHAT", "GENERATE", "EMBED", "CLASSIFY", "SUMMARIZE", "TRANSLATE", "TOOL_CALL", "RERANK", "SEARCH", "MODERATION", "VISION", "TRANSFORM", "GUARDRAIL", "AUDIO", "VIDEO", "IMAGE", "OTHER"]
         | NotGiven = NOT_GIVEN,
@@ -1184,7 +1351,17 @@ class AsyncAIResource(AsyncAPIResource):
         product_name: str | NotGiven = NOT_GIVEN,
         reasoning_token_count: int | NotGiven = NOT_GIVEN,
         response_quality_score: float | NotGiven = NOT_GIVEN,
+        skip_reason: Literal[
+            "FREE_TIER",
+            "RATE_LIMITED",
+            "QUOTA_EXCEEDED",
+            "CONTENT_POLICY_VIOLATION",
+            "CAPACITY_UNAVAILABLE",
+            "SERVICE_UNAVAILABLE",
+        ]
+        | NotGiven = NOT_GIVEN,
         subscriber: ai_create_completion_params.Subscriber | NotGiven = NOT_GIVEN,
+        subscriber_email_source: str | NotGiven = NOT_GIVEN,
         subscription_id: str | NotGiven = NOT_GIVEN,
         system_fingerprint: str | NotGiven = NOT_GIVEN,
         task_type: str | NotGiven = NOT_GIVEN,
@@ -1219,6 +1396,11 @@ class AsyncAIResource(AsyncAPIResource):
         input_messages: str | NotGiven = NOT_GIVEN,
         output_response: str | NotGiven = NOT_GIVEN,
         prompts_truncated: bool | NotGiven = NOT_GIVEN,
+        actual_service_tier: str | NotGiven = NOT_GIVEN,
+        requested_service_tier: str | NotGiven = NOT_GIVEN,
+        pricing_tier: Literal["STANDARD", "BATCH"] | NotGiven = NOT_GIVEN,
+        subscription_tier: str | NotGiven = NOT_GIVEN,
+        cost_multiplier: float | NotGiven = NOT_GIVEN,
         # Use the following arguments if you need to pass additional parameters to the API that aren't available via kwargs.
         # The extra values given here take precedence over values defined on the client or passed to this method.
         extra_headers: Headers | None = None,
@@ -1259,6 +1441,16 @@ class AsyncAIResource(AsyncAPIResource):
 
           agent: The AI agent that is making the request
 
+          billing_skipped: If true, backend returns $0 cost
+
+          cache_creation1h_token_count: The number of cached creation tokens written with a 1 hour TTL. This is a
+              breakdown of cache_creation_token_count, which remains the aggregate across
+              every TTL.
+
+          cache_creation5m_token_count: The number of cached creation tokens written with a 5 minute TTL. This is a
+              breakdown of cache_creation_token_count, which remains the aggregate across
+              every TTL.
+
           cache_creation_token_cost: The cache creation token cost associated with the LLM completion. Note that if
               you send a valuefor this parameter in your request, it will override Revenium's
               automatic calculation of tokencost by AI model.
@@ -1271,6 +1463,17 @@ class AsyncAIResource(AsyncAPIResource):
 
           cache_read_token_count: The number of cached read tokens in the completion
 
+          coding_assistant_account_uuid: Unique identifier of the coding assistant account that produced this
+              completion. Caller-supplied attribution: the middleware cannot infer it, so it
+              is read from usage_metadata.
+
+          effort: The reasoning effort level requested of the model. Free-form string, not
+              an enum: the value is passed through unchanged -- it is not lowercased or
+              otherwise coerced -- and the backend validates it (at most 16 characters
+              matching ^[A-Za-z0-9_-]+$).
+
+          error_code: HTTP error code if the operation failed
+
           error_reason: The details of the error that occurred during the LLM completion
 
           input_token_cost: The input token cost associated with the LLM completion
@@ -1278,6 +1481,9 @@ class AsyncAIResource(AsyncAPIResource):
           mediation_latency: The latency, in milliseconds, of latency by an AI or API gateway
 
           middleware_source: The source middleware or SDK that generated this AI completion request
+
+          model_host: The infrastructure that billed this coding assistant invocation (e.g.
+              'bedrock', 'foundry', 'vertex', 'anthropic'), as reported by the client.
 
           model_source: The source of the AI model used for the completion
 
@@ -1300,7 +1506,15 @@ class AsyncAIResource(AsyncAPIResource):
 
           response_quality_score: The quality score of the response
 
+          skip_reason: Reason why billing was skipped. The completions endpoint accepts its own
+              member set; it is not the same list the audio, video and image endpoints
+              accept.
+
           subscriber: The subscriber metadata
+
+          subscriber_email_source: How the subscriber email attribute was sourced client-side (e.g.
+              'cli-flag', 'env', 'custom-env', 'git', 'manual'). Diagnostic provenance
+              metadata only, not the email itself.
 
           subscription_id: Unique identifier of the subscription from your own system that you wish to use
               to correlate usage between Revenium & your application.
@@ -1374,6 +1588,16 @@ class AsyncAIResource(AsyncAPIResource):
 
           transaction_name: Human-friendly name for this operation
 
+          actual_service_tier: The service tier the provider actually used
+
+          requested_service_tier: The service tier requested by your application
+
+          pricing_tier: The pricing tier this completion is billed at
+
+          subscription_tier: The subscription tier in effect for this completion
+
+          cost_multiplier: Multiplier applied to the calculated cost of this completion
+
           extra_headers: Send extra headers
 
           extra_query: Add additional query parameters to the request
@@ -1400,14 +1624,21 @@ class AsyncAIResource(AsyncAPIResource):
                     "total_token_count": total_token_count,
                     "transaction_id": transaction_id,
                     "agent": agent,
+                    "billing_skipped": billing_skipped,
+                    "cache_creation1h_token_count": cache_creation1h_token_count,
+                    "cache_creation5m_token_count": cache_creation5m_token_count,
                     "cache_creation_token_cost": cache_creation_token_cost,
                     "cache_creation_token_count": cache_creation_token_count,
                     "cache_read_token_cost": cache_read_token_cost,
                     "cache_read_token_count": cache_read_token_count,
+                    "coding_assistant_account_uuid": coding_assistant_account_uuid,
+                    "effort": effort,
+                    "error_code": error_code,
                     "error_reason": error_reason,
                     "input_token_cost": input_token_cost,
                     "mediation_latency": mediation_latency,
                     "middleware_source": middleware_source,
+                    "model_host": model_host,
                     "model_source": model_source,
                     "operation_type": operation_type,
                     "organization_name": organization_name if organization_name is not NOT_GIVEN else organization_id,
@@ -1415,7 +1646,9 @@ class AsyncAIResource(AsyncAPIResource):
                     "product_name": product_name if product_name is not NOT_GIVEN else product_id,
                     "reasoning_token_count": reasoning_token_count,
                     "response_quality_score": response_quality_score,
+                    "skip_reason": skip_reason,
                     "subscriber": subscriber,
+                    "subscriber_email_source": subscriber_email_source,
                     "subscription_id": subscription_id,
                     "system_fingerprint": system_fingerprint,
                     "task_type": task_type,
@@ -1450,6 +1683,11 @@ class AsyncAIResource(AsyncAPIResource):
                     "input_messages": input_messages,
                     "output_response": output_response,
                     "prompts_truncated": prompts_truncated,
+                    "actual_service_tier": actual_service_tier,
+                    "requested_service_tier": requested_service_tier,
+                    "pricing_tier": pricing_tier,
+                    "subscription_tier": subscription_tier,
+                    "cost_multiplier": cost_multiplier,
                 },
                 ai_create_completion_params.AICreateCompletionParams,
             ),
@@ -1525,6 +1763,10 @@ class AsyncAIResource(AsyncAPIResource):
         middleware_source: str | NotGiven = NOT_GIVEN,
         model_source: str | NotGiven = NOT_GIVEN,
         credential_alias: str | NotGiven = NOT_GIVEN,
+        actual_service_tier: str | NotGiven = NOT_GIVEN,
+        requested_service_tier: str | NotGiven = NOT_GIVEN,
+        pricing_tier: Literal["STANDARD", "BATCH"] | NotGiven = NOT_GIVEN,
+        cost_type: Literal["AI"] | NotGiven = NOT_GIVEN,
         # Use the following arguments if you need to pass additional parameters to the API that aren't available via kwargs.
         # The extra values given here take precedence over values defined on the client or passed to this method.
         extra_headers: Headers | None = None,
@@ -1656,6 +1898,14 @@ class AsyncAIResource(AsyncAPIResource):
 
           credential_alias: Human-readable name for the API key being used
 
+          actual_service_tier: The service tier the provider actually used
+
+          requested_service_tier: The service tier requested by your application
+
+          pricing_tier: The pricing tier this audio operation is billed at
+
+          cost_type: Cost type for the audio operation
+
           extra_headers: Send extra headers
 
           extra_query: Add additional query parameters to the request
@@ -1728,6 +1978,10 @@ class AsyncAIResource(AsyncAPIResource):
                     "middleware_source": middleware_source,
                     "model_source": model_source,
                     "credential_alias": credential_alias,
+                    "actual_service_tier": actual_service_tier,
+                    "requested_service_tier": requested_service_tier,
+                    "pricing_tier": pricing_tier,
+                    "cost_type": cost_type,
                 },
                 ai_create_audio_params.AICreateAudioParams,
             ),
@@ -1755,7 +2009,11 @@ class AsyncAIResource(AsyncAPIResource):
         aspect_ratio: str | NotGiven = NOT_GIVEN,
         video_job_id: str | NotGiven = NOT_GIVEN,
         async_operation: bool | NotGiven = NOT_GIVEN,
+        completion_status: Literal["SUCCESS", "PARTIAL_TIMEOUT", "FAILED"] | NotGiven = NOT_GIVEN,
+        source_transaction_id: str | NotGiven = NOT_GIVEN,
         operation_subtype: str | NotGiven = NOT_GIVEN,
+        billing_unit: Literal["PER_IMAGE", "PER_MINUTE", "PER_SECOND", "PER_CHARACTER", "PER_TOKEN", "CREDITS"]
+        | NotGiven = NOT_GIVEN,
         total_cost: float | NotGiven = NOT_GIVEN,
         error_reason: str | NotGiven = NOT_GIVEN,
         error_code: int | NotGiven = NOT_GIVEN,
@@ -1795,6 +2053,11 @@ class AsyncAIResource(AsyncAPIResource):
         middleware_source: str | NotGiven = NOT_GIVEN,
         model_source: str | NotGiven = NOT_GIVEN,
         credential_alias: str | NotGiven = NOT_GIVEN,
+        actual_service_tier: str | NotGiven = NOT_GIVEN,
+        requested_service_tier: str | NotGiven = NOT_GIVEN,
+        pricing_tier: Literal["STANDARD", "BATCH"] | NotGiven = NOT_GIVEN,
+        priority_tier: str | NotGiven = NOT_GIVEN,
+        cost_type: Literal["AI"] | NotGiven = NOT_GIVEN,
         # Use the following arguments if you need to pass additional parameters to the API that aren't available via kwargs.
         # The extra values given here take precedence over values defined on the client or passed to this method.
         extra_headers: Headers | None = None,
@@ -1836,7 +2099,13 @@ class AsyncAIResource(AsyncAPIResource):
 
           async_operation: Whether this was an asynchronous video generation operation
 
+          completion_status: Terminal status of the video generation job
+
+          source_transaction_id: Transaction ID of the source video this operation derives from (edit-and-regenerate lineage)
+
           operation_subtype: Technical classification of the video operation (e.g., 'generation', 'editing')
+
+          billing_unit: How this operation should be billed
 
           total_cost: The total cost in USD for this video operation (overrides automatic calculation)
 
@@ -1910,6 +2179,16 @@ class AsyncAIResource(AsyncAPIResource):
 
           credential_alias: Human-readable name for the API key being used
 
+          actual_service_tier: The service tier the provider actually used
+
+          requested_service_tier: The service tier requested by your application
+
+          pricing_tier: The pricing tier this video operation is billed at
+
+          priority_tier: The priority tier this video operation was queued at
+
+          cost_type: Cost type for the video operation
+
           extra_headers: Send extra headers
 
           extra_query: Add additional query parameters to the request
@@ -1937,7 +2216,10 @@ class AsyncAIResource(AsyncAPIResource):
                     "aspect_ratio": aspect_ratio,
                     "video_job_id": video_job_id,
                     "async_operation": async_operation,
+                    "completion_status": completion_status,
+                    "source_transaction_id": source_transaction_id,
                     "operation_subtype": operation_subtype,
+                    "billing_unit": billing_unit,
                     "total_cost": total_cost,
                     "error_reason": error_reason,
                     "error_code": error_code,
@@ -1974,6 +2256,11 @@ class AsyncAIResource(AsyncAPIResource):
                     "middleware_source": middleware_source,
                     "model_source": model_source,
                     "credential_alias": credential_alias,
+                    "actual_service_tier": actual_service_tier,
+                    "requested_service_tier": requested_service_tier,
+                    "pricing_tier": pricing_tier,
+                    "priority_tier": priority_tier,
+                    "cost_type": cost_type,
                 },
                 ai_create_video_params.AICreateVideoParams,
             ),
@@ -2000,7 +2287,11 @@ class AsyncAIResource(AsyncAPIResource):
         style: str | NotGiven = NOT_GIVEN,
         format: str | NotGiven = NOT_GIVEN,
         revised_prompt_provided: bool | NotGiven = NOT_GIVEN,
+        source_image_provided: bool | NotGiven = NOT_GIVEN,
+        source_transaction_id: str | NotGiven = NOT_GIVEN,
         operation_subtype: str | NotGiven = NOT_GIVEN,
+        billing_unit: Literal["PER_IMAGE", "PER_MINUTE", "PER_SECOND", "PER_CHARACTER", "PER_TOKEN", "CREDITS"]
+        | NotGiven = NOT_GIVEN,
         total_cost: float | NotGiven = NOT_GIVEN,
         error_reason: str | NotGiven = NOT_GIVEN,
         error_code: int | NotGiven = NOT_GIVEN,
@@ -2040,6 +2331,11 @@ class AsyncAIResource(AsyncAPIResource):
         middleware_source: str | NotGiven = NOT_GIVEN,
         model_source: str | NotGiven = NOT_GIVEN,
         credential_alias: str | NotGiven = NOT_GIVEN,
+        actual_service_tier: str | NotGiven = NOT_GIVEN,
+        requested_service_tier: str | NotGiven = NOT_GIVEN,
+        pricing_tier: Literal["STANDARD", "BATCH"] | NotGiven = NOT_GIVEN,
+        priority_tier: str | NotGiven = NOT_GIVEN,
+        cost_type: Literal["AI"] | NotGiven = NOT_GIVEN,
         # Use the following arguments if you need to pass additional parameters to the API that aren't available via kwargs.
         # The extra values given here take precedence over values defined on the client or passed to this method.
         extra_headers: Headers | None = None,
@@ -2079,7 +2375,13 @@ class AsyncAIResource(AsyncAPIResource):
 
           revised_prompt_provided: Whether the AI provider returned a revised/improved version of the prompt
 
+          source_image_provided: Whether the caller supplied a source image (edit and variation operations)
+
+          source_transaction_id: Transaction ID of the source image this operation derives from (edit-and-regenerate lineage)
+
           operation_subtype: Technical classification of the image operation (e.g., 'generation', 'edit', 'variation')
+
+          billing_unit: How this operation should be billed
 
           total_cost: The total cost in USD for this image operation (overrides automatic calculation)
 
@@ -2153,6 +2455,16 @@ class AsyncAIResource(AsyncAPIResource):
 
           credential_alias: Human-readable name for the API key being used
 
+          actual_service_tier: The service tier the provider actually used
+
+          requested_service_tier: The service tier requested by your application
+
+          pricing_tier: The pricing tier this image operation is billed at
+
+          priority_tier: The priority tier this image operation was queued at
+
+          cost_type: Cost type for the image operation
+
           extra_headers: Send extra headers
 
           extra_query: Add additional query parameters to the request
@@ -2179,7 +2491,10 @@ class AsyncAIResource(AsyncAPIResource):
                     "style": style,
                     "format": format,
                     "revised_prompt_provided": revised_prompt_provided,
+                    "source_image_provided": source_image_provided,
+                    "source_transaction_id": source_transaction_id,
                     "operation_subtype": operation_subtype,
+                    "billing_unit": billing_unit,
                     "total_cost": total_cost,
                     "error_reason": error_reason,
                     "error_code": error_code,
@@ -2216,6 +2531,11 @@ class AsyncAIResource(AsyncAPIResource):
                     "middleware_source": middleware_source,
                     "model_source": model_source,
                     "credential_alias": credential_alias,
+                    "actual_service_tier": actual_service_tier,
+                    "requested_service_tier": requested_service_tier,
+                    "pricing_tier": pricing_tier,
+                    "priority_tier": priority_tier,
+                    "cost_type": cost_type,
                 },
                 ai_create_image_params.AICreateImageParams,
             ),

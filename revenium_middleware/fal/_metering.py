@@ -18,6 +18,9 @@ from revenium_middleware._core.fields import (
     extract_org_and_product,
     extract_common_metadata,
     extract_agentic_job_fields,
+    extract_media_lineage_fields,
+    extract_service_tier_fields,
+    extract_effort_field,
     merge_extra_body,
 )
 from .trace_fields import (
@@ -289,6 +292,7 @@ def handle_metering(
             # Omit-if-unset: an explicit null would reach the wire, unlike
             # the NotGiven default of the typed client methods.
             ticket_id = get_ticket_id(usage_metadata)
+            lineage_fields = extract_media_lineage_fields(usage_metadata)
 
             logger.debug(
                 "Metering fal.ai call - application: %s, media_type: %s",
@@ -309,6 +313,10 @@ def handle_metering(
                 }
                 if ticket_id:
                     image_args["ticket_id"] = ticket_id
+                image_args.update(lineage_fields)
+                image_args.update(
+                    extract_service_tier_fields(usage_metadata, "image")
+                )
                 metering_result = submit_ai_event("image", image_args)
             elif media_type == "video":
                 video_fields = extract_video_fields(result, arguments)
@@ -324,6 +332,10 @@ def handle_metering(
                 }
                 if ticket_id:
                     video_args["ticket_id"] = ticket_id
+                video_args.update(lineage_fields)
+                video_args.update(
+                    extract_service_tier_fields(usage_metadata, "video")
+                )
                 metering_result = submit_ai_event("video", video_args)
             elif media_type == "audio":
                 audio_fields = extract_audio_fields(result, arguments)
@@ -336,6 +348,9 @@ def handle_metering(
                 }
                 if ticket_id:
                     audio_args["ticket_id"] = ticket_id
+                audio_args.update(
+                    extract_service_tier_fields(usage_metadata, "audio")
+                )
                 metering_result = submit_ai_event("audio", audio_args)
             else:
                 completion_args = {
@@ -354,6 +369,10 @@ def handle_metering(
                 }
                 if ticket_id:
                     completion_args["ticket_id"] = ticket_id
+                completion_args.update(
+                    extract_service_tier_fields(usage_metadata, "completion")
+                )
+                completion_args.update(extract_effort_field(usage_metadata))
                 metering_result = submit_ai_event("completion", completion_args)
 
             logger.debug("Metering call result: %s", metering_result)

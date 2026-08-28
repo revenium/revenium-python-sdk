@@ -50,6 +50,9 @@ class AICreateVideoParams(TypedDict, total=False):
     resolution: str
     """Video resolution (e.g., '1080p', '720p', '4K')"""
 
+    # aspect_ratio is not in the published spec; kept pending confirmation from
+    # the metering API owners that the ingest API still accepts it. Never
+    # removed on spec evidence alone.
     aspect_ratio: Annotated[str, PropertyInfo(alias="aspectRatio")]
     """Aspect ratio of the generated video (e.g., '16:9')"""
 
@@ -59,8 +62,23 @@ class AICreateVideoParams(TypedDict, total=False):
     async_operation: Annotated[bool, PropertyInfo(alias="asyncOperation")]
     """Whether this was an asynchronous video generation operation"""
 
+    completion_status: Annotated[
+        Literal["SUCCESS", "PARTIAL_TIMEOUT", "FAILED"],
+        PropertyInfo(alias="completionStatus")
+    ]
+    """Terminal status of the video generation job"""
+
+    source_transaction_id: Annotated[str, PropertyInfo(alias="sourceTransactionId")]
+    """Transaction ID of the source video this operation derives from (edit-and-regenerate lineage)"""
+
     operation_subtype: Annotated[str, PropertyInfo(alias="operationSubtype")]
     """Technical classification of the video operation (e.g., 'generation', 'editing')"""
+
+    billing_unit: Annotated[
+        Literal["PER_IMAGE", "PER_MINUTE", "PER_SECOND", "PER_CHARACTER", "PER_TOKEN", "CREDITS"],
+        PropertyInfo(alias="billingUnit")
+    ]
+    """How this operation should be billed"""
 
     # Cost and error fields
     total_cost: Annotated[float, PropertyInfo(alias="totalCost")]
@@ -85,13 +103,15 @@ class AICreateVideoParams(TypedDict, total=False):
     subscriber: Subscriber
     """The subscriber metadata"""
 
-    # Undocumented in the current published spec but still accepted and sent;
-    # keep until the backend confirms its fate. Never removed on spec evidence alone.
+    # Flat form is not in the published spec but is still populated on live
+    # traffic from the same usage_metadata key _core/subscriber.py reads;
+    # removal pending confirmation from the metering API owners.
     subscriber_email: Annotated[str, PropertyInfo(alias="subscriberEmail")]
     """The email address of the subscriber"""
 
-    # Undocumented in the current published spec but still accepted and sent;
-    # keep until the backend confirms its fate. Never removed on spec evidence alone.
+    # Flat form is not in the published spec but is still populated on live
+    # traffic from the same usage_metadata key _core/subscriber.py reads;
+    # removal pending confirmation from the metering API owners.
     subscriber_id: Annotated[str, PropertyInfo(alias="subscriberId")]
     """Unique identifier for the subscriber"""
 
@@ -105,8 +125,9 @@ class AICreateVideoParams(TypedDict, total=False):
     Example: "AcmeCorp", "Engineering-Dept"
     """
 
-    # Undocumented in the current published spec; deprecated in favor of the
-    # *_name variant but still accepted. Keep until removal is confirmed server-side.
+    # Deprecated in favor of organization_name and not in the published spec,
+    # but _core/fields.py still resolves it from usage_metadata on live
+    # traffic; removal pending confirmation from the metering API owners.
     organization_id: Annotated[str, PropertyInfo(alias="organizationId")]
     """
     DEPRECATED: Use organization_name instead. This field will be removed in a future version.
@@ -120,8 +141,9 @@ class AICreateVideoParams(TypedDict, total=False):
     Example: "chatbot", "email-assistant"
     """
 
-    # Undocumented in the current published spec; deprecated in favor of the
-    # *_name variant but still accepted. Keep until removal is confirmed server-side.
+    # Deprecated in favor of product_name and not in the published spec, but
+    # _core/fields.py still resolves it from usage_metadata on live traffic;
+    # removal pending confirmation from the metering API owners.
     product_id: Annotated[str, PropertyInfo(alias="productId")]
     """
     DEPRECATED: Use product_name instead. This field will be removed in a future version.
@@ -204,10 +226,29 @@ class AICreateVideoParams(TypedDict, total=False):
     model_source: Annotated[str, PropertyInfo(alias="modelSource")]
     """The source of the AI model used"""
 
-    # Undocumented in the current published spec but still accepted and sent;
-    # keep until the backend confirms its fate. Never removed on spec evidence alone.
+    # Sent on every metered call although it is not in the published spec:
+    # _core/trace_fields.py::get_credential_alias() supplies the value on
+    # live traffic; removal pending confirmation from the metering API owners.
     credential_alias: Annotated[str, PropertyInfo(alias="credentialAlias")]
     """Human-readable name for the API key being used"""
+
+    # Service tier and pricing fields
+    actual_service_tier: Annotated[str, PropertyInfo(alias="actualServiceTier")]
+    """The service tier the provider actually used"""
+
+    requested_service_tier: Annotated[str, PropertyInfo(alias="requestedServiceTier")]
+    """The service tier requested by your application"""
+
+    pricing_tier: Annotated[Literal["STANDARD", "BATCH"], PropertyInfo(alias="pricingTier")]
+    """The pricing tier this video operation is billed at"""
+
+    priority_tier: Annotated[str, PropertyInfo(alias="priorityTier")]
+    """The priority tier this video operation was queued at"""
+
+    # Optional here, unlike the completion params: the video path has no
+    # client-side invariant that a cost type is always supplied.
+    cost_type: Annotated[Literal["AI"], PropertyInfo(alias="costType")]
+    """Cost type for the video operation"""
 
 
 class SubscriberCredential(TypedDict, total=False):

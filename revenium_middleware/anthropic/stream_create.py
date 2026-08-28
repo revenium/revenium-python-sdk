@@ -10,6 +10,8 @@ still metered.
 
 import logging
 
+from revenium_middleware._core.cache_tokens import extract_cache_creation_ttl_counts
+
 logger = logging.getLogger("revenium_middleware.anthropic")
 
 
@@ -17,7 +19,9 @@ class StreamUsageState:
     """Usage accumulated from raw stream events.
 
     input tokens / id / model arrive on message_start; output tokens (cumulative)
-    and stop_reason arrive on message_delta events.
+    and stop_reason arrive on message_delta events. The per-TTL cache-creation
+    breakdown also arrives on message_start, and stays empty when the response
+    carries no split.
     """
 
     def __init__(self):
@@ -27,6 +31,7 @@ class StreamUsageState:
         self.output_tokens = 0
         self.cache_creation_input_tokens = 0
         self.cache_read_input_tokens = 0
+        self.cache_creation_ttl_counts = {}
         self.stop_reason = None
         self.first_event_time_dt = None
         self.saw_message_start = False
@@ -47,6 +52,7 @@ class StreamUsageState:
                     self.output_tokens = getattr(usage, "output_tokens", 0) or 0
                     self.cache_creation_input_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
                     self.cache_read_input_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
+                    self.cache_creation_ttl_counts = extract_cache_creation_ttl_counts(usage)
                 self.saw_message_start = True
             elif event_type == "message_delta":
                 usage = getattr(event, "usage", None)

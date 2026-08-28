@@ -35,6 +35,13 @@ from ._core.outcomes import (
 
 logger = logging.getLogger(__name__)
 
+# The ingest API caps outcomeReason at 2048 characters (a Jakarta @Size
+# constraint on the request schema); anything longer fails the WHOLE request
+# with a 400. The auto-FAILED safety net must never trade "outcome recorded"
+# for "full exception text", so it truncates to the cap before sending.
+_OUTCOME_REASON_MAX_LEN = 2048
+
+
 _VALID_EXECUTION_STATUSES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
 _DEFAULT_PROFITSTREAM_BASE_URL = "https://api.revenium.io"
 
@@ -268,8 +275,14 @@ class JobContext:
         outcome_currency: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         reported_by: Optional[str] = None,
+        outcome_reason: Optional[str] = None,
     ) -> None:
         """Report the job's terminal business outcome.
+
+        ``outcome_reason`` (wire field ``outcomeReason``) is the prescribed field
+        for the business explanation of a FAILED or CANCELLED job — pass it here
+        instead of encoding the reason inside ``metadata``. The ingest API caps
+        it at 2048 characters and rejects longer values with a 400.
 
         Raises:
             ValueError: invalid ``execution_status``, ``outcome_value`` without
@@ -293,16 +306,15 @@ class JobContext:
         team_id = self._resolve_team_id(api_key)
 
         payload: Dict[str, Any] = {"executionStatus": execution_status}
-        if outcome_type is not None:
-            payload["outcomeType"] = outcome_type
-        if outcome_value is not None:
-            payload["outcomeValue"] = float(outcome_value)
-        if outcome_currency is not None:
-            payload["outcomeCurrency"] = outcome_currency
-        if metadata is not None:
-            payload["metadata"] = json.dumps(metadata)
-        if reported_by is not None:
-            payload["reportedBy"] = reported_by
+        self._add_optional_outcome_fields(
+            payload,
+            outcome_type=outcome_type,
+            outcome_value=outcome_value,
+            outcome_currency=outcome_currency,
+            metadata=metadata,
+            reported_by=reported_by,
+            outcome_reason=outcome_reason,
+        )
 
         try:
             report_outcome_request(
@@ -330,11 +342,19 @@ class JobContext:
         outcome_currency: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         reported_by: Optional[str] = None,
+        outcome_reason: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Amend a previously-reported outcome (PATCH; outcomes are amendable).
 
         Returns the parsed job resource as a dict (the backend's JobResource
         JSON; this SDK does not define a typed JobResource class).
+
+        ``outcome_reason`` (wire field ``outcomeReason``) is the prescribed field
+        for the outcome's business failure explanation — not to be confused with
+        ``reason``, which is this amendment's audit justification. Omit it to
+        leave the stored value untouched; pass an empty string to clear it. The
+        ingest API caps it at 2048 characters and rejects longer values with a
+        400.
 
         Raises:
             ValueError: blank ``reason``, invalid ``execution_status``, or a
@@ -362,16 +382,15 @@ class JobContext:
         payload: Dict[str, Any] = {"reason": reason}
         if execution_status is not None:
             payload["executionStatus"] = execution_status
-        if outcome_type is not None:
-            payload["outcomeType"] = outcome_type
-        if outcome_value is not None:
-            payload["outcomeValue"] = float(outcome_value)
-        if outcome_currency is not None:
-            payload["outcomeCurrency"] = outcome_currency
-        if metadata is not None:
-            payload["metadata"] = json.dumps(metadata)
-        if reported_by is not None:
-            payload["reportedBy"] = reported_by
+        self._add_optional_outcome_fields(
+            payload,
+            outcome_type=outcome_type,
+            outcome_value=outcome_value,
+            outcome_currency=outcome_currency,
+            metadata=metadata,
+            reported_by=reported_by,
+            outcome_reason=outcome_reason,
+        )
 
         response = amend_outcome_request(
             self._http(),
@@ -390,6 +409,37 @@ class JobContext:
             return {}
 
     # ------------------------------------------------------------------ internals
+
+    @staticmethod
+    def _add_optional_outcome_fields(
+        payload: Dict[str, Any],
+        *,
+        outcome_type: Optional[str],
+        outcome_value: Optional[float],
+        outcome_currency: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+        reported_by: Optional[str],
+        outcome_reason: Optional[str],
+    ) -> None:
+        """Add the optional outcome fields the POST and PATCH bodies share.
+
+        Every field is tested with ``is not None`` rather than truthiness: the
+        amendment contract distinguishes an omitted key (leave the stored value
+        untouched) from an empty string (clear it), and ``0.0`` is a legitimate
+        outcome value.
+        """
+        if outcome_type is not None:
+            payload["outcomeType"] = outcome_type
+        if outcome_value is not None:
+            payload["outcomeValue"] = float(outcome_value)
+        if outcome_currency is not None:
+            payload["outcomeCurrency"] = outcome_currency
+        if metadata is not None:
+            payload["metadata"] = json.dumps(metadata)
+        if reported_by is not None:
+            payload["reportedBy"] = reported_by
+        if outcome_reason is not None:
+            payload["outcomeReason"] = outcome_reason
 
     def _http(self) -> httpx.Client:
         if self._http_client is None:
@@ -432,6 +482,7 @@ class JobContext:
             self.report_outcome(
                 execution_status="FAILED",
                 metadata={"error": str(exc), "errorType": exc.__class__.__name__},
+                outcome_reason=str(exc)[:_OUTCOME_REASON_MAX_LEN],
             )
         except Exception as report_exc:  # noqa: BLE001 — must never mask the user's exception
             logger.warning(
@@ -475,6 +526,7 @@ class JobContext:
             "metadata": json.dumps(
                 {"error": str(exc), "errorType": exc.__class__.__name__}
             ),
+            "outcomeReason": str(exc)[:_OUTCOME_REASON_MAX_LEN],
         }
 
         def _report() -> None:

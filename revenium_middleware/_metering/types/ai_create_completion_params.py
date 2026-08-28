@@ -68,6 +68,23 @@ class AICreateCompletionParams(TypedDict, total=False):
     agent: str
     """The AI agent that is making the request"""
 
+    billing_skipped: Annotated[bool, PropertyInfo(alias="billingSkipped")]
+    """If true, backend returns $0 cost"""
+
+    cache_creation1h_token_count: Annotated[int, PropertyInfo(alias="cacheCreation1hTokenCount")]
+    """The number of cached creation tokens written with a 1 hour TTL.
+
+    This is a breakdown of cache_creation_token_count, which remains the
+    aggregate across every TTL.
+    """
+
+    cache_creation5m_token_count: Annotated[int, PropertyInfo(alias="cacheCreation5mTokenCount")]
+    """The number of cached creation tokens written with a 5 minute TTL.
+
+    This is a breakdown of cache_creation_token_count, which remains the
+    aggregate across every TTL.
+    """
+
     cache_creation_token_cost: Annotated[float, PropertyInfo(alias="cacheCreationTokenCost")]
     """The cache creation token cost associated with the LLM completion.
 
@@ -88,6 +105,28 @@ class AICreateCompletionParams(TypedDict, total=False):
     cache_read_token_count: Annotated[int, PropertyInfo(alias="cacheReadTokenCount")]
     """The number of cached read tokens in the completion"""
 
+    # Caller-supplied attribution resolved from usage_metadata via the
+    # CODING_ASSISTANT_FIELD_MAP alias table in _core/fields.py.
+    coding_assistant_account_uuid: Annotated[str, PropertyInfo(alias="codingAssistantAccountUuid")]
+    """
+    Unique identifier of the coding assistant account that produced this
+    completion. Caller-supplied attribution: the middleware cannot infer it.
+    """
+
+    effort: str
+    """The reasoning effort level requested of the model for this completion.
+
+    A free-form string rather than an enum: vendor vocabularies differ and
+    drift (low, medium, high, xhigh, ultra all appear in real traffic), so the
+    SDK passes the caller's value through unchanged -- it is not lowercased or
+    otherwise coerced -- and the backend owns validation (at most 16 characters
+    matching ^[A-Za-z0-9_-]+$). Distinct from reasoning_token_count, which
+    counts the tokens actually spent rather than the level requested.
+    """
+
+    error_code: Annotated[int, PropertyInfo(alias="errorCode")]
+    """HTTP error code if the operation failed"""
+
     error_reason: Annotated[str, PropertyInfo(alias="errorReason")]
     """The details of the error that occurred during the LLM completion"""
 
@@ -99,6 +138,12 @@ class AICreateCompletionParams(TypedDict, total=False):
 
     middleware_source: Annotated[str, PropertyInfo(alias="middlewareSource")]
     """The source middleware or SDK that generated this AI completion request"""
+
+    model_host: Annotated[str, PropertyInfo(alias="modelHost")]
+    """
+    The infrastructure that billed this coding assistant invocation (e.g.
+    'bedrock', 'foundry', 'vertex', 'anthropic'), as reported by the client.
+    """
 
     model_source: Annotated[str, PropertyInfo(alias="modelSource")]
     """The source of the AI model used for the completion"""
@@ -119,8 +164,9 @@ class AICreateCompletionParams(TypedDict, total=False):
     for the entire organization broken down by subscriber.
     """
 
-    # Undocumented in the current published spec; deprecated in favor of the
-    # *_name variant but still accepted. Keep until removal is confirmed server-side.
+    # Deprecated in favor of organization_name and not in the published spec,
+    # but _core/fields.py still resolves it from usage_metadata on live
+    # traffic; removal pending confirmation from the metering API owners.
     organization_id: Annotated[str, PropertyInfo(alias="organizationId")]
     """
     DEPRECATED: Use organization_name instead. This field will be removed in a future version.
@@ -147,8 +193,9 @@ class AICreateCompletionParams(TypedDict, total=False):
     a NAME (e.g., "chatbot", "email-assistant", "code-analyzer"), not an ID.
     """
 
-    # Undocumented in the current published spec; deprecated in favor of the
-    # *_name variant but still accepted. Keep until removal is confirmed server-side.
+    # Deprecated in favor of product_name and not in the published spec, but
+    # _core/fields.py still resolves it from usage_metadata on live traffic;
+    # removal pending confirmation from the metering API owners.
     product_id: Annotated[str, PropertyInfo(alias="productId")]
     """
     DEPRECATED: Use product_name instead. This field will be removed in a future version.
@@ -164,8 +211,32 @@ class AICreateCompletionParams(TypedDict, total=False):
     response_quality_score: Annotated[float, PropertyInfo(alias="responseQualityScore")]
     """The quality score of the response"""
 
+    skip_reason: Annotated[
+        Literal[
+            "FREE_TIER",
+            "RATE_LIMITED",
+            "QUOTA_EXCEEDED",
+            "CONTENT_POLICY_VIOLATION",
+            "CAPACITY_UNAVAILABLE",
+            "SERVICE_UNAVAILABLE",
+        ],
+        PropertyInfo(alias="skipReason"),
+    ]
+    """Reason why billing was skipped.
+
+    The completions endpoint accepts its own member set; it is not the same
+    list the audio, video and image endpoints accept.
+    """
+
     subscriber: Subscriber
     """The subscriber metadata"""
+
+    subscriber_email_source: Annotated[str, PropertyInfo(alias="subscriberEmailSource")]
+    """
+    How the subscriber email attribute was sourced client-side (e.g. 'cli-flag',
+    'env', 'custom-env', 'git', 'manual'). Diagnostic provenance metadata only,
+    not the email itself.
+    """
 
     subscription_id: Annotated[str, PropertyInfo(alias="subscriptionId")]
     """
@@ -203,8 +274,9 @@ class AICreateCompletionParams(TypedDict, total=False):
     trace_id: Annotated[str, PropertyInfo(alias="traceId")]
     """Trace multiple LLM calls belonging to same overall request"""
 
-    # Undocumented in the current published spec but still accepted and sent;
-    # keep until the backend confirms its fate. Never removed on spec evidence alone.
+    # Sent on every metered call although it is not in the published spec:
+    # _core/trace_fields.py::get_credential_alias() supplies the value on
+    # live traffic; removal pending confirmation from the metering API owners.
     credential_alias: Annotated[str, PropertyInfo(alias="credentialAlias")]
     """Human-readable name for the API key being used"""
 
@@ -285,6 +357,22 @@ class AICreateCompletionParams(TypedDict, total=False):
 
     prompts_truncated: Annotated[bool, PropertyInfo(alias="promptsTruncated")]
     """Indicates if any prompt or response field was truncated due to length limits"""
+
+    # Service tier and pricing fields
+    actual_service_tier: Annotated[str, PropertyInfo(alias="actualServiceTier")]
+    """The service tier the provider actually used"""
+
+    requested_service_tier: Annotated[str, PropertyInfo(alias="requestedServiceTier")]
+    """The service tier requested by your application"""
+
+    pricing_tier: Annotated[Literal["STANDARD", "BATCH"], PropertyInfo(alias="pricingTier")]
+    """The pricing tier this completion is billed at"""
+
+    subscription_tier: Annotated[str, PropertyInfo(alias="subscriptionTier")]
+    """The subscription tier in effect for this completion"""
+
+    cost_multiplier: Annotated[float, PropertyInfo(alias="costMultiplier")]
+    """Multiplier applied to the calculated cost of this completion"""
 
 
 class SubscriberCredential(TypedDict, total=False):
