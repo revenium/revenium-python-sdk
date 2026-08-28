@@ -82,6 +82,11 @@ def openai_basic_example():
             "task_type": "explanation-request",
             "trace_id": f"session-{int(time.time() * 1000)}",
 
+            # Reasoning effort requested of the model (optional).
+            # Free-form string, not an enum: pass whatever level the provider
+            # was asked for and Revenium stores it as-is.
+            "effort": "high",
+
             # Custom fields (optional)
             "agent": "openai-python-basic",
             "response_quality_score": 0.95

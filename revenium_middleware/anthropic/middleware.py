@@ -19,8 +19,9 @@ from .bedrock_adapter import (
 # Import decorator support and metering client from core package
 from revenium_middleware import client, run_async_in_thread, shutdown_event, merge_metadata
 from revenium_middleware._core import submit_ai_event
+from revenium_middleware._core.cache_tokens import extract_cache_creation_ttl_counts
 from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
-from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, merge_extra_body
+from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, extract_effort_field, merge_extra_body
 from revenium_middleware._core.config import is_selective_metering_enabled, is_capture_prompts_enabled
 from revenium_middleware._core.context import is_inside_decorated_function
 from revenium_middleware._core.patch_registry import register_patch
@@ -221,6 +222,18 @@ def _handle_bedrock_stream_request(args, kwargs, usage_metadata, request_time_dt
     )
 
 
+def _effort_payload(trace_fields):
+    """Spread into a completion payload: an unset level contributes no key.
+
+    ``create_completion`` only drops ``NotGiven`` values when it serializes the
+    request, so handing it ``effort=None`` would put ``"effort": null`` on the
+    wire. Omitting the keyword entirely keeps the payload byte-identical to
+    what integrations sent before BACK-2710.
+    """
+    effort = trace_fields.get('effort')
+    return {} if effort is None else {'effort': effort}
+
+
 def _extract_trace_fields(usage_metadata, request_body=None):
     """
     Extract trace visualization fields from usage_metadata and environment variables.
@@ -251,6 +264,10 @@ def _extract_trace_fields(usage_metadata, request_body=None):
         get_trace_name()
     )
     ticket_id = get_ticket_id(usage_metadata)
+    # Reasoning effort is caller-supplied only and forwarded verbatim; absent
+    # metadata resolves to None, and _effort_payload() drops the key entirely
+    # at the payload sites so nothing is sent.
+    effort = extract_effort_field(usage_metadata).get('effort')
     parent_transaction_id = (
         usage_metadata.get('parentTransactionId') or
         usage_metadata.get('parent_transaction_id') or
@@ -285,6 +302,7 @@ def _extract_trace_fields(usage_metadata, request_body=None):
         'trace_type': trace_type,
         'trace_name': trace_name,
         'ticket_id': ticket_id,
+        'effort': effort,
         'parent_transaction_id': parent_transaction_id,
         'transaction_name': transaction_name,
         'retry_number': retry_number,
@@ -378,6 +396,7 @@ def _create_bedrock_metering_call(response, usage_metadata, request_time, respon
                 "trace_type": trace_fields.get('trace_type'),
                 "trace_name": trace_fields.get('trace_name'),
                 "ticket_id": trace_fields.get('ticket_id'),
+                **_effort_payload(trace_fields),
                 "parent_transaction_id": trace_fields.get('parent_transaction_id'),
                 "transaction_name": trace_fields.get('transaction_name'),
                 "retry_number": trace_fields.get('retry_number'),
@@ -510,6 +529,7 @@ def _meter_raw_stream(state, usage_metadata, request_kwargs, request_time, reque
     completion_tokens = state.output_tokens
     cache_creation_input_tokens = state.cache_creation_input_tokens
     cache_read_input_tokens = state.cache_read_input_tokens
+    cache_creation_ttl_counts = state.cache_creation_ttl_counts
     model = state.model or request_kwargs.get("model")
 
     finish_reason_map = {
@@ -555,6 +575,7 @@ def _meter_raw_stream(state, usage_metadata, request_kwargs, request_time, reque
 
             result = submit_ai_event("completion", {
                 "cache_creation_token_count": cache_creation_input_tokens,
+                **cache_creation_ttl_counts,
                 "cache_read_token_count": cache_read_input_tokens,
                 "input_token_cost": None,
                 "output_token_cost": None,
@@ -591,6 +612,7 @@ def _meter_raw_stream(state, usage_metadata, request_kwargs, request_time, reque
                 "trace_type": trace_fields.get('trace_type'),
                 "trace_name": trace_fields.get('trace_name'),
                 "ticket_id": trace_fields.get('ticket_id'),
+                **_effort_payload(trace_fields),
                 "parent_transaction_id": trace_fields.get('parent_transaction_id'),
                 "transaction_name": trace_fields.get('transaction_name'),
                 "retry_number": trace_fields.get('retry_number'),
@@ -700,6 +722,7 @@ if register_patch("anthropic.resources.messages.messages.Messages.create"):
         completion_tokens = response.usage.output_tokens
         cache_creation_input_tokens = response.usage.cache_creation_input_tokens
         cache_read_input_tokens = response.usage.cache_read_input_tokens
+        cache_creation_ttl_counts = extract_cache_creation_ttl_counts(response.usage)
 
         logger.debug(
             "Anthropic client.ai.create_completion token usage - prompt: %d, completion: %d, "
@@ -754,6 +777,7 @@ if register_patch("anthropic.resources.messages.messages.Messages.create"):
 
                 result = submit_ai_event("completion", {
                     "cache_creation_token_count": cache_creation_input_tokens,
+                    **cache_creation_ttl_counts,
                     "cache_read_token_count": cache_read_input_tokens,
                     "input_token_cost": None,
                     "output_token_cost": None,
@@ -790,6 +814,7 @@ if register_patch("anthropic.resources.messages.messages.Messages.create"):
                     "trace_type": trace_fields.get('trace_type'),
                     "trace_name": trace_fields.get('trace_name'),
                     "ticket_id": trace_fields.get('ticket_id'),
+                    **_effort_payload(trace_fields),
                     "parent_transaction_id": trace_fields.get('parent_transaction_id'),
                     "transaction_name": trace_fields.get('transaction_name'),
                     "retry_number": trace_fields.get('retry_number'),
@@ -882,6 +907,7 @@ if register_patch("anthropic.resources.messages.messages.AsyncMessages.create"):
             completion_tokens = response.usage.output_tokens
             cache_creation_input_tokens = response.usage.cache_creation_input_tokens
             cache_read_input_tokens = response.usage.cache_read_input_tokens
+            cache_creation_ttl_counts = extract_cache_creation_ttl_counts(response.usage)
 
             anthropic_finish_reason = None
             if response.stop_reason:
@@ -927,6 +953,7 @@ if register_patch("anthropic.resources.messages.messages.AsyncMessages.create"):
 
                     result = submit_ai_event("completion", {
                         "cache_creation_token_count": cache_creation_input_tokens,
+                        **cache_creation_ttl_counts,
                         "cache_read_token_count": cache_read_input_tokens,
                         "input_token_cost": None,
                         "output_token_cost": None,
@@ -963,6 +990,7 @@ if register_patch("anthropic.resources.messages.messages.AsyncMessages.create"):
                         "trace_type": trace_fields.get('trace_type'),
                         "trace_name": trace_fields.get('trace_name'),
                         "ticket_id": trace_fields.get('ticket_id'),
+                        **_effort_payload(trace_fields),
                         "parent_transaction_id": trace_fields.get('parent_transaction_id'),
                         "transaction_name": trace_fields.get('transaction_name'),
                         "retry_number": trace_fields.get('retry_number'),
@@ -1075,6 +1103,7 @@ if register_patch("anthropic.resources.messages.messages.Messages.stream"):
                     completion_tokens = self.final_message.usage.output_tokens
                     cache_creation_input_tokens = self.final_message.usage.cache_creation_input_tokens
                     cache_read_input_tokens = self.final_message.usage.cache_read_input_tokens
+                    cache_creation_ttl_counts = extract_cache_creation_ttl_counts(self.final_message.usage)
 
                     logger.debug(
                         "Anthropic client.messages.stream token usage - prompt: %d, completion: %d, "
@@ -1129,6 +1158,7 @@ if register_patch("anthropic.resources.messages.messages.Messages.stream"):
 
                             result = submit_ai_event("completion", {
                                 "cache_creation_token_count": cache_creation_input_tokens,
+                                **cache_creation_ttl_counts,
                                 "cache_read_token_count": cache_read_input_tokens,
                                 "input_token_cost": None,
                                 "output_token_cost": None,
@@ -1166,6 +1196,7 @@ if register_patch("anthropic.resources.messages.messages.Messages.stream"):
                                 "trace_type": trace_fields.get('trace_type'),
                                 "trace_name": trace_fields.get('trace_name'),
                                 "ticket_id": trace_fields.get('ticket_id'),
+                                **_effort_payload(trace_fields),
                                 "parent_transaction_id": trace_fields.get('parent_transaction_id'),
                                 "transaction_name": trace_fields.get('transaction_name'),
                                 "retry_number": trace_fields.get('retry_number'),

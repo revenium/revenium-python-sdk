@@ -6,13 +6,16 @@ stalling the caller for the full round-trip on a slow endpoint. They must
 dispatch fire-and-forget like AI-completion metering does.
 """
 import asyncio
+import contextlib
 import inspect
+import json
 import logging
 import time
 import warnings
 
 import pytest
 
+from revenium_middleware._core.context import _agentic_job_context, set_agentic_job_fields
 from revenium_middleware._metering import decorator as tool_metering
 from revenium_middleware._metering.decorator import configure, meter_tool, report_tool_call
 
@@ -32,11 +35,17 @@ class FakeResponse:
         return None
 
 
-class SlowHttpxStub:
-    """Stands in for the httpx module: every POST takes SLOW_SECONDS."""
+class HttpxStub:
+    """Stands in for the httpx module; every POST sleeps for ``delay`` seconds.
 
-    def __init__(self):
+    The dispatch tests need a slow endpoint to prove the caller is not blocked;
+    the payload tests only care about the posted body, so they use delay=0 and
+    stay fast.
+    """
+
+    def __init__(self, delay=SLOW_SECONDS):
         self.calls = []
+        self.delay = delay
         stub = self
 
         class Client:
@@ -50,7 +59,7 @@ class SlowHttpxStub:
                 return False
 
             def post(self, url, headers=None, json=None):
-                time.sleep(SLOW_SECONDS)
+                time.sleep(stub.delay)
                 stub.calls.append(RecordedCall(url, headers, json))
                 return FakeResponse()
 
@@ -65,7 +74,7 @@ class SlowHttpxStub:
                 return False
 
             async def post(self, url, headers=None, json=None):
-                await asyncio.sleep(SLOW_SECONDS)
+                await asyncio.sleep(stub.delay)
                 stub.calls.append(RecordedCall(url, headers, json))
                 return FakeResponse()
 
@@ -75,7 +84,22 @@ class SlowHttpxStub:
 
 @pytest.fixture()
 def slow_endpoint(monkeypatch):
-    stub = SlowHttpxStub()
+    stub = HttpxStub()
+    monkeypatch.setattr(tool_metering, "httpx", stub)
+    configure(metering_url="http://metering.test", api_key="rev_mk_test")
+    yield stub
+    configure()  # clear overrides; resolution falls back to the environment
+
+
+@pytest.fixture()
+def endpoint(monkeypatch):
+    """A metering endpoint that answers immediately, for body assertions.
+
+    Also clears REVENIUM_AGENTIC_JOB_ID so a developer machine that exports it
+    cannot make the "no job id anywhere" case pass or fail by accident.
+    """
+    monkeypatch.delenv("REVENIUM_AGENTIC_JOB_ID", raising=False)
+    stub = HttpxStub(delay=0)
     monkeypatch.setattr(tool_metering, "httpx", stub)
     configure(metering_url="http://metering.test", api_key="rev_mk_test")
     yield stub
@@ -203,3 +227,155 @@ def test_dispatch_failure_does_not_leak_unawaited_coroutine(slow_endpoint, monke
     finally:
         # Idempotent; keeps a failing run from also spewing the leak warning.
         coro.close()
+
+
+# ---------------------------------------------------------------------------
+# agenticJobId attribution (BACK-2751)
+#
+# Tool spend only joins the agentic job it belongs to if the tool event carries
+# the same agenticJobId the process already puts on its AI completions. The
+# precedence below is the completion path's precedence, reused verbatim.
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def ambient_job(job_id):
+    """Set the ambient agentic job for the block, the way JobContext does."""
+    token = set_agentic_job_fields(job_id=job_id)
+    try:
+        yield
+    finally:
+        _agentic_job_context.reset(token)
+
+
+def posted_body(stub):
+    """Return the single posted event body, waiting for the background thread."""
+    assert wait_for_calls(stub), "no tool event was posted"
+    return stub.calls[0].json
+
+
+def test_usage_metadata_snake_case_job_id_beats_context_and_env(endpoint, monkeypatch):
+    monkeypatch.setenv("REVENIUM_AGENTIC_JOB_ID", "job-from-env")
+
+    with ambient_job("job-from-context"):
+        report_tool_call(
+            tool_id="firecrawl",
+            usage_metadata={"agentic_job_id": "job-from-metadata"},
+        )
+
+    assert posted_body(endpoint)["agenticJobId"] == "job-from-metadata"
+
+
+def test_usage_metadata_camel_case_alias_resolves(endpoint):
+    report_tool_call(tool_id="firecrawl", usage_metadata={"agenticJobId": "job-camel"})
+
+    assert posted_body(endpoint)["agenticJobId"] == "job-camel"
+
+
+def test_ambient_job_context_supplies_job_id_when_metadata_is_silent(endpoint, monkeypatch):
+    # Env is set to a different value so this also pins context above env.
+    monkeypatch.setenv("REVENIUM_AGENTIC_JOB_ID", "job-from-env")
+
+    @meter_tool("firecrawl", operation="scrape")
+    def scrape(url):
+        return {"pages": 1}
+
+    with ambient_job("job-from-context"):
+        assert scrape("https://example.test") == {"pages": 1}
+
+    assert posted_body(endpoint)["agenticJobId"] == "job-from-context"
+
+
+def test_env_var_is_the_last_fallback(endpoint, monkeypatch):
+    monkeypatch.setenv("REVENIUM_AGENTIC_JOB_ID", "job-from-env")
+
+    @meter_tool("firecrawl")
+    def scrape():
+        return "ok"
+
+    assert scrape() == "ok"
+
+    assert posted_body(endpoint)["agenticJobId"] == "job-from-env"
+
+
+def test_job_id_key_is_absent_when_nothing_resolves(endpoint):
+    # The `endpoint` fixture clears REVENIUM_AGENTIC_JOB_ID; no context, no metadata.
+    @meter_tool("firecrawl")
+    def scrape():
+        return "ok"
+
+    scrape()
+
+    body = posted_body(endpoint)
+    assert "agenticJobId" not in body, "unset job id must be omitted, not sent as null"
+    # The field must not reach the wire as an explicit null either.
+    assert "agenticJobId" not in json.loads(json.dumps(body))
+
+
+def test_unusable_metadata_job_id_is_omitted_and_never_raises(endpoint):
+    # A non-string (here also unhashable) value cannot be a job id on the wire.
+    # Resolution happens inside a fire-and-forget dispatch, so it must degrade
+    # to omitting the field rather than surfacing an error to the caller.
+    @meter_tool("firecrawl", output_fields=["agentic_job_id"])
+    def scrape():
+        return {"agentic_job_id": {"nested": ["not", "a", "string"]}}
+
+    assert scrape() == {"agentic_job_id": {"nested": ["not", "a", "string"]}}
+
+    body = posted_body(endpoint)
+    assert "agenticJobId" not in body
+    # The raw metadata is still forwarded verbatim, as it always was.
+    assert body["usageMetadata"] == {"agentic_job_id": {"nested": ["not", "a", "string"]}}
+
+
+def test_non_mapping_usage_metadata_still_resolves_the_ambient_job(endpoint):
+    # report_tool_call takes whatever the caller passes; a non-mapping must not
+    # break resolution, it must simply contribute nothing to it.
+    with ambient_job("job-from-context"):
+        report_tool_call(tool_id="firecrawl", usage_metadata=["not", "a", "mapping"])
+
+    assert posted_body(endpoint)["agenticJobId"] == "job-from-context"
+
+
+class TestAgenticJobIdServerPatternGate:
+    """Ids the server's pattern rejects are dropped, not sent.
+
+    The tool-events controller validates agenticJobId against
+    JobValidation.AGENTIC_JOB_ID_PATTERN and 400s the WHOLE event on a
+    violation — and dispatch is fire-and-forget, so the event and its cost
+    would vanish silently. Dropping the field loses one call's attribution;
+    sending it loses the event.
+    """
+
+    @pytest.mark.parametrize(
+        "bad_id",
+        [
+            "has space",
+            "colon:sep",
+            "slash/sep",
+            "at@sign",
+            "-leading-dash",
+            "_leading_underscore",
+            "x" * 256,
+            "types",
+            "conversion-funnel",
+            # Python-specific traps: $ accepts a trailing newline and .match()
+            # does not require full consumption — both must still be rejected,
+            # because the server's Java matches() demands the whole string.
+            "job-1\n",
+            "job-1\nx",
+        ],
+    )
+    def test_invalid_id_is_dropped_and_event_still_posts(self, endpoint, bad_id):
+        report_tool_call(tool_id="hammer", usage_metadata={"agentic_job_id": bad_id})
+        body = posted_body(endpoint)
+        assert "agenticJobId" not in body
+        assert body["toolId"] == "hammer"
+
+    @pytest.mark.parametrize(
+        "good_id",
+        ["job-1", "A", "j.o.b_2-x", "types2", "conversion-funnel-a", "x" * 255],
+    )
+    def test_valid_id_passes_verbatim(self, endpoint, good_id):
+        report_tool_call(tool_id="hammer", usage_metadata={"agentic_job_id": good_id})
+        assert posted_body(endpoint)["agenticJobId"] == good_id

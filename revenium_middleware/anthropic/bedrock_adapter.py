@@ -785,7 +785,7 @@ class BedrockStreamWrapper:
             from .middleware import _get_thread_safe_client, _safe_run_async_in_thread
             from .trace_fields import detect_vision_content
             from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
-            from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, merge_extra_body
+            from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, extract_effort_field, merge_extra_body
 
             if shutdown_event.is_set():
                 logger.warning("Skipping metering call during shutdown")
@@ -866,6 +866,13 @@ class BedrockStreamWrapper:
                         "operation_type": "CHAT",
                         "response_quality_score": meta["response_quality_score"],
                         "middleware_source": "PYTHON",
+                        # Reasoning effort is caller-supplied and forwarded
+                        # verbatim. Spread the sparse resolver result rather
+                        # than reading a key off it: create_completion only
+                        # drops NotGiven during serialization, so an explicit
+                        # None would go on the wire as "effort": null instead
+                        # of being omitted.
+                        **extract_effort_field(self.usage_metadata),
                         "extra_body": extra_body if extra_body else None,
                     })
                     logger.debug("Metering call result for Bedrock stream: %s", result)

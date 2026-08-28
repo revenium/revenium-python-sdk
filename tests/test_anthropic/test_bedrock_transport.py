@@ -478,3 +478,33 @@ class TestReviewRegressions:
             assert field in args
         assert args["environment"] == "staging"
         assert args["ticket_id"] == "JIRA-77"
+
+    def test_payload_carries_the_reasoning_effort_level(self, transport_on):
+        """BACK-2710: effort is caller-supplied and forwarded verbatim."""
+        import revenium_middleware
+        from revenium_middleware.anthropic import middleware as anthropic_middleware
+
+        payloads = []
+        token = anthropic_middleware.usage_context.set({"effort": "xhigh"})
+        try:
+            with patch("revenium_middleware._core.submit_ai_event",
+                       side_effect=lambda op, args: payloads.append(args)), \
+                    patch.object(revenium_middleware, "run_async_in_thread",
+                                 side_effect=TestPayloadContract._run_inline):
+                call("Converse", converse_response())
+        finally:
+            anthropic_middleware.usage_context.reset(token)
+
+        assert payloads[0]["effort"] == "xhigh"
+
+    def test_payload_omits_effort_without_caller_metadata(self, transport_on):
+        import revenium_middleware
+
+        payloads = []
+        with patch("revenium_middleware._core.submit_ai_event",
+                   side_effect=lambda op, args: payloads.append(args)), \
+                patch.object(revenium_middleware, "run_async_in_thread",
+                             side_effect=TestPayloadContract._run_inline):
+            call("Converse", converse_response())
+
+        assert "effort" not in payloads[0]

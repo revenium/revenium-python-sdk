@@ -301,7 +301,7 @@ def send_tool_event(*, step: ToolStep, cost_usd: float, agent: str, subscriber: 
 
 def report_outcome(*, outcome: Outcome, value: float, reported_by: str,
                    agentic_job_id: str, metadata: dict[str, Any], timestamp: str | None,
-                   dry_run: bool) -> None:
+                   dry_run: bool, outcome_reason: str | None = None) -> None:
     global _OUTCOME_FAILURES
     payload = {
         "executionStatus": outcome.execution_status,
@@ -312,6 +312,9 @@ def report_outcome(*, outcome: Outcome, value: float, reported_by: str,
         "outcomeCurrency": "USD",
         "metadata": json.dumps(metadata) if metadata else None,
         "reportedBy": reported_by,
+        # The prescribed field for a failure/cancellation explanation — the API
+        # wants it here, never folded into the metadata blob.
+        "outcomeReason": outcome_reason,
         "outcomeReportedAt": timestamp or _now_iso(),
     }
     payload = {k: v for k, v in payload.items() if v is not None}
@@ -424,12 +427,16 @@ def _run_one_job(spec: ExampleSpec, item: JobPlan, job_base: datetime,
         tool_cost += cost
 
     metadata = spec.build_metadata(scenario, job_idx, len(llm_steps), metadata_outcome, ai_cost + tool_cost, job_id, job_name) if spec.build_metadata else {}
+    # A non-SUCCESS run has something to explain, and outcomeReason is where the
+    # API wants that explanation; SUCCESS runs send no reason at all.
+    failure_reason = (outcome.reason or None) if outcome.execution_status != "SUCCESS" else None
     # report_outcome catches and records its own failures in _OUTCOME_FAILURES;
     # an outer try/except here would only ever fire on programming errors, which
     # should surface, not be silently swallowed.
     report_outcome(
         outcome=outcome, value=scaled_value, reported_by=spec.reported_by,
-        agentic_job_id=job_id, metadata=metadata, timestamp=step_time(), dry_run=args.dry_run
+        agentic_job_id=job_id, metadata=metadata, timestamp=step_time(), dry_run=args.dry_run,
+        outcome_reason=failure_reason,
     )
     return JobResult(ai_cost, tool_cost, outcome.outcome_type, metadata)
 

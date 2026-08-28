@@ -6,6 +6,11 @@ retryable failures (408/429/5xx/connection errors) with exponential backoff
 capped at 8s, honors Retry-After (delta-seconds and HTTP-date), and on
 exhaustion fails open -- an enforcement-refresh outage must never become a
 customer traffic outage.
+
+A successful fetch returns the whole payload: the rules plus the server's
+top-level ``orgUnitBudgetBlocks`` map (subscriber email -> blocking rule id)
+that decides department budgets. Bodies that predate the map -- a bare list,
+a dict without the key, an HTTP 204 -- yield an empty map, which blocks nobody.
 """
 import datetime
 from email.utils import format_datetime
@@ -65,9 +70,9 @@ class TestRetryOnTransientFailures:
             make_response(200, json_body={"rules": [{"id": "r1"}]}),
         ])
 
-        rules = enforcement._fetch_rules()
+        fetched = enforcement._fetch_rules()
 
-        assert rules == [{"id": "r1"}]
+        assert fetched.rules == [{"id": "r1"}]
         assert stub.calls == 3
         assert len(sleeps) == 2
 
@@ -76,9 +81,9 @@ class TestRetryOnTransientFailures:
         monkeypatch, sleeps = fetch_env
         stub = stub_get(monkeypatch, [make_response(status), make_response(200)])
 
-        rules = enforcement._fetch_rules()
+        fetched = enforcement._fetch_rules()
 
-        assert rules == []
+        assert fetched.rules == []
         assert stub.calls == 2
 
     def test_connection_errors_are_retried(self, fetch_env):
@@ -89,9 +94,9 @@ class TestRetryOnTransientFailures:
             make_response(200, json_body={"rules": []}),
         ])
 
-        rules = enforcement._fetch_rules()
+        fetched = enforcement._fetch_rules()
 
-        assert rules == []
+        assert fetched.rules == []
         assert stub.calls == 3
 
     def test_backoff_is_exponential_and_capped_at_8s(self, fetch_env):
@@ -159,9 +164,9 @@ class TestFailOpen:
         monkeypatch, sleeps = fetch_env
         stub = stub_get(monkeypatch, [make_response(401)])
 
-        rules = enforcement._fetch_rules()
+        fetched = enforcement._fetch_rules()
 
-        assert rules is None  # fail open: caller keeps previous cache
+        assert fetched is None  # fail open: caller keeps previous cache
         assert stub.calls == 1
         assert sleeps == []
 
@@ -169,9 +174,9 @@ class TestFailOpen:
         monkeypatch, sleeps = fetch_env
         stub = stub_get(monkeypatch, [make_response(503)] * 20)
 
-        rules = enforcement._fetch_rules()
+        fetched = enforcement._fetch_rules()
 
-        assert rules is None
+        assert fetched is None
         assert stub.calls == enforcement._FETCH_MAX_ATTEMPTS  # rode the spike to exhaustion
 
     def test_shutdown_during_backoff_stops_retrying(self, fetch_env):
@@ -182,9 +187,9 @@ class TestFailOpen:
         monkeypatch.setattr(enforcement, "_sleep",
                             lambda seconds: sleeps.append(seconds) or True)
 
-        rules = enforcement._fetch_rules()
+        fetched = enforcement._fetch_rules()
 
-        assert rules is None  # fail open: caller keeps previous cache
+        assert fetched is None  # fail open: caller keeps previous cache
         assert stub.calls == 1  # no network calls after shutdown
         assert sleeps == [enforcement._FETCH_BACKOFF_INITIAL]
 
@@ -204,3 +209,83 @@ class TestFailOpen:
         stub_get(monkeypatch, [httpx.ConnectError("backend down")] * 20)
 
         enforcement.check_enforcement({"organizationName": "AcmeCorp"})  # must not raise
+
+
+class TestOrgUnitBudgetBlocks:
+    """The department-budget map must survive the fetch and reach the cache."""
+
+    def test_map_is_returned_alongside_the_rules(self, fetch_env):
+        monkeypatch, _ = fetch_env
+        stub_get(monkeypatch, [make_response(200, json_body={
+            "rules": [{"ruleId": 7777, "name": "Engineering budget"}],
+            "compiledAt": "2026-08-24T00:00:00Z",
+            "orgUnitBudgetBlocks": {"dept-user@example.test": 7777},
+        })])
+
+        fetched = enforcement._fetch_rules()
+
+        assert fetched.rules == [{"ruleId": 7777, "name": "Engineering budget"}]
+        assert fetched.org_unit_blocks == {"dept-user@example.test": 7777}
+
+    def test_legacy_bare_list_body_still_works(self, fetch_env):
+        """A body predating the wrapper object yields rules and an empty map."""
+        monkeypatch, _ = fetch_env
+        stub_get(monkeypatch, [make_response(200, json_body=[{"ruleId": 7777}])])
+
+        fetched = enforcement._fetch_rules()
+
+        assert fetched.rules == [{"ruleId": 7777}]
+        assert fetched.org_unit_blocks == {}
+
+    def test_dict_body_without_the_key_yields_an_empty_map(self, fetch_env):
+        monkeypatch, _ = fetch_env
+        stub_get(monkeypatch, [make_response(200, json_body={"rules": [], "compiledAt": "x"})])
+
+        assert enforcement._fetch_rules().org_unit_blocks == {}
+
+    @pytest.mark.parametrize("blocks", [None, [], "nope", 7])
+    def test_malformed_map_is_ignored(self, fetch_env, blocks):
+        """Garbage in the map field must not become a blocking verdict."""
+        monkeypatch, _ = fetch_env
+        stub_get(monkeypatch, [make_response(200, json_body={
+            "rules": [], "orgUnitBudgetBlocks": blocks,
+        })])
+
+        assert enforcement._fetch_rules().org_unit_blocks == {}
+
+    def test_204_yields_empty_rules_and_an_empty_map(self, fetch_env):
+        monkeypatch, _ = fetch_env
+        response = SimpleNamespace(status_code=204,
+                                   headers={},
+                                   raise_for_status=lambda: None,
+                                   json=lambda: None)
+        stub_get(monkeypatch, [response])
+
+        assert enforcement._fetch_rules() == ([], {})
+
+    def test_refresh_caches_the_map_with_the_rules(self, fetch_env):
+        monkeypatch, _ = fetch_env
+        monkeypatch.delenv("REVENIUM_CACHE_DIR", raising=False)
+        monkeypatch.setattr(enforcement, "_cached_rules", [])
+        monkeypatch.setattr(enforcement, "_cached_org_unit_blocks", {})
+        monkeypatch.setattr(enforcement, "_cache_timestamp", 0.0)
+        monkeypatch.setattr(enforcement, "_cache_initialized", False)
+        stub_get(monkeypatch, [make_response(200, json_body={
+            "rules": [{"ruleId": 7777}],
+            "orgUnitBudgetBlocks": {"dept-user@example.test": 7777},
+        })])
+
+        enforcement._refresh_cache()
+
+        assert enforcement._cached_rules == [{"ruleId": 7777}]
+        assert enforcement._cached_org_unit_blocks == {"dept-user@example.test": 7777}
+        assert enforcement._cache_initialized is True
+
+    def test_fetch_outage_preserves_the_previous_map(self, fetch_env):
+        monkeypatch, _ = fetch_env
+        stub_get(monkeypatch, [make_response(503)] * 20)
+        monkeypatch.setattr(enforcement, "_cached_org_unit_blocks", {"keep@me.test": 1})
+
+        enforcement._refresh_cache()
+
+        assert enforcement._cached_org_unit_blocks == {"keep@me.test": 1}

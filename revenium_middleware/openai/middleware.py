@@ -11,7 +11,7 @@ from revenium_middleware import client, get_client, run_async_in_thread, shutdow
 from revenium_middleware._core.enforcement import check_enforcement
 from revenium_middleware._core.exceptions import BudgetExceededError  # noqa: F401 — re-exported via openai.exceptions
 from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
-from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, extract_skill_fields, merge_extra_body
+from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, extract_skill_fields, extract_coding_assistant_fields, extract_service_tier_fields, extract_effort_field, merge_extra_body
 from revenium_middleware._core.config import is_selective_metering_enabled, is_capture_prompts_enabled
 from revenium_middleware._core.context import is_inside_decorated_function
 from revenium_middleware._core.patch_registry import register_patch
@@ -105,6 +105,29 @@ def _extract_cache_token_counts(usage: Any) -> Tuple[int, int]:
         _get_value(prompt_details, "cached_tokens", 0)
     )
     return 0, cache_read_token_count
+
+
+def _extract_reasoning_token_count(usage: Any) -> int:
+    """
+    Return the reasoning token count the provider reported, or 0.
+
+    OpenAI reports reasoning tokens in the nested output-token detail block:
+    `completion_tokens_details.reasoning_tokens` on Chat Completions and
+    `output_tokens_details.reasoning_tokens` on the Responses API. Both blocks
+    are absent for non-reasoning models and for surfaces that never report the
+    figure, which keeps the count at 0 rather than inventing one.
+    """
+    completion_tokens_details = _get_value(usage, "completion_tokens_details")
+    reasoning_token_count = _coerce_int(
+        _get_value(completion_tokens_details, "reasoning_tokens", 0)
+    )
+    if reasoning_token_count:
+        return reasoning_token_count
+
+    output_tokens_details = _get_value(usage, "output_tokens_details")
+    return _coerce_int(
+        _get_value(output_tokens_details, "reasoning_tokens", 0)
+    )
 
 
 def extract_prompt_data_if_enabled(
@@ -339,6 +362,7 @@ def extract_usage_data(response, operation_type: OperationType, request_time: st
     cache_creation_token_count, cache_read_token_count = _extract_cache_token_counts(
         response.usage
     )
+    reasoning_token_count = _extract_reasoning_token_count(response.usage)
 
     # Build unified usage data structure
     usage_data = {
@@ -355,7 +379,7 @@ def extract_usage_data(response, operation_type: OperationType, request_time: st
         "time_to_first_token": 0,  # Will be set by caller if applicable
         "cache_creation_token_count": cache_creation_token_count,
         "cache_read_token_count": cache_read_token_count,
-        "reasoning_token_count": 0,
+        "reasoning_token_count": reasoning_token_count,
         "request_time": request_time,
         "response_time": response_time,
         "completion_start_time": response_time,
@@ -414,6 +438,7 @@ async def log_token_usage(
         prompts_truncated: Optional[bool] = None,
         cache_creation_token_count: Optional[int] = None,
         cache_read_token_count: Optional[int] = None,
+        reasoning_token_count: Optional[int] = None,
 ) -> None:
     """Log token usage to Revenium."""
     if get_client() is None:
@@ -444,6 +469,9 @@ async def log_token_usage(
         cache_creation_tokens = cache_creation_token_count
     if cache_read_token_count is None:
         cache_read_token_count = _coerce_int(cached_tokens)
+    # A caller that reports nothing keeps the field at 0 rather than omitting
+    # it, so the emitted payload shape is unchanged for non-reasoning traffic.
+    reasoning_tokens = _coerce_int(reasoning_token_count)
 
     completion_args = {
         "cache_creation_token_count": cache_creation_tokens,
@@ -454,7 +482,7 @@ async def log_token_usage(
         "input_token_count": prompt_tokens,
         "provider": provider,
         "model_source": model_source,
-        "reasoning_token_count": 0,
+        "reasoning_token_count": reasoning_tokens,
         "request_time": request_time,
         "response_time": response_time,
         "completion_start_time": response_time,
@@ -496,6 +524,20 @@ async def log_token_usage(
     skill_fields = extract_skill_fields(usage_metadata)
     if skill_fields:
         completion_args.update(skill_fields)
+
+    # Coding assistant attribution is likewise a first-class typed param
+    coding_assistant_fields = extract_coding_assistant_fields(usage_metadata)
+    if coding_assistant_fields:
+        completion_args.update(coding_assistant_fields)
+
+    # Service tier and pricing fields are likewise first-class typed params
+    service_tier_fields = extract_service_tier_fields(usage_metadata, "completion")
+    if service_tier_fields:
+        completion_args.update(service_tier_fields)
+
+    # Reasoning effort is a caller-supplied pass-through: forwarded verbatim,
+    # omitted entirely when unset.
+    completion_args.update(extract_effort_field(usage_metadata))
 
     # Add trace visualization fields only if they have values
     if environment:
@@ -686,6 +728,7 @@ def create_metering_call(
             cached_tokens=usage_data["cache_creation_token_count"],
             cache_creation_token_count=usage_data["cache_creation_token_count"],
             cache_read_token_count=usage_data["cache_read_token_count"],
+            reasoning_token_count=usage_data["reasoning_token_count"],
             stop_reason=usage_data["stop_reason"],
             request_time=usage_data["request_time"],
             response_time=usage_data["response_time"],
@@ -1136,6 +1179,7 @@ def handle_streaming_response(
             total_tokens = 0
             cache_creation_token_count = 0
             cache_read_token_count = 0
+            reasoning_token_count = 0
 
             # First check if we have the final usage data from the special chunk
             if self.final_usage:
@@ -1143,6 +1187,9 @@ def handle_streaming_response(
                 completion_tokens = self.final_usage.completion_tokens
                 total_tokens = self.final_usage.total_tokens
                 cache_creation_token_count, cache_read_token_count = _extract_cache_token_counts(
+                    self.final_usage
+                )
+                reasoning_token_count = _extract_reasoning_token_count(
                     self.final_usage
                 )
                 logger.debug(
@@ -1263,6 +1310,7 @@ def handle_streaming_response(
                         cached_tokens=0,
                         cache_creation_token_count=cache_creation_token_count,
                         cache_read_token_count=cache_read_token_count,
+                        reasoning_token_count=reasoning_token_count,
                         stop_reason=stop_reason,
                         request_time=self.request_time_dt.strftime(
                             "%Y-%m-%dT%H:%M:%SZ"
@@ -1472,6 +1520,7 @@ def handle_streaming_responses(stream, request_time_dt, usage_metadata,
             total_tokens = 0
             cache_creation_token_count = 0
             cache_read_token_count = 0
+            reasoning_token_count = 0
 
             # Get usage data from the final chunk or last chunk
             if self.final_usage:
@@ -1479,6 +1528,9 @@ def handle_streaming_responses(stream, request_time_dt, usage_metadata,
                 output_tokens = self.final_usage.output_tokens
                 total_tokens = self.final_usage.total_tokens
                 cache_creation_token_count, cache_read_token_count = _extract_cache_token_counts(
+                    self.final_usage
+                )
+                reasoning_token_count = _extract_reasoning_token_count(
                     self.final_usage
                 )
                 logger.debug(
@@ -1490,6 +1542,9 @@ def handle_streaming_responses(stream, request_time_dt, usage_metadata,
                 output_tokens = self.last_chunk.usage.output_tokens
                 total_tokens = self.last_chunk.usage.total_tokens
                 cache_creation_token_count, cache_read_token_count = _extract_cache_token_counts(
+                    self.last_chunk.usage
+                )
+                reasoning_token_count = _extract_reasoning_token_count(
                     self.last_chunk.usage
                 )
                 logger.debug(
@@ -1586,6 +1641,7 @@ def handle_streaming_responses(stream, request_time_dt, usage_metadata,
                         cached_tokens=0,
                         cache_creation_token_count=cache_creation_token_count,
                         cache_read_token_count=cache_read_token_count,
+                        reasoning_token_count=reasoning_token_count,
                         stop_reason="END",
                         request_time=self.request_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
                         response_time=response_time,

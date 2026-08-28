@@ -8,6 +8,7 @@ from revenium_middleware._core.fields import (
     extract_agentic_job_fields,
     extract_common_metadata,
     extract_field_with_fallback,
+    extract_media_lineage_fields,
     extract_org_and_product,
     extract_with_aliases,
     merge_extra_body,
@@ -431,3 +432,229 @@ class TestExtractSkillFields:
     def test_empty_dict_when_no_skill_fields(self):
         with patch.dict(os.environ, {}, clear=True):
             assert self._extract({}) == {}
+
+
+class TestExtractMediaLineageFields:
+    """Media lineage aliases callers may supply through usage_metadata.
+
+    Mirrors the skill-field extractor: snake_case wins over the camelCase
+    alias, absent fields are omitted rather than emitted as None, and the
+    returned keys match the typed create_image / create_video parameters.
+    """
+
+    def test_snake_case_alias(self):
+        source = {"source_transaction_id": "txn-source-1"}
+        assert extract_media_lineage_fields(source) == {"source_transaction_id": "txn-source-1"}
+
+    def test_camel_case_alias(self):
+        source = {"sourceTransactionId": "txn-source-2"}
+        assert extract_media_lineage_fields(source) == {"source_transaction_id": "txn-source-2"}
+
+    def test_snake_takes_precedence_over_camel(self):
+        source = {"source_transaction_id": "snake-wins", "sourceTransactionId": "camel-loses"}
+        assert extract_media_lineage_fields(source) == {"source_transaction_id": "snake-wins"}
+
+    def test_missing_field_omitted(self):
+        assert extract_media_lineage_fields({"ticket_id": "JIRA-1"}) == {}
+
+    def test_empty_metadata(self):
+        assert extract_media_lineage_fields({}) == {}
+
+    def test_none_metadata(self):
+        assert extract_media_lineage_fields(None) == {}
+
+
+class TestExtractServiceTierFields:
+    """usage_metadata alias resolution for the service-tier fields.
+
+    A tier field the middleware never resolves is inert on the wire, so these
+    guard the snake/camel alias table and the per-endpoint field sets.
+    """
+
+    _ALL_SNAKE = {
+        "actual_service_tier": "flex",
+        "requested_service_tier": "priority",
+        "pricing_tier": "BATCH",
+        "subscription_tier": "enterprise",
+        "cost_multiplier": 1.5,
+        "priority_tier": "high",
+    }
+
+    def _extract(self, source, endpoint="completion"):
+        from revenium_middleware._core.fields import extract_service_tier_fields
+
+        return extract_service_tier_fields(source, endpoint)
+
+    def test_completion_snake_case_keys(self):
+        result = self._extract(dict(self._ALL_SNAKE))
+        assert result == {
+            "actual_service_tier": "flex",
+            "requested_service_tier": "priority",
+            "pricing_tier": "BATCH",
+            "subscription_tier": "enterprise",
+            "cost_multiplier": 1.5,
+        }
+
+    def test_completion_camel_case_aliases(self):
+        source = {
+            "actualServiceTier": "flex",
+            "requestedServiceTier": "priority",
+            "pricingTier": "BATCH",
+            "subscriptionTier": "enterprise",
+            "costMultiplier": 1.5,
+        }
+        assert self._extract(source) == {
+            "actual_service_tier": "flex",
+            "requested_service_tier": "priority",
+            "pricing_tier": "BATCH",
+            "subscription_tier": "enterprise",
+            "cost_multiplier": 1.5,
+        }
+
+    def test_snake_takes_precedence_over_camel(self):
+        source = {"pricing_tier": "STANDARD", "pricingTier": "BATCH"}
+        assert self._extract(source) == {"pricing_tier": "STANDARD"}
+
+    def test_audio_drops_completion_only_and_priority_fields(self):
+        result = self._extract(dict(self._ALL_SNAKE), "audio")
+        assert result == {
+            "actual_service_tier": "flex",
+            "requested_service_tier": "priority",
+            "pricing_tier": "BATCH",
+        }
+
+    @pytest.mark.parametrize("endpoint", ["video", "image"])
+    def test_video_and_image_keep_priority_tier(self, endpoint):
+        result = self._extract(dict(self._ALL_SNAKE), endpoint)
+        assert result == {
+            "actual_service_tier": "flex",
+            "requested_service_tier": "priority",
+            "pricing_tier": "BATCH",
+            "priority_tier": "high",
+        }
+
+    def test_fields_resolve_independently(self):
+        assert self._extract({"pricingTier": "BATCH"}) == {
+            "pricing_tier": "BATCH"
+        }
+
+    def test_missing_fields_omitted(self):
+        result = self._extract({"actual_service_tier": "flex"})
+        assert result == {"actual_service_tier": "flex"}
+        assert "pricing_tier" not in result
+
+    def test_empty_dict_when_no_tier_fields(self):
+        assert self._extract({}) == {}
+
+    def test_cost_type_is_never_populated(self):
+        """costType is a pass-through wire field, not a middleware-resolved
+        one; the alias table must not claim it."""
+        from revenium_middleware._core.fields import SERVICE_TIER_FIELD_MAP
+
+        assert "cost_type" not in SERVICE_TIER_FIELD_MAP
+        assert self._extract({"cost_type": "AI", "costType": "AI"}) == {}
+
+    def test_falsy_zero_multiplier_is_preserved(self):
+        assert self._extract({"cost_multiplier": 0.0}) == {
+            "cost_multiplier": 0.0
+        }
+
+
+class TestExtractCodingAssistantFields:
+    """Coding assistant resolver: usage_metadata snake > camel alias, no env."""
+
+    _ALL_SNAKE = {
+        "coding_assistant_account_uuid": "acct-uuid-1",
+    }
+
+    def _extract(self, source):
+        from revenium_middleware._core.fields import extract_coding_assistant_fields
+
+        return extract_coding_assistant_fields(source)
+
+    def test_snake_case_keys(self):
+        assert self._extract(dict(self._ALL_SNAKE)) == self._ALL_SNAKE
+
+    def test_camel_case_aliases(self):
+        source = {"codingAssistantAccountUuid": "acct-uuid-1"}
+        assert self._extract(source) == self._ALL_SNAKE
+
+    def test_snake_takes_precedence_over_camel(self):
+        source = {
+            "coding_assistant_account_uuid": "snake-wins",
+            "codingAssistantAccountUuid": "camel-loses",
+        }
+        assert self._extract(source) == {"coding_assistant_account_uuid": "snake-wins"}
+
+    def test_missing_fields_omitted(self):
+        result = self._extract({"skill_name": "unrelated"})
+        assert result == {}
+        assert "coding_assistant_account_uuid" not in result
+
+    def test_no_env_var_fallback(self):
+        """Attribution is caller-supplied only; no REVENIUM_* env var resolves it."""
+        env = {"REVENIUM_CODING_ASSISTANT_ACCOUNT_UUID": "env-uuid"}
+        with patch.dict(os.environ, env, clear=False):
+            assert self._extract({}) == {}
+
+    def test_table_registers_the_wire_alias(self):
+        from revenium_middleware._core.fields import CODING_ASSISTANT_FIELD_MAP
+
+        assert CODING_ASSISTANT_FIELD_MAP["coding_assistant_account_uuid"] == (
+            "coding_assistant_account_uuid",
+            "codingAssistantAccountUuid",
+        )
+
+
+class TestExtractEffortField:
+    """Reasoning effort resolver: caller-supplied, pass-through, no env fallback."""
+
+    def _extract(self, source):
+        from revenium_middleware._core.fields import extract_effort_field
+
+        return extract_effort_field(source)
+
+    def test_effort_resolved_from_usage_metadata(self):
+        assert self._extract({"effort": "high"}) == {"effort": "high"}
+
+    def test_missing_effort_omitted(self):
+        result = self._extract({"trace_id": "unrelated"})
+        assert result == {}
+        assert "effort" not in result
+
+    def test_empty_source_omitted(self):
+        assert self._extract({}) == {}
+        assert self._extract(None) == {}
+
+    @pytest.mark.parametrize("level", ["low", "medium", "high", "xhigh", "ultra"])
+    def test_known_vendor_levels_pass_through(self, level):
+        assert self._extract({"effort": level}) == {"effort": level}
+
+    def test_unrecognised_well_formed_level_passes_through(self):
+        """A vendor's next level must reach the backend, not be dropped here.
+
+        The SDK keeps no allow-list: the backend owns validation, so a level
+        this release has never heard of still gets metered.
+        """
+        assert self._extract({"effort": "hyper_9"}) == {"effort": "hyper_9"}
+
+    def test_value_is_not_coerced_or_lowercased(self):
+        """Casing is the caller's; the backend normalizes, the SDK does not."""
+        assert self._extract({"effort": "HIGH"}) == {"effort": "HIGH"}
+
+    def test_value_the_backend_would_reject_is_still_forwarded(self):
+        """Client-side rejection would hide the mistake; the 400 must surface."""
+        assert self._extract({"effort": "way too long and spaced"}) == {
+            "effort": "way too long and spaced"
+        }
+
+    def test_no_env_var_fallback(self):
+        """Effort describes one request, not the process: no env var resolves it."""
+        env = {"REVENIUM_EFFORT": "env-high", "REVENIUM_REASONING_EFFORT": "env-high"}
+        with patch.dict(os.environ, env, clear=False):
+            assert self._extract({}) == {}
+
+    def test_table_registers_the_wire_alias(self):
+        from revenium_middleware._core.fields import EFFORT_FIELD_MAP
+
+        assert EFFORT_FIELD_MAP["effort"] == ("effort",)

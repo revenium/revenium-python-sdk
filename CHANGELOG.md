@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-08-28
+
+### Added
+- Reasoning effort on completion metering. Record the effort level requested of the model (`usage_metadata={"effort": ...}` or `REVENIUM_EFFORT`); unset effort is omitted from the wire, never sent as null.
+- `model_host` and `subscriber_email_source` on AI completion metering — where the model actually ran (bedrock, vertex, anthropic-api) and how the subscriber email was obtained, matching what OTLP ingestion already carries.
+- Tool usage events join their agentic job: `@meter_tool` / `report_tool_call` resolve `agentic_job_id` with the same precedence as completions (call metadata, then JobContext, then environment). An id the server would reject is dropped with a debug log so the event and its cost still deliver — losing attribution, never the event.
+- Department (org-unit) budget enforcement in the pre-call circuit breaker. The poller now consumes the server-computed department block map and blocks exactly the callers the platform says are over budget; the on-disk snapshot is rollback-safe (rules keep the legacy shape older SDKs read), the department map is owner-only (0600) because it is keyed by email, and it is content-bound to its rules snapshot so a torn write can never pair it with the wrong rules.
+- Per-group balances honored when evaluating subscriber-grouped enforcement rules.
+- Service-tier and pricing fields, billing-skip/error/cache-TTL telemetry fields on completion metering; audio, image and video payloads aligned with the current platform spec.
+- Anthropic per-TTL cache-creation buckets forwarded from the native middleware.
+- `outcomeReason` across job outcome reporting, amendment and history — automatic FAILED reports populate it from the exception (truncated to the ingest cap).
+
+### Fixed
+- OpenAI reasoning token counts are read from the response instead of hardcoded to zero.
+- LiteLLM proxy middleware populates cache token counts, on success and failure paths alike.
+- Flat subscriber attribution fields are matched when nested metadata suppresses them; the nested subscriber email is authoritative when both are present; group matching fails open on non-string subscriber identifiers.
+
 ## [0.6.0] - 2026-08-13
 
 ### Added

@@ -94,6 +94,44 @@ class TestGetOutcomeHistory:
                 )
         assert counter["n"] == 2  # not the 10-attempt default schedule
 
+    def test_outcome_reason_mapped_and_distinct_from_amendment_reason(self):
+        rows = [
+            {
+                "sequence": 1,
+                "executionStatus": "FAILED",
+                "reason": None,
+                "outcomeReason": "Applicant withdrew before underwriting",
+            },
+            {
+                "sequence": 2,
+                "executionStatus": "CANCELLED",
+                "reason": "Corrected after manual review",
+                "outcomeReason": "",
+            },
+        ]
+        http, _ = _client(rows)
+        with patch.dict(os.environ, ENV):
+            history = get_outcome_history("job-1", profitstream_base_url=BASE, http_client=http)
+        assert history[0].outcome_reason == "Applicant withdrew before underwriting"
+        assert history[0].reason is None
+        assert history[1].outcome_reason == ""  # cleared by the amendment
+        assert history[1].reason == "Corrected after manual review"
+
+    def test_row_without_outcome_reason_maps_to_none(self):
+        http, _ = _client(HISTORY)
+        with patch.dict(os.environ, ENV):
+            history = get_outcome_history("job-1", profitstream_base_url=BASE, http_client=http)
+        assert all(a.outcome_reason is None for a in history)
+
+    def test_positional_construction_still_works(self):
+        # outcome_reason is appended last and defaulted, so user code that builds
+        # rows positionally keeps compiling.
+        row = JobOutcomeAmendment(
+            2, "SUCCESS", "CONVERTED", 750.0, "USD", None, "orchestrator", None, "expanded",
+        )
+        assert row.reason == "expanded"
+        assert row.outcome_reason is None
+
     def test_metering_key_fails_fast(self):
         http, seen = _client(HISTORY)
         env = {"REVENIUM_OUTCOME_API_KEY": "rev_mk_TENANT_abc", "REVENIUM_TEAM_ID": "team-1"}

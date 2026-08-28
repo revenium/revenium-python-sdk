@@ -214,7 +214,10 @@ history = get_outcome_history("sales-lead-8842")
 # List[JobOutcomeAmendment], ordered by amendment_sequence (1 = the initial report)
 ```
 
-`amend_outcome()` takes a mandatory non-blank `reason` plus the same optional fields as `report_outcome()` (`execution_status`, `outcome_type`, `outcome_value`, `outcome_currency`, `metadata`, `reported_by`), and returns the updated job as a dict.
+`amend_outcome()` takes a mandatory non-blank `reason` plus the same optional fields as `report_outcome()` (`execution_status`, `outcome_type`, `outcome_value`, `outcome_currency`, `metadata`, `reported_by`, `outcome_reason`), and returns the updated job as a dict.
+
+- **`reason` vs `outcome_reason`:** `reason` is the amendment's own audit justification (why the record changed); `outcome_reason` is the business explanation of why the job failed or was cancelled. Use `outcome_reason` for failure explanations rather than burying them in `metadata` — it is a first-class field on the outcome and is returned on every `get_outcome_history()` row.
+- **Clearing `outcome_reason`:** omit the argument to leave the stored value untouched; pass an empty string (`outcome_reason=""`) to clear it.
 
 ### Outcome Exceptions
 
@@ -682,6 +685,7 @@ litellm_settings:
 ```
 
 When using the LiteLLM proxy, pass metadata via HTTP headers (`x-revenium-*`).
+Reasoning effort travels as `x-revenium-effort` on the proxied request.
 
 #### LiteLLM Decorators
 
@@ -974,6 +978,7 @@ Add business context to any API call by passing a `usage_metadata` dictionary. A
 | `productName` | Your product or feature name | Attribute AI costs to specific features (e.g., `"customer-chatbot"`, `"email-assistant"`). Auto-creates if not found |
 | `agent` | AI agent or bot identifier | Distinguish between multiple AI agents or automation workflows |
 | `response_quality_score` | Custom quality rating (0.0-1.0) | Track user satisfaction or automated quality metrics for model performance analysis |
+| `effort` | Reasoning effort level requested of the model (free-form string, max 16 chars, `^[A-Za-z0-9_-]+$`) | Report what share of AI spend is high-effort reasoning, and compare cost per effort level |
 
 **Example:**
 
@@ -996,10 +1001,26 @@ response = client.chat.completions.create(
         "subscription_id": "pro-plan-Q1",
         "productName": "customer-support-chatbot",
         "agent": "support-agent",
-        "response_quality_score": 0.92
+        "response_quality_score": 0.92,
+        "effort": "high"
     }
 )
 ```
+
+**Reasoning effort:** `effort` records how hard the model was asked to think, so
+high-effort reasoning spend can be separated from the rest. It is a free-form
+string, not an enum -- vendor vocabularies differ and drift, so `low`, `medium`,
+`high`, `xhigh` and `ultra` are all real values, and a level this SDK release has
+never heard of is passed through untouched rather than rejected or rewritten. The
+Revenium backend owns validation (at most 16 characters, matching
+`^[A-Za-z0-9_-]+$`); a value it rejects fails the metering call visibly instead
+of being silently dropped, so it surfaces in the log and in
+`get_metering_status()`. It is distinct from the reported reasoning token count,
+which measures the tokens actually spent rather than the level requested.
+
+Set it per call in `usage_metadata` on any provider integration. In LiteLLM proxy
+mode, where per-call attribution travels as request headers rather than
+`usage_metadata`, send `x-revenium-effort` instead.
 
 **Deprecation notice:** The legacy field aliases `organizationId`, `organization_id`, `productId`, and `product_id` are accepted by this SDK only as an input-layer convenience and emit a `DeprecationWarning`. The Revenium backend no longer accepts them — they are translated to `organizationName` / `productName` before the wire call. Migrate to `organization_name` / `organizationName` and `product_name` / `productName` now; the input-layer aliases will be removed in the next major release.
 

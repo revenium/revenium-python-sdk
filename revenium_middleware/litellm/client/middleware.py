@@ -3,7 +3,8 @@ import logging
 import datetime
 from revenium_middleware import client, get_client, run_async_in_thread, shutdown_event
 from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
-from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, merge_extra_body
+from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, extract_effort_field, merge_extra_body
+from revenium_middleware._core.cache_tokens import extract_cache_tokens
 from revenium_middleware._core.config import is_selective_metering_enabled
 from revenium_middleware._core.context import is_inside_decorated_function
 from revenium_middleware._core import submit_ai_event
@@ -106,14 +107,7 @@ def handle_response(response, request_time_dt, usage_metadata, is_streaming):
         # Extract token counts from LiteLLM response
         prompt_tokens = getattr(response.usage, 'prompt_tokens', 0)
         completion_tokens = getattr(response.usage, 'completion_tokens', 0)
-        # OpenAI-style responses report cache reads under
-        # prompt_tokens_details; LiteLLM's Anthropic passthrough exposes
-        # them as top-level cache_read/cache_creation_input_tokens.
-        prompt_details = getattr(response.usage, 'prompt_tokens_details', None)
-        cache_read_tokens = getattr(prompt_details, 'cached_tokens', 0) or 0
-        if not cache_read_tokens:
-            cache_read_tokens = getattr(response.usage, 'cache_read_input_tokens', 0) or 0
-        cache_creation_tokens = getattr(response.usage, 'cache_creation_input_tokens', 0) or 0
+        cache_read_tokens, cache_creation_tokens = extract_cache_tokens(response.usage)
         total_tokens = prompt_tokens + completion_tokens
 
         logger.debug(
@@ -240,6 +234,9 @@ def handle_response(response, request_time_dt, usage_metadata, is_streaming):
             ticket_id = trace_fields.get_ticket_id(usage_metadata)
             if ticket_id:
                 completion_args["ticket_id"] = ticket_id
+
+            # Reasoning effort level (caller-supplied, forwarded verbatim)
+            completion_args.update(extract_effort_field(usage_metadata))
 
             # Parent transaction ID field
             parent_transaction_id = (

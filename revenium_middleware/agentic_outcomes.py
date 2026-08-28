@@ -156,6 +156,12 @@ class AgenticOutcomeClient:
             output_token_cost=payload.get("outputTokenCost"),
             product_name=payload.get("productName"),
             reasoning_token_count=payload.get("reasoningTokenCount"),
+            # Only pass the reasoning effort level when the caller supplied
+            # one: create_completion drops NotGiven but keeps an explicit
+            # None, which would reach the wire as "effort": null. A key
+            # present with None counts as not supplied — callers forwarding
+            # their own .get("effort") must not reintroduce the null.
+            **({"effort": payload["effort"]} if payload.get("effort") is not None else {}),
             subscriber=payload.get("subscriber"),
             task_type=payload.get("taskType"),
             time_to_first_token=payload.get("timeToFirstToken"),
@@ -241,6 +247,16 @@ class AgenticOutcomeClient:
         self, agentic_job_id: str, payload: Dict[str, Any], *, dry_run: bool = False
     ) -> None:
         """Report the terminal outcome for a job.
+
+        The payload is sent as-is, so any documented outcome field can be
+        included, e.g.::
+
+            {"executionStatus": "FAILED", "outcomeType": "UNSUCCESSFUL",
+             "outcomeReason": "Customer unreachable after three attempts"}
+
+        outcomeReason is the prescribed field for a failure explanation — do not
+        encode it inside metadata. It is read-only on the job resource itself,
+        which is why create_job never sends it.
 
         Raises OutcomeAlreadyReportedError when the job already has an outcome
         (backend 409 with structured amendment guidance).

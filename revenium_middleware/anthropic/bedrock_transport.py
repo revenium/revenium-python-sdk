@@ -124,6 +124,7 @@ def _emit_completion(
     from revenium_middleware._core.fields import (
         extract_agentic_job_fields,
         extract_common_metadata,
+        extract_effort_field,
         extract_org_and_product,
         merge_extra_body,
     )
@@ -194,6 +195,12 @@ def _emit_completion(
                        or usage_metadata.get("traceName")
                        or core_trace_fields.get_trace_name()),
         "ticket_id": core_trace_fields.get_ticket_id(usage_metadata),
+        # Reasoning effort is caller-supplied and forwarded verbatim. Spread
+        # the sparse resolver result rather than reading a key off it:
+        # create_completion only drops NotGiven during serialization, so an
+        # explicit None would go on the wire as "effort": null instead of
+        # being omitted.
+        **extract_effort_field(usage_metadata),
         "parent_transaction_id": (usage_metadata.get("parent_transaction_id")
                                   or usage_metadata.get("parentTransactionId")
                                   or core_trace_fields.get_parent_transaction_id()),

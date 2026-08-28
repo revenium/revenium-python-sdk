@@ -13,8 +13,10 @@ import time
 import uuid
 import asyncio
 import functools
+import re
 from typing import Any, Dict, List, TypeVar, Callable, Optional, cast
 from datetime import datetime, timezone
+from collections.abc import Mapping
 
 import httpx
 
@@ -28,9 +30,25 @@ from revenium_middleware._core.metering_status import (
     record_metering_success,
 )
 
+# Same reasoning: fields (and the context module it reads the ambient job from)
+# depend only on stdlib plus other _core leaves, and revenium_middleware/__init__
+# finishes importing _core before it reaches _metering. Reusing this resolver --
+# rather than re-implementing the precedence here -- is what keeps tool events
+# and AI completions attributing spend to the same agentic job.
+from revenium_middleware._core.fields import extract_agentic_job_fields
+
 __all__ = ["meter_tool", "report_tool_call", "configure"]
 
 F = TypeVar("F", bound=Callable[..., Any])
+
+# Mirror of the server's JobValidation.AGENTIC_JOB_ID_PATTERN (hypercurrent
+# :commons). The tool-events controller binds the body with @Validated, so an
+# id violating this pattern 400s the WHOLE event — and dispatch here is
+# fire-and-forget, so that event and its cost would vanish silently. Unlike
+# the other attribution fields (which the middleware forwards verbatim and
+# the server accepts verbatim), this one is gated client-side: dropping the
+# field loses attribution for one call; sending it loses the event.
+_AGENTIC_JOB_ID_RE = re.compile(r"^(?!types$|conversion-funnel$)[a-zA-Z0-9][a-zA-Z0-9._-]{0,254}$")
 
 # Global configuration (set via configure()); None falls back to the
 # REVENIUM_METERING_* environment variables.
@@ -87,6 +105,43 @@ def _resolve_endpoint() -> "tuple[Optional[str], Optional[str]]":
     return f"{base}/v2/tool/events", key
 
 
+def _resolve_agentic_job_id(usage_metadata: Any) -> Optional[str]:
+    """Resolve the agentic job id for a tool event, or None when it is unset.
+
+    Precedence mirrors the AI-completion path exactly, because it is the same
+    resolver: the call's ``usage_metadata`` (``agentic_job_id``, then the
+    ``agenticJobId`` alias) > the ambient job contextvar set by
+    ``set_agentic_job_fields`` / ``JobContext`` > the ``REVENIUM_AGENTIC_JOB_ID``
+    environment variable. ``usage_metadata`` is typed ``Any`` because
+    ``report_tool_call`` forwards whatever the caller passed; anything that is
+    not a mapping degrades to ``{}`` so the ambient/env sources still resolve.
+
+    Never raises. Tool events are dispatched fire-and-forget from inside the
+    wrapped tool call, so values the wire cannot carry drop the field rather
+    than surface an error to the caller. An id that fails the server's
+    ``agenticJobId`` pattern is dropped too (see ``_AGENTIC_JOB_ID_RE``):
+    sending it would 400 the whole event, silently losing the event and its
+    cost instead of just the attribution.
+    """
+    try:
+        source = usage_metadata if isinstance(usage_metadata, Mapping) else {}
+        job_id = extract_agentic_job_fields(source).get("agenticJobId")
+        if not (isinstance(job_id, str) and job_id):
+            return None
+        # fullmatch, not match: Python's ``$`` accepts a trailing newline and
+        # ``.match()`` never requires the whole string to be consumed, so
+        # ``"job-1\n"`` would pass a ``.match()`` gate here and still 400 on
+        # the server, whose Java ``matches()`` demands full consumption.
+        if not _AGENTIC_JOB_ID_RE.fullmatch(job_id):
+            logger.debug(
+                "Dropping agenticJobId that would fail server validation: %r", job_id
+            )
+            return None
+    except Exception:
+        return None
+    return job_id
+
+
 def _build_event_payload(
     tool_id: str,
     operation: Optional[str],
@@ -114,6 +169,13 @@ def _build_event_payload(
 
     if usage_metadata:
         event_payload["usageMetadata"] = usage_metadata
+
+    # Joins this tool's spend to the agentic job that drove it. Omitted
+    # entirely when nothing resolves: the field is optional and nullable on
+    # POST /v2/tool/events, and an explicit null carries no information.
+    agentic_job_id = _resolve_agentic_job_id(usage_metadata)
+    if agentic_job_id:
+        event_payload["agenticJobId"] = agentic_job_id
 
     # Add context fields (agent, product, organizationName, etc.)
     if context.agent:

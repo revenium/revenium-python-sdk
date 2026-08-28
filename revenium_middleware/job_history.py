@@ -31,6 +31,10 @@ class JobOutcomeAmendment:
     reported_by: Optional[str] = None
     reported_at: Optional[datetime] = None
     reason: Optional[str] = None  # None for the initial report (sequence=1)
+    # The outcome's own business failure/cancellation explanation, distinct from
+    # ``reason`` above (this amendment's audit justification). Kept last and
+    # defaulted so positional construction of the earlier fields still works.
+    outcome_reason: Optional[str] = None
 
 
 def get_outcome_history(
@@ -112,6 +116,7 @@ def _parse_history(data: Any) -> List[JobOutcomeAmendment]:
             reported_by=row.get("reportedBy"),
             reported_at=_parse_dt(row.get("reportedAt")),
             reason=row.get("reason"),
+            outcome_reason=row.get("outcomeReason"),
         )
         for row in rows
     ]

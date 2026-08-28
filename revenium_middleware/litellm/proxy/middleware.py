@@ -1,6 +1,7 @@
 from litellm.integrations.custom_logger import CustomLogger
 from revenium_middleware import client, get_client, run_async_in_thread
 from revenium_middleware._core.fields import merge_extra_body
+from revenium_middleware._core.cache_tokens import extract_cache_tokens, get_usage_field
 from revenium_middleware._core import submit_ai_event
 import logging
 
@@ -66,8 +67,16 @@ class MiddlewareHandler(CustomLogger):
         headers = metadata.get("headers", {})
 
         response = response_obj
-        # tokens used in response
+        # tokens used in response. Read every field -- cache and base token
+        # counts alike -- through the same tolerant accessor (see the
+        # failure path below for why: reading some fields directly and
+        # others through a tolerant accessor is what caused the two
+        # preceding review rounds to each find another zeroed field).
         usage = response_obj["usage"]
+        cache_read_tokens, cache_creation_tokens = extract_cache_tokens(usage)
+        prompt_tokens = get_usage_field(usage, "prompt_tokens", 0)
+        completion_tokens = get_usage_field(usage, "completion_tokens", 0)
+        total_tokens = get_usage_field(usage, "total_tokens", 0)
 
         # Create subscriber object from metadata and headers
         subscriber = {}
@@ -94,15 +103,15 @@ class MiddlewareHandler(CustomLogger):
         extra_body = merge_extra_body(None, agentic_fields)
 
         completion_args = {
-            "cache_creation_token_count": 0,
-            "cache_read_token_count": 0,
+            "cache_creation_token_count": cache_creation_tokens,
+            "cache_read_token_count": cache_read_tokens,
             "input_token_cost": None,
             "output_token_cost": None,
             "total_cost": None,
-            "output_token_count": usage.completion_tokens,
+            "output_token_count": completion_tokens,
             "cost_type": "AI",
             "model": model,
-            "input_token_count": usage.prompt_tokens,
+            "input_token_count": prompt_tokens,
             "provider": "LITELLM",
             "model_source": "LITELLM",
             "reasoning_token_count": 0,
@@ -112,7 +121,7 @@ class MiddlewareHandler(CustomLogger):
             "request_duration": (end_time - start_time).total_seconds() * 1000,
             "time_to_first_token": (end_time - start_time).total_seconds() * 1000,
             "stop_reason": "END",
-            "total_token_count": usage.total_tokens,
+            "total_token_count": total_tokens,
             "transaction_id": response.id,
             "trace_id": headers.get("x-revenium-trace-id"),
             "task_type": headers.get("x-revenium-task-type"),
@@ -121,6 +130,11 @@ class MiddlewareHandler(CustomLogger):
             "subscription_id": headers.get("x-revenium-subscription-id"),
             "product_name": product_name,
             "agent": headers.get("x-revenium-agent"),
+            # Present only when the caller sent the header: create_completion
+            # drops NotGiven but keeps an explicit None, which would reach the
+            # wire as "effort": null instead of being omitted.
+            **({"effort": headers["x-revenium-effort"]}
+               if "x-revenium-effort" in headers else {}),
             "response_quality_score": headers.get("x-revenium-response-quality-score"),
             "is_streamed": metadata.get('hidden_params', {}).get('optional_params', {}).get('stream', False),
             "operation_type": "CHAT",
@@ -155,10 +169,18 @@ class MiddlewareHandler(CustomLogger):
         metadata = litellm_params.get("metadata", {})  # headers passed to LiteLLM proxy, can be found here
         headers = metadata.get("headers", {})
 
-        # For failures, we may not have usage information
-        usage = getattr(response_obj, "usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
-        if isinstance(usage, dict) is False:
-            usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        # For failures, we may not have usage information. Read every field --
+        # cache and base token counts alike -- through the same tolerant
+        # accessor rather than normalizing `usage` to a dict first: that
+        # normalization silently zeroed every field (not just cache) for
+        # attribute-style usage objects, producing a payload with real cache
+        # counts alongside zeroed prompt/completion/total tokens for the same
+        # call.
+        usage = getattr(response_obj, "usage", None)
+        cache_read_tokens, cache_creation_tokens = extract_cache_tokens(usage)
+        prompt_tokens = get_usage_field(usage, "prompt_tokens", 0)
+        completion_tokens = get_usage_field(usage, "completion_tokens", 0)
+        total_tokens = get_usage_field(usage, "total_tokens", 0)
 
         error_message = str(response_obj)
         error_type = type(response_obj).__name__
@@ -188,15 +210,15 @@ class MiddlewareHandler(CustomLogger):
         extra_body = merge_extra_body(None, agentic_fields)
 
         completion_args = {
-            "cache_creation_token_count": 0,
-            "cache_read_token_count": 0,
+            "cache_creation_token_count": cache_creation_tokens,
+            "cache_read_token_count": cache_read_tokens,
             "input_token_cost": None,
             "output_token_cost": None,
             "total_cost": None,
-            "output_token_count": usage.get("completion_tokens", 0),
+            "output_token_count": completion_tokens,
             "cost_type": "AI",
             "model": model,
-            "input_token_count": usage.get("prompt_tokens", 0),
+            "input_token_count": prompt_tokens,
             "provider": "LITELLM",
             "model_source": "LITELLM",
             "reasoning_token_count": 0,
@@ -206,7 +228,7 @@ class MiddlewareHandler(CustomLogger):
             "request_duration": (end_time - start_time).total_seconds() * 1000,
             "time_to_first_token": (end_time - start_time).total_seconds() * 1000,
             "stop_reason": "ERROR",
-            "total_token_count": usage.get("total_tokens", 0),
+            "total_token_count": total_tokens,
             "transaction_id": getattr(response_obj, "id", "error-no-id"),
             "trace_id": headers.get("x-revenium-trace-id"),
             "task_type": headers.get("x-revenium-task-type"),
@@ -215,6 +237,11 @@ class MiddlewareHandler(CustomLogger):
             "subscription_id": headers.get("x-revenium-subscription-id"),
             "product_name": product_name,
             "agent": headers.get("x-revenium-agent"),
+            # Present only when the caller sent the header: create_completion
+            # drops NotGiven but keeps an explicit None, which would reach the
+            # wire as "effort": null instead of being omitted.
+            **({"effort": headers["x-revenium-effort"]}
+               if "x-revenium-effort" in headers else {}),
             "response_quality_score": headers.get("x-revenium-response-quality-score"),
             "is_streamed": metadata.get('hidden_params', {}).get('optional_params', {}).get('stream', False),
             "operation_type": "CHAT",
