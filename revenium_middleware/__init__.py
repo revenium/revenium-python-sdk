@@ -179,6 +179,13 @@ from .agentic_outcomes import AgenticOutcomeClient, AgenticOutcomeSettings  # no
 # Public job-context surface (BACK-777)
 from .job_context import JobContext  # noqa: E402
 from .job_history import JobOutcomeAmendment, get_outcome_history  # noqa: E402
+from .job_type_economics import (  # noqa: E402
+    Baseline, BaselineProvenance, JobTypeEconomics, JobTypeMetricDirection,
+    JobTypeMonetizationBasis, JobTypeMonetizationCategory,
+    OutcomeMetricProvenance, PeriodFactEntry,
+    create_baseline, get_job_type_economics, list_baselines,
+    report_period_facts, upsert_job_type_economics,
+)
 from ._core.exceptions import (  # noqa: E402
     OutcomeAlreadyReportedError,
     OutcomeAmendConflictError,
@@ -235,4 +242,17 @@ __all__ = [
     "JobOutcomeAmendment",
     "OutcomeNotReportedError",
     "OutcomeAmendConflictError",
+    "PeriodFactEntry",
+    "Baseline",
+    "BaselineProvenance",
+    "JobTypeEconomics",
+    "JobTypeMetricDirection",
+    "JobTypeMonetizationBasis",
+    "JobTypeMonetizationCategory",
+    "OutcomeMetricProvenance",
+    "report_period_facts",
+    "get_job_type_economics",
+    "upsert_job_type_economics",
+    "create_baseline",
+    "list_baselines",
 ]

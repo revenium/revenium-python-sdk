@@ -1,8 +1,10 @@
 """Tests for the validate_api_key helper in revenium_middleware._core.config."""
 
+import warnings
+
 import pytest
 
-from revenium_middleware._core.config import validate_api_key, Config
+from revenium_middleware._core.config import Config, resolve_write_api_key, validate_api_key
 
 
 class TestValidateApiKeyPrefixes:
@@ -53,3 +55,33 @@ class TestValidApiKeyPrefixesConstant:
 
     def test_prefixes_are_exactly_hak_and_rev(self):
         assert Config.VALID_API_KEY_PREFIXES == ("hak_", "rev_")
+
+    def test_write_env_var_name_is_exact(self):
+        assert Config.ENV_REVENIUM_WRITE_API_KEY == "REVENIUM_WRITE_API_KEY"
+
+
+class TestResolveWriteApiKey:
+    def test_prefers_explicit_then_write_then_outcome_then_metering(self, monkeypatch):
+        monkeypatch.setenv(Config.ENV_REVENIUM_WRITE_API_KEY, "rev_sk_TENANT_write")
+        monkeypatch.setenv(Config.ENV_REVENIUM_OUTCOME_API_KEY, "rev_sk_TENANT_legacy")
+        monkeypatch.setenv(Config.ENV_REVENIUM_API_KEY, "rev_mk_TENANT_metering")
+
+        assert resolve_write_api_key("rev_sk_TENANT_explicit") == "rev_sk_TENANT_explicit"
+        assert resolve_write_api_key() == "rev_sk_TENANT_write"
+
+        monkeypatch.delenv(Config.ENV_REVENIUM_WRITE_API_KEY)
+        with pytest.warns(DeprecationWarning, match="REVENIUM_WRITE_API_KEY"):
+            assert resolve_write_api_key() == "rev_sk_TENANT_legacy"
+
+        monkeypatch.delenv(Config.ENV_REVENIUM_OUTCOME_API_KEY)
+        assert resolve_write_api_key() == "rev_mk_TENANT_metering"
+
+    def test_both_write_and_outcome_set_uses_write_without_deprecation(self, monkeypatch):
+        monkeypatch.setenv(Config.ENV_REVENIUM_WRITE_API_KEY, "rev_sk_TENANT_write")
+        monkeypatch.setenv(Config.ENV_REVENIUM_OUTCOME_API_KEY, "rev_sk_TENANT_legacy")
+
+        with warnings.catch_warnings(record=True) as recorded:
+            warnings.simplefilter("always")
+            assert resolve_write_api_key() == "rev_sk_TENANT_write"
+
+        assert recorded == []

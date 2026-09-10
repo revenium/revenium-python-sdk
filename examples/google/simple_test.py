@@ -170,7 +170,7 @@ def google_ai_basic_example():
             )
 
         print(" Zero-config integration successful!")
-        print("   Your usage is automatically tracked in Revenium")
+        print("   Your usage is automatically sent to Revenium")
         return True
 
     except Exception as e:

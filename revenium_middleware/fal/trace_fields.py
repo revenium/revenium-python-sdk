@@ -12,8 +12,11 @@ from typing import Optional, Dict, Any
 
 from revenium_middleware._core.trace_fields import (  # noqa: F401 — re-exported
     TICKET_ID_MAX_LENGTH,
+    AGENT_VERSION_MAX_LENGTH,
     get_ticket_id,
+    get_agent_version,
     validate_ticket_id,
+    validate_agent_version,
 )
 
 logger = logging.getLogger(__name__)

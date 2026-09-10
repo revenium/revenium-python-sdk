@@ -5,8 +5,8 @@ Public surface:
 - AgenticOutcomeClient: emit_completion / emit_tool_event / report_outcome.
 
 Single-key contract: settings.api_key authenticates both metering (via the
-in-package ReveniumMetering client) and the raw-HTTP fallback for endpoints the SDK does
-not yet cover (/meter/v2/tool/events, /profitstream/v2/api/jobs/{id}/outcome).
+in-package ReveniumMetering client) and the raw-HTTP fallback for endpoints not provided
+by that client (/meter/v2/tool/events, /profitstream/v2/api/jobs/{id}/outcome).
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import threading
 import urllib.parse
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import httpx
 from revenium_middleware._core import outcomes as _outcomes
@@ -179,7 +179,7 @@ class AgenticOutcomeClient:
             prompts_truncated=payload.get("promptsTruncated"),
             error_reason=payload.get("errorReason"),
             extra_body=extra_body or None,
-            # Per-instance client; idempotency key generated inline (see FRONT-1208 spec exception).
+            # Per-instance client with an inline idempotency key.
             extra_headers={"Idempotency-Key": str(uuid.uuid4())},
         )
         return payload
@@ -214,6 +214,18 @@ class AgenticOutcomeClient:
         environment: Optional[str] = None,
         dry_run: bool = False,
     ) -> Dict[str, Any]:
+        """Create (or re-affirm) a job. Returns the created job resource.
+
+        The response carries the job's ``entityVersion``, which the outcome
+        PATCH accepts back as ``expectedEntityVersion`` — returning the parsed
+        body lets a caller seed that version without a second read of the job.
+
+        The response is merged over the request body rather than replacing it,
+        and the request body is returned alone when the response cannot supply
+        one — a 409 idempotent re-run answers with an error body rather than a
+        job resource, and a dry run or a bodiless 2xx has nothing to parse. So
+        the return value always still carries every field the caller supplied.
+        """
         url = f"{self.settings.profitstream_base_url.rstrip('/')}/profitstream/v2/api/jobs"
         body: Dict[str, Any] = {"agenticJobId": agentic_job_id}
         if name:
@@ -230,7 +242,7 @@ class AgenticOutcomeClient:
         team_id = self._get_team_id()
         params = {"teamId": team_id} if team_id else None
         # 409 Conflict is acceptable (idempotent re-runs of the same agenticJobId).
-        _outcomes.post_with_retry(
+        response = _outcomes.post_with_retry(
             self.http_client,
             url,
             params=params,
@@ -241,7 +253,7 @@ class AgenticOutcomeClient:
             retry_initial_seconds=self.settings.outcome_retry_initial_seconds,
             retry_max_seconds=self.settings.outcome_retry_max_seconds,
         )
-        return body
+        return _job_resource_or(body, response)
 
     def report_outcome(
         self, agentic_job_id: str, payload: Dict[str, Any], *, dry_run: bool = False
@@ -286,6 +298,64 @@ class AgenticOutcomeClient:
             retry_max_seconds=self.settings.outcome_retry_max_seconds,
         )
 
+    def append_outcome_metrics(
+        self,
+        agentic_job_id: str,
+        entries: Sequence[Mapping[str, Any]],
+        *,
+        dry_run: bool = False,
+    ) -> None:
+        """Append declared per-job metric facts to an existing job.
+
+        The entries are sent as the request body itself — a bare JSON array,
+        which is what this endpoint declares — with each entry forwarded exactly
+        as supplied::
+
+            [{"key": "quality_rate", "value": 0.93, "provenance": "MEASURED"}]
+
+        ``provenance``, ``recordedBy`` and ``source`` are optional and default
+        server-side (SELF_REPORTED, the calling principal, api). The metric must
+        already be declared PER_JOB on the job type's economics contract, and
+        quality_rate is range-checked to 0..1 by the server; an undeclared key
+        or an out-of-range rate is a 400.
+
+        Unlike ``report_outcome``, whose payload is an opaque dict this client
+        deliberately passes through untouched, ``entries`` is a typed argument
+        and gets the same shape check ``JobContext`` applies: a sequence of
+        mappings, each with a non-blank ``key`` and a ``value``, at least one of
+        them. It runs before the dry-run print and before any key or team
+        resolution, so both entry points reject the same inputs at the same
+        point and a dry run never prints a payload the real call would refuse.
+
+        Raises:
+            ValueError: no entries, a malformed entry, or a metering
+                (``rev_mk_``) API key.
+        """
+        validated = _outcomes.normalize_outcome_metrics(
+            entries, require_entries=True
+        ) or []
+        safe_id = urllib.parse.quote(agentic_job_id, safe="")
+        url = (
+            f"{self.settings.profitstream_base_url.rstrip('/')}"
+            f"/profitstream/v2/api/jobs/{safe_id}/outcome/metrics"
+        )
+        if dry_run:
+            _print_dry_run("POST", url, validated)
+            return
+        api_key = self._outcome_key()
+        team_id = self._get_team_id()
+        _outcomes.append_outcome_metrics_request(
+            self.http_client,
+            self.settings.profitstream_base_url,
+            agentic_job_id,
+            validated,
+            team_id=team_id,
+            api_key=api_key,
+            retry_attempts=self.settings.outcome_retry_attempts,
+            retry_initial_seconds=self.settings.outcome_retry_initial_seconds,
+            retry_max_seconds=self.settings.outcome_retry_max_seconds,
+        )
+
     def _outcome_key(self) -> str:
         # Job/outcome control requires a write-scope key (rev_sk_); a metering
         # key (rev_mk_) is rejected here so callers fail fast client-side
@@ -316,6 +386,31 @@ class AgenticOutcomeClient:
         return resolved
 
 
-def _print_dry_run(method: str, url: str, payload: Dict[str, Any]) -> None:
+def _job_resource_or(
+    request_body: Dict[str, Any], response: Optional[httpx.Response]
+) -> Dict[str, Any]:
+    """The created job resource merged over ``request_body``.
+
+    Merged, not substituted: this call has always returned every field the
+    caller supplied, so a response that omits one (a partial job resource, a
+    projection) must not silently drop it — the response wins only where the
+    two overlap. The accepted 409 of an idempotent re-run carries an error body
+    rather than a job, and a bodiless or non-JSON 2xx carries nothing at all;
+    neither is a failure, so both fall back to the request body alone.
+    """
+    if response is None or response.status_code == 409:
+        return request_body
+    try:
+        data = response.json()
+    except Exception:  # noqa: BLE001 — a bodiless or non-JSON 2xx is expected
+        return request_body
+    if isinstance(data, dict) and data:
+        return {**request_body, **data}
+    return request_body
+
+
+def _print_dry_run(
+    method: str, url: str, payload: Union[Dict[str, Any], List[Any]]
+) -> None:
     print(f"[DRY-RUN] {method} {url}")
     print(json.dumps(payload, indent=2))

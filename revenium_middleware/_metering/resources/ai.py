@@ -118,6 +118,7 @@ class AIResource(SyncAPIResource):
         retry_number: int | NotGiven = NOT_GIVEN,
         trace_name: str | NotGiven = NOT_GIVEN,
         ticket_id: str | NotGiven = NOT_GIVEN,
+        agent_version: str | NotGiven = NOT_GIVEN,
         skill_invocation_trigger: str | NotGiven = NOT_GIVEN,
         skill_kind: str | NotGiven = NOT_GIVEN,
         skill_marketplace_name: str | NotGiven = NOT_GIVEN,
@@ -295,6 +296,8 @@ class AIResource(SyncAPIResource):
 
           ticket_id: External ticket or issue ID (e.g. Jira, Linear) for cost attribution per ticket (max 256 chars)
 
+          agent_version: Version of the AI agent that produced this call, for cost attribution per agent version (max 64 chars)
+
           skill_invocation_trigger: What triggered the skill invocation (max 32 chars; common
               values: user-slash, claude-proactive, nested-skill)
 
@@ -405,6 +408,7 @@ class AIResource(SyncAPIResource):
                     "retry_number": retry_number,
                     "trace_name": trace_name,
                     "ticket_id": ticket_id,
+                    "agent_version": agent_version,
                     "skill_invocation_trigger": skill_invocation_trigger,
                     "skill_kind": skill_kind,
                     "skill_marketplace_name": skill_marketplace_name,
@@ -482,6 +486,7 @@ class AIResource(SyncAPIResource):
         trace_type: str | NotGiven = NOT_GIVEN,
         trace_name: str | NotGiven = NOT_GIVEN,
         ticket_id: str | NotGiven = NOT_GIVEN,
+        agent_version: str | NotGiven = NOT_GIVEN,
         agentic_job_id: str | NotGiven = NOT_GIVEN,
         agentic_job_name: str | NotGiven = NOT_GIVEN,
         agentic_job_type: str | NotGiven = NOT_GIVEN,
@@ -597,6 +602,8 @@ class AIResource(SyncAPIResource):
 
           ticket_id: External ticket or issue ID (e.g. Jira, Linear) for cost attribution per ticket (max 256 chars)
 
+          agent_version: Version of the AI agent that produced this call, for cost attribution per agent version (max 64 chars)
+
           agentic_job_id: Unique identifier of the agentic job this call belongs to
 
           agentic_job_name: Human-readable name of the agentic job
@@ -698,6 +705,7 @@ class AIResource(SyncAPIResource):
                     "trace_type": trace_type,
                     "trace_name": trace_name,
                     "ticket_id": ticket_id,
+                    "agent_version": agent_version,
                     "agentic_job_id": agentic_job_id,
                     "agentic_job_name": agentic_job_name,
                     "agentic_job_type": agentic_job_type,
@@ -772,6 +780,7 @@ class AIResource(SyncAPIResource):
         trace_type: str | NotGiven = NOT_GIVEN,
         trace_name: str | NotGiven = NOT_GIVEN,
         ticket_id: str | NotGiven = NOT_GIVEN,
+        agent_version: str | NotGiven = NOT_GIVEN,
         agentic_job_id: str | NotGiven = NOT_GIVEN,
         agentic_job_name: str | NotGiven = NOT_GIVEN,
         agentic_job_type: str | NotGiven = NOT_GIVEN,
@@ -878,6 +887,8 @@ class AIResource(SyncAPIResource):
 
           ticket_id: External ticket or issue ID (e.g. Jira, Linear) for cost attribution per ticket (max 256 chars)
 
+          agent_version: Version of the AI agent that produced this call, for cost attribution per agent version (max 64 chars)
+
           agentic_job_id: Unique identifier of the agentic job this call belongs to
 
           agentic_job_name: Human-readable name of the agentic job
@@ -976,6 +987,7 @@ class AIResource(SyncAPIResource):
                     "trace_type": trace_type,
                     "trace_name": trace_name,
                     "ticket_id": ticket_id,
+                    "agent_version": agent_version,
                     "agentic_job_id": agentic_job_id,
                     "agentic_job_name": agentic_job_name,
                     "agentic_job_type": agentic_job_type,
@@ -1050,6 +1062,7 @@ class AIResource(SyncAPIResource):
         trace_type: str | NotGiven = NOT_GIVEN,
         trace_name: str | NotGiven = NOT_GIVEN,
         ticket_id: str | NotGiven = NOT_GIVEN,
+        agent_version: str | NotGiven = NOT_GIVEN,
         agentic_job_id: str | NotGiven = NOT_GIVEN,
         agentic_job_name: str | NotGiven = NOT_GIVEN,
         agentic_job_type: str | NotGiven = NOT_GIVEN,
@@ -1154,6 +1167,8 @@ class AIResource(SyncAPIResource):
 
           ticket_id: External ticket or issue ID (e.g. Jira, Linear) for cost attribution per ticket (max 256 chars)
 
+          agent_version: Version of the AI agent that produced this call, for cost attribution per agent version (max 64 chars)
+
           agentic_job_id: Unique identifier of the agentic job this call belongs to
 
           agentic_job_name: Human-readable name of the agentic job
@@ -1251,6 +1266,7 @@ class AIResource(SyncAPIResource):
                     "trace_type": trace_type,
                     "trace_name": trace_name,
                     "ticket_id": ticket_id,
+                    "agent_version": agent_version,
                     "agentic_job_id": agentic_job_id,
                     "agentic_job_name": agentic_job_name,
                     "agentic_job_type": agentic_job_type,
@@ -1377,6 +1393,7 @@ class AsyncAIResource(AsyncAPIResource):
         retry_number: int | NotGiven = NOT_GIVEN,
         trace_name: str | NotGiven = NOT_GIVEN,
         ticket_id: str | NotGiven = NOT_GIVEN,
+        agent_version: str | NotGiven = NOT_GIVEN,
         skill_invocation_trigger: str | NotGiven = NOT_GIVEN,
         skill_kind: str | NotGiven = NOT_GIVEN,
         skill_marketplace_name: str | NotGiven = NOT_GIVEN,
@@ -1554,6 +1571,8 @@ class AsyncAIResource(AsyncAPIResource):
 
           ticket_id: External ticket or issue ID (e.g. Jira, Linear) for cost attribution per ticket (max 256 chars)
 
+          agent_version: Version of the AI agent that produced this call, for cost attribution per agent version (max 64 chars)
+
           skill_invocation_trigger: What triggered the skill invocation (max 32 chars; common
               values: user-slash, claude-proactive, nested-skill)
 
@@ -1664,6 +1683,7 @@ class AsyncAIResource(AsyncAPIResource):
                     "retry_number": retry_number,
                     "trace_name": trace_name,
                     "ticket_id": ticket_id,
+                    "agent_version": agent_version,
                     "skill_invocation_trigger": skill_invocation_trigger,
                     "skill_kind": skill_kind,
                     "skill_marketplace_name": skill_marketplace_name,
@@ -1741,6 +1761,7 @@ class AsyncAIResource(AsyncAPIResource):
         trace_type: str | NotGiven = NOT_GIVEN,
         trace_name: str | NotGiven = NOT_GIVEN,
         ticket_id: str | NotGiven = NOT_GIVEN,
+        agent_version: str | NotGiven = NOT_GIVEN,
         agentic_job_id: str | NotGiven = NOT_GIVEN,
         agentic_job_name: str | NotGiven = NOT_GIVEN,
         agentic_job_type: str | NotGiven = NOT_GIVEN,
@@ -1856,6 +1877,8 @@ class AsyncAIResource(AsyncAPIResource):
 
           ticket_id: External ticket or issue ID (e.g. Jira, Linear) for cost attribution per ticket (max 256 chars)
 
+          agent_version: Version of the AI agent that produced this call, for cost attribution per agent version (max 64 chars)
+
           agentic_job_id: Unique identifier of the agentic job this call belongs to
 
           agentic_job_name: Human-readable name of the agentic job
@@ -1957,6 +1980,7 @@ class AsyncAIResource(AsyncAPIResource):
                     "trace_type": trace_type,
                     "trace_name": trace_name,
                     "ticket_id": ticket_id,
+                    "agent_version": agent_version,
                     "agentic_job_id": agentic_job_id,
                     "agentic_job_name": agentic_job_name,
                     "agentic_job_type": agentic_job_type,
@@ -2031,6 +2055,7 @@ class AsyncAIResource(AsyncAPIResource):
         trace_type: str | NotGiven = NOT_GIVEN,
         trace_name: str | NotGiven = NOT_GIVEN,
         ticket_id: str | NotGiven = NOT_GIVEN,
+        agent_version: str | NotGiven = NOT_GIVEN,
         agentic_job_id: str | NotGiven = NOT_GIVEN,
         agentic_job_name: str | NotGiven = NOT_GIVEN,
         agentic_job_type: str | NotGiven = NOT_GIVEN,
@@ -2137,6 +2162,8 @@ class AsyncAIResource(AsyncAPIResource):
 
           ticket_id: External ticket or issue ID (e.g. Jira, Linear) for cost attribution per ticket (max 256 chars)
 
+          agent_version: Version of the AI agent that produced this call, for cost attribution per agent version (max 64 chars)
+
           agentic_job_id: Unique identifier of the agentic job this call belongs to
 
           agentic_job_name: Human-readable name of the agentic job
@@ -2235,6 +2262,7 @@ class AsyncAIResource(AsyncAPIResource):
                     "trace_type": trace_type,
                     "trace_name": trace_name,
                     "ticket_id": ticket_id,
+                    "agent_version": agent_version,
                     "agentic_job_id": agentic_job_id,
                     "agentic_job_name": agentic_job_name,
                     "agentic_job_type": agentic_job_type,
@@ -2309,6 +2337,7 @@ class AsyncAIResource(AsyncAPIResource):
         trace_type: str | NotGiven = NOT_GIVEN,
         trace_name: str | NotGiven = NOT_GIVEN,
         ticket_id: str | NotGiven = NOT_GIVEN,
+        agent_version: str | NotGiven = NOT_GIVEN,
         agentic_job_id: str | NotGiven = NOT_GIVEN,
         agentic_job_name: str | NotGiven = NOT_GIVEN,
         agentic_job_type: str | NotGiven = NOT_GIVEN,
@@ -2413,6 +2442,8 @@ class AsyncAIResource(AsyncAPIResource):
 
           ticket_id: External ticket or issue ID (e.g. Jira, Linear) for cost attribution per ticket (max 256 chars)
 
+          agent_version: Version of the AI agent that produced this call, for cost attribution per agent version (max 64 chars)
+
           agentic_job_id: Unique identifier of the agentic job this call belongs to
 
           agentic_job_name: Human-readable name of the agentic job
@@ -2510,6 +2541,7 @@ class AsyncAIResource(AsyncAPIResource):
                     "trace_type": trace_type,
                     "trace_name": trace_name,
                     "ticket_id": ticket_id,
+                    "agent_version": agent_version,
                     "agentic_job_id": agentic_job_id,
                     "agentic_job_name": agentic_job_name,
                     "agentic_job_type": agentic_job_type,

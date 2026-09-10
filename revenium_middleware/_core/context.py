@@ -100,11 +100,26 @@ def clear_injected_metadata() -> None:
     _injected_metadata_context.set(None)
 
 
+def _canonical_metadata_key(key: Any) -> Any:
+    """Fold a metadata key to a spelling-independent form.
+
+    Every aliased metadata field in this SDK is accepted as both snake_case
+    and camelCase (``agent_version`` / ``agentVersion``, ``ticket_id`` /
+    ``ticketId``), so both spellings fold to the same canonical string.
+    Non-string keys are returned unchanged and can only ever collide with
+    themselves.
+    """
+    if not isinstance(key, str):
+        return key
+    return key.replace("_", "").lower()
+
+
 def merge_metadata(api_metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Merge injected metadata with API-level metadata.
 
-    API-level metadata takes precedence over injected metadata.
+    API-level metadata takes precedence over injected metadata, including
+    when the two sides spell the same field differently.
 
     Args:
         api_metadata: Metadata passed directly to the API call
@@ -114,6 +129,20 @@ def merge_metadata(api_metadata: Optional[Dict[str, Any]] = None) -> Dict[str, A
     """
     injected = get_injected_metadata() or {}
     api = api_metadata or {}
+
+    if injected and api:
+        # Merging by literal key alone keeps a scoped ``agent_version``
+        # alongside a direct ``agentVersion``. The alias precedence applied
+        # downstream then picks whichever spelling it looks for first, which
+        # can resolve the scoped value and invert the precedence documented
+        # above. Drop scoped keys the direct call already supplies under any
+        # spelling, so the direct value is the only one left to resolve.
+        api_keys = {_canonical_metadata_key(key) for key in api}
+        injected = {
+            key: value
+            for key, value in injected.items()
+            if _canonical_metadata_key(key) not in api_keys
+        }
 
     # Start with injected metadata, then override with API-level metadata
     merged = {**injected, **api}

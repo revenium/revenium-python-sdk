@@ -240,6 +240,10 @@ async def log_token_usage(
     if ticket_id:
         completion_args["ticket_id"] = ticket_id
 
+    agent_version = trace_fields.get_agent_version(usage_metadata)
+    if agent_version:
+        completion_args["agent_version"] = agent_version
+
     # Service tier and pricing fields
     completion_args.update(
         extract_service_tier_fields(usage_metadata, "completion")
@@ -629,6 +633,10 @@ async def log_image_usage(
     if ticket_id:
         image_args["ticket_id"] = ticket_id
 
+    agent_version = trace_fields.get_agent_version(usage_metadata)
+    if agent_version:
+        image_args["agent_version"] = agent_version
+
     # Media lineage fields (source attribution for edit-and-regenerate flows)
     image_args.update(extract_media_lineage_fields(usage_metadata))
     # Service tier and pricing fields
@@ -743,6 +751,10 @@ async def log_video_usage(
     ticket_id = trace_fields.get_ticket_id(usage_metadata)
     if ticket_id:
         video_args["ticket_id"] = ticket_id
+
+    agent_version = trace_fields.get_agent_version(usage_metadata)
+    if agent_version:
+        video_args["agent_version"] = agent_version
 
     # Media lineage fields (source attribution for edit-and-regenerate flows)
     video_args.update(extract_media_lineage_fields(usage_metadata))

@@ -301,6 +301,9 @@ class AICreateCompletionParams(TypedDict, total=False):
     ticket_id: Annotated[str, PropertyInfo(alias="ticketId")]
     """External ticket or issue ID (e.g. Jira, Linear) for cost attribution per ticket (max 256 chars)"""
 
+    agent_version: Annotated[str, PropertyInfo(alias="agentVersion")]
+    """Version of the AI agent that produced this call, for cost attribution per agent version (max 64 chars)"""
+
     skill_invocation_trigger: Annotated[str, PropertyInfo(alias="skillInvocationTrigger")]
     """What triggered the skill invocation (max 32 chars; common values: user-slash, claude-proactive, nested-skill)"""
 

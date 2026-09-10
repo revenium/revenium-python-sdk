@@ -167,7 +167,63 @@ when the provider's SDK is installed.
 
 Emit per-agent terminal outcomes (`CONVERTED`, `DEFLECTED`, `ESCALATED`) alongside completion and tool-event records, so dashboards show business value next to AI cost.
 
-> **You need a write-scope key (`rev_sk_`) to use the agentic outcomes API.** Metering keys (`rev_mk_`) can only meter completions and tool events — they cannot report, amend, or read job outcomes, and the SDK rejects them client-side before any HTTP request is made. Key resolution: explicit `api_key=` > `REVENIUM_OUTCOME_API_KEY` > `REVENIUM_METERING_API_KEY`.
+> **You need a write-scope key (`rev_sk_`) to use the agentic outcomes API.** Metering keys (`rev_mk_`) can only meter completions and tool events — they cannot report, amend, or read job outcomes, and the SDK rejects them client-side before any HTTP request is made. Key resolution: explicit `api_key=` > `REVENIUM_WRITE_API_KEY` > `REVENIUM_OUTCOME_API_KEY` (deprecated fallback) > `REVENIUM_METERING_API_KEY`.
+
+### Job-Type Economics and Outcome Facts
+
+Keep a metering key for AI telemetry and a separate write key for outcomes and
+job-type configuration. A registered `valuePerUnit` rule takes precedence over
+an outcome's `outcome_value`; the backend never sums the two value sources.
+
+```python
+from revenium_middleware import (
+    Baseline, JobTypeEconomics, PeriodFactEntry, create_baseline,
+    report_period_facts, upsert_job_type_economics,
+)
+
+upsert_job_type_economics("claim", JobTypeEconomics(
+    unit_metric_key="completed_claims", unit_label="claim",
+    metrics=[{
+        "key": "completed_claims", "type": "COUNT",
+        "direction": "HIGHER_IS_BETTER", "aggregation": "SUM",
+        "resolution": "PER_JOB",
+    }],
+    dimensions=[{"key": "region", "allowedValues": ["us", "ca"]}],
+    monetization={
+        "metricKey": "completed_claims", "valuePerUnit": 4.25,
+        "currency": "USD", "category": "COST_AVOIDED", "basis": "REALIZED",
+    },
+))
+create_baseline("claim", Baseline(
+    effective_from="2026-08-01T00:00:00Z", cost_per_unit=4.25, currency="USD",
+))
+report_period_facts("claim", [PeriodFactEntry(
+    period_start="2026-08-01T00:00:00Z", period_end="2026-09-01T00:00:00Z",
+    dimension_key="region", dimension_value="us",
+    key="completed_claims", value=1280,
+)])
+```
+
+`effective_from` is the only required field on a baseline; every other field
+is optional, and a baseline without it is rejected. A job type must be
+declared with `upsert_job_type_economics` before it accepts baselines or
+facts, and `report_period_facts` accepts only metrics declared with
+`"resolution": "PERIOD"`.
+
+Job economics currency values must be USD. Baselines and period facts use
+server-supplied attribution when their provenance,
+reporter, and source fields are omitted. Set those fields only when you need an
+explicit override. Economics metric directions are
+`HIGHER_IS_BETTER` or `LOWER_IS_BETTER`; monetization categories are
+`REVENUE`, `COST_AVOIDED`, `TIME_SAVED`, and `LEADING_VALUE`, with a
+`REALIZED` or `EXPECTED` basis.
+
+Use `CUSTOMER_DECLARED` or `MEASURED` for a baseline override. Use `MEASURED`,
+`SELF_REPORTED`, or `DERIVED` for a period fact override.
+
+Facts are append-only and keyed on the period, dimension and metric key
+together. Re-appending that tuple supersedes the active fact, and the server
+requires `reason=` on the entry when it does.
 
 ### JobContext
 
@@ -214,10 +270,70 @@ history = get_outcome_history("sales-lead-8842")
 # List[JobOutcomeAmendment], ordered by amendment_sequence (1 = the initial report)
 ```
 
-`amend_outcome()` takes a mandatory non-blank `reason` plus the same optional fields as `report_outcome()` (`execution_status`, `outcome_type`, `outcome_value`, `outcome_currency`, `metadata`, `reported_by`, `outcome_reason`), and returns the updated job as a dict.
+`amend_outcome()` takes `reason` — the amendment's audit justification, still the first positional argument — plus the same optional fields as `report_outcome()` (`execution_status`, `outcome_type`, `outcome_value`, `outcome_currency`, `metadata`, `reported_by`, `outcome_reason`, `metrics`), and returns the updated job as a dict.
 
+- **Detecting a lost update:** `report_outcome()` and `amend_outcome()` record the job's `entityVersion` from the response on the handle (readable as `job.entity_version`). The next `amend_outcome()` on that same handle sends it as `expectedEntityVersion`, so an amendment that would overwrite a change made by another writer in the meantime raises `OutcomeAmendConflictError` instead of silently winning. Pass `expected_entity_version=` to lock against a version you fetched yourself; use a fresh `JobContext.attach()` handle — which has recorded nothing — for the old last-write-wins behavior.
+
+```python
+from revenium_middleware import OutcomeAmendConflictError, get_outcome_history
+
+try:
+    job.amend_outcome(reason="Chargeback", outcome_value=0.0)
+except OutcomeAmendConflictError as conflict:
+    # The conflict reports the version the platform actually holds.
+    print(conflict.current_entity_version)          # e.g. 9
+
+    # Look at what the other writer changed, and only re-issue the amendment
+    # if it still applies to what is recorded now.
+    history = get_outcome_history("sales-lead-8842")
+    if still_applies(history[-1]):
+        job.amend_outcome(reason="Chargeback, re-checked", outcome_value=0.0,
+                          expected_entity_version=conflict.current_entity_version)
+```
+
+The handle also records that version, so the retry above works with or without passing `expected_entity_version=` explicitly. `current_entity_version` is `None` when the conflict body carries no version; the version then has to come from a job read (`GET /v2/api/jobs/{agenticJobId}`), which this SDK does not wrap yet, and a retry without it is unlocked (last-write-wins). `get_outcome_history()` rows carry an `amendment_sequence`, not an entity version — history tells you *what* changed, never which version to retry with.
+
+Every outcome call replaces the recorded version with the one its response reports, including clearing it when a response carries none, so a completed call never leaves a token behind that the platform has already moved past.
+
+- **Omitting `reason`:** an API-key caller may leave `reason` out and the platform records an automated correction reason derived from the source. A session caller must supply one; a blank string is rejected client-side either way.
 - **`reason` vs `outcome_reason`:** `reason` is the amendment's own audit justification (why the record changed); `outcome_reason` is the business explanation of why the job failed or was cancelled. Use `outcome_reason` for failure explanations rather than burying them in `metadata` — it is a first-class field on the outcome and is returned on every `get_outcome_history()` row.
 - **Clearing `outcome_reason`:** omit the argument to leave the stored value untouched; pass an empty string (`outcome_reason=""`) to clear it.
+- **`metrics`:** both `report_outcome()` and `amend_outcome()` accept a `metrics` argument for recording the measurable facts behind an outcome.
+
+### Recording Metric Facts
+
+Beyond the single `outcome_value`, a job can carry the measurable facts its job type declares — `quality_rate` and its siblings — either with the outcome or later, once they are measurable.
+
+```python
+from revenium_middleware import JobContext
+
+with JobContext("claim-8842", type="claims_triage") as job:
+    ...
+    job.report_outcome(
+        execution_status="SUCCESS",
+        outcome_type="CONVERTED",
+        metrics=[
+            {"key": "quality_rate", "value": 0.93, "provenance": "MEASURED"},
+            {"key": "cases_closed", "value": 12},
+        ],
+    )
+
+# Two days later a human grades a sample of that same job's output.
+handle = JobContext.attach("claim-8842")
+handle.append_outcome_metrics([
+    {"key": "quality_rate", "value": 0.87, "provenance": "ATTESTED",
+     "reason": "graded sample of 200 cases"},
+])
+handle.close()
+```
+
+- **Declare the metric first:** a fact only lands if the job type's economics contract declares that key as a `PER_JOB` metric; an undeclared key is rejected with a 400. `quality_rate` is a rate and the platform range-checks it to 0..1.
+- **Entry shape:** `key` and `value` are required; `provenance` (`MEASURED` | `SELF_REPORTED` | `DERIVED` | `ATTESTED`), `recordedBy`, `source`, `reason` and `recordedAt` are optional. Entries are sent exactly as you write them, so the fields you omit take the platform's defaults (`SELF_REPORTED`, the calling principal, `api`) instead of being guessed by the SDK. A missing `key` or `value` — or no entries at all on `append_outcome_metrics()` — raises `ValueError` before any HTTP request, on `JobContext` and `AgenticOutcomeClient` alike.
+- **Append-only:** facts accumulate; the SDK never dedupes or replaces one, because the platform owns fact identity. `metrics=` on `amend_outcome()` appends as part of the amendment.
+- **Not part of outcome history:** `get_outcome_history()` returns the outcome revisions only — appended facts do not appear in those rows.
+- **Retries:** an append is retried only on `429`, which proves the platform rejected the request before recording anything. A `502`/`503`/`504` is raised instead of retried: the facts may already be recorded, and a second append is a second fact, so the decision to resend is yours (check the recorded facts first).
+- **Locking is unaffected:** appending facts does not change the job's `entityVersion`, so the handle keeps the version it recorded and a following `amend_outcome()` still locks against it. (`report_outcome()` and `amend_outcome()` clear the recorded version when their response carries none, because those calls advance it; an append does not.)
+- **Why it matters:** AI Alerts evaluate `QUALITY_RATE` from these facts, so a job whose integration emits none is invisible to those rules.
 
 ### Outcome Exceptions
 
@@ -228,7 +344,7 @@ All outcome exceptions are importable from `revenium_middleware` and share the `
 | `OutcomeReportingError` | Base class — configuration failures (no API key available, unresolvable `team_id`) | Fix the key / team configuration |
 | `OutcomeAlreadyReportedError` | Re-reporting a job that already has an outcome (backend 409) | Amend with `amend_outcome()` instead; the exception carries `reported_at` and `amendment_count` |
 | `OutcomeNotReportedError` | Amending a job that has no outcome yet (backend 422) | Call `report_outcome()` first |
-| `OutcomeAmendConflictError` | A concurrent amendment changed the outcome (backend 409, optimistic lock) | Refetch with `get_outcome_history()` and retry — the SDK does not auto-retry |
+| `OutcomeAmendConflictError` | A concurrent amendment changed the outcome (backend 409, optimistic lock) | Re-check the outcome against `get_outcome_history()`, then retry with `expected_entity_version=conflict.current_entity_version` — the SDK does not auto-retry |
 
 ### Low-Level Client
 
@@ -243,10 +359,11 @@ client = AgenticOutcomeClient(settings)
 client.emit_completion(...)                # one per LLM call
 client.emit_tool_event(...)                # one per tool / step
 client.report_outcome(job_id, {...})       # close the job with a terminal outcome
+client.append_outcome_metrics(job_id, [...])  # append declared per-job facts later
 client.close()
 ```
 
-The job is created implicitly by the first metric ingested for `agenticJobId`. Call `client.create_job(job_id)` explicitly if you need to record an agent run before emitting any metrics.
+The job is created implicitly by the first metric ingested for `agenticJobId`. Call `client.create_job(job_id)` explicitly if you need to record an agent run before emitting any metrics; it returns the created job resource merged over the fields you supplied, including the `entityVersion` an outcome amendment sends back as `expectedEntityVersion`.
 
 See [`examples/agentic_outcomes/`](examples/agentic_outcomes/) for runnable demos (sales / coding / support) with configurable failure rates and outcome distributions.
 
@@ -1045,6 +1162,7 @@ Enhanced observability fields for tracking AI operations across environments, re
 | `transaction_name` | `REVENIUM_TRANSACTION_NAME` | Human-friendly operation name | Label operations (e.g., `"Generate Response"`, `"Analyze Sentiment"`) |
 | `retry_number` | `REVENIUM_RETRY_NUMBER` | Retry attempt number (0 = first attempt) | Track retry attempts for failed operations |
 | `ticket_id` | `REVENIUM_TICKET_ID` | External ticket or issue ID (e.g., Jira, Linear) (max 256 chars) | Attribute AI costs to individual tickets or issues |
+| `agent_version` | _(none — per call only)_ | Version of the AI agent that produced the call (max 64 chars) | Compare cost across agent releases; not `agentic_job_version`, which versions the job definition |
 | `skill_name` | `REVENIUM_SKILL_NAME` | Name of the agent skill that produced the call (max 256 chars) | Attribute AI costs to the skill that generated them |
 | `skill_source` | `REVENIUM_SKILL_SOURCE` | Where the skill was loaded from — accepted values: `bundled`, `projectSettings`, `userSettings`, `plugin` (case-sensitive) | Classify skill origin in the shared skill catalog |
 | `skill_kind` | `REVENIUM_SKILL_KIND` | Kind of skill invoked — accepted value: `workflow` (omit otherwise) | Distinguish workflow skills in reporting |
@@ -1079,7 +1197,8 @@ response = client.chat.completions.create(
         "trace_name": "Support Chat Session",
         "transaction_name": "Generate Response",
         "parent_transaction_id": "parent-txn-123",
-        "ticket_id": "JIRA-123"
+        "ticket_id": "JIRA-123",
+        "agent_version": "1.4.2"
     }
 )
 ```
@@ -1496,7 +1615,8 @@ print(get_buffer_stats())
 | `REVENIUM_AGENTIC_JOB_NAME` | - | Human-readable agentic job name |
 | `REVENIUM_AGENTIC_JOB_TYPE` | - | Agentic job type category |
 | `REVENIUM_AGENTIC_JOB_VERSION` | - | Agentic job version |
-| `REVENIUM_OUTCOME_API_KEY` | - | Write-scope key (`rev_sk_`) for the agentic outcomes API (report/amend/history); falls back to `REVENIUM_METERING_API_KEY` |
+| `REVENIUM_WRITE_API_KEY` | - | Primary write-scope key (`rev_sk_`) for the agentic outcomes API (report/amend/history); falls back to `REVENIUM_OUTCOME_API_KEY` (deprecated), then `REVENIUM_METERING_API_KEY` |
+| `REVENIUM_OUTCOME_API_KEY` | - | Deprecated fallback name for the write-scope key; used only when `REVENIUM_WRITE_API_KEY` is unset |
 | `REVENIUM_PROFITSTREAM_BASE_URL` | `https://api.revenium.io` | Agentic outcomes API base URL |
 | `REVENIUM_BEDROCK_DISABLE` | - | Set to `1` to disable Bedrock auto-detection |
 | `REVENIUM_BUFFER_MAX_SIZE` | `1000` | Store-and-forward buffer capacity (oldest events evicted when full) |

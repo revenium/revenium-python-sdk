@@ -102,6 +102,6 @@ print(f"Embedding dimensions: {len(embedding)}")
 print(f"Transaction ID: {response._revenium_transaction_id}")
 print()
 
-print("All embeddings usage is automatically tracked in Revenium dashboard.")
+print("All embeddings usage appears automatically in the Revenium dashboard.")
 print()
 print("=" * 80)

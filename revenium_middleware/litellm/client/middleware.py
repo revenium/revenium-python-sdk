@@ -235,6 +235,10 @@ def handle_response(response, request_time_dt, usage_metadata, is_streaming):
             if ticket_id:
                 completion_args["ticket_id"] = ticket_id
 
+            agent_version = trace_fields.get_agent_version(usage_metadata)
+            if agent_version:
+                completion_args["agent_version"] = agent_version
+
             # Reasoning effort level (caller-supplied, forwarded verbatim)
             completion_args.update(extract_effort_field(usage_metadata))
 

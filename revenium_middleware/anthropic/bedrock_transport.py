@@ -195,6 +195,7 @@ def _emit_completion(
                        or usage_metadata.get("traceName")
                        or core_trace_fields.get_trace_name()),
         "ticket_id": core_trace_fields.get_ticket_id(usage_metadata),
+        "agent_version": core_trace_fields.get_agent_version(usage_metadata),
         # Reasoning effort is caller-supplied and forwarded verbatim. Spread
         # the sparse resolver result rather than reading a key off it:
         # create_completion only drops NotGiven during serialization, so an

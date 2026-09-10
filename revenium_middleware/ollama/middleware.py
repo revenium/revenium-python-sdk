@@ -23,6 +23,7 @@ from .trace_fields import (
     get_transaction_name,
     get_retry_number,
     get_ticket_id,
+    get_agent_version,
     detect_operation_type
 )
 
@@ -277,6 +278,7 @@ def handle_response(
             parent_transaction_id = get_parent_transaction_id()
             transaction_name = get_transaction_name(usage_metadata)
             ticket_id = get_ticket_id(usage_metadata)
+            agent_version = get_agent_version(usage_metadata)
             retry_number = get_retry_number()
 
             organization_name, product_name = extract_org_and_product(usage_metadata)
@@ -321,6 +323,7 @@ def handle_response(
                 "trace_type": trace_type,
                 "trace_name": trace_name,
                 "ticket_id": ticket_id,
+                "agent_version": agent_version,
                 "parent_transaction_id": parent_transaction_id,
                 "transaction_name": transaction_name,
                 "retry_number": retry_number,
@@ -412,6 +415,7 @@ def handle_embeddings_response(
             parent_transaction_id = get_parent_transaction_id()
             transaction_name = get_transaction_name(usage_metadata)
             ticket_id = get_ticket_id(usage_metadata)
+            agent_version = get_agent_version(usage_metadata)
             retry_number = get_retry_number()
 
             organization_name, product_name = extract_org_and_product(usage_metadata)
@@ -456,6 +460,7 @@ def handle_embeddings_response(
                 "trace_type": trace_type,
                 "trace_name": trace_name,
                 "ticket_id": ticket_id,
+                "agent_version": agent_version,
                 "parent_transaction_id": parent_transaction_id,
                 "transaction_name": transaction_name,
                 "retry_number": retry_number,

@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
+from revenium_middleware._core.config import resolve_write_api_key
+
 
 @dataclass(frozen=True)
 class LlmStep:
@@ -156,7 +158,7 @@ def reload_from_env() -> None:
     TEAM_ID = os.environ.get("REVENIUM_TEAM_ID", "")
     METER_URL = f"{METER_BASE_URL}/meter/v2/ai/completions"
     TOOL_URL = f"{METER_BASE_URL}/meter/v2/tool/events"
-    OUTCOME_API_KEY = os.environ.get("REVENIUM_OUTCOME_API_KEY", API_KEY)
+    OUTCOME_API_KEY = resolve_write_api_key() or API_KEY
     _CLIENT = None
     _CLIENT_SETTINGS = {
         "api_key": API_KEY,
@@ -256,6 +258,7 @@ def send_completion(*, model: str, provider: str, prompt_tokens: int, response_t
         "productName": product_name, "squadName": squad_name, "squadId": squad_id,
         "agenticJobId": agentic_job_id, "agenticJobName": agentic_job_name,
         "agenticJobType": agentic_job_type, "agenticJobVersion": "1.0.0",
+        "agentVersion": "1.0.0",
         "environment": "demo", "retryNumber": 0,
     }
     payload.update(prompt_fields)
@@ -284,6 +287,7 @@ def send_tool_event(*, step: ToolStep, cost_usd: float, agent: str, subscriber: 
         "productName": product_name, "subscriber": subscriber, "traceId": trace_id,
         "agenticJobId": agentic_job_id, "agenticJobName": agentic_job_name,
         "agenticJobType": agentic_job_type, "agenticJobVersion": "1.0.0",
+        "agentVersion": "1.0.0",
         "environment": "demo",
     }
     if parent_transaction_id:

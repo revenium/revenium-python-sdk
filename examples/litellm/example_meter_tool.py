@@ -110,7 +110,7 @@ def main():
 
     # Step 1: Fetch data from API (metered via @meter_tool)
     print("\nStep 1: Fetching API metrics (metered as tool call)...")
-    result = fetch_from_api("https://api.internal.example.com/v1/metrics")
+    result = fetch_from_api("https://api.example.com/v1/metrics")
     print(f"  Status: {result['status']} - {len(result['data'])} metrics received")
 
     # Step 2: Analyze with LiteLLM (metered via LiteLLM middleware)

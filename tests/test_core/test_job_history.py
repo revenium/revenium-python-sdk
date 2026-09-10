@@ -1,5 +1,6 @@
 """get_outcome_history (BACK-777 Phase 3, addendum §C)."""
 import os
+import warnings
 from datetime import datetime
 from unittest.mock import patch
 
@@ -7,9 +8,14 @@ import httpx
 import pytest
 
 from revenium_middleware import JobOutcomeAmendment, get_outcome_history
+from revenium_middleware._core.config import Config
 
 BASE = "https://api.revenium.example"
-ENV = {"REVENIUM_OUTCOME_API_KEY": "rev_sk_TENANT_abc", "REVENIUM_TEAM_ID": "team-1"}
+WRITE_KEY = "rev_sk_TENANT_write"
+LEGACY_KEY = "rev_sk_TENANT_legacy"
+EXPLICIT_KEY = "rev_sk_TENANT_explicit"
+METERING_KEY = "rev_mk_TENANT_metering"
+ENV = {Config.ENV_REVENIUM_WRITE_API_KEY: WRITE_KEY, "REVENIUM_TEAM_ID": "team-1"}
 
 HISTORY = [
     {
@@ -44,12 +50,94 @@ def _client(body, status=200):
         seen["method"] = req.method
         seen["path"] = req.url.path
         seen["team"] = req.url.params.get("teamId")
+        seen["headers"] = dict(req.headers)
         return httpx.Response(status, json=body)
 
     return httpx.Client(transport=httpx.MockTransport(handler)), seen
 
 
 class TestGetOutcomeHistory:
+    def test_write_env_used_without_deprecation_warning(self):
+        http, seen = _client(HISTORY)
+        with patch.dict(os.environ, ENV, clear=True):
+            with warnings.catch_warnings(record=True) as recorded:
+                warnings.simplefilter("always")
+                get_outcome_history("job-1", profitstream_base_url=BASE, http_client=http)
+
+        assert seen["headers"]["x-api-key"] == WRITE_KEY
+        assert [
+            warning for warning in recorded if issubclass(warning.category, DeprecationWarning)
+        ] == []
+
+    def test_outcome_env_still_works_but_warns(self):
+        http, seen = _client(HISTORY)
+        env = {
+            Config.ENV_REVENIUM_OUTCOME_API_KEY: LEGACY_KEY,
+            "REVENIUM_TEAM_ID": "team-1",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            with pytest.warns(DeprecationWarning, match="REVENIUM_WRITE_API_KEY"):
+                get_outcome_history("job-1", profitstream_base_url=BASE, http_client=http)
+
+        assert seen["headers"]["x-api-key"] == LEGACY_KEY
+
+    def test_write_env_wins_over_outcome_env_without_deprecation_warning(self):
+        http, seen = _client(HISTORY)
+        env = {
+            Config.ENV_REVENIUM_WRITE_API_KEY: WRITE_KEY,
+            Config.ENV_REVENIUM_OUTCOME_API_KEY: LEGACY_KEY,
+            "REVENIUM_TEAM_ID": "team-1",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            with warnings.catch_warnings(record=True) as recorded:
+                warnings.simplefilter("always")
+                get_outcome_history("job-1", profitstream_base_url=BASE, http_client=http)
+
+        assert seen["headers"]["x-api-key"] == WRITE_KEY
+        assert [
+            warning for warning in recorded if issubclass(warning.category, DeprecationWarning)
+        ] == []
+
+    def test_explicit_api_key_wins_over_env_vars_without_deprecation_warning(self):
+        http, seen = _client(HISTORY)
+        env = {
+            Config.ENV_REVENIUM_WRITE_API_KEY: WRITE_KEY,
+            Config.ENV_REVENIUM_OUTCOME_API_KEY: LEGACY_KEY,
+            "REVENIUM_TEAM_ID": "team-1",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            with warnings.catch_warnings(record=True) as recorded:
+                warnings.simplefilter("always")
+                get_outcome_history(
+                    "job-1",
+                    api_key=EXPLICIT_KEY,
+                    profitstream_base_url=BASE,
+                    http_client=http,
+                )
+
+        assert seen["headers"]["x-api-key"] == EXPLICIT_KEY
+        assert [
+            warning for warning in recorded if issubclass(warning.category, DeprecationWarning)
+        ] == []
+
+    def test_metering_env_fallback_still_fails_fast(self):
+        http, seen = _client(HISTORY)
+        env = {Config.ENV_REVENIUM_API_KEY: METERING_KEY, "REVENIUM_TEAM_ID": "team-1"}
+
+        with patch.dict(os.environ, env, clear=True):
+            with warnings.catch_warnings(record=True) as recorded:
+                warnings.simplefilter("always")
+                with pytest.raises(ValueError, match="write-scope"):
+                    get_outcome_history("job-1", profitstream_base_url=BASE, http_client=http)
+
+        assert "method" not in seen
+        assert [
+            warning for warning in recorded if issubclass(warning.category, DeprecationWarning)
+        ] == []
+
     def test_returns_ordered_dataclasses(self):
         http, seen = _client(HISTORY)
         with patch.dict(os.environ, ENV):
@@ -134,7 +222,7 @@ class TestGetOutcomeHistory:
 
     def test_metering_key_fails_fast(self):
         http, seen = _client(HISTORY)
-        env = {"REVENIUM_OUTCOME_API_KEY": "rev_mk_TENANT_abc", "REVENIUM_TEAM_ID": "team-1"}
+        env = {Config.ENV_REVENIUM_WRITE_API_KEY: "rev_mk_TENANT_abc", "REVENIUM_TEAM_ID": "team-1"}
         with patch.dict(os.environ, env):
             with pytest.raises(ValueError, match="write-scope"):
                 get_outcome_history("job-1", profitstream_base_url=BASE, http_client=http)

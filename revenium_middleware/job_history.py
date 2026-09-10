@@ -1,4 +1,4 @@
-"""Outcome amendment history (BACK-777 Phase 3, addendum §C)."""
+"""Outcome amendment history for agentic jobs."""
 
 import os
 from dataclasses import dataclass
@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from ._core.config import Config
+from ._core.config import Config, resolve_write_api_key
 from ._core.exceptions import OutcomeReportingError
 from ._core.outcomes import (
     get_outcome_history_request,
@@ -51,22 +51,20 @@ def get_outcome_history(
     """Return a job's full outcome history, ordered by amendment_sequence ASC.
 
     Requires a write-scope API key (``rev_sk_``): explicit ``api_key`` >
-    ``REVENIUM_OUTCOME_API_KEY`` > ``REVENIUM_METERING_API_KEY``.
+    ``REVENIUM_WRITE_API_KEY`` > ``REVENIUM_OUTCOME_API_KEY`` (deprecated
+    fallback) > ``REVENIUM_METERING_API_KEY``.
 
     The retry knobs match ``JobContext``: omit them for the default bounded
     schedule, or pass any of them to tune this GET's transient-error retry.
     """
     if not isinstance(job_id, str) or not job_id.strip():
         raise ValueError("job_id must be a non-empty string")
-    key = (
-        api_key
-        or os.getenv(Config.ENV_REVENIUM_OUTCOME_API_KEY)
-        or os.getenv(Config.ENV_REVENIUM_API_KEY)
-    )
+    key = resolve_write_api_key(api_key)
     if not key:
         raise OutcomeReportingError(
-            "No API key available: pass api_key= or set REVENIUM_OUTCOME_API_KEY "
-            "(write-scope rev_sk_ key required)."
+            "No API key available: pass api_key= or set REVENIUM_WRITE_API_KEY "
+            "(REVENIUM_OUTCOME_API_KEY is a deprecated fallback; write-scope "
+            "rev_sk_ key required)."
         )
     key = validate_outcome_key(key)
     base_url = (

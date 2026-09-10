@@ -21,6 +21,12 @@ EXPECTED_ALL = {
     # BACK-777 Phase 3: amendments + history
     "get_outcome_history", "JobOutcomeAmendment",
     "OutcomeNotReportedError", "OutcomeAmendConflictError",
+    # BACK-2746: job-type economics, baselines and period facts
+    "OutcomeMetricProvenance", "PeriodFactEntry", "Baseline",
+    "BaselineProvenance", "JobTypeEconomics", "JobTypeMetricDirection",
+    "JobTypeMonetizationCategory", "JobTypeMonetizationBasis",
+    "report_period_facts", "get_job_type_economics",
+    "upsert_job_type_economics", "create_baseline", "list_baselines",
     # Metering error visibility (BACK-778)
     "MeteringErrorEvent", "MeteringStatus", "get_metering_status",
     "on_metering_error", "remove_metering_error_callback", "reset_metering_status",

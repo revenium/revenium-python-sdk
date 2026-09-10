@@ -57,6 +57,6 @@ transaction_id = response._revenium_transaction_id
 print(f"Transaction ID: {transaction_id}")
 print()
 
-print("Usage is automatically tracked in Revenium dashboard.")
+print("Usage appears automatically in the Revenium dashboard.")
 print()
 print("=" * 80)

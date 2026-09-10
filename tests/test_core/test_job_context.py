@@ -1,16 +1,26 @@
 """JobContext public surface (BACK-777 Phase 2)."""
 import json
 import os
+import warnings
 from unittest.mock import patch
 
 import httpx
 import pytest
 
-from revenium_middleware import JobContext, OutcomeAlreadyReportedError, OutcomeReportingError
+from revenium_middleware import (
+    JobContext,
+    OutcomeAlreadyReportedError,
+    OutcomeAmendConflictError,
+    OutcomeReportingError,
+)
+from revenium_middleware._core.config import Config
 from revenium_middleware._core.fields import extract_agentic_job_fields
 
-WRITE_KEY = "rev_sk_TENANT_abc"
-ENV = {"REVENIUM_OUTCOME_API_KEY": WRITE_KEY, "REVENIUM_TEAM_ID": "team-1"}
+WRITE_KEY = "rev_sk_TENANT_write"
+LEGACY_KEY = "rev_sk_TENANT_legacy"
+EXPLICIT_KEY = "rev_sk_TENANT_explicit"
+METERING_KEY = "rev_mk_TENANT_metering"
+ENV = {Config.ENV_REVENIUM_WRITE_API_KEY: WRITE_KEY, "REVENIUM_TEAM_ID": "team-1"}
 
 
 def _recording_client(status=200, body=None):
@@ -60,6 +70,87 @@ class TestContextPropagation:
 
 
 class TestReportOutcome:
+    def test_write_env_used_without_deprecation_warning(self):
+        http, calls = _recording_client()
+        with patch.dict(os.environ, ENV, clear=True):
+            with warnings.catch_warnings(record=True) as recorded:
+                warnings.simplefilter("always")
+                with JobContext(job_id="loan-1", http_client=http) as job:
+                    job.report_outcome(execution_status="SUCCESS")
+
+        assert calls[0].headers["x-api-key"] == WRITE_KEY
+        assert [
+            warning for warning in recorded if issubclass(warning.category, DeprecationWarning)
+        ] == []
+
+    def test_outcome_env_still_works_but_warns(self):
+        http, calls = _recording_client()
+        env = {
+            Config.ENV_REVENIUM_OUTCOME_API_KEY: LEGACY_KEY,
+            "REVENIUM_TEAM_ID": "team-1",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            with pytest.warns(DeprecationWarning, match="REVENIUM_WRITE_API_KEY"):
+                with JobContext(job_id="loan-1", http_client=http) as job:
+                    job.report_outcome(execution_status="SUCCESS")
+
+        assert calls[0].headers["x-api-key"] == LEGACY_KEY
+
+    def test_write_env_wins_over_outcome_env_without_deprecation_warning(self):
+        http, calls = _recording_client()
+        env = {
+            Config.ENV_REVENIUM_WRITE_API_KEY: WRITE_KEY,
+            Config.ENV_REVENIUM_OUTCOME_API_KEY: LEGACY_KEY,
+            "REVENIUM_TEAM_ID": "team-1",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            with warnings.catch_warnings(record=True) as recorded:
+                warnings.simplefilter("always")
+                with JobContext(job_id="loan-1", http_client=http) as job:
+                    job.report_outcome(execution_status="SUCCESS")
+
+        assert calls[0].headers["x-api-key"] == WRITE_KEY
+        assert [
+            warning for warning in recorded if issubclass(warning.category, DeprecationWarning)
+        ] == []
+
+    def test_explicit_api_key_wins_over_env_vars_without_deprecation_warning(self):
+        http, calls = _recording_client()
+        env = {
+            Config.ENV_REVENIUM_WRITE_API_KEY: WRITE_KEY,
+            Config.ENV_REVENIUM_OUTCOME_API_KEY: LEGACY_KEY,
+            "REVENIUM_TEAM_ID": "team-1",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            with warnings.catch_warnings(record=True) as recorded:
+                warnings.simplefilter("always")
+                with JobContext(job_id="loan-1", api_key=EXPLICIT_KEY, http_client=http) as job:
+                    job.report_outcome(execution_status="SUCCESS")
+
+        assert calls[0].headers["x-api-key"] == EXPLICIT_KEY
+        assert [
+            warning for warning in recorded if issubclass(warning.category, DeprecationWarning)
+        ] == []
+
+    def test_metering_env_fallback_still_fails_fast(self):
+        http, calls = _recording_client()
+        env = {Config.ENV_REVENIUM_API_KEY: METERING_KEY, "REVENIUM_TEAM_ID": "team-1"}
+
+        with patch.dict(os.environ, env, clear=True):
+            with warnings.catch_warnings(record=True) as recorded:
+                warnings.simplefilter("always")
+                with JobContext(job_id="j1", http_client=http) as job:
+                    with pytest.raises(ValueError, match="write-scope"):
+                        job.report_outcome(execution_status="SUCCESS")
+
+        assert calls == []
+        assert [
+            warning for warning in recorded if issubclass(warning.category, DeprecationWarning)
+        ] == []
+
     def test_posts_camel_case_payload_with_team_and_key(self):
         http, calls = _recording_client()
         with patch.dict(os.environ, ENV):
@@ -119,7 +210,7 @@ class TestReportOutcome:
 
     def test_metering_key_fails_fast_before_http(self):
         http, calls = _recording_client()
-        env = {"REVENIUM_OUTCOME_API_KEY": "rev_mk_TENANT_abc", "REVENIUM_TEAM_ID": "team-1"}
+        env = {Config.ENV_REVENIUM_WRITE_API_KEY: "rev_mk_TENANT_abc", "REVENIUM_TEAM_ID": "team-1"}
         with patch.dict(os.environ, env):
             with JobContext(job_id="j1", http_client=http) as job:
                 with pytest.raises(ValueError, match="write-scope"):
@@ -134,7 +225,7 @@ class TestReportOutcome:
 
     def test_unresolvable_team_raises_reporting_error(self):
         http, _ = _recording_client(status=503)
-        with patch.dict(os.environ, {"REVENIUM_OUTCOME_API_KEY": "bogus_key"}, clear=True):
+        with patch.dict(os.environ, {Config.ENV_REVENIUM_WRITE_API_KEY: "bogus_key"}, clear=True):
             with JobContext(job_id="j1", http_client=http) as job:
                 with pytest.raises(OutcomeReportingError):
                     job.report_outcome(execution_status="SUCCESS")
@@ -366,6 +457,18 @@ class TestAmendOutcome:
             with pytest.raises(ValueError):
                 handle.amend_outcome(reason="   ")
         assert calls == []
+
+    def test_reason_is_omitted_when_not_supplied(self):
+        seen = {}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(req.content)
+            return httpx.Response(200, json={})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.dict(os.environ, ENV):
+            JobContext.attach(job_id="j1", http_client=http).amend_outcome()
+        assert seen["body"] == {}
 
     def test_422_maps_to_not_reported(self):
         http, _ = _recording_client(status=422, body={"error": "no outcome"})
@@ -863,3 +966,429 @@ class TestConcurrencyAndCancellation:
         assert seen["closed_mid_flight"] is False  # cleanup did not race the worker
         assert http.closed_count == 1  # closed once, by the worker, not the caller
         assert extract_agentic_job_fields({}) == {}
+
+
+class TestEntityVersion:
+    """Optimistic locking on outcome amendment (BACK-3079).
+
+    The platform returns ``entityVersion`` on every job/outcome response and
+    accepts it back as ``expectedEntityVersion`` on the amendment PATCH. Without
+    it, two writers amending the same outcome silently overwrite each other.
+    """
+
+    def _versioned_client(self, versions):
+        """A PATCH/POST recorder answering with the given versions in order."""
+        bodies = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            bodies.append(json.loads(req.content))
+            version = versions[min(len(bodies) - 1, len(versions) - 1)]
+            body = {"id": "job-1"} if version is None else {"id": "job-1", "entityVersion": version}
+            return httpx.Response(200, json=body)
+
+        return httpx.Client(transport=httpx.MockTransport(handler)), bodies
+
+    def test_report_records_the_returned_version(self):
+        http, _ = self._versioned_client([7])
+        with patch.dict(os.environ, ENV):
+            with JobContext(job_id="loan-1", http_client=http) as job:
+                job.report_outcome(execution_status="SUCCESS")
+                assert job.entity_version == 7
+
+    def test_report_tolerates_a_response_without_a_version(self):
+        """An older backend sends no version; reporting must still succeed."""
+        http, _ = self._versioned_client([None])
+        with patch.dict(os.environ, ENV):
+            with JobContext(job_id="loan-1", http_client=http) as job:
+                job.report_outcome(execution_status="SUCCESS")
+                assert job.entity_version is None
+
+    def test_amend_sends_the_version_recorded_by_the_report(self):
+        http, bodies = self._versioned_client([7, 8])
+        with patch.dict(os.environ, ENV):
+            with JobContext(job_id="loan-1", http_client=http) as job:
+                job.report_outcome(execution_status="SUCCESS")
+                job.amend_outcome(reason="Value corrected", outcome_value=750.0)
+        assert "expectedEntityVersion" not in bodies[0]  # POST has no such field
+        assert bodies[1]["expectedEntityVersion"] == 7
+
+    def test_amend_records_the_version_from_its_own_response(self):
+        """Chained amendments each need the version the previous one produced."""
+        http, bodies = self._versioned_client([7, 8, 9])
+        with patch.dict(os.environ, ENV):
+            with JobContext(job_id="loan-1", http_client=http) as job:
+                job.report_outcome(execution_status="SUCCESS")
+                job.amend_outcome(reason="First correction")
+                assert job.entity_version == 8
+                job.amend_outcome(reason="Second correction")
+        assert bodies[2]["expectedEntityVersion"] == 8
+
+    def test_amend_omits_the_version_when_none_is_known(self):
+        """An attach() handle has reported nothing, so it must not lock."""
+        http, bodies = self._versioned_client([5])
+        with patch.dict(os.environ, ENV):
+            handle = JobContext.attach(job_id="loan-1", http_client=http)
+            handle.amend_outcome(reason="Blind correction")
+        assert "expectedEntityVersion" not in bodies[0]
+
+    def test_explicit_version_wins_over_the_recorded_one(self):
+        http, bodies = self._versioned_client([7, 8])
+        with patch.dict(os.environ, ENV):
+            with JobContext(job_id="loan-1", http_client=http) as job:
+                job.report_outcome(execution_status="SUCCESS")
+                job.amend_outcome(reason="Refetched", expected_entity_version=11)
+        assert bodies[1]["expectedEntityVersion"] == 11
+
+    def test_version_zero_is_sent_not_dropped(self):
+        """A freshly created job sits at version 0 — a real version, not "unknown"."""
+        http, bodies = self._versioned_client([8])
+        with patch.dict(os.environ, ENV):
+            handle = JobContext.attach(job_id="loan-1", http_client=http)
+            handle.amend_outcome(reason="Correcting the first report",
+                                 expected_entity_version=0)
+        assert bodies[0]["expectedEntityVersion"] == 0
+
+    def test_versionless_success_discards_the_stale_lock(self):
+        """A completed amendment has advanced the version, so the old one is wrong.
+
+        Keeping it would make the next amendment send a token the backend
+        cannot match and report a conflict that never happened.
+        """
+        http, bodies = self._versioned_client([7, None, None])
+        with patch.dict(os.environ, ENV):
+            with JobContext(job_id="loan-1", http_client=http) as job:
+                job.report_outcome(execution_status="SUCCESS")
+                job.amend_outcome(reason="Correction")
+                assert job.entity_version is None
+                job.amend_outcome(reason="Second correction")
+        assert bodies[1]["expectedEntityVersion"] == 7
+        # Unlocked, not locked to the version the first amendment invalidated.
+        assert "expectedEntityVersion" not in bodies[2]
+
+    def test_bodiless_success_discards_the_stale_lock(self):
+        """The transport accepts a bodiless 2xx as success; so must the lock."""
+        bodies = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            bodies.append(json.loads(req.content))
+            if len(bodies) == 1:
+                return httpx.Response(200, json={"entityVersion": 7})
+            return httpx.Response(204)
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.dict(os.environ, ENV):
+            with JobContext(job_id="loan-1", http_client=http) as job:
+                job.report_outcome(execution_status="SUCCESS")
+                job.amend_outcome(reason="Correction")
+                assert job.entity_version is None
+                job.amend_outcome(reason="Second correction")
+        assert "expectedEntityVersion" not in bodies[2]
+
+    def test_reenter_forgets_the_previous_run_version(self):
+        http, bodies = self._versioned_client([7, None])
+        with patch.dict(os.environ, ENV):
+            job = JobContext(job_id="loan-1", http_client=http)
+            with job:
+                job.report_outcome(execution_status="SUCCESS")
+            assert job.entity_version == 7
+            with job:
+                assert job.entity_version is None
+                job.amend_outcome(reason="Correction on a new run")
+        assert "expectedEntityVersion" not in bodies[1]
+
+    def test_bad_explicit_version_rejected_before_http(self):
+        """A value the SDK cannot legally send must not reach the wire.
+
+        ``3.5`` is the one that matters: truncating it to ``3`` would lock the
+        amendment against a version the caller never named.
+        """
+        http, calls = _recording_client()
+        with patch.dict(os.environ, ENV):
+            handle = JobContext.attach(job_id="j1", http_client=http)
+            for bad in (-1, 3.5, "not-a-number", "3.0", True, object()):
+                with pytest.raises(ValueError, match="non-negative integer"):
+                    handle.amend_outcome(reason="r", expected_entity_version=bad)
+        assert calls == []
+
+    def test_integral_versions_accepted(self):
+        """A JSON-ish integral value is a version: 3.0 and "3" both mean 3."""
+        http, bodies = self._versioned_client([9])
+        with patch.dict(os.environ, ENV):
+            handle = JobContext.attach(job_id="j1", http_client=http)
+            handle.amend_outcome(reason="r", expected_entity_version=3.0)
+            handle.amend_outcome(reason="r", expected_entity_version="3")
+        assert bodies[0]["expectedEntityVersion"] == 3
+        assert bodies[1]["expectedEntityVersion"] == 3
+
+    def test_conflict_records_the_version_the_backend_holds(self):
+        """The 409 is what closes the loop: it reports the current version."""
+        bodies = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            bodies.append(json.loads(req.content))
+            if len(bodies) == 1:
+                return httpx.Response(200, json={"entityVersion": 7})
+            if len(bodies) == 2:
+                return httpx.Response(409, json={
+                    "status": 409, "error": "Conflict",
+                    "message": "Outcome has changed since entity version 7; "
+                               "current version is 9. Refetch and retry.",
+                })
+            return httpx.Response(200, json={"entityVersion": 10})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.dict(os.environ, ENV):
+            with JobContext(job_id="loan-1", http_client=http) as job:
+                job.report_outcome(execution_status="SUCCESS")
+                with pytest.raises(OutcomeAmendConflictError) as conflict:
+                    job.amend_outcome(reason="Correction", outcome_value=750.0)
+                assert conflict.value.current_entity_version == 9
+                # Recorded, so a caller who decides the amendment still applies
+                # can retry through this handle without threading it back.
+                assert job.entity_version == 9
+                job.amend_outcome(reason="Correction, re-checked", outcome_value=750.0)
+        assert bodies[1]["expectedEntityVersion"] == 7
+        assert bodies[2]["expectedEntityVersion"] == 9
+
+    def test_versionless_conflict_leaves_the_next_amendment_unlocked(self):
+        """No version in the body means no version to retry with: unlock."""
+        bodies = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            bodies.append(json.loads(req.content))
+            if len(bodies) == 1:
+                return httpx.Response(200, json={"entityVersion": 7})
+            if len(bodies) == 2:
+                return httpx.Response(409, json={"error": "Conflict"})
+            return httpx.Response(200, json={"entityVersion": 11})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.dict(os.environ, ENV):
+            with JobContext(job_id="loan-1", http_client=http) as job:
+                job.report_outcome(execution_status="SUCCESS")
+                with pytest.raises(OutcomeAmendConflictError) as conflict:
+                    job.amend_outcome(reason="Correction")
+                assert conflict.value.current_entity_version is None
+                assert job.entity_version is None
+                job.amend_outcome(reason="Correction, unlocked")
+        assert "expectedEntityVersion" not in bodies[2]
+
+
+class TestAmendReasonOptional:
+    """``reason`` is optional for API-key callers (BACK-3079).
+
+    ``UpdateOutcomeRequest.reason`` is nullable: an API-key caller that omits it
+    gets an automated correction reason from the server, so the SDK must be able
+    to omit the key rather than force a placeholder into the audit trail.
+    """
+
+    def test_omitted_reason_is_absent_from_the_payload(self):
+        bodies = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            bodies.append(json.loads(req.content))
+            return httpx.Response(200, json={"id": "job-1", "entityVersion": 2})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.dict(os.environ, ENV):
+            handle = JobContext.attach(job_id="loan-1", http_client=http)
+            handle.amend_outcome(outcome_value=750.0)
+        assert "reason" not in bodies[0]
+        assert bodies[0]["outcomeValue"] == 750.0
+
+    def test_reason_still_positional(self):
+        """Existing callers pass reason as the first positional argument."""
+        bodies = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            bodies.append(json.loads(req.content))
+            return httpx.Response(200, json={})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.dict(os.environ, ENV):
+            handle = JobContext.attach(job_id="loan-1", http_client=http)
+            handle.amend_outcome("Customer expanded contract")
+        assert bodies[0]["reason"] == "Customer expanded contract"
+
+    def test_blank_reason_still_rejected(self):
+        """Omitting is deliberate; a blank string is a caller bug either way."""
+        http, calls = _recording_client()
+        with patch.dict(os.environ, ENV):
+            handle = JobContext.attach(job_id="j1", http_client=http)
+            with pytest.raises(ValueError):
+                handle.amend_outcome(reason="   ")
+        assert calls == []
+
+
+class TestOutcomeMetrics:
+    """Declared metric facts on the outcome bodies and the late-append call (BACK-3080).
+
+    A fact only lands if the job type's economics contract declares the metric
+    (BACK-3078), and the server range-checks ``quality_rate`` — so these tests
+    are about the wire shape and about shape errors surfacing before any HTTP,
+    not about which values the platform accepts.
+    """
+
+    METRICS = [
+        {"key": "quality_rate", "value": 0.93, "provenance": "MEASURED",
+         "reason": "graded sample of 200 cases"},
+        {"key": "cases_closed", "value": 12},
+    ]
+
+    def test_report_body_carries_the_metrics_array_unchanged(self):
+        http, calls = _recording_client()
+        with patch.dict(os.environ, ENV):
+            with JobContext(job_id="loan-1", http_client=http) as job:
+                job.report_outcome(execution_status="SUCCESS", metrics=self.METRICS)
+        body = json.loads(calls[0].content)
+        # Entries reach the wire exactly as supplied: provenance, recordedBy and
+        # source all have server-side defaults, and filling them in client-side
+        # would misattribute the fact.
+        assert body["metrics"] == self.METRICS
+
+    def test_amend_body_carries_the_metrics_array_unchanged(self):
+        http, calls = _recording_client()
+        with patch.dict(os.environ, ENV):
+            handle = JobContext.attach(job_id="loan-1", http_client=http)
+            handle.amend_outcome(reason="Graded after review", metrics=self.METRICS)
+        assert calls[0].method == "PATCH"
+        assert json.loads(calls[0].content)["metrics"] == self.METRICS
+
+    def test_metrics_key_absent_when_not_passed(self):
+        http, calls = _recording_client()
+        with patch.dict(os.environ, ENV):
+            with JobContext(job_id="loan-1", http_client=http) as job:
+                job.report_outcome(execution_status="SUCCESS")
+            handle = JobContext.attach(job_id="loan-1", http_client=http)
+            handle.amend_outcome(reason="No facts to add")
+        assert "metrics" not in json.loads(calls[0].content)
+        assert "metrics" not in json.loads(calls[1].content)
+
+    def test_empty_metrics_omits_the_key(self):
+        """An empty array is what the server ignores, so do not send it."""
+        http, calls = _recording_client()
+        with patch.dict(os.environ, ENV):
+            with JobContext(job_id="loan-1", http_client=http) as job:
+                job.report_outcome(execution_status="SUCCESS", metrics=[])
+        assert "metrics" not in json.loads(calls[0].content)
+
+    @pytest.mark.parametrize("bad", [
+        {"key": "quality_rate", "value": 0.9},          # a single mapping, not a sequence
+        "quality_rate",                                  # a bare string
+        [["quality_rate", 0.9]],                         # entries that are not mappings
+        [{"value": 0.9}],                                # no key
+        [{"key": "quality_rate"}],                       # no value
+        [{"key": "", "value": 0.9}],                     # blank key
+        [{"key": "quality_rate", "value": None}],        # null value
+    ])
+    def test_malformed_metrics_raise_before_any_request(self, bad):
+        http, calls = _recording_client()
+        with patch.dict(os.environ, ENV):
+            with JobContext(job_id="loan-1", http_client=http) as job:
+                with pytest.raises(ValueError, match="metrics"):
+                    job.report_outcome(execution_status="SUCCESS", metrics=bad)
+                with pytest.raises(ValueError, match="metrics"):
+                    job.append_outcome_metrics(bad)
+            handle = JobContext.attach(job_id="loan-1", http_client=http)
+            with pytest.raises(ValueError, match="metrics"):
+                handle.amend_outcome(reason="r", metrics=bad)
+        # Nothing reached the network, including the team-resolution GET.
+        assert calls == []
+
+    def test_append_posts_a_bare_array_to_the_metrics_path(self):
+        http, calls = _recording_client(status=201)
+        with patch.dict(os.environ, ENV):
+            handle = JobContext.attach(job_id="loan-1", http_client=http)
+            handle.append_outcome_metrics(self.METRICS)
+        assert len(calls) == 1
+        req = calls[0]
+        assert req.method == "POST"
+        assert req.url.path.endswith("/profitstream/v2/api/jobs/loan-1/outcome/metrics")
+        assert req.url.params["teamId"] == "team-1"
+        assert req.headers["x-api-key"] == WRITE_KEY
+        assert json.loads(req.content) == self.METRICS
+
+    def test_append_rejects_empty_entries_before_http(self):
+        """There is nothing to append, and the server answers 400 for it."""
+        http, calls = _recording_client(status=201)
+        with patch.dict(os.environ, ENV):
+            handle = JobContext.attach(job_id="loan-1", http_client=http)
+            with pytest.raises(ValueError, match="metrics"):
+                handle.append_outcome_metrics([])
+        assert calls == []
+
+    def test_append_rejects_none_entries_before_http(self):
+        """An unset variable forwarded here is a caller bug, not an empty POST."""
+        http, calls = _recording_client(status=201)
+        with patch.dict(os.environ, ENV):
+            handle = JobContext.attach(job_id="loan-1", http_client=http)
+            with pytest.raises(ValueError, match="metrics"):
+                handle.append_outcome_metrics(None)
+        assert calls == []
+
+    def test_omitted_metrics_is_still_not_an_error_on_the_outcome_bodies(self):
+        """``metrics=None`` means "no facts" there; only the append demands entries."""
+        http, calls = _recording_client()
+        with patch.dict(os.environ, ENV):
+            with JobContext(job_id="loan-1", http_client=http) as job:
+                job.report_outcome(execution_status="SUCCESS", metrics=None)
+        assert "metrics" not in json.loads(calls[0].content)
+
+    def test_append_rejects_a_metering_key_before_http(self):
+        http, calls = _recording_client(status=201)
+        # The metering key has to sit in the resolved position, which is now
+        # REVENIUM_WRITE_API_KEY; overriding the deprecated fallback would be
+        # shadowed by the write key ENV already sets, and the call would pass.
+        env = dict(ENV, **{Config.ENV_REVENIUM_WRITE_API_KEY: "rev_mk_TENANT_abc"})
+        with patch.dict(os.environ, env):
+            handle = JobContext.attach(job_id="loan-1", http_client=http)
+            with pytest.raises(ValueError, match="write-scope"):
+                handle.append_outcome_metrics(self.METRICS)
+        assert calls == []
+
+    def test_append_records_an_entity_version_when_the_response_carries_one(self):
+        http, _ = _recording_client(body={"entityVersion": 11})
+        with patch.dict(os.environ, ENV):
+            handle = JobContext.attach(job_id="loan-1", http_client=http)
+            handle.append_outcome_metrics(self.METRICS)
+            assert handle.entity_version == 11
+
+    def test_append_leaves_the_recorded_version_alone_on_a_bodiless_201(self):
+        """Appending facts does not advance the job's version, so the lock holds.
+
+        report/amend clear the recorded token on a versionless response because
+        they mutate the Job row and anything held from before them is stale. The
+        facts append writes no Job row and answers a bodiless 201, so clearing
+        would unlock the next amendment for nothing — re-opening the lost update
+        the lock exists to catch.
+        """
+        bodies = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            bodies.append(req)
+            if req.url.path.endswith("/outcome/metrics"):
+                return httpx.Response(201)
+            return httpx.Response(200, json={"id": "job-1", "entityVersion": 4})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.dict(os.environ, ENV):
+            with JobContext(job_id="loan-1", http_client=http) as job:
+                job.report_outcome(execution_status="SUCCESS")
+                assert job.entity_version == 4
+                job.append_outcome_metrics(self.METRICS)
+                assert job.entity_version == 4
+                job.amend_outcome(reason="Graded after the facts landed")
+        assert json.loads(bodies[-1].content)["expectedEntityVersion"] == 4
+
+    def test_append_does_not_count_as_reporting_an_outcome(self):
+        """Facts are not a terminal outcome: auto-FAILED must still fire."""
+        http, calls = _recording_client(status=201)
+        with patch.dict(os.environ, ENV):
+            with pytest.raises(RuntimeError):
+                with JobContext(job_id="loan-1", http_client=http) as job:
+                    job.append_outcome_metrics(self.METRICS)
+                    raise RuntimeError("agent crashed after recording facts")
+        paths = [c.url.path for c in calls]
+        assert paths[0].endswith("/outcome/metrics")
+        assert paths[1].endswith("/outcome")
+        assert json.loads(calls[1].content)["executionStatus"] == "FAILED"
