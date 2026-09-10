@@ -30,6 +30,17 @@ _AGENTIC_JOB_ENV_MAP = {
     "agenticJobVersion": Config.ENV_REVENIUM_AGENTIC_JOB_VERSION,
 }
 
+# Keys are the typed snake_case params on all four AI metering methods; values
+# are the accepted usage_metadata aliases in precedence order. agentVersion is
+# the AI agent's own version and is deliberately NOT folded into
+# AGENTIC_JOB_FIELD_MAP above: agenticJobVersion is the agentic job
+# definition's version, a separate wire field, and sharing one key would
+# silently overwrite job-definition attribution. Caller-supplied only, so
+# there is no env-var fallback map beside this one.
+AGENT_VERSION_FIELD_MAP = {
+    "agent_version": ("agent_version", "agentVersion"),
+}
+
 # Keys are the typed snake_case params on create_completion; values are the
 # accepted usage_metadata aliases in precedence order.
 SKILL_FIELD_MAP = {
@@ -264,6 +275,24 @@ def extract_coding_assistant_fields(source: Mapping[str, Any]) -> Dict[str, Any]
     caller-supplied attribution the middleware has no way to infer.
     """
     return _resolve_field_map(source, CODING_ASSISTANT_FIELD_MAP)
+
+
+def extract_agent_version_field(source: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Resolve the AI agent's own version from caller-supplied metadata.
+
+    Reads ``agent_version`` then its ``agentVersion`` alias and returns it
+    under the snake_case keyword the typed ``create_completion`` /
+    ``create_audio`` / ``create_image`` / ``create_video`` parameters expect.
+    An absent version is omitted entirely (never emitted as None) so the typed
+    client keeps its NotGiven default and nothing extra reaches the wire.
+
+    This is not ``agenticJobVersion`` (see AGENT_VERSION_FIELD_MAP): the two
+    are separate wire fields and resolve independently. Length capping lives
+    in ``trace_fields.validate_agent_version``, beside the ticketId cap.
+    """
+    if not source:
+        return {}
+    return _resolve_field_map(source, AGENT_VERSION_FIELD_MAP)
 
 
 def extract_effort_field(source: Optional[Mapping[str, Any]]) -> Dict[str, Any]:

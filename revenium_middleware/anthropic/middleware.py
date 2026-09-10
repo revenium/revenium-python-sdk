@@ -31,6 +31,7 @@ from .trace_fields import (
     get_environment, get_region, get_credential_alias,
     get_trace_type, get_trace_name, get_parent_transaction_id,
     get_transaction_name, get_retry_number, get_ticket_id,
+    get_agent_version,
     detect_operation_type, detect_vision_content
 )
 
@@ -264,6 +265,7 @@ def _extract_trace_fields(usage_metadata, request_body=None):
         get_trace_name()
     )
     ticket_id = get_ticket_id(usage_metadata)
+    agent_version = get_agent_version(usage_metadata)
     # Reasoning effort is caller-supplied only and forwarded verbatim; absent
     # metadata resolves to None, and _effort_payload() drops the key entirely
     # at the payload sites so nothing is sent.
@@ -302,6 +304,7 @@ def _extract_trace_fields(usage_metadata, request_body=None):
         'trace_type': trace_type,
         'trace_name': trace_name,
         'ticket_id': ticket_id,
+        'agent_version': agent_version,
         'effort': effort,
         'parent_transaction_id': parent_transaction_id,
         'transaction_name': transaction_name,
@@ -396,6 +399,7 @@ def _create_bedrock_metering_call(response, usage_metadata, request_time, respon
                 "trace_type": trace_fields.get('trace_type'),
                 "trace_name": trace_fields.get('trace_name'),
                 "ticket_id": trace_fields.get('ticket_id'),
+                "agent_version": trace_fields.get('agent_version'),
                 **_effort_payload(trace_fields),
                 "parent_transaction_id": trace_fields.get('parent_transaction_id'),
                 "transaction_name": trace_fields.get('transaction_name'),
@@ -612,6 +616,7 @@ def _meter_raw_stream(state, usage_metadata, request_kwargs, request_time, reque
                 "trace_type": trace_fields.get('trace_type'),
                 "trace_name": trace_fields.get('trace_name'),
                 "ticket_id": trace_fields.get('ticket_id'),
+                "agent_version": trace_fields.get('agent_version'),
                 **_effort_payload(trace_fields),
                 "parent_transaction_id": trace_fields.get('parent_transaction_id'),
                 "transaction_name": trace_fields.get('transaction_name'),
@@ -814,6 +819,7 @@ if register_patch("anthropic.resources.messages.messages.Messages.create"):
                     "trace_type": trace_fields.get('trace_type'),
                     "trace_name": trace_fields.get('trace_name'),
                     "ticket_id": trace_fields.get('ticket_id'),
+                    "agent_version": trace_fields.get('agent_version'),
                     **_effort_payload(trace_fields),
                     "parent_transaction_id": trace_fields.get('parent_transaction_id'),
                     "transaction_name": trace_fields.get('transaction_name'),
@@ -990,6 +996,7 @@ if register_patch("anthropic.resources.messages.messages.AsyncMessages.create"):
                         "trace_type": trace_fields.get('trace_type'),
                         "trace_name": trace_fields.get('trace_name'),
                         "ticket_id": trace_fields.get('ticket_id'),
+                        "agent_version": trace_fields.get('agent_version'),
                         **_effort_payload(trace_fields),
                         "parent_transaction_id": trace_fields.get('parent_transaction_id'),
                         "transaction_name": trace_fields.get('transaction_name'),
@@ -1196,6 +1203,7 @@ if register_patch("anthropic.resources.messages.messages.Messages.stream"):
                                 "trace_type": trace_fields.get('trace_type'),
                                 "trace_name": trace_fields.get('trace_name'),
                                 "ticket_id": trace_fields.get('ticket_id'),
+                                "agent_version": trace_fields.get('agent_version'),
                                 **_effort_payload(trace_fields),
                                 "parent_transaction_id": trace_fields.get('parent_transaction_id'),
                                 "transaction_name": trace_fields.get('transaction_name'),

@@ -557,3 +557,152 @@ def test_metering_paths_still_accept_a_metering_key():
     client.emit_tool_event({"transactionId": "tx-mk"})
     assert seen["x_api_key"] == "rev_mk_TENANT_abc"
     client.close()
+
+
+def test_create_job_returns_the_response_body_with_entity_version():
+    """The examples-pack client needs the version without a second call (BACK-3079)."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"agenticJobId": "job-777", "entityVersion": 0})
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    client = AgenticOutcomeClient(_settings(), http_client=http)
+    body = client.create_job("job-777", name="run")
+    assert body["entityVersion"] == 0
+    assert body["agenticJobId"] == "job-777"
+    # Merged over the request body, so a response that omits a field the caller
+    # supplied does not drop it from the return value.
+    assert body["name"] == "run"
+    client.close()
+
+
+def test_create_job_response_wins_where_the_two_overlap():
+    """The server is authoritative on the fields it does return."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"agenticJobId": "job-777", "name": "normalized",
+                                         "id": "5jXkgO", "entityVersion": 2})
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    client = AgenticOutcomeClient(_settings(), http_client=http)
+    body = client.create_job("job-777", name="run", type="agent")
+    assert body["name"] == "normalized"
+    assert body["type"] == "agent"
+    assert body["id"] == "5jXkgO"
+    client.close()
+
+
+def test_create_job_409_still_returns_the_request_body_shape():
+    """An idempotent re-run answers 409 with an error body, not a job resource."""
+    http = httpx.Client(
+        transport=httpx.MockTransport(lambda req: httpx.Response(409, json={"error": "exists"}))
+    )
+    client = AgenticOutcomeClient(_settings(), http_client=http)
+    body = client.create_job("job-456", name="re-run")
+    assert body["agenticJobId"] == "job-456"
+    assert body["name"] == "re-run"
+    assert "error" not in body
+    client.close()
+
+
+def test_create_job_tolerates_a_bodiless_response():
+    """A 204 (or non-JSON) response must not turn a created job into an empty dict."""
+    http = httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(204)))
+    client = AgenticOutcomeClient(_settings(), http_client=http)
+    body = client.create_job("job-204")
+    assert body["agenticJobId"] == "job-204"
+    client.close()
+
+
+# ---------------------------------------------------------------------------
+# Late per-job metric facts (BACK-3080). The examples-pack client forwards
+# entries as-is, like report_outcome forwards its payload.
+# ---------------------------------------------------------------------------
+def test_append_outcome_metrics_posts_a_bare_array():
+    seen = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["method"] = req.method
+        seen["path"] = req.url.path
+        seen["team"] = req.url.params.get("teamId")
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(201)
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    client = AgenticOutcomeClient(_settings(), http_client=http)
+    entries = [{"key": "quality_rate", "value": 0.87, "provenance": "MEASURED"}]
+    client.append_outcome_metrics("job-777", entries)
+    assert seen["method"] == "POST"
+    assert seen["path"] == "/profitstream/v2/api/jobs/job-777/outcome/metrics"
+    assert seen["team"] == "TEAM"
+    assert seen["body"] == entries
+    client.close()
+
+
+def test_append_outcome_metrics_dry_run_makes_no_http_calls(capsys):
+    calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        return httpx.Response(201)
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    client = AgenticOutcomeClient(_settings(), http_client=http)
+    client.append_outcome_metrics(
+        "job-dry", [{"key": "quality_rate", "value": 0.5}], dry_run=True
+    )
+    out = capsys.readouterr().out
+    assert "DRY-RUN" in out
+    assert "/profitstream/v2/api/jobs/job-dry/outcome/metrics" in out
+    assert calls == []
+    client.close()
+
+
+def test_append_outcome_metrics_rejects_metering_key_before_http():
+    calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        return httpx.Response(201)
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    settings = _settings(api_key="rev_mk_TENANT_abc", outcome_api_key=None)
+    client = AgenticOutcomeClient(settings, http_client=http)
+    with pytest.raises(ValueError, match="write-scope"):
+        client.append_outcome_metrics("job-1", [{"key": "quality_rate", "value": 0.5}])
+    assert calls == []
+    client.close()
+
+
+@pytest.mark.parametrize("bad", [
+    [],                                       # nothing to append
+    None,                                     # an unset variable forwarded here
+    {"key": "quality_rate", "value": 0.9},    # one entry passed unwrapped
+    [{"value": 0.9}],                         # no key
+])
+def test_append_outcome_metrics_rejects_malformed_entries_before_http(bad):
+    """The examples client shape-checks entries exactly as JobContext does.
+
+    Without it an empty list reached the server, and a bare mapping became a
+    JSON array of its keys.
+    """
+    calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        return httpx.Response(201)
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    client = AgenticOutcomeClient(_settings(), http_client=http)
+    with pytest.raises(ValueError, match="metrics"):
+        client.append_outcome_metrics("job-1", bad)
+    assert calls == []
+    client.close()
+
+
+@pytest.mark.parametrize("bad", [[], None, {"key": "quality_rate", "value": 0.9}])
+def test_append_outcome_metrics_dry_run_refuses_to_print_a_payload_it_would_reject(bad, capsys):
+    """A dry run that prints an invalid body is worse than no dry run."""
+    client = AgenticOutcomeClient(_settings())
+    with pytest.raises(ValueError, match="metrics"):
+        client.append_outcome_metrics("job-1", bad, dry_run=True)
+    assert "DRY-RUN" not in capsys.readouterr().out
+    client.close()

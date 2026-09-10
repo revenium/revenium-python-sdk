@@ -46,8 +46,8 @@ ReveniumCostLimitExceeded = BudgetExceededError
 class OutcomeReportingError(Exception):
     """Raised when an agentic job outcome cannot be reported.
 
-    Base of the outcome exception family (BACK-777). Configuration failures
-    (unresolvable team_id, missing API key) raise this class directly;
+    Configuration failures (unresolvable team_id, missing API key) raise this
+    class directly;
     backend-state conditions raise the subclasses.
     """
 
@@ -56,7 +56,7 @@ class OutcomeAlreadyReportedError(OutcomeReportingError):
     """The job already has an outcome (backend 409 with amendment guidance).
 
     Callers can inspect ``reported_at`` / ``amendment_count`` and decide to
-    amend (``amend_outcome``, BACK-777 Phase 3).
+    amend (``amend_outcome``).
     """
 
     def __init__(
@@ -80,6 +80,23 @@ class OutcomeNotReportedError(OutcomeReportingError):
 class OutcomeAmendConflictError(OutcomeReportingError):
     """Concurrent amendment changed the outcome row (backend 409, optimistic lock).
 
-    Retryable by the caller: refetch the current state (``get_outcome_history``)
-    and re-issue the amendment. The SDK does not auto-retry.
+    Raised on any amendment conflict the backend reports, including one on an
+    amendment that carried no ``expected_entity_version`` at all — a versionless
+    amendment racing another writer still conflicts. When the amendment did
+    carry a version, the conflict also means the backend no longer holds it.
+
+    ``current_entity_version`` is the version the backend does hold, read off
+    the conflict body, and it is what makes the conflict recoverable: re-check
+    the outcome you intend to write (``get_outcome_history`` shows what the
+    other writer changed), then re-issue the amendment with
+    ``expected_entity_version`` set to it. It is ``None`` when the body carries
+    no version, in which case the version has to come from a job read outside
+    this SDK (``GET /v2/api/jobs/{agenticJobId}``) — history rows carry a
+    ``sequence``, not an entity version. The SDK does not auto-retry:
+    PATCH-amend is not idempotent, so a blind retry can append a duplicate
+    history row.
     """
+
+    def __init__(self, message: str, current_entity_version: Optional[int] = None):
+        super().__init__(message)
+        self.current_entity_version = current_entity_version

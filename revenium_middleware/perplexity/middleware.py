@@ -41,7 +41,8 @@ from .trace_fields import (
     get_parent_transaction_id,
     get_transaction_name,
     get_retry_number,
-    get_ticket_id
+    get_ticket_id,
+    get_agent_version
 )
 
 logger = logging.getLogger("revenium_middleware.perplexity")
@@ -212,6 +213,8 @@ def send_metering_data(
             trace_fields = build_trace_fields()
             if ticket_id := get_ticket_id(usage_metadata):
                 trace_fields["ticket_id"] = ticket_id
+            if agent_version := get_agent_version(usage_metadata):
+                trace_fields["agent_version"] = agent_version
 
             # Build completion args
             completion_args = {

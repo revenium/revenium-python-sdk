@@ -8,6 +8,7 @@ this via class inheritance and re-export symbols for backward compatibility.
 
 import logging
 import os
+import warnings
 from typing import Set, Optional
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,7 @@ class Config:
     ENV_REVENIUM_SKILL_NAME: str = "REVENIUM_SKILL_NAME"
     ENV_REVENIUM_SKILL_PLUGIN_NAME: str = "REVENIUM_SKILL_PLUGIN_NAME"
     ENV_REVENIUM_SKILL_SOURCE: str = "REVENIUM_SKILL_SOURCE"
+    ENV_REVENIUM_WRITE_API_KEY: str = "REVENIUM_WRITE_API_KEY"
     ENV_REVENIUM_OUTCOME_API_KEY: str = "REVENIUM_OUTCOME_API_KEY"
     ENV_REVENIUM_PROFITSTREAM_BASE_URL: str = "REVENIUM_PROFITSTREAM_BASE_URL"
 
@@ -156,6 +158,27 @@ def get_team_id() -> Optional[str]:
 def get_base_url() -> str:
     """Get Revenium base URL from environment (defaults to https://api.revenium.ai)."""
     return get_config_value(Config.ENV_REVENIUM_BASE_URL, Config.DEFAULT_BASE_URL)
+
+
+def resolve_write_api_key(api_key: Optional[str] = None) -> Optional[str]:
+    """Resolve the write-scope key from the supported precedence chain."""
+    if api_key:
+        return api_key
+
+    write_key = os.getenv(Config.ENV_REVENIUM_WRITE_API_KEY)
+    if write_key:
+        return write_key
+
+    outcome_key = os.getenv(Config.ENV_REVENIUM_OUTCOME_API_KEY)
+    if outcome_key:
+        warnings.warn(
+            "REVENIUM_OUTCOME_API_KEY is deprecated; set REVENIUM_WRITE_API_KEY instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return outcome_key
+
+    return os.getenv(Config.ENV_REVENIUM_API_KEY)
 
 
 def validate_api_key(api_key: str) -> None:

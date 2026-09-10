@@ -25,6 +25,50 @@ client.report_outcome("job-id", {
 client.close()
 ```
 
+## Economics, baselines and period facts
+
+Job-type economics and period facts use the same write key as outcomes. Keep a
+separate metering key only when your application also needs AI telemetry. If a
+registered job type has `monetization.valuePerUnit`, that computed value wins
+over `outcomeValue`; they are never summed.
+
+```python
+from revenium_middleware import (
+    Baseline, JobTypeEconomics, PeriodFactEntry, create_baseline,
+    report_period_facts, upsert_job_type_economics,
+)
+
+upsert_job_type_economics("claim", JobTypeEconomics(
+    unit_metric_key="completed_claims", unit_label="claim",
+    metrics=[{
+        "key": "completed_claims", "type": "COUNT",
+        "direction": "HIGHER_IS_BETTER", "aggregation": "SUM",
+        "resolution": "PER_JOB",
+    }],
+    dimensions=[{"key": "region", "allowedValues": ["us", "ca"]}],
+    monetization={
+        "metricKey": "completed_claims", "valuePerUnit": 4.25,
+        "currency": "USD", "category": "COST_AVOIDED", "basis": "REALIZED",
+    },
+))
+create_baseline("claim", Baseline(
+    effective_from="2026-08-01T00:00:00Z", cost_per_unit=4.25, currency="USD",
+))
+report_period_facts("claim", [PeriodFactEntry(
+    period_start="2026-08-01T00:00:00Z", period_end="2026-09-01T00:00:00Z",
+    dimension_key="region", dimension_value="us",
+    key="completed_claims", value=1280,
+)])
+```
+
+Job economics currency values must be USD. `effective_from` is the only
+required field on a baseline. Omit baseline and fact attribution fields to use
+the server defaults. Set them only when you need
+an explicit override. Metric directions are `HIGHER_IS_BETTER`
+or `LOWER_IS_BETTER`. Re-appending a fact for a period, dimension and key that
+already has one supersedes it, and the server requires `reason=` when it
+does.
+
 The Job is created implicitly when the first metric for that `agenticJobId` is ingested. Call `client.create_job("job-id")` explicitly only when you need to register the agent run before any metric (e.g. long-running workflows where the outcome may report before any LLM call).
 
 The SDK wraps these API calls:

@@ -431,6 +431,7 @@ async def log_token_usage(
         trace_type: Optional[str] = None,
         trace_name: Optional[str] = None,
         ticket_id: Optional[str] = None,
+        agent_version: Optional[str] = None,
         # Prompt capture fields
         system_prompt: Optional[str] = None,
         input_messages: Optional[str] = None,
@@ -560,6 +561,8 @@ async def log_token_usage(
         completion_args["trace_name"] = trace_name
     if ticket_id:
         completion_args["ticket_id"] = ticket_id
+    if agent_version:
+        completion_args["agent_version"] = agent_version
 
     # Add prompt capture fields only if they have values
     if system_prompt is not None:
@@ -626,7 +629,8 @@ def create_metering_call(
         get_environment, get_region, get_credential_alias,
         get_trace_type, get_trace_name, get_parent_transaction_id,
         get_transaction_name, get_retry_number, detect_operation_type,
-        validate_trace_type, validate_trace_name, get_ticket_id
+        validate_trace_type, validate_trace_name, get_ticket_id,
+        get_agent_version
     )
 
     # Record timing
@@ -676,6 +680,7 @@ def create_metering_call(
     )
     trace_name = validate_trace_name(trace_name_raw) if trace_name_raw else get_trace_name()
     ticket_id = get_ticket_id(usage_metadata)
+    agent_version = get_agent_version(usage_metadata)
     parent_transaction_id = (
         usage_metadata.get('parentTransactionId') or
         usage_metadata.get('parent_transaction_id') or
@@ -751,6 +756,7 @@ def create_metering_call(
             trace_type=trace_type,
             trace_name=trace_name,
             ticket_id=ticket_id,
+            agent_version=agent_version,
             # Prompt capture fields
             system_prompt=system_prompt,
             input_messages=input_messages,
@@ -1239,7 +1245,7 @@ def handle_streaming_response(
                     get_transaction_name, get_retry_number,
                     detect_operation_type,
                     validate_trace_type, validate_trace_name,
-                    get_ticket_id
+                    get_ticket_id, get_agent_version
                 )
 
                 # Get trace fields (usage_metadata takes precedence)
@@ -1271,6 +1277,7 @@ def handle_streaming_response(
                 )
                 trace_name = validate_trace_name(trace_name_raw) if trace_name_raw else get_trace_name()
                 ticket_id = get_ticket_id(self.usage_metadata)
+                agent_version = get_agent_version(self.usage_metadata)
                 parent_transaction_id = (
                     self.usage_metadata.get('parentTransactionId') or
                     self.usage_metadata.get('parent_transaction_id') or
@@ -1335,6 +1342,7 @@ def handle_streaming_response(
                         trace_type=trace_type,
                         trace_name=trace_name,
                         ticket_id=ticket_id,
+                        agent_version=agent_version,
                         # Prompt capture fields
                         system_prompt=system_prompt,
                         input_messages=input_messages,
@@ -1585,7 +1593,7 @@ def handle_streaming_responses(stream, request_time_dt, usage_metadata,
                     get_transaction_name, get_retry_number,
                     detect_operation_type,
                     validate_trace_type, validate_trace_name,
-                    get_ticket_id
+                    get_ticket_id, get_agent_version
                 )
 
                 environment = (
@@ -1612,6 +1620,7 @@ def handle_streaming_responses(stream, request_time_dt, usage_metadata,
                 )
                 trace_name = validate_trace_name(trace_name_raw) if trace_name_raw else get_trace_name()
                 ticket_id = get_ticket_id(self.usage_metadata)
+                agent_version = get_agent_version(self.usage_metadata)
                 parent_transaction_id = (
                     self.usage_metadata.get('parentTransactionId') or
                     self.usage_metadata.get('parent_transaction_id') or
@@ -1663,6 +1672,7 @@ def handle_streaming_responses(stream, request_time_dt, usage_metadata,
                         trace_type=trace_type,
                         trace_name=trace_name,
                         ticket_id=ticket_id,
+                        agent_version=agent_version,
                     )
 
                 thread = run_async_in_thread(metering_call())

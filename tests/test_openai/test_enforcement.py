@@ -179,8 +179,10 @@ def test_204_response_clears_cache(monkeypatch):
             return None
 
     monkeypatch.setattr(enforcement.httpx, "get", lambda *a, **kw: _Resp())
-    # (rules, orgUnitBudgetBlocks): no rules, and no department blocks either.
-    assert enforcement._fetch_rules() == ([], {})
+    # (rules, orgUnitBudgetBlocks, orgUnitBudgetBlockBalances,
+    # orgUnitBudgetWarnings): no rules, no department blocks, no per-person
+    # balances and nobody warned.
+    assert enforcement._fetch_rules() == ([], {}, {}, {})
 
 
 def test_poll_interval_env_var_parsed(monkeypatch):

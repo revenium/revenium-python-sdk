@@ -77,6 +77,41 @@ def mock_revenium_client():
 
 
 @pytest.fixture(autouse=True)
+def _reap_enforcement_poller(monkeypatch):
+    """Stop any enforcement rule-poll thread a test leaves running.
+
+    ``check_enforcement`` starts a daemon thread (``_ensure_poller_running``)
+    that calls ``_refresh_cache`` every ``_DEFAULT_POLL_INTERVAL`` seconds and
+    outlives the test that started it. Once the whole suite takes longer than
+    one interval, that thread wakes up inside an unrelated test and refreshes
+    against whatever ``httpx.get`` stub and module globals that test installed
+    -- overwriting ``_cache_timestamp`` so the test's own refresh is skipped as
+    "fresh", consuming responses from its stub, or setting a Retry-After
+    cooldown it never asked for.
+
+    That is a real cross-test dependency rather than a flake: it passes on a
+    fast machine, where the suite finishes inside a single poll interval, and
+    fails on a slower CI runner, where it does not.
+
+    Requesting ``monkeypatch`` orders this teardown before the stubs are
+    restored, so a thread on its way out cannot fall through to real ``httpx``.
+    """
+    from revenium_middleware._core import enforcement
+
+    def reap():
+        thread = enforcement._poll_thread
+        enforcement._stop_event.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5)
+        enforcement._poll_thread = None
+        enforcement._stop_event.clear()
+
+    reap()
+    yield
+    reap()
+
+
+@pytest.fixture(autouse=True)
 def _clear_deprecated_field_warning_cache():
     """The deprecated-field logger.warning dedup in revenium_middleware._core.fields is
     module-level state. Clear it before every test so tests that assert on the warning

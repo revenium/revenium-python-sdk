@@ -20,6 +20,7 @@ from revenium_middleware._core.trace_fields import (  # noqa: F401 — re-export
     TRACE_TYPE_MAX_LENGTH,
     TRACE_NAME_MAX_LENGTH,
     TICKET_ID_MAX_LENGTH,
+    AGENT_VERSION_MAX_LENGTH,
     TRACE_TYPE_PATTERN,
     ENV_REVENIUM_ENVIRONMENT,
     ENV_ENVIRONMENT,
@@ -46,9 +47,11 @@ from revenium_middleware._core.trace_fields import (  # noqa: F401 — re-export
     get_transaction_name,
     get_retry_number,
     get_ticket_id,
+    get_agent_version,
     validate_trace_type,
     validate_trace_name,
     validate_ticket_id,
+    validate_agent_version,
 )
 
 logger = logging.getLogger(__name__)

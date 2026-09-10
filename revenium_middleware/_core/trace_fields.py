@@ -12,6 +12,7 @@ import logging
 from typing import Optional, Dict, Any
 
 from .config import Config
+from .fields import extract_agent_version_field
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,9 @@ ENV_REVENIUM_TICKET_ID = Config.ENV_REVENIUM_TICKET_ID
 TRACE_TYPE_MAX_LENGTH = 128
 TRACE_NAME_MAX_LENGTH = 256
 TICKET_ID_MAX_LENGTH = 256
+# Mirrors ReveniumAttributes.MAX_AGENT_VERSION_LENGTH on the metering
+# service, which caps agentVersion on all four /v2/ai ingest bodies.
+AGENT_VERSION_MAX_LENGTH = 64
 TRACE_TYPE_PATTERN = re.compile(r'^[a-zA-Z0-9_-]+$')
 
 
@@ -210,6 +214,34 @@ def get_ticket_id(usage_metadata: Optional[Dict[str, Any]] = None) -> Optional[s
     return None
 
 
+def get_agent_version(
+    usage_metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """
+    Get the AI agent's own version from usage metadata.
+
+    Reads ``agent_version`` then its ``agentVersion`` alias through
+    ``fields.AGENT_VERSION_FIELD_MAP``, the single declaration of the accepted
+    aliases. Unlike ticketId there is no environment-variable fallback: the
+    agent version is per-call attribution the middleware cannot infer.
+
+    This is not ``agenticJobVersion`` (the agentic job definition's version).
+    The two are separate wire fields and must not be conflated.
+
+    Args:
+        usage_metadata: Optional metadata dictionary
+
+    Returns:
+        Validated agent version (truncated if needed) or None if not set
+    """
+    if not usage_metadata:
+        return None
+    agent_version = extract_agent_version_field(usage_metadata).get('agent_version')
+    if agent_version:
+        return validate_agent_version(agent_version)
+    return None
+
+
 def get_retry_number() -> int:
     """
     Get retry number from environment variables.
@@ -321,3 +353,53 @@ def validate_ticket_id(ticket_id: str) -> Optional[str]:
         return ticket_id[:TICKET_ID_MAX_LENGTH]
 
     return ticket_id
+
+
+def validate_agent_version(agent_version: Any) -> Optional[str]:
+    """
+    Validate agent version length and truncate if needed.
+
+    Rules:
+    - Non-string values are dropped, never coerced
+    - Maximum AGENT_VERSION_MAX_LENGTH characters
+    - Truncates with warning if too long
+
+    Args:
+        agent_version: Caller-supplied agent version. Typed as Any rather
+            than str because it arrives straight from ``usage_metadata``,
+            which the caller controls and the SDK does not validate upstream.
+
+    Returns:
+        Valid agent version (truncated if needed) or None if empty,
+        non-string, or otherwise unusable
+    """
+    if agent_version is None:
+        return None
+
+    if not isinstance(agent_version, str):
+        # Drop, never coerce: str(123) would invent attribution the caller
+        # never wrote. Dropping keeps the metering event and its cost
+        # flowing, which matters here because this runs after the provider
+        # call has already returned (and again on stream finalisation) --
+        # a TypeError at this point would surface as the failure of a call
+        # that actually succeeded.
+        logger.debug(
+            "Ignoring non-string agentVersion of type %s; "
+            "agent version attribution dropped for this event.",
+            type(agent_version).__name__,
+        )
+        return None
+
+    if not agent_version:
+        return None
+
+    if len(agent_version) > AGENT_VERSION_MAX_LENGTH:
+        logger.warning(
+            f"agentVersion exceeds maximum length of "
+            f"{AGENT_VERSION_MAX_LENGTH} characters. "
+            f"Truncating from {len(agent_version)} to "
+            f"{AGENT_VERSION_MAX_LENGTH} characters."
+        )
+        return agent_version[:AGENT_VERSION_MAX_LENGTH]
+
+    return agent_version

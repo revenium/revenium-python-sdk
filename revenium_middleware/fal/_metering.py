@@ -33,6 +33,7 @@ from .trace_fields import (
     get_transaction_name,
     get_retry_number,
     get_ticket_id,
+    get_agent_version,
     detect_media_type,
     normalize_model_name,
 )
@@ -292,6 +293,7 @@ def handle_metering(
             # Omit-if-unset: an explicit null would reach the wire, unlike
             # the NotGiven default of the typed client methods.
             ticket_id = get_ticket_id(usage_metadata)
+            agent_version = get_agent_version(usage_metadata)
             lineage_fields = extract_media_lineage_fields(usage_metadata)
 
             logger.debug(
@@ -313,6 +315,8 @@ def handle_metering(
                 }
                 if ticket_id:
                     image_args["ticket_id"] = ticket_id
+                if agent_version:
+                    image_args["agent_version"] = agent_version
                 image_args.update(lineage_fields)
                 image_args.update(
                     extract_service_tier_fields(usage_metadata, "image")
@@ -332,6 +336,8 @@ def handle_metering(
                 }
                 if ticket_id:
                     video_args["ticket_id"] = ticket_id
+                if agent_version:
+                    video_args["agent_version"] = agent_version
                 video_args.update(lineage_fields)
                 video_args.update(
                     extract_service_tier_fields(usage_metadata, "video")
@@ -348,6 +354,8 @@ def handle_metering(
                 }
                 if ticket_id:
                     audio_args["ticket_id"] = ticket_id
+                if agent_version:
+                    audio_args["agent_version"] = agent_version
                 audio_args.update(
                     extract_service_tier_fields(usage_metadata, "audio")
                 )
@@ -369,6 +377,8 @@ def handle_metering(
                 }
                 if ticket_id:
                     completion_args["ticket_id"] = ticket_id
+                if agent_version:
+                    completion_args["agent_version"] = agent_version
                 completion_args.update(
                     extract_service_tier_fields(usage_metadata, "completion")
                 )

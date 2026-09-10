@@ -7,7 +7,6 @@ value. Before this test existed, the proxy middleware hardcoded
 cache_creation_token_count / cache_read_token_count to 0 in both paths, silently
 mis-rating every cache-heavy call routed through the LiteLLM proxy.
 """
-import asyncio
 import datetime
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -19,60 +18,15 @@ import pytest
 pytest.importorskip("litellm")
 
 from revenium_middleware.litellm.proxy import middleware as mw  # noqa: E402
+from .proxy_hook_harness import (  # noqa: E402
+    base_kwargs,
+    make_success_response,
+    run_hook,
+    run_inline,
+    submitted_args,
+)
 
 NOW = datetime.datetime.now(datetime.timezone.utc)
-
-
-def run_inline(coro):
-    """Execute the metering coroutine synchronously so asserts see the call."""
-    asyncio.run(coro)
-    return SimpleNamespace(name="inline-metering")
-
-
-def run_hook(coro):
-    """Drive MiddlewareHandler's async_log_*_event coroutine to completion.
-
-    Those methods have no internal `await` points -- they build the payload
-    synchronously and hand a nested coroutine to (mocked) run_async_in_thread
-    without awaiting it. So a plain `send(None)` runs the whole body in one
-    step, without asyncio.run()/get_event_loop() marking a loop as "running".
-    That matters here because run_inline (above) calls asyncio.run() itself to
-    execute the metering coroutine; nesting two real asyncio.run() calls would
-    raise "cannot be called from a running event loop".
-    """
-    try:
-        coro.send(None)
-    except StopIteration:
-        pass
-
-
-class SubscriptableResponse:
-    """Stand-in for LiteLLM's ModelResponse: `response_obj["usage"]` plus `.id`."""
-
-    def __init__(self, response_id, usage):
-        self.id = response_id
-        self._usage = usage
-
-    def __getitem__(self, key):
-        if key == "usage":
-            return self._usage
-        raise KeyError(key)
-
-
-def make_success_response(usage, response_id="txn-proxy-cache-mapping"):
-    return SubscriptableResponse(response_id, usage)
-
-
-def base_kwargs(model="gpt-4o-mini"):
-    return {
-        "model": model,
-        "litellm_params": {"metadata": {"headers": {}}},
-    }
-
-
-def submitted_args(mock_submit):
-    assert mock_submit.call_count == 1
-    return mock_submit.call_args[0][1]
 
 
 @patch.object(mw, "run_async_in_thread", side_effect=run_inline)

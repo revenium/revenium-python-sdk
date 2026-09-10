@@ -1,0 +1,99 @@
+{
+  "backendSource": "hypercurrent service/src/main/kotlin/io/hypercurrent/profitstream/service/v2/request/JobTypeEconomicsRequests.kt (JobTypeEconomicsRequest, BaselineRequest, PeriodFactEntry) and service/src/main/kotlin/io/hypercurrent/profitstream/service/v2/resource/JobTypeEconomicsResource.kt",
+  "refreshNote": "When the backend request types change, copy their required fields and enum members into this fixture, update the canonical payloads below, and run tests/test_core/test_job_type_economics.py.",
+  "enums": {
+    "baselineProvenance": [
+      "CUSTOMER_DECLARED",
+      "MEASURED",
+      "SIGNED_OFF"
+    ],
+    "outcomeMetricProvenance": [
+      "MEASURED",
+      "SELF_REPORTED",
+      "DERIVED",
+      "ATTESTED"
+    ],
+    "metricDirection": [
+      "HIGHER_IS_BETTER",
+      "LOWER_IS_BETTER"
+    ],
+    "monetizationCategory": [
+      "REVENUE",
+      "COST_AVOIDED",
+      "TIME_SAVED",
+      "LEADING_VALUE"
+    ],
+    "monetizationBasis": [
+      "REALIZED",
+      "EXPECTED"
+    ]
+  },
+  "canonicalPayloads": {
+    "periodFact": {
+      "periodStart": "2026-08-01T00:00:00Z",
+      "periodEnd": "2026-08-02T00:00:00Z",
+      "dimensionKey": "region",
+      "dimensionValue": "us",
+      "key": "completed_claims",
+      "value": 4,
+      "provenance": "MEASURED",
+      "recordedBy": "claims-worker",
+      "source": "workflow",
+      "reason": "restating August after the warehouse reload"
+    },
+    "economics": {
+      "unitMetricKey": "completed_claims",
+      "unitLabel": "claim",
+      "metrics": [
+        {
+          "key": "completed_claims",
+          "type": "COUNT",
+          "direction": "HIGHER_IS_BETTER",
+          "aggregation": "SUM",
+          "resolution": "PER_JOB"
+        }
+      ],
+      "dimensions": [
+        {
+          "key": "region",
+          "allowedValues": [
+            "us",
+            "ca"
+          ]
+        }
+      ],
+      "monetization": {
+        "metricKey": "completed_claims",
+        "valuePerUnit": 4.25,
+        "currency": "USD",
+        "category": "COST_AVOIDED",
+        "basis": "REALIZED"
+      }
+    },
+    "baseline": {
+      "costPerUnit": 4.5,
+      "currency": "USD",
+      "provenance": "CUSTOMER_DECLARED",
+      "declaredBy": "claims-operations",
+      "effectiveFrom": "2026-08-01T00:00:00Z"
+    }
+  },
+  "requiredFields": {
+    "economics": [
+      "unitMetricKey",
+      "unitLabel",
+      "metrics"
+    ],
+    "baseline": [
+      "effectiveFrom"
+    ],
+    "periodFact": [
+      "periodStart",
+      "periodEnd",
+      "dimensionKey",
+      "dimensionValue",
+      "key",
+      "value"
+    ]
+  }
+}
