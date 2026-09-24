@@ -27,6 +27,16 @@ it names no address because these maps are PII (see ``_normalize_map_keys``).
 An integrator who wants more can read the map, which is cached and persisted
 like the other two. Revisit if a caller asks for a programmatic warn signal.
 
+Two inspection calls sit beside the enforcement path without being part of
+it. ``fetch_enforcement_rule(rule_id)`` reads one rule straight from the
+server, and ``fetch_enforcement_rule_roster(rule_id)`` reads the people (or
+departments) that rule is measuring, each with their spend, cap and band.
+Neither is cached and neither is consulted by ``check_enforcement``: they
+answer "why was this caller blocked, and who else does this rule cover?" for
+a person debugging, and a cached answer to that question would be worse than
+no answer. The polling refresh stays team-wide for the reason given on
+``_fetch_rules``.
+
 Opt-in via ``REVENIUM_CIRCUIT_BREAKER_ENABLED``. Disabled by default so the
 SDK stays no-op for callers who haven't enrolled in cost controls.
 """
@@ -649,12 +659,18 @@ def _fetched_from_payload(data) -> Optional[_FetchedRules]:
     return None
 
 
-def _fetch_rules() -> Optional[_FetchedRules]:
-    """Fetch the current enforcement payload from the Revenium API.
+class _FetchTarget(NamedTuple):
+    """The credentials and the team-scoped URL every enforcement read hangs off."""
 
-    Returns the rules and the three department-budget maps on success — any of
-    them may be empty -- or ``None`` on failure so the caller can preserve the
-    previous cache.
+    api_key: str
+    team_url: str
+
+
+def _fetch_target() -> Optional[_FetchTarget]:
+    """Resolve the API key and the team-scoped enforcement URL.
+
+    ``None`` when the SDK is not configured to read enforcement at all, which
+    every caller treats as "no reading available" rather than as an error.
     """
     global _team_id_warned
 
@@ -678,14 +694,35 @@ def _fetch_rules() -> Optional[_FetchedRules]:
     # containing '/', '..', or '?' cannot retarget the request to a
     # different endpoint on the same origin.
     safe_team_id = quote(team_id, safe="")
-    url = f"{base_url}/v2/api/ai/enforcement-rules/{safe_team_id}"
+    return _FetchTarget(api_key, f"{base_url}/v2/api/ai/enforcement-rules/{safe_team_id}")
+
+
+def _get_enforcement(url: str, api_key: str, resource: str,
+                     params: Optional[dict] = None) -> Optional["httpx.Response"]:
+    """GET one enforcement resource under the shared retry and Retry-After budget.
+
+    Returns the first response the retry policy does not retry -- the caller
+    reads its status and its body -- or ``None`` once the fetch has given up,
+    so every caller fails open on what it already holds. ``resource`` names
+    the read in the log lines.
+
+    Every enforcement read goes through here rather than calling ``httpx.get``
+    itself: the Retry-After budget and the refresh cooldown (FRONT-1682) exist
+    because these reads run on a caller's own request thread, and a second
+    unguarded GET against the same throttled origin reintroduces the request
+    amplification that ticket fixed.
+
+    ``params`` of ``None`` sends the request httpx builds from the URL alone,
+    which is what the unfiltered team-wide read has always sent.
+    """
     # Server-requested wait time this call may still spend, in total across
     # every attempt. See _RETRY_AFTER_GIVE_UP_SECONDS.
     retry_after_budget = _RETRY_AFTER_GIVE_UP_SECONDS
     for attempt in range(_FETCH_MAX_ATTEMPTS):
         backoff = min(_FETCH_BACKOFF_INITIAL * (2 ** attempt), _FETCH_BACKOFF_CAP)
         try:
-            response = httpx.get(url, headers={"x-api-key": api_key}, timeout=10)
+            response = httpx.get(url, params=params,
+                                 headers={"x-api-key": api_key}, timeout=10)
         except (httpx.TimeoutException, httpx.TransportError):
             if attempt == _FETCH_MAX_ATTEMPTS - 1:
                 break
@@ -693,45 +730,184 @@ def _fetch_rules() -> Optional[_FetchedRules]:
                 break
             continue
         except Exception:
-            logger.debug("Failed to fetch enforcement rules, falling open", exc_info=True)
+            logger.debug("Failed to fetch enforcement %s, falling open", resource, exc_info=True)
             return None
 
-        if _is_retryable_status(response.status_code):
-            plan = _plan_retry(response, backoff, retry_after_budget)
-            retry_after_budget = plan.budget_remaining
-            if plan.wait_seconds is None:
-                # Give up without waiting and without retrying: the cooldown
-                # _plan_retry recorded keeps the server's interval, and the
-                # caller falls open on the rules it already has.
-                return None
-            if attempt == _FETCH_MAX_ATTEMPTS - 1:
-                break
-            if _sleep(plan.wait_seconds):
-                break
-            continue
+        if not _is_retryable_status(response.status_code):
+            return response
 
-        try:
-            # 204 No Content == no rules configured for this team; cache empty
-            if response.status_code == 204:
-                return _FetchedRules([], {}, {}, {})
-            response.raise_for_status()
-            # Server currently returns ``{"rules": [...], "compiledAt": ...,
-            # "orgUnitBudgetBlocks": {...}, "orgUnitBudgetBlockBalances":
-            # {...}, "orgUnitBudgetWarnings": {...}}``; a bare list is accepted
-            # too. See ``_fetched_from_payload``.
-            return _fetched_from_payload(response.json())
-        except Exception:
-            logger.debug("Failed to fetch enforcement rules, falling open", exc_info=True)
+        plan = _plan_retry(response, backoff, retry_after_budget)
+        retry_after_budget = plan.budget_remaining
+        if plan.wait_seconds is None:
+            # Give up without waiting and without retrying: the cooldown
+            # _plan_retry recorded keeps the server's interval, and the caller
+            # falls open on the reading it already has.
             return None
+        if attempt == _FETCH_MAX_ATTEMPTS - 1:
+            break
+        if _sleep(plan.wait_seconds):
+            break
 
     # Deliberate fail-open: an enforcement-refresh outage must never become a
-    # customer traffic outage. The caller preserves the previous cache and the
-    # next poll cycle tries again.
+    # customer traffic outage. The caller preserves what it has and the next
+    # poll cycle tries again.
     logger.warning(
-        "Enforcement rule fetch exhausted %d attempts; failing open on the previous cache",
-        _FETCH_MAX_ATTEMPTS,
+        "Enforcement %s fetch exhausted %d attempts; failing open",
+        resource, _FETCH_MAX_ATTEMPTS,
     )
     return None
+
+
+def _fetch_rules(rule_id: Optional[str] = None) -> Optional[_FetchedRules]:
+    """Fetch the current enforcement payload from the Revenium API.
+
+    Returns the rules and the three department-budget maps on success — any of
+    them may be empty -- or ``None`` on failure so the caller can preserve the
+    previous cache.
+
+    ``rule_id`` sends the server's ``ruleId`` filter and is opt-in: the poller
+    and the stale-cache refresh never send it. The server computes the
+    department-budget maps team-wide and attaches them to the whole-team read,
+    so a refresh narrowed to one rule would stop receiving them and department
+    budgets would silently stop blocking anybody (BACK-3066). Narrowing is for
+    an integrator inspecting one rule, never for the cache the pre-call path
+    reads.
+    """
+    target = _fetch_target()
+    if target is None:
+        return None
+
+    params = {"ruleId": rule_id} if rule_id else None
+    response = _get_enforcement(target.team_url, target.api_key, "rule", params)
+    if response is None:
+        return None
+
+    try:
+        # 204 No Content == no rules configured for this team; cache empty
+        if response.status_code == 204:
+            return _FetchedRules([], {}, {}, {})
+        response.raise_for_status()
+        # Server currently returns ``{"rules": [...], "compiledAt": ...,
+        # "orgUnitBudgetBlocks": {...}, "orgUnitBudgetBlockBalances":
+        # {...}, "orgUnitBudgetWarnings": {...}}``; a bare list is accepted
+        # too. See ``_fetched_from_payload``.
+        return _fetched_from_payload(response.json())
+    except Exception:
+        logger.debug("Failed to fetch enforcement rules, falling open", exc_info=True)
+        return None
+
+
+def _fetch_roster(rule_id: str, page: int = 0, size: int = 25,
+                  search: Optional[str] = None,
+                  band: Optional[str] = None) -> Optional[dict]:
+    """Fetch one page of the roster the server holds for a single rule.
+
+    Deliberately not cached, unlike ``_cached_rules``: the roster is a
+    point-in-time reading an integrator asks for while debugging, nothing on
+    the pre-call path reads it, and a cached copy would carry a second
+    lifetime that could outlive the rule it describes.
+
+    It spends the same Retry-After budget as the rule fetch and records the
+    same cooldown when it gives up, but unlike ``_refresh_cache`` a cooldown
+    already in force does not suppress it: this is one read a person asked
+    for, not one per customer request, and answering it with ``None`` because
+    the poller was throttled would hide the reading rather than protect the
+    origin.
+
+    Returns the server's roster object, or ``None`` when there is no reading
+    yet (HTTP 204), the team has no such rule, or the fetch gave up.
+    """
+    target = _fetch_target()
+    if target is None:
+        return None
+
+    params: Dict[str, object] = {"ruleId": rule_id, "page": page, "size": size}
+    if search:
+        params["search"] = search
+    if band:
+        params["band"] = band
+
+    response = _get_enforcement(f"{target.team_url}/roster", target.api_key,
+                                "roster", params)
+    if response is None:
+        return None
+
+    try:
+        # 204 No Content == the rule has no compiled reading yet, which is a
+        # different answer from the rules read's 204 (see the controller): it
+        # carries no envelope to say how old the reading is.
+        if response.status_code == 204:
+            return None
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        logger.debug("Failed to fetch enforcement rule roster, falling open", exc_info=True)
+        return None
+
+    if not isinstance(payload, dict):
+        logger.warning("Unexpected enforcement roster response shape: %r",
+                       type(payload).__name__)
+        return None
+    return payload
+
+
+def fetch_enforcement_rule(rule_id: str) -> Optional[dict]:
+    """Read one enforcement rule from the server, bypassing the rule cache.
+
+    An inspection call for integrators. It is not on the pre-call path, it
+    neither reads nor writes the cache ``check_enforcement`` evaluates, and it
+    is the only place the SDK asks the server for a single rule.
+
+    Args:
+        rule_id: Revenium hashid of the rule to read.
+
+    Returns:
+        The rule as the server compiled it, or ``None`` when the team has no
+        such compiled rule (a disabled rule is never compiled) or the read
+        could not be completed.
+
+    Raises:
+        ValueError: If ``rule_id`` is empty.
+    """
+    if not rule_id:
+        raise ValueError("rule_id is required to read a single enforcement rule")
+
+    fetched = _fetch_rules(rule_id)
+    if fetched is None or not fetched.rules:
+        return None
+    return fetched.rules[0]
+
+
+def fetch_enforcement_rule_roster(rule_id: str, page: int = 0, size: int = 25,
+                                  search: Optional[str] = None,
+                                  band: Optional[str] = None) -> Optional[dict]:
+    """Read who one enforcement rule currently covers.
+
+    An inspection call for integrators answering "why was this caller blocked,
+    and who else is this rule measuring?". Like ``fetch_enforcement_rule`` it
+    is off the pre-call path and is never cached, so it always reports what
+    the server holds right now.
+
+    Args:
+        rule_id: Revenium hashid of the rule whose roster to read.
+        page: Zero-based page index.
+        size: Rows per page, 1 to 200.
+        search: Case-insensitive substring over a row's key, label and email.
+        band: One of ``BLOCKED``, ``WARNED``, ``UNDER`` or ``ALL``.
+
+    Returns:
+        The server's roster object -- ``rows`` plus the rule's window,
+        threshold and the whole roster's ``blockedCount`` / ``warnedCount`` /
+        ``underCount`` -- or ``None`` when the rule has no reading yet, groups
+        on nothing, or the read could not be completed.
+
+    Raises:
+        ValueError: If ``rule_id`` is empty.
+    """
+    if not rule_id:
+        raise ValueError("rule_id is required to read an enforcement rule roster")
+
+    return _fetch_roster(rule_id, page=page, size=size, search=search, band=band)
 
 
 def _refresh_cache() -> None:

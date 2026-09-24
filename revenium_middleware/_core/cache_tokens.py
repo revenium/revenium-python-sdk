@@ -11,8 +11,11 @@ See BACK-2391 for the history of this bug class (hardcoded/zeroed cache-token
 fields recurring across multiple emitters) and BACK-1925 for the LiteLLM
 client's cache-token contract, which this module's defaults must not break.
 """
+import logging
 from numbers import Number
 from typing import Any, Dict, NamedTuple, Optional
+
+logger = logging.getLogger("revenium_middleware")
 
 
 class CacheTokens(NamedTuple):
@@ -64,6 +67,66 @@ def extract_cache_tokens(usage: Any) -> CacheTokens:
     cache_creation_tokens = get_usage_field(usage, "cache_creation_input_tokens", 0)
 
     return CacheTokens(cache_read_tokens=cache_read_tokens, cache_creation_tokens=cache_creation_tokens)
+
+
+def billable_input_tokens(
+    prompt_tokens: int,
+    cache_read_tokens: int,
+    cache_creation_tokens: int,
+    prompt_folds_cache: bool,
+) -> int:
+    """The part of a prompt count that Revenium prices at the input rate.
+
+    ``prompt_tokens`` is the OpenAI and LiteLLM spelling, and whether the cache
+    tokens sit inside it in a way this row may remove depends on which upstream
+    served the call, which only the caller knows: hence ``prompt_folds_cache``.
+    (Anthropic's own ``input_tokens`` spelling reports the cache buckets beside
+    it and never reaches this function.)
+
+    Getting that scope wrong costs money in both directions. Left folded for an
+    Anthropic response, the cache tokens are priced once at the input rate and
+    again in ``cache_read_token_count`` / ``cache_creation_token_count``, which
+    is the 4.5x this fix exists for (BACK-3334). Taken out for an OpenAI-shaped
+    provider, they are taken out twice: hypercurrent's
+    ``AICompletionMetricProcessor.normalizeCacheOverlap`` subtracts
+    ``cacheReadTokenCount`` from ``inputTokenCount`` itself for catalog models
+    whose provider is OPENAI, GROQ, XAI, AZURE or GEMINI -- its documented
+    invariant is that the stored input count is gross -- and clamps a negative
+    result to zero, which prices the whole input leg at nothing. A mirror of
+    that provider set lives in isotope's ``AiMetricsCosted`` SQL. Anthropic is
+    deliberately absent from both, which is why the gateway row is the only
+    place an Anthropic overlap can be removed, and why every other provider's
+    prompt count is reported exactly as LiteLLM built it.
+
+    A count that comes out negative contradicts the cache counts reported
+    beside it, so it is reported unchanged and said out loud rather than
+    clamped to a figure no provider sent.
+    """
+    if not prompt_tokens or not prompt_folds_cache:
+        return prompt_tokens
+    billable = prompt_tokens - cache_read_tokens - cache_creation_tokens
+    if billable < 0:
+        logger.warning(
+            "Usage counts contradict each other: prompt_tokens %s is smaller than "
+            "the cache tokens reported inside it (read %s, creation %s); reporting "
+            "the prompt count unchanged",
+            prompt_tokens, cache_read_tokens, cache_creation_tokens,
+        )
+        return prompt_tokens
+    return billable
+
+
+def total_priced_tokens(
+    input_tokens: int, output_tokens: int, cache_read_tokens: int, cache_creation_tokens: int
+) -> int:
+    """Every token the platform prices for one call, summed.
+
+    The cache counts are outside ``input_token_count`` once the split above has
+    been applied, so a total derived as input + output alone would stop
+    matching the total Claude Code's own telemetry reports for the same call --
+    the record a gateway row has to agree with.
+    """
+    return input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens
 
 
 def _optional_token_count(source: Any, name: str) -> Optional[int]:

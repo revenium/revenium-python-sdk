@@ -164,6 +164,16 @@ class FakeMessageStream:
     def get_final_message(self):
         return self._final_message
 
+    @property
+    def current_message_snapshot(self):
+        """What the real MessageStream exposes as it accumulates events.
+
+        Finalisation reads this rather than draining the stream, so the
+        stand-in has to carry it too. A fully consumed stream's snapshot is
+        its final message.
+        """
+        return self._final_message
+
 
 @pytest.fixture(autouse=True)
 def reset_shutdown_state():

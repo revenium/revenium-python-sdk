@@ -123,6 +123,9 @@ class TestLiteLLMProxyCacheTokenMappingSuccess:
         args = submitted_args(mock_submit)
         assert args["cache_read_token_count"] == 30
         assert args["cache_creation_token_count"] == 50
+        # The event names no upstream, so the prompt count is reported exactly
+        # as LiteLLM built it. Only an Anthropic row may have its cache overlap
+        # removed here -- see test_proxy_cache_token_parity.py (BACK-3334).
         assert args["input_token_count"] == 100
         assert args["output_token_count"] == 10
         assert args["total_token_count"] == 110
@@ -204,6 +207,9 @@ class TestLiteLLMProxyCacheTokenMappingFailure:
         args = submitted_args(mock_submit)
         assert args["cache_read_token_count"] == 30
         assert args["cache_creation_token_count"] == 50
+        # The event names no upstream, so the prompt count is reported exactly
+        # as LiteLLM built it. Only an Anthropic row may have its cache overlap
+        # removed here -- see test_proxy_cache_token_parity.py (BACK-3334).
         assert args["input_token_count"] == 100
         assert args["output_token_count"] == 10
         assert args["total_token_count"] == 110

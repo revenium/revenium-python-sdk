@@ -4,9 +4,20 @@ Tests for middleware integration with Bedrock support.
 
 import pytest
 import json
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
+from freezegun import freeze_time
 from revenium_middleware.anthropic.middleware import create_wrapper, stream_wrapper, _handle_bedrock_request, _handle_bedrock_stream_request
 from revenium_middleware.anthropic.provider import Provider
+
+anthropic = pytest.importorskip("anthropic")
+
+FOUNDRY_RESOURCE = "example-resource"
+
+requires_foundry_client = pytest.mark.skipif(
+    not hasattr(anthropic, "AnthropicFoundry"),
+    reason="Installed anthropic SDK predates the Foundry client classes"
+)
 
 
 class TestMiddlewareIntegration:
@@ -510,8 +521,14 @@ class TestAsyncBedrockAttribution:
         response.usage.cache_read_input_tokens = 0
         return response
 
-    def _run_create(self, mock_detect_value, kwargs=None):
+    def _run_create(self, mock_detect_value=None, kwargs=None, instance=None):
+        """Drive the async create wrapper once and return its metering payload.
+
+        mock_detect_value=None leaves the real detect_provider in place, so a
+        test can exercise provider signals on ``instance._client`` end to end.
+        """
         import asyncio
+        from contextlib import ExitStack
         import revenium_middleware.anthropic.middleware as mw
 
         response = self._make_response()
@@ -520,13 +537,15 @@ class TestAsyncBedrockAttribution:
             return response
 
         payloads = []
-        with patch.object(mw, 'detect_provider', return_value=mock_detect_value), \
-                patch.object(mw, 'submit_ai_event',
-                             side_effect=lambda op, args: payloads.append(args)), \
-                patch.object(mw, '_safe_run_async_in_thread',
-                             side_effect=self._run_metering_inline):
+        with ExitStack() as stack:
+            if mock_detect_value is not None:
+                stack.enter_context(patch.object(mw, 'detect_provider', return_value=mock_detect_value))
+            stack.enter_context(patch.object(mw, 'submit_ai_event',
+                                             side_effect=lambda op, args: payloads.append(args)))
+            stack.enter_context(patch.object(mw, '_safe_run_async_in_thread',
+                                             side_effect=self._run_metering_inline))
             wrapper = self._wrapper()
-            instance = MagicMock()
+            instance = instance if instance is not None else MagicMock()
             result = asyncio.run(wrapper(
                 wrapped, instance, (),
                 {"model": "claude-3-5-sonnet-20241022",
@@ -552,9 +571,27 @@ class TestAsyncBedrockAttribution:
         assert payload["output_token_count"] == 5
 
     def test_async_bedrock_disable_env_forces_anthropic(self, monkeypatch):
+        """The switch is applied by the real detect_provider, not by the wrapper.
+
+        A genuine Bedrock signal on the client is ignored while the switch is
+        on, so the payload is direct Anthropic. (With detect_provider mocked to
+        BEDROCK this would be untestable: the wrapper no longer second-guesses
+        the detector, which is what lets Foundry survive the switch.)
+        """
         monkeypatch.setenv("REVENIUM_BEDROCK_DISABLE", "1")
-        payload = self._run_create(Provider.BEDROCK)
+        instance = MagicMock()
+        instance._client.meta.service_model.service_name = "bedrock-runtime"
+        payload = self._run_create(None, instance=instance)
         assert payload["provider"] == "ANTHROPIC"
+
+    @requires_foundry_client
+    def test_async_foundry_create_keeps_foundry_label_with_bedrock_disabled(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_BEDROCK_DISABLE", "1")
+        instance = MagicMock()
+        instance._client = anthropic.AnthropicFoundry(api_key="test-key", resource=FOUNDRY_RESOURCE)
+        payload = self._run_create(None, instance=instance)
+        assert payload["provider"] == "Foundry"
+        assert payload["model_source"] == "ANTHROPIC"
 
     def test_async_bedrock_raw_stream_finalizes_with_detected_provider(self):
         import asyncio
@@ -593,6 +630,253 @@ class TestAsyncBedrockAttribution:
 
         assert mock_meter.call_count == 1
         assert mock_meter.call_args[0][5] == Provider.BEDROCK
+
+
+class TestFoundryAttribution:
+    """Foundry-served calls must carry Foundry provider metadata.
+
+    Foundry clients inherit the same patched methods as direct Anthropic
+    clients, so the only Foundry-specific behaviour is attribution: detection
+    must recognise the client and the resulting label must reach the metering
+    payload without disturbing any other field.
+    """
+
+    @staticmethod
+    def _run_metering_inline(fn):
+        import asyncio
+        import threading
+        thread = threading.Thread(target=lambda: asyncio.run(fn()))
+        thread.start()
+        thread.join()
+        return thread
+
+    @staticmethod
+    def _make_response():
+        response = MagicMock()
+        response.id = "msg_foundry"
+        response.model = "claude-3-5-sonnet-20241022"
+        response.stop_reason = "end_turn"
+        response.usage.input_tokens = 11
+        response.usage.output_tokens = 7
+        response.usage.cache_creation_input_tokens = 0
+        response.usage.cache_read_input_tokens = 0
+        return response
+
+    def _capture_payload(self, client_instance):
+        """Run the sync create wrapper for one client and return its payload."""
+        import revenium_middleware.anthropic.middleware as mw
+        # wrapt < 2.2 leaves the patched name as a FunctionWrapper.
+        wrapper = getattr(mw.create_wrapper, "_self_wrapper", mw.create_wrapper)
+
+        response = self._make_response()
+        wrapped = MagicMock(return_value=response)
+        instance = MagicMock()
+        instance._client = client_instance
+
+        payloads = []
+        with patch.object(mw, 'submit_ai_event',
+                          side_effect=lambda op, args: payloads.append(args)), \
+                patch.object(mw, '_safe_run_async_in_thread',
+                             side_effect=self._run_metering_inline):
+            result = wrapper(wrapped, instance, (),
+                             {"model": "claude-3-5-sonnet-20241022",
+                              "messages": [{"role": "user", "content": "hi"}],
+                              "max_tokens": 16})
+
+        assert result is response
+        assert len(payloads) == 1
+        return payloads[0]
+
+    @requires_foundry_client
+    def test_foundry_sync_create_emits_foundry_provider(self):
+        client = anthropic.AnthropicFoundry(api_key="test-key", resource=FOUNDRY_RESOURCE)
+
+        payload = self._capture_payload(client)
+
+        assert payload["provider"] == "Foundry"
+        assert payload["model_source"] == "ANTHROPIC"
+        # Token counts come from the stubbed response, proving the wrapper did
+        # real work rather than emitting an empty payload.
+        assert payload["input_token_count"] == 11
+        assert payload["output_token_count"] == 7
+
+    @requires_foundry_client
+    @freeze_time("2023-01-01T12:00:00Z")
+    def test_foundry_payload_differs_from_anthropic_only_by_provider(self):
+        foundry_client = anthropic.AnthropicFoundry(api_key="test-key", resource=FOUNDRY_RESOURCE)
+        direct_client = anthropic.Anthropic(api_key="test-key")
+
+        foundry_payload = self._capture_payload(foundry_client)
+        direct_payload = self._capture_payload(direct_client)
+
+        assert direct_payload["provider"] == "ANTHROPIC"
+        differing = {key for key in set(foundry_payload) | set(direct_payload)
+                     if foundry_payload.get(key) != direct_payload.get(key)}
+        assert differing == {"provider"}
+
+
+def _run_metering_inline(fn):
+    """Run the metering coroutine to completion on a dedicated thread.
+
+    Mirrors production, where _safe_run_async_in_thread dispatches to a thread,
+    while keeping the assertion synchronous.
+    """
+    import asyncio
+    import threading
+    thread = threading.Thread(target=lambda: asyncio.run(fn()))
+    thread.start()
+    thread.join(timeout=10)
+    return thread
+
+
+class _FakeMessageStream:
+    """Stands in for the client.messages.stream() context-manager helper."""
+
+    def __init__(self, final_message):
+        self._final_message = final_message
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+    def get_final_message(self):
+        return self._final_message
+
+    @property
+    def current_message_snapshot(self):
+        """What the real MessageStream exposes as it accumulates events.
+
+        Finalisation reads this rather than draining the stream, so the
+        stand-in has to carry it too. A fully consumed stream's snapshot is
+        its final message.
+        """
+        return self._final_message
+
+
+class TestStreamProviderAttribution:
+    """messages.stream() must attribute to the provider it detected.
+
+    Finalisation used to label every SDK-native stream as direct Anthropic, so
+    a Foundry client's streaming spend landed in direct-Anthropic totals even
+    though the non-streaming path attributed it correctly.
+    """
+
+    @staticmethod
+    def _final_message():
+        # SimpleNamespace rather than MagicMock: the per-TTL cache extraction
+        # inspects usage, and an auto-attribute double cannot express "the
+        # response carried no TTL split".
+        return SimpleNamespace(
+            id="msg_stream_attribution",
+            model="claude-3-5-sonnet-20241022",
+            stop_reason="end_turn",
+            usage=SimpleNamespace(
+                input_tokens=13,
+                output_tokens=5,
+                cache_creation_input_tokens=0,
+                cache_read_input_tokens=0,
+            ),
+        )
+
+    def _capture_stream_payload(self, client_instance, monkeypatch, bedrock_disabled=False):
+        """Drive the stream wrapper for one client and return its payload."""
+        import revenium_middleware.anthropic.middleware as mw
+        if bedrock_disabled:
+            monkeypatch.setenv("REVENIUM_BEDROCK_DISABLE", "1")
+        else:
+            monkeypatch.delenv("REVENIUM_BEDROCK_DISABLE", raising=False)
+        # wrapt < 2.2 leaves the patched name as a FunctionWrapper.
+        wrapper = getattr(mw.stream_wrapper, "_self_wrapper", mw.stream_wrapper)
+
+        instance = MagicMock()
+        instance._client = client_instance
+        wrapped = MagicMock(return_value=_FakeMessageStream(self._final_message()))
+
+        payloads = []
+        with patch.object(mw, 'submit_ai_event',
+                          side_effect=lambda op, args: payloads.append(args)), \
+                patch.object(mw, '_safe_run_async_in_thread',
+                             side_effect=_run_metering_inline), \
+                patch.object(mw, '_get_thread_safe_client', return_value=MagicMock()):
+            with wrapper(wrapped, instance, (),
+                         {"model": "claude-3-5-sonnet-20241022",
+                          "messages": [{"role": "user", "content": "hi"}],
+                          "max_tokens": 16}):
+                pass
+
+        assert len(payloads) == 1
+        return payloads[0]
+
+    @requires_foundry_client
+    def test_foundry_stream_emits_foundry_provider(self, monkeypatch):
+        client = anthropic.AnthropicFoundry(api_key="test-key", resource=FOUNDRY_RESOURCE)
+
+        payload = self._capture_stream_payload(client, monkeypatch)
+
+        assert payload["provider"] == "Foundry"
+        assert payload["model_source"] == "ANTHROPIC"
+        assert payload["is_streamed"] is True
+        # Token counts come from the stubbed final message, proving the wrapper
+        # metered a real finalisation rather than an empty payload.
+        assert payload["input_token_count"] == 13
+        assert payload["output_token_count"] == 5
+
+    @requires_foundry_client
+    def test_foundry_stream_keeps_foundry_label_with_bedrock_disabled(self, monkeypatch):
+        """REVENIUM_BEDROCK_DISABLE used to skip detection on the stream path
+        entirely, relabelling Foundry spend as direct Anthropic (Greptile P1 on
+        BACK-2566). The switch now suppresses Bedrock signals only.
+        """
+        client = anthropic.AnthropicFoundry(api_key="test-key", resource=FOUNDRY_RESOURCE)
+
+        payload = self._capture_stream_payload(client, monkeypatch, bedrock_disabled=True)
+
+        assert payload["provider"] == "Foundry"
+        assert payload["model_source"] == "ANTHROPIC"
+
+    @requires_foundry_client
+    def test_direct_anthropic_stream_still_emits_anthropic_provider(self, monkeypatch):
+        client = anthropic.Anthropic(api_key="test-key")
+
+        payload = self._capture_stream_payload(client, monkeypatch)
+
+        assert payload["provider"] == "ANTHROPIC"
+        assert payload["model_source"] == "ANTHROPIC"
+        assert payload["is_streamed"] is True
+
+    def test_bedrock_fallback_stream_still_emits_anthropic_provider(self, monkeypatch):
+        """A Bedrock stream the fast-path could not serve stays on Anthropic.
+
+        Bedrock streaming normally never reaches this finalisation -- it is
+        routed to the Bedrock transport, which meters itself. The one exception
+        is the fast-path-unavailable fallback, and there the SDK-native call is
+        what serves the request, matching the non-streaming wrapper.
+        """
+        import revenium_middleware.anthropic.middleware as mw
+        monkeypatch.delenv("REVENIUM_BEDROCK_DISABLE", raising=False)
+        wrapper = getattr(mw.stream_wrapper, "_self_wrapper", mw.stream_wrapper)
+
+        wrapped = MagicMock(return_value=_FakeMessageStream(self._final_message()))
+
+        payloads = []
+        with patch.object(mw, 'detect_provider', return_value=Provider.BEDROCK), \
+                patch.object(mw, '_handle_bedrock_stream_request',
+                             side_effect=mw.BedrockValidationError("no payload")), \
+                patch.object(mw, 'submit_ai_event',
+                             side_effect=lambda op, args: payloads.append(args)), \
+                patch.object(mw, '_safe_run_async_in_thread',
+                             side_effect=_run_metering_inline), \
+                patch.object(mw, '_get_thread_safe_client', return_value=MagicMock()):
+            with wrapper(wrapped, MagicMock(), (),
+                         {"model": "claude-3-5-sonnet-20241022",
+                          "messages": [{"role": "user", "content": "hi"}],
+                          "max_tokens": 16}):
+                pass
+
+        assert len(payloads) == 1
+        assert payloads[0]["provider"] == "ANTHROPIC"
 
 
 class TestBedrockTransportLoad:

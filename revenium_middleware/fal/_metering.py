@@ -21,6 +21,7 @@ from revenium_middleware._core.fields import (
     extract_media_lineage_fields,
     extract_service_tier_fields,
     extract_effort_field,
+    extract_prompt_context_fields,
     merge_extra_body,
 )
 from .trace_fields import (
@@ -383,6 +384,7 @@ def handle_metering(
                     extract_service_tier_fields(usage_metadata, "completion")
                 )
                 completion_args.update(extract_effort_field(usage_metadata))
+                completion_args.update(extract_prompt_context_fields(usage_metadata))
                 metering_result = submit_ai_event("completion", completion_args)
 
             logger.debug("Metering call result: %s", metering_result)

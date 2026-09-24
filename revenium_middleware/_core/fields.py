@@ -88,6 +88,18 @@ EFFORT_FIELD_MAP = {
     "effort": ("effort",),
 }
 
+# Keys are the typed snake_case params on create_completion; values are the
+# accepted usage_metadata aliases in precedence order. Like effort these are
+# per-request facts only the caller knows, so there is no env-var fallback, and
+# the values pass through verbatim because the backend owns their vocabulary.
+PROMPT_CONTEXT_FIELD_MAP = {
+    "prompt_id": ("prompt_id", "promptId"),
+    "prompt_length": ("prompt_length", "promptLength"),
+    "query_source": ("query_source", "querySource"),
+    "speed": ("speed",),
+    "subagent_type": ("subagent_type", "subagentType"),
+}
+
 # Keys are the typed snake_case params on the AI metering methods; values are
 # the accepted usage_metadata aliases in precedence order. costType is
 # deliberately absent: it is a pass-through wire field, never populated here.
@@ -311,6 +323,20 @@ def extract_effort_field(source: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     if not source:
         return {}
     return _resolve_field_map(source, EFFORT_FIELD_MAP)
+
+
+def extract_prompt_context_fields(source: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Resolve prompt, speed-mode and subagent attribution from caller metadata.
+
+    Each field resolves from its snake_case key then its camelCase alias and is
+    returned under the snake_case keyword ``create_completion`` expects. Absent
+    fields are omitted entirely (never emitted as None) so nothing extra
+    reaches the wire. Completion-only: the audio, image and video params do not
+    declare these fields.
+    """
+    if not source:
+        return {}
+    return _resolve_field_map(source, PROMPT_CONTEXT_FIELD_MAP)
 
 
 def extract_service_tier_fields(

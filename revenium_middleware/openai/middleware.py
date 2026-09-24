@@ -11,7 +11,7 @@ from revenium_middleware import client, get_client, run_async_in_thread, shutdow
 from revenium_middleware._core.enforcement import check_enforcement
 from revenium_middleware._core.exceptions import BudgetExceededError  # noqa: F401 — re-exported via openai.exceptions
 from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
-from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, extract_skill_fields, extract_coding_assistant_fields, extract_service_tier_fields, extract_effort_field, merge_extra_body
+from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, extract_skill_fields, extract_coding_assistant_fields, extract_service_tier_fields, extract_effort_field, extract_prompt_context_fields, merge_extra_body
 from revenium_middleware._core.config import is_selective_metering_enabled, is_capture_prompts_enabled
 from revenium_middleware._core.context import is_inside_decorated_function
 from revenium_middleware._core.patch_registry import register_patch
@@ -539,6 +539,7 @@ async def log_token_usage(
     # Reasoning effort is a caller-supplied pass-through: forwarded verbatim,
     # omitted entirely when unset.
     completion_args.update(extract_effort_field(usage_metadata))
+    completion_args.update(extract_prompt_context_fields(usage_metadata))
 
     # Add trace visualization fields only if they have values
     if environment:

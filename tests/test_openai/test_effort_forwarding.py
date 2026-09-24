@@ -71,3 +71,25 @@ def test_unrecognised_level_reaches_the_wire_unchanged():
 
 def test_unset_effort_omitted_from_the_wire():
     assert "effort" not in _wire_body({"trace_id": "no-effort-field"})
+
+
+def test_prompt_context_fields_reach_the_wire():
+    """BACK-3388: prompt, speed and subagent attribution rides the same path."""
+    body = _wire_body({
+        "prompt_id": "prompt-42",
+        "promptLength": 1834,
+        "query_source": "repl_main_thread",
+        "speed": "fast",
+        "subagentType": "Explore",
+    })
+    assert body["promptId"] == "prompt-42"
+    assert body["promptLength"] == 1834
+    assert body["querySource"] == "repl_main_thread"
+    assert body["speed"] == "fast"
+    assert body["subagentType"] == "Explore"
+
+
+def test_unset_prompt_context_fields_omitted_from_the_wire():
+    body = _wire_body({"trace_id": "no-prompt-context"})
+    for wire_name in ("promptId", "promptLength", "querySource", "speed", "subagentType"):
+        assert wire_name not in body, wire_name

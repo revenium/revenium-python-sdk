@@ -409,8 +409,11 @@ def coerce_entity_version(value: Any) -> Optional[int]:
         coerced = int(value)
     elif isinstance(value, str):
         text = value.strip()
-        # str.isdigit() is exactly "non-negative integer, no sign, no point".
-        if not text.isdigit():
+        # ASCII digits only: str.isdigit() also accepts superscripts and other
+        # Unicode digit-like code points that int() cannot parse, and this
+        # function must never raise (both callers rely on None for "no
+        # version"). The field is a Kotlin Long, so ASCII is the whole contract.
+        if not (text.isascii() and text.isdigit()):
             return None
         coerced = int(text)
     else:

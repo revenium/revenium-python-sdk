@@ -265,3 +265,193 @@ class TestOrgUnitBudgetBlocks:
         enforcement._refresh_cache()
 
         assert enforcement._cached_org_unit_blocks == {"keep@me.test": 1}
+
+
+class TestRuleIdFilter:
+    """BACK-3359: the per-rule read is opt-in, and the default read is untouched.
+
+    The server computes the three department-budget maps team-wide and hangs
+    them off the whole-team read, so a refresh that narrowed to one rule would
+    stop receiving them and department budgets would quietly stop blocking
+    anybody (BACK-3066). The filter therefore exists only for a caller who
+    asks for it by name.
+    """
+
+    def test_the_default_fetch_sends_no_rule_filter(self, fetch_env):
+        monkeypatch, _ = fetch_env
+        stub = stub_get(monkeypatch, [make_response(200)])
+
+        enforcement._fetch_rules()
+
+        assert stub.last_params is None
+        assert stub.last_url.endswith("/v2/api/ai/enforcement-rules/team-1")
+
+    def test_the_polling_refresh_never_narrows(self, fetch_env):
+        """The cache the pre-call path reads must stay the team-wide payload."""
+        monkeypatch, _ = fetch_env
+        stub = stub_get(monkeypatch, [make_response(200, json_body={
+            "rules": [{"ruleId": 1}],
+            "orgUnitBudgetBlocks": {"dept-user@example.test": 1},
+        })])
+
+        enforcement._refresh_cache()
+
+        assert stub.last_params is None
+        assert enforcement._cached_org_unit_blocks == {"dept-user@example.test": 1}
+
+    def test_a_rule_id_is_sent_as_the_ruleId_query_parameter(self, fetch_env):
+        monkeypatch, _ = fetch_env
+        stub = stub_get(monkeypatch, [make_response(200)])
+
+        enforcement._fetch_rules("mN3xpQz")
+
+        assert stub.last_params == {"ruleId": "mN3xpQz"}
+
+    def test_fetch_enforcement_rule_returns_the_one_rule(self, fetch_env):
+        monkeypatch, _ = fetch_env
+        stub = stub_get(monkeypatch, [make_response(200, json_body={
+            "rules": [{"ruleId": "mN3xpQz", "name": "Monthly cap"}],
+        })])
+
+        rule = enforcement.fetch_enforcement_rule("mN3xpQz")
+
+        assert rule == {"ruleId": "mN3xpQz", "name": "Monthly cap"}
+        assert stub.last_params == {"ruleId": "mN3xpQz"}
+
+    def test_a_rule_the_team_does_not_have_is_none_not_an_error(self, fetch_env):
+        """A disabled rule is never compiled, so an empty list is the ordinary answer."""
+        monkeypatch, _ = fetch_env
+        stub_get(monkeypatch, [make_response(200, json_body={"rules": []})])
+
+        assert enforcement.fetch_enforcement_rule("mN3xpQz") is None
+
+    def test_an_unreachable_server_is_none_not_an_error(self, fetch_env):
+        monkeypatch, _ = fetch_env
+        stub_get(monkeypatch, [make_response(503)] * 10)
+
+        assert enforcement.fetch_enforcement_rule("mN3xpQz") is None
+
+    def test_an_empty_rule_id_is_refused_rather_than_read_as_the_whole_team(self, fetch_env):
+        monkeypatch, _ = fetch_env
+        stub = stub_get(monkeypatch, [make_response(200)])
+
+        with pytest.raises(ValueError):
+            enforcement.fetch_enforcement_rule("")
+
+        assert stub.calls == 0
+
+
+class TestRuleRoster:
+    """BACK-3360: who one rule covers, read on demand and never cached.
+
+    The roster answers a person's debugging question, not the pre-call path's.
+    Nothing in ``check_enforcement`` reads it, so caching it would add a second
+    lifetime beside ``_cached_rules`` that could outlive the rule it describes.
+    """
+
+    def test_the_roster_is_a_sub_resource_of_the_team_read(self, fetch_env):
+        monkeypatch, _ = fetch_env
+        stub = stub_get(monkeypatch, [make_response(200, json_body={"rows": []})])
+
+        enforcement.fetch_enforcement_rule_roster("mN3xpQz")
+
+        assert stub.last_url.endswith("/v2/api/ai/enforcement-rules/team-1/roster")
+        assert stub.last_params["ruleId"] == "mN3xpQz"
+
+    def test_the_server_pages_bands_and_searches_not_the_sdk(self, fetch_env):
+        monkeypatch, _ = fetch_env
+        stub = stub_get(monkeypatch, [make_response(200, json_body={"rows": []})])
+
+        enforcement.fetch_enforcement_rule_roster(
+            "mN3xpQz", page=2, size=50, search="jane", band="BLOCKED")
+
+        assert stub.last_params == {
+            "ruleId": "mN3xpQz", "page": 2, "size": 50,
+            "search": "jane", "band": "BLOCKED",
+        }
+
+    def test_selectors_left_out_are_not_sent(self, fetch_env):
+        monkeypatch, _ = fetch_env
+        stub = stub_get(monkeypatch, [make_response(200, json_body={"rows": []})])
+
+        enforcement.fetch_enforcement_rule_roster("mN3xpQz")
+
+        assert stub.last_params == {"ruleId": "mN3xpQz", "page": 0, "size": 25}
+
+    def test_the_rows_and_band_counts_are_returned_as_the_server_computed_them(self, fetch_env):
+        monkeypatch, _ = fetch_env
+        payload = {
+            "ruleId": "mN3xpQz",
+            "dimension": "SUBSCRIBER",
+            "threshold": 100.0,
+            "total": 2,
+            "blockedCount": 1,
+            "warnedCount": 1,
+            "underCount": 0,
+            "rows": [
+                {"key": "jane@acme.test", "label": "Jane Smith", "spend": 105.5,
+                 "limit": 100.0, "band": "BLOCKED"},
+                {"key": "bob@acme.test", "label": "Bob", "spend": 85.0,
+                 "limit": 100.0, "band": "WARNED"},
+            ],
+        }
+        stub_get(monkeypatch, [make_response(200, json_body=payload)])
+
+        assert enforcement.fetch_enforcement_rule_roster("mN3xpQz") == payload
+
+    def test_no_reading_yet_is_none(self, fetch_env):
+        """204 here means the rule is not in the current compiled snapshot."""
+        monkeypatch, _ = fetch_env
+        stub_get(monkeypatch, [make_response(204)])
+
+        assert enforcement.fetch_enforcement_rule_roster("mN3xpQz") is None
+
+    def test_a_rule_with_no_roster_is_none(self, fetch_env):
+        monkeypatch, _ = fetch_env
+        stub_get(monkeypatch, [make_response(404)])
+
+        assert enforcement.fetch_enforcement_rule_roster("mN3xpQz") is None
+
+    def test_an_unexpected_body_shape_is_none(self, fetch_env):
+        monkeypatch, _ = fetch_env
+        stub_get(monkeypatch, [make_response(200, json_body=["not", "an", "object"])])
+
+        assert enforcement.fetch_enforcement_rule_roster("mN3xpQz") is None
+
+    def test_every_read_asks_the_server_again(self, fetch_env):
+        """Not cached: a stale roster must not outlive the rule it describes."""
+        monkeypatch, _ = fetch_env
+        stub = stub_get(monkeypatch, [make_response(200, json_body={"rows": []})])
+
+        enforcement.fetch_enforcement_rule_roster("mN3xpQz")
+        enforcement.fetch_enforcement_rule_roster("mN3xpQz")
+
+        assert stub.calls == 2
+
+    def test_the_roster_never_touches_the_enforcement_cache(self, fetch_env):
+        monkeypatch, _ = fetch_env
+        monkeypatch.setattr(enforcement, "_cached_rules", [{"ruleId": 1}])
+        monkeypatch.setattr(enforcement, "_cached_org_unit_blocks", {"keep@me.test": 1})
+        stub_get(monkeypatch, [make_response(200, json_body={"rows": [{"key": "a"}]})])
+
+        enforcement.fetch_enforcement_rule_roster("mN3xpQz")
+
+        assert enforcement._cached_rules == [{"ruleId": 1}]
+        assert enforcement._cached_org_unit_blocks == {"keep@me.test": 1}
+
+    def test_an_empty_rule_id_is_refused(self, fetch_env):
+        monkeypatch, _ = fetch_env
+        stub = stub_get(monkeypatch, [make_response(200)])
+
+        with pytest.raises(ValueError):
+            enforcement.fetch_enforcement_rule_roster("")
+
+        assert stub.calls == 0
+
+    def test_an_unconfigured_sdk_reads_nothing(self, fetch_env):
+        monkeypatch, _ = fetch_env
+        monkeypatch.delenv("REVENIUM_TEAM_ID", raising=False)
+        stub = stub_get(monkeypatch, [make_response(200)])
+
+        assert enforcement.fetch_enforcement_rule_roster("mN3xpQz") is None
+        assert stub.calls == 0

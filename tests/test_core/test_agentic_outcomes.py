@@ -392,6 +392,81 @@ def test_emit_completion_forwards_to_metering_sdk():
     # extra_body carries agentic + currency fields
     assert captured["kwargs"]["extra_body"]["agenticJobId"] == "job-1"
     assert captured["kwargs"]["extra_body"]["currency"] == "USD"
+    # agentVersion is absent from this payload, so it must not reach the
+    # typed client at all (an explicit None would go on the wire as null).
+    assert "agent_version" not in captured["kwargs"]
+    client.close()
+
+
+def test_emit_completion_forwards_agent_version_as_the_typed_keyword():
+    captured = {}
+
+    class FakeAI:
+        def create_completion(self, **kwargs):
+            captured["kwargs"] = kwargs
+
+    class FakeMetering:
+        def __init__(self):
+            self.ai = FakeAI()
+
+    client = AgenticOutcomeClient(_settings(), metering_client=FakeMetering())
+    payload = {
+        "completionStartTime": "2026-01-01T00:00:00Z",
+        "costType": "AI",
+        "inputTokenCount": 100,
+        "isStreamed": False,
+        "model": "gpt-5",
+        "outputTokenCount": 50,
+        "provider": "chatgpt",
+        "requestDuration": 1000,
+        "requestTime": "2026-01-01T00:00:00Z",
+        "responseTime": "2026-01-01T00:00:01Z",
+        "stopReason": "END",
+        "totalTokenCount": 150,
+        "transactionId": "tx-2",
+        "agentVersion": "1.4.2",
+        "agenticJobVersion": "7",
+    }
+    client.emit_completion(payload)
+    assert captured["kwargs"]["agent_version"] == "1.4.2"
+    # The job definition's version stays a separate field in extra_body.
+    assert captured["kwargs"]["extra_body"]["agenticJobVersion"] == "7"
+    client.close()
+
+
+def test_emit_completion_validates_agent_version_like_the_other_paths():
+    captured = {}
+
+    class FakeAI:
+        def create_completion(self, **kwargs):
+            captured["kwargs"] = kwargs
+
+    class FakeMetering:
+        def __init__(self):
+            self.ai = FakeAI()
+
+    client = AgenticOutcomeClient(_settings(), metering_client=FakeMetering())
+    base = {
+        "completionStartTime": "2026-01-01T00:00:00Z",
+        "costType": "AI",
+        "inputTokenCount": 100,
+        "isStreamed": False,
+        "model": "gpt-5",
+        "outputTokenCount": 50,
+        "provider": "chatgpt",
+        "requestDuration": 1000,
+        "requestTime": "2026-01-01T00:00:00Z",
+        "responseTime": "2026-01-01T00:00:01Z",
+        "stopReason": "END",
+        "totalTokenCount": 150,
+        "transactionId": "tx-3",
+    }
+    # A non-string is dropped, not stringified.
+    client.emit_completion({**base, "agentVersion": 142})
+    assert "agent_version" not in captured["kwargs"]
+    # An over-long value is capped at the ingest limit, not sent unchanged.
+    client.emit_completion({**base, "agentVersion": "v" * 200})
+    assert len(captured["kwargs"]["agent_version"]) == 64
     client.close()
 
 

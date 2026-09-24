@@ -95,9 +95,12 @@ ANTHROPIC_MESSAGES_BODY = {
 
 # LiteLLM's AnthropicConfig.calculate_usage reports prompt_tokens as the sum of
 # input_tokens and both cache buckets, and total_tokens as prompt + completion.
-# These are the numbers the metering payload must carry, not the raw
-# input_tokens/output_tokens from the Anthropic body.
+# The metered input count is the one Revenium prices at the input rate, which
+# is that sum with the two cache buckets taken back out -- they are priced
+# again in their own fields (BACK-3334) -- so it is Anthropic's own
+# input_tokens. The total keeps counting every bucket once.
 EXPECTED_PROMPT_TOKENS = 150
+EXPECTED_INPUT_TOKENS = 123
 EXPECTED_COMPLETION_TOKENS = 45
 EXPECTED_TOTAL_TOKENS = 195
 EXPECTED_CACHE_READ_TOKENS = 20
@@ -187,14 +190,14 @@ class TestAnthropicShapedRouteIsMetered:
         converted = converted_anthropic_response()
 
         run_hook(mw.proxy_handler_instance.async_log_success_event(
-            base_kwargs(model=ANTHROPIC_MODEL), converted, NOW, NOW
+            base_kwargs(model=ANTHROPIC_MODEL, custom_llm_provider="anthropic"), converted, NOW, NOW
         ))
 
         # submitted_args asserts call_count == 1, so both a missing submission
         # (the BACK-2405 risk) and a doubled one fail here.
         args = submitted_args(mock_submit)
         assert args["transaction_id"] == converted.id
-        assert args["input_token_count"] == EXPECTED_PROMPT_TOKENS
+        assert args["input_token_count"] == EXPECTED_INPUT_TOKENS
         assert args["output_token_count"] == EXPECTED_COMPLETION_TOKENS
         assert args["total_token_count"] == EXPECTED_TOTAL_TOKENS
         assert args["cache_read_token_count"] == EXPECTED_CACHE_READ_TOKENS
@@ -207,25 +210,29 @@ class TestAnthropicShapedRouteIsMetered:
     def test_transaction_id_is_the_litellm_id_not_the_anthropic_message_id(
         self, mock_submit, _get_client, _run
     ):
-        """The metered id is synthesized by LiteLLM, not carried over from Anthropic.
+        """The metered id is whatever LiteLLM put on the converted response.
 
-        ``transform_parsed_response`` populates usage, model and choices on the
-        ``litellm.ModelResponse()`` it is handed but never assigns ``.id``, so the
-        response keeps LiteLLM's generated ``chatcmpl-<uuid>``. The submission is
-        therefore well-formed and unique per call -- metering works -- but the
-        transaction id cannot be joined to the upstream Anthropic ``msg_`` id.
-        Anything that needs that correlation has to carry it separately.
+        Which id that is depends on the vendor. Through litellm 1.100.x
+        ``transform_parsed_response`` never assigned ``.id``, so the response
+        kept LiteLLM's generated ``chatcmpl-<uuid>``. From 1.101.0 the
+        conversion carries the upstream Anthropic ``msg_`` id onto the
+        ``ModelResponse``. BACK-3197 decided to accept the upstream id rather
+        than synthesize one: with the shared call id (BACK-2399) off, the
+        gateway row is keyed on ``response.id`` whatever LiteLLM chose, and
+        with it on, the minted id wins anyway. What this pins is the
+        invariant both versions share -- the metered id is ``response.id``,
+        non-empty, and never a constant.
         """
         converted = converted_anthropic_response()
 
         run_hook(mw.proxy_handler_instance.async_log_success_event(
-            base_kwargs(model=ANTHROPIC_MODEL), converted, NOW, NOW
+            base_kwargs(model=ANTHROPIC_MODEL, custom_llm_provider="anthropic"), converted, NOW, NOW
         ))
 
         args = submitted_args(mock_submit)
         assert args["transaction_id"]
-        assert args["transaction_id"] != ANTHROPIC_MESSAGES_BODY["id"]
-        assert args["transaction_id"].startswith("chatcmpl-")
+        assert args["transaction_id"] == converted.id
+        assert args["transaction_id"] not in ("error-no-id", "no-transaction-id")
 
     def test_openai_shaped_response_produces_exactly_one_submission(
         self, mock_submit, _get_client, _run
@@ -267,7 +274,7 @@ class TestUnconvertedAnthropicPayloadIsNotMetered:
         # nothing reaches Revenium.
         with pytest.raises(AttributeError):
             run_hook(mw.proxy_handler_instance.async_log_success_event(
-                base_kwargs(model=ANTHROPIC_MODEL), dict(ANTHROPIC_MESSAGES_BODY), NOW, NOW
+                base_kwargs(model=ANTHROPIC_MODEL, custom_llm_provider="anthropic"), dict(ANTHROPIC_MESSAGES_BODY), NOW, NOW
             ))
 
         assert mock_submit.call_count == 0
@@ -286,7 +293,7 @@ class TestUnconvertedAnthropicPayloadIsNotMetered:
         )
 
         run_hook(mw.proxy_handler_instance.async_log_success_event(
-            base_kwargs(model=ANTHROPIC_MODEL), unconverted, NOW, NOW
+            base_kwargs(model=ANTHROPIC_MODEL, custom_llm_provider="anthropic"), unconverted, NOW, NOW
         ))
 
         args = submitted_args(mock_submit)
@@ -384,7 +391,7 @@ class TestLiteLLMActuallyDispatchesToUsOnTheAnthropicRoute:
 
         args = await self._dispatch(logging_obj, ANTHROPIC_MESSAGES_BODY, mock_submit)
 
-        assert args["input_token_count"] == EXPECTED_PROMPT_TOKENS
+        assert args["input_token_count"] == EXPECTED_INPUT_TOKENS
         assert args["output_token_count"] == EXPECTED_COMPLETION_TOKENS
         assert args["total_token_count"] == EXPECTED_TOTAL_TOKENS
         assert args["cache_read_token_count"] == EXPECTED_CACHE_READ_TOKENS
@@ -392,9 +399,12 @@ class TestLiteLLMActuallyDispatchesToUsOnTheAnthropicRoute:
         assert args["middleware_source"] == "PROXY"
         assert args["trace_id"] == "back-2405-anthropic-route"
         # LiteLLM converted the body before handing it to us, so the metered id
-        # is its own -- never the Anthropic msg_ id the client received.
-        assert args["transaction_id"].startswith("chatcmpl-")
-        assert args["transaction_id"] != ANTHROPIC_MESSAGES_BODY["id"]
+        # is the converted response's own. Which value that is moved with the
+        # vendor (chatcmpl-<uuid> through 1.100.x, the upstream msg_ id from
+        # 1.101.0 -- BACK-3197 accepts either); what must hold is that it is
+        # present and is not a shared sentinel.
+        assert args["transaction_id"]
+        assert args["transaction_id"] not in ("error-no-id", "no-transaction-id")
 
     @pytest.mark.asyncio
     async def test_openai_route_through_the_dispatch_loop_is_metered_once(

@@ -9,7 +9,13 @@ from .metering import run_async_in_thread, shutdown_event, client, get_client, i
 from .metering_buffer import get_buffer_stats
 from .metering_submission import submit_ai_event
 from .exceptions import BudgetExceededError
-from .enforcement import check_enforcement, is_circuit_breaker_enabled, stop_polling
+from .enforcement import (
+    check_enforcement,
+    fetch_enforcement_rule,
+    fetch_enforcement_rule_roster,
+    is_circuit_breaker_enabled,
+    stop_polling,
+)
 from .context import (
     is_inside_decorated_function,
     get_function_metadata,
@@ -60,6 +66,8 @@ __all__ = [
     # Enforcement / circuit breaker
     "BudgetExceededError",
     "check_enforcement",
+    "fetch_enforcement_rule",
+    "fetch_enforcement_rule_roster",
     "is_circuit_breaker_enabled",
     "stop_polling",
     # Decorators

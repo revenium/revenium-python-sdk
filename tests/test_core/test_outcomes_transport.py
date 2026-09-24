@@ -467,6 +467,13 @@ class TestCoerceEntityVersion:
         for value in (3.5, -1, -1.0, "-1", "3.0", True, False, None, object(), [3]):
             assert coerce_entity_version(value) is None, value
 
+    def test_non_ascii_digit_strings_are_none_not_a_value_error(self):
+        # str.isdigit() accepts these; int() rejects the first and would
+        # silently parse the others. The contract is "never raises", so all
+        # of them are simply "no version".
+        for value in ("\u00b2", "\u0663", "\uff13", "1\u00b2"):
+            assert coerce_entity_version(value) is None, value
+
 
 class TestReportOutcomeRequest:
     def test_returns_the_response_so_entity_version_reaches_the_caller(self):

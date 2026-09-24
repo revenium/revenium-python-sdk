@@ -341,3 +341,62 @@ class TestNoCustomerRequestIsHarmedWhenTheFetchGivesUp:
 
         assert stub.calls == 1
         assert sleeps == []
+
+
+class TestTheRosterReadRidesTheSameBudget:
+    """BACK-3360: the roster is a second GET on the same origin, under the same rules.
+
+    A bare ``httpx.get`` here would reintroduce exactly what FRONT-1682 fixed:
+    an unguarded request against an origin that has already said how long to
+    wait. The roster read therefore shares ``_get_enforcement`` with the rule
+    fetch, so the give-up budget, the cooldown and the fail-open are one
+    implementation rather than two that can drift.
+    """
+
+    def test_a_retry_after_inside_the_bound_is_waited_out_in_full(self, fetch_env):
+        monkeypatch, sleeps = fetch_env
+        stub = stub_get(monkeypatch, [
+            throttled(15),
+            make_response(200, json_body={"rows": []}),
+        ])
+
+        roster = enforcement.fetch_enforcement_rule_roster("mN3xpQz")
+
+        assert sleeps == [15.0]
+        assert stub.calls == 2
+        assert roster == {"rows": []}
+
+    def test_a_retry_after_beyond_the_bound_neither_waits_nor_retries(self, fetch_env):
+        monkeypatch, sleeps = fetch_env
+        stub = stub_get(monkeypatch, [throttled(120)] * 10)
+
+        assert enforcement.fetch_enforcement_rule_roster("mN3xpQz") is None
+        assert sleeps == []
+        assert stub.calls == 1
+
+    def test_giving_up_starts_the_cooldown_the_rule_refresh_honours(self, fetch_env):
+        """One throttled origin, one cooldown: the roster cannot spend it twice."""
+        monkeypatch, _ = fetch_env
+        stub = stub_get(monkeypatch, [throttled(120)] * 10)
+
+        enforcement.fetch_enforcement_rule_roster("mN3xpQz")
+        enforcement._refresh_cache()
+
+        assert enforcement._refresh_is_on_cooldown() is True
+        assert stub.calls == 1
+
+    def test_the_budget_is_spent_across_the_whole_roster_read(self, fetch_env):
+        """A server repeating an in-bound interval cannot park a reader per attempt."""
+        monkeypatch, sleeps = fetch_env
+        stub_get(monkeypatch, [throttled(8)] * 10)
+
+        enforcement.fetch_enforcement_rule_roster("mN3xpQz")
+
+        assert sum(sleeps) <= enforcement._RETRY_AFTER_GIVE_UP_SECONDS
+
+    def test_transient_failures_are_retried_then_fail_open_on_none(self, fetch_env):
+        monkeypatch, _ = fetch_env
+        stub = stub_get(monkeypatch, [make_response(503)] * 10)
+
+        assert enforcement.fetch_enforcement_rule_roster("mN3xpQz") is None
+        assert stub.calls == enforcement._FETCH_MAX_ATTEMPTS

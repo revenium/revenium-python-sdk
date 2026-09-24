@@ -287,7 +287,6 @@ def send_tool_event(*, step: ToolStep, cost_usd: float, agent: str, subscriber: 
         "productName": product_name, "subscriber": subscriber, "traceId": trace_id,
         "agenticJobId": agentic_job_id, "agenticJobName": agentic_job_name,
         "agenticJobType": agentic_job_type, "agenticJobVersion": "1.0.0",
-        "agentVersion": "1.0.0",
         "environment": "demo",
     }
     if parent_transaction_id:

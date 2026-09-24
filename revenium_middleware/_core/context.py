@@ -8,6 +8,7 @@ and to store metadata that should be injected into API calls.
 
 import contextlib
 import contextvars
+import re
 from typing import Optional, Dict, Any, Iterator
 
 # Context variable to track if we're inside a decorated function
@@ -100,18 +101,24 @@ def clear_injected_metadata() -> None:
     _injected_metadata_context.set(None)
 
 
-def _canonical_metadata_key(key: Any) -> Any:
-    """Fold a metadata key to a spelling-independent form.
+_CAMEL_BOUNDARY = re.compile(r"(?<!^)(?=[A-Z])")
 
-    Every aliased metadata field in this SDK is accepted as both snake_case
-    and camelCase (``agent_version`` / ``agentVersion``, ``ticket_id`` /
-    ``ticketId``), so both spellings fold to the same canonical string.
-    Non-string keys are returned unchanged and can only ever collide with
-    themselves.
+
+def _canonical_metadata_key(key: Any) -> Any:
+    """Return the snake_case spelling of a metadata key.
+
+    Every aliased metadata field in this SDK is accepted as snake_case and as
+    its exact camelCase conversion (``agent_version`` / ``agentVersion``,
+    ``ticket_id`` / ``ticketId``), so a key is mapped to its snake_case form
+    and two keys are the same field only when those forms match. This is
+    deliberately narrower than stripping underscores and lower-casing:
+    arbitrary custom keys such as ``foo_bar`` and ``foobar`` are distinct
+    fields and must not collide. Non-string keys are returned unchanged and
+    can only ever collide with themselves.
     """
     if not isinstance(key, str):
         return key
-    return key.replace("_", "").lower()
+    return _CAMEL_BOUNDARY.sub("_", key).lower()
 
 
 def merge_metadata(api_metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

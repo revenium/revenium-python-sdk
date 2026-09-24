@@ -785,7 +785,8 @@ class BedrockStreamWrapper:
             from .middleware import _get_thread_safe_client, _safe_run_async_in_thread
             from .trace_fields import detect_vision_content
             from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
-            from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, extract_effort_field, merge_extra_body
+            from revenium_middleware._core import trace_fields as core_trace_fields
+            from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, extract_effort_field, extract_prompt_context_fields, merge_extra_body
 
             if shutdown_event.is_set():
                 logger.warning("Skipping metering call during shutdown")
@@ -832,6 +833,9 @@ class BedrockStreamWrapper:
                     subscriber = extract_subscriber_from_metadata(self.usage_metadata)
                     organization_name, product_name = extract_org_and_product(self.usage_metadata)
                     meta = extract_common_metadata(self.usage_metadata)
+                    # The agent's own version, validated and capped exactly as
+                    # the non-streaming Bedrock and Anthropic paths do it.
+                    agent_version = core_trace_fields.get_agent_version(self.usage_metadata)
 
                     result = submit_ai_event("completion", {
                         "cache_creation_token_count": self.cache_creation_tokens,
@@ -873,6 +877,10 @@ class BedrockStreamWrapper:
                         # None would go on the wire as "effort": null instead
                         # of being omitted.
                         **extract_effort_field(self.usage_metadata),
+                        **extract_prompt_context_fields(self.usage_metadata),
+                        # Same sparse rule for the agent version: absent means
+                        # omitted, never "agentVersion": null.
+                        **({"agent_version": agent_version} if agent_version is not None else {}),
                         "extra_body": extra_body if extra_body else None,
                     })
                     logger.debug("Metering call result for Bedrock stream: %s", result)
