@@ -94,6 +94,10 @@ class Config:
     ENV_REVENIUM_CB_FAIL_MODE: str = "REVENIUM_CB_FAIL_MODE"
     ENV_REVENIUM_CACHE_DIR: str = "REVENIUM_CACHE_DIR"
 
+    # Shared per-call id for the LiteLLM proxy -- see
+    # revenium_middleware.litellm.proxy.guardrail. On by default.
+    ENV_REVENIUM_LITELLM_SHARED_CALL_ID: str = "REVENIUM_LITELLM_SHARED_CALL_ID"
+
 
 class SecurityConfig:
     """Security-related configuration shared across all providers."""
@@ -113,6 +117,28 @@ class SecurityConfig:
 
 def is_capture_prompts_enabled() -> bool:
     return os.getenv("REVENIUM_CAPTURE_PROMPTS", "false").lower() in ("true", "1", "yes", "on")
+
+
+def is_shared_call_id_enabled() -> bool:
+    """Whether the LiteLLM proxy integration mints a shared per-call id.
+
+    On by default; set the variable to "false" to opt out. When on,
+    ``ReveniumGuardrail`` mints one id per proxied Anthropic messages request,
+    returns it to the client as the ``request-id`` response header and submits
+    it as the metered row's ``transaction_id``, so a Claude Code call seen by
+    both its own telemetry and the proxy is stored once rather than twice.
+
+    Read per call rather than once at import: a module-level global reading
+    ``os.environ`` at import is what ``docs/conventions/PYTHON_CONVENTIONS.md``
+    forbids under Secrets and Config, and an import-time read cannot be
+    exercised by a test that sets the environment.
+
+    Returns:
+        True when the environment variable is unset or one of "true", "1",
+        "yes", "on".
+    """
+    value = os.getenv(Config.ENV_REVENIUM_LITELLM_SHARED_CALL_ID, "true")
+    return value.lower() in ("true", "1", "yes", "on")
 
 
 def is_selective_metering_enabled() -> bool:

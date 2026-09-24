@@ -8,7 +8,7 @@ logger = logging.getLogger("revenium_middleware.extension")
 from revenium_middleware import client, get_client, run_async_in_thread, shutdown_event, merge_metadata
 from revenium_middleware._core import submit_ai_event
 from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
-from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, extract_effort_field, merge_extra_body
+from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, extract_effort_field, extract_prompt_context_fields, merge_extra_body
 from revenium_middleware._core.config import is_selective_metering_enabled
 from revenium_middleware._core.context import is_inside_decorated_function
 from revenium_middleware._core.log_sanitize import sanitize_for_logging
@@ -332,6 +332,7 @@ def handle_response(
 
             # Reasoning effort level (caller-supplied, forwarded verbatim)
             completion_args.update(extract_effort_field(usage_metadata))
+            completion_args.update(extract_prompt_context_fields(usage_metadata))
 
             logger.debug("Arguments for create_completion: %s", completion_args)
 
@@ -469,6 +470,7 @@ def handle_embeddings_response(
 
             # Reasoning effort level (caller-supplied, forwarded verbatim)
             completion_args.update(extract_effort_field(usage_metadata))
+            completion_args.update(extract_prompt_context_fields(usage_metadata))
 
             logger.debug("Arguments for create_completion: %s", completion_args)
 

@@ -21,6 +21,7 @@ from revenium_middleware._core.fields import (
     extract_media_lineage_fields,
     extract_service_tier_fields,
     extract_effort_field,
+    extract_prompt_context_fields,
     merge_extra_body,
 )
 
@@ -251,6 +252,7 @@ async def log_token_usage(
 
     # Reasoning effort level (caller-supplied, forwarded verbatim)
     completion_args.update(extract_effort_field(usage_metadata))
+    completion_args.update(extract_prompt_context_fields(usage_metadata))
 
     # Parent transaction ID field
     parent_transaction_id = (

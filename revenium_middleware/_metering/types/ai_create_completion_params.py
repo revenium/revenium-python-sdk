@@ -124,6 +124,26 @@ class AICreateCompletionParams(TypedDict, total=False):
     counts the tokens actually spent rather than the level requested.
     """
 
+    prompt_id: Annotated[str, PropertyInfo(alias="promptId")]
+    """Identifier of the user prompt that produced this completion (max 64 chars)"""
+
+    prompt_length: Annotated[int, PropertyInfo(alias="promptLength")]
+    """Length of the user prompt that produced this completion"""
+
+    query_source: Annotated[str, PropertyInfo(alias="querySource")]
+    """Where the query originated, as reported by the caller (max 128 chars)"""
+
+    speed: str
+    """The speed mode the completion was served in (max 16 chars).
+
+    Distinct from the float playback rate on the audio params: this is the
+    serving mode (for example fast or normal), which the backend prices
+    separately.
+    """
+
+    subagent_type: Annotated[str, PropertyInfo(alias="subagentType")]
+    """Type of the subagent that issued this completion (max 128 chars)"""
+
     error_code: Annotated[int, PropertyInfo(alias="errorCode")]
     """HTTP error code if the operation failed"""
 

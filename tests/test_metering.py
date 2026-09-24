@@ -953,3 +953,82 @@ class TestCreateCompletionEffortField:
             {"effort": "medium"},
             ai_create_completion_params.AICreateCompletionParams,
         ) == {"effort": "medium"}
+
+
+class TestCreateCompletionPromptContextFields:
+    """Prompt, speed-mode and subagent attribution on create_completion (BACK-3388).
+
+    The five fields are optional; each leaves under its camelCase wire name and
+    is omitted entirely when unset. Their vocabulary belongs to the backend.
+    """
+
+    _COMPLETION_KWARGS = TestCreateCompletionEffortField._COMPLETION_KWARGS
+
+    _FIELDS = {
+        "prompt_id": "prompt-42",
+        "prompt_length": 1834,
+        "query_source": "repl_main_thread",
+        "speed": "fast",
+        "subagent_type": "general-purpose",
+    }
+
+    _WIRE = {
+        "prompt_id": "promptId",
+        "prompt_length": "promptLength",
+        "query_source": "querySource",
+        "speed": "speed",
+        "subagent_type": "subagentType",
+    }
+
+    def _assert_wire(self, body):
+        for param, wire_name in self._WIRE.items():
+            assert body[wire_name] == self._FIELDS[param], wire_name
+            if wire_name != param:
+                assert param not in body, param
+
+    def test_create_completion_sends_each_field_under_its_wire_name(self):
+        from revenium_middleware._metering import ReveniumMetering
+
+        client = ReveniumMetering(api_key="test-key")
+        with patch.object(client.ai, "_post") as mock_post:
+            client.ai.create_completion(
+                transaction_id="txn-prompt-1",
+                **self._COMPLETION_KWARGS,
+                **self._FIELDS,
+            )
+        self._assert_wire(mock_post.call_args.kwargs["body"])
+
+    @pytest.mark.asyncio
+    async def test_async_create_completion_sends_each_field_under_its_wire_name(self):
+        from revenium_middleware._metering import AsyncReveniumMetering
+
+        client = AsyncReveniumMetering(api_key="test-key")
+        with patch.object(client.ai, "_post", new_callable=AsyncMock) as mock_post:
+            await client.ai.create_completion(
+                transaction_id="txn-prompt-2",
+                **self._COMPLETION_KWARGS,
+                **self._FIELDS,
+            )
+        self._assert_wire(mock_post.call_args.kwargs["body"])
+
+    def test_fields_omitted_from_the_wire_when_unset(self):
+        from revenium_middleware._metering import ReveniumMetering
+
+        client = ReveniumMetering(api_key="test-key")
+        with patch.object(client.ai, "_post") as mock_post:
+            client.ai.create_completion(
+                transaction_id="txn-prompt-3",
+                **self._COMPLETION_KWARGS,
+            )
+        body = mock_post.call_args.kwargs["body"]
+        for wire_name in self._WIRE.values():
+            assert wire_name not in body, wire_name
+
+    def test_params_type_declares_the_wire_names(self):
+        from revenium_middleware._metering._utils import maybe_transform
+        from revenium_middleware._metering.types import ai_create_completion_params
+
+        assert maybe_transform(
+            self._FIELDS,
+            ai_create_completion_params.AICreateCompletionParams,
+        ) == {self._WIRE[k]: v for k, v in self._FIELDS.items()}

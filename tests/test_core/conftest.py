@@ -26,19 +26,31 @@ class SequencedGet:
 
     The last outcome repeats once the sequence runs out, so a test that wants
     "429 forever" can pass one response. ``calls`` is the control-plane request
-    count the tests assert on.
+    count the tests assert on, and ``requests`` is the ``(url, kwargs)`` of
+    each one for the tests that assert on the request the fetch built.
     """
 
     def __init__(self, outcomes):
         self.outcomes = list(outcomes)
         self.calls = 0
+        self.requests = []
 
     def __call__(self, *args, **kwargs):
+        url = args[0] if args else kwargs.get("url")
+        self.requests.append((url, kwargs))
         outcome = self.outcomes[min(self.calls, len(self.outcomes) - 1)]
         self.calls += 1
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
+
+    @property
+    def last_url(self):
+        return self.requests[-1][0]
+
+    @property
+    def last_params(self):
+        return self.requests[-1][1].get("params")
 
 
 def stub_get(monkeypatch, outcomes):

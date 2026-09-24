@@ -21,7 +21,7 @@ from revenium_middleware import client, run_async_in_thread, shutdown_event, mer
 from revenium_middleware._core import submit_ai_event
 from revenium_middleware._core.cache_tokens import extract_cache_creation_ttl_counts
 from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
-from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, extract_effort_field, merge_extra_body
+from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, extract_effort_field, extract_prompt_context_fields, merge_extra_body
 from revenium_middleware._core.config import is_selective_metering_enabled, is_capture_prompts_enabled
 from revenium_middleware._core.context import is_inside_decorated_function
 from revenium_middleware._core.patch_registry import register_patch
@@ -306,6 +306,7 @@ def _extract_trace_fields(usage_metadata, request_body=None):
         'ticket_id': ticket_id,
         'agent_version': agent_version,
         'effort': effort,
+        'prompt_context': extract_prompt_context_fields(usage_metadata),
         'parent_transaction_id': parent_transaction_id,
         'transaction_name': transaction_name,
         'retry_number': retry_number,
@@ -401,6 +402,7 @@ def _create_bedrock_metering_call(response, usage_metadata, request_time, respon
                 "ticket_id": trace_fields.get('ticket_id'),
                 "agent_version": trace_fields.get('agent_version'),
                 **_effort_payload(trace_fields),
+                **trace_fields['prompt_context'],
                 "parent_transaction_id": trace_fields.get('parent_transaction_id'),
                 "transaction_name": trace_fields.get('transaction_name'),
                 "retry_number": trace_fields.get('retry_number'),
@@ -618,6 +620,7 @@ def _meter_raw_stream(state, usage_metadata, request_kwargs, request_time, reque
                 "ticket_id": trace_fields.get('ticket_id'),
                 "agent_version": trace_fields.get('agent_version'),
                 **_effort_payload(trace_fields),
+                **trace_fields['prompt_context'],
                 "parent_transaction_id": trace_fields.get('parent_transaction_id'),
                 "transaction_name": trace_fields.get('transaction_name'),
                 "retry_number": trace_fields.get('retry_number'),
@@ -661,6 +664,335 @@ def _meter_raw_stream(state, usage_metadata, request_kwargs, request_time, reque
     logger.debug("Metering thread started for raw stream: %s", thread)
 
 
+def _text_delta_of(event):
+    """Return the text a messages.stream() event carries, if any.
+
+    Keyed on the raw ``content_block_delta`` / ``text_delta`` pair rather than
+    the SDK's synthesized ``text`` event: the stream fires both for the same
+    delta, so reading only one of the two keeps the accumulation exact.
+    """
+    if getattr(event, "type", None) != "content_block_delta":
+        return None
+    delta = getattr(event, "delta", None)
+    if getattr(delta, "type", None) != "text_delta":
+        return None
+    return getattr(delta, "text", None)
+
+
+def _final_message_text(final_message):
+    """Concatenate the text blocks of a (possibly partial) message.
+
+    The authoritative output text, whatever the caller did with the stream.
+    The SDK accumulates every text delta into the message before handing the
+    event on, so this covers all the consumption styles at once -- including
+    the mixed one that defeats a chunk-by-chunk accumulator: iterate a few
+    chunks, then let ``get_final_message()`` drain the rest, which happens on
+    the SDK stream directly and never reaches the wrappers' iterators.
+    """
+    parts = []
+    for block in getattr(final_message, "content", None) or []:
+        if getattr(block, "type", None) == "text":
+            text = getattr(block, "text", None)
+            if text:
+                parts.append(text)
+    return ''.join(parts)
+
+
+def _accumulated_message(stream_context):
+    """The message the SDK has assembled so far, or None if nothing arrived.
+
+    A stream the caller abandoned part-way cannot be finalised -- the response
+    is closed by then, and draining it here would do I/O the caller declined --
+    but the events already read are billable, and the SDK kept them. Its
+    ``current_message_snapshot`` asserts instead of returning None when no
+    ``message_start`` was ever seen, hence the except.
+    """
+    try:
+        return stream_context.current_message_snapshot
+    except (AssertionError, AttributeError):
+        return None
+
+
+def _meter_message_stream(final_message, usage_metadata, request_kwargs, request_time,
+                          request_time_dt, response_time_dt, provider,
+                          first_token_time=None, request_start_time=None):
+    """Fire the metering event for a client.messages.stream() finalisation.
+
+    Shared by the sync and the async context-manager wrappers so both emit an
+    identical payload; only the timing inputs and the accumulated text differ.
+    ``final_message`` may be a partial snapshot from an interrupted stream --
+    what was read is what gets billed. Callers must not call this when
+    ``final_message.usage`` is None: there is nothing billable to report.
+
+    ``first_token_time`` and ``request_start_time`` are milliseconds since the
+    epoch, as recorded by the wrappers off ``time.time()``.
+    """
+    accumulated_content = _final_message_text(final_message)
+    response_time = response_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    request_duration = (response_time_dt - request_time_dt).total_seconds() * 1000
+    response_id = final_message.id
+
+    # Latency to the first token, not to the end of the stream: reporting the
+    # finish time as the completion start understates it for every stream.
+    time_to_first_token = 0
+    completion_start_time = response_time
+    if first_token_time:
+        completion_start_time = datetime.datetime.fromtimestamp(
+            first_token_time / 1000, datetime.timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if request_start_time:
+            time_to_first_token = first_token_time - request_start_time
+
+    prompt_tokens = final_message.usage.input_tokens
+    completion_tokens = final_message.usage.output_tokens
+    cache_creation_input_tokens = final_message.usage.cache_creation_input_tokens
+    cache_read_input_tokens = final_message.usage.cache_read_input_tokens
+    cache_creation_ttl_counts = extract_cache_creation_ttl_counts(final_message.usage)
+
+    logger.debug(
+        "Anthropic client.messages.stream token usage - prompt: %d, completion: %d, "
+        "cache_creation_input_tokens: %d, cache_read_input_tokens: %d",
+        prompt_tokens, completion_tokens, cache_creation_input_tokens, cache_read_input_tokens
+    )
+
+    anthropic_finish_reason = None
+    if final_message.stop_reason:
+        anthropic_finish_reason = final_message.stop_reason
+
+    finish_reason_map = {
+        "end_turn": "END",
+        "tool_use": "END_SEQUENCE",
+        "max_tokens": "TOKEN_LIMIT",
+        "content_filter": "ERROR"
+    }
+    stop_reason = finish_reason_map.get(anthropic_finish_reason, "END")
+
+    (system_prompt, input_messages, output_response, prompts_truncated) = (
+        extract_prompt_data_if_enabled(request_kwargs, accumulated_content=accumulated_content)
+    )
+
+    # The detected provider, not a hardcoded Anthropic label: Foundry clients
+    # are served by this SDK-native streaming path, so hardcoding dropped their
+    # spend into direct Anthropic totals.
+    provider_metadata = get_provider_metadata(provider)
+
+    async def metering_call():
+        try:
+            from revenium_middleware import shutdown_event
+
+            if shutdown_event.is_set():
+                logger.warning("Skipping metering call during shutdown")
+                return
+            logger.debug("Metering call to Revenium for stream completion %s", response_id)
+
+            client = _get_thread_safe_client()
+            if not client:
+                logger.warning("No thread-safe client available for stream metering")
+                return
+
+            subscriber = extract_subscriber_from_metadata(usage_metadata)
+
+            trace_fields = _extract_trace_fields(usage_metadata, request_kwargs)
+
+            extra_body = {}
+            if trace_fields.get('has_vision_content'):
+                extra_body['hasVisionContent'] = True
+            extra_body = merge_extra_body(extra_body, extract_agentic_job_fields(usage_metadata))
+
+            organization_name, product_name = _extract_organization_and_product_names(usage_metadata)
+            meta = extract_common_metadata(usage_metadata)
+
+            result = submit_ai_event("completion", {
+                "cache_creation_token_count": cache_creation_input_tokens,
+                **cache_creation_ttl_counts,
+                "cache_read_token_count": cache_read_input_tokens,
+                "input_token_cost": None,
+                "output_token_cost": None,
+                "total_cost": None,
+                "output_token_count": completion_tokens,
+                "cost_type": "AI",
+                "model": final_message.model,
+                "input_token_count": prompt_tokens,
+                "provider": provider_metadata["provider"],
+                "model_source": provider_metadata["model_source"],
+                "reasoning_token_count": 0,
+                "request_time": request_time,
+                "response_time": response_time,
+                "completion_start_time": completion_start_time,
+                "request_duration": int(request_duration),
+                "time_to_first_token": int(time_to_first_token),
+                "stop_reason": stop_reason,
+                "total_token_count": prompt_tokens + completion_tokens,
+                "transaction_id": response_id,
+                "trace_id": meta["trace_id"],
+                "task_type": meta["task_type"],
+                "subscriber": subscriber if subscriber else None,
+                "organization_name": organization_name,
+                "subscription_id": meta["subscription_id"],
+                "product_name": product_name,
+                "agent": meta["agent"],
+                "is_streamed": True,
+                "operation_type": trace_fields.get('operation_type', 'CHAT'),
+                "response_quality_score": meta["response_quality_score"],
+                "middleware_source": "PYTHON",
+                "environment": trace_fields.get('environment'),
+                "region": trace_fields.get('region'),
+                "credential_alias": trace_fields.get('credential_alias'),
+                "trace_type": trace_fields.get('trace_type'),
+                "trace_name": trace_fields.get('trace_name'),
+                "ticket_id": trace_fields.get('ticket_id'),
+                "agent_version": trace_fields.get('agent_version'),
+                **_effort_payload(trace_fields),
+                **trace_fields['prompt_context'],
+                "parent_transaction_id": trace_fields.get('parent_transaction_id'),
+                "transaction_name": trace_fields.get('transaction_name'),
+                "retry_number": trace_fields.get('retry_number'),
+                "operation_subtype": trace_fields.get('operation_subtype'),
+                "system_prompt": system_prompt,
+                "input_messages": input_messages,
+                "output_response": output_response,
+                "prompts_truncated": prompts_truncated,
+                "extra_body": extra_body if extra_body else None,
+            })
+            logger.debug("Metering call result for stream: %s", result)
+            success = False
+            try:
+                if result is None:
+                    success = False
+                elif hasattr(result, 'status_code'):
+                    status_code = int(getattr(result, 'status_code', 0) or 0)
+                    success = 200 <= status_code < 300
+                elif hasattr(result, 'resource_type') or hasattr(result, 'resourceType') or hasattr(result, 'id'):
+                    success = True
+                else:
+                    success = True
+            except Exception:
+                success = False
+
+            if success:
+                logger.debug("[REVENIUM SUCCESS] Streaming metering call successful for transaction %s", response_id)
+            else:
+                logger.warning(
+                    "[REVENIUM ERROR] Streaming metering call did not return success for transaction %s: %s",
+                    response_id, result
+                )
+        except Exception as e:
+            from revenium_middleware import shutdown_event
+            if not shutdown_event.is_set():
+                logger.warning(f"Error in metering call for stream: {str(e)}")
+                import traceback
+                logger.warning(f"Traceback: {traceback.format_exc()}")
+
+    thread = _safe_run_async_in_thread(metering_call)
+    logger.debug("Metering thread started for stream: %s", thread)
+
+
+class _AsyncMessageStreamMetering:
+    """Metering wrapper around anthropic's AsyncMessageStreamManager.
+
+    ``AsyncMessages.stream`` hands back a manager whose ``__aenter__`` yields an
+    ``AsyncMessageStream``, and none of that flow passes through
+    ``AsyncMessages.create``. Until this wrapper existed, an
+    ``async with client.messages.stream(...)`` block therefore produced no
+    metering record at all -- silent, unbilled spend.
+
+    It mirrors the sync ``stream_wrapper``: callers keep the stream's own
+    surface (``async for``, ``text_stream``, ``await get_final_message()``,
+    plus anything else forwarded by ``__getattr__``), and the accumulated usage
+    is metered fire-and-forget when the ``async with`` block exits.
+    """
+
+    def __init__(self, stream_manager, usage_metadata, request_kwargs,
+                 request_time, request_time_dt, provider):
+        self._stream_manager = stream_manager
+        self._usage_metadata = usage_metadata
+        self._request_kwargs = request_kwargs
+        self._request_time = request_time
+        self._request_time_dt = request_time_dt
+        self._provider = provider
+        self._stream_context = None
+        self.final_message = None
+        self.first_token_time = None
+        self.request_start_time = time.time() * 1000
+
+    async def __aenter__(self):
+        self._stream_context = await self._stream_manager.__aenter__()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        result = await self._stream_manager.__aexit__(exc_type, exc_val, exc_tb)
+
+        if self._stream_context is None:
+            return result
+
+        try:
+            # Whatever the SDK accumulated, without draining anything the
+            # caller left unread. Tokens already delivered are billable, so a
+            # stream broken off mid-iteration, or one that failed part-way, is
+            # metered from its snapshot; only a stream nothing was ever read
+            # from has nothing to report.
+            if self.final_message is None:
+                self.final_message = _accumulated_message(self._stream_context)
+
+            response_time_dt = datetime.datetime.now(datetime.timezone.utc)
+
+            if self.final_message is None or self.final_message.usage is None:
+                return result
+
+            _meter_message_stream(
+                self.final_message, self._usage_metadata, self._request_kwargs,
+                self._request_time, self._request_time_dt, response_time_dt,
+                self._provider,
+                first_token_time=self.first_token_time,
+                request_start_time=self.request_start_time,
+            )
+        except Exception as e:
+            logger.warning(f"Error processing final message from async stream: {str(e)}")
+            import traceback
+            logger.warning(f"Traceback: {traceback.format_exc()}")
+
+        return result
+
+    def _record_first_token(self, text):
+        if text and self.first_token_time is None:
+            self.first_token_time = time.time() * 1000
+
+    def __aiter__(self):
+        return self._iterate_events()
+
+    async def _iterate_events(self):
+        async for event in self._stream_context:
+            self._record_first_token(_text_delta_of(event))
+            yield event
+
+    @property
+    def text_stream(self):
+        return self._iterate_text(self._stream_context.text_stream)
+
+    async def _iterate_text(self, source):
+        async for chunk in source:
+            self._record_first_token(chunk)
+            yield chunk
+
+    async def get_final_message(self):
+        # Cached so the finalisation reuses it instead of awaiting a second
+        # consumption of the stream.
+        if self.final_message is None:
+            self.final_message = await self._stream_context.get_final_message()
+        return self.final_message
+
+    def __getattr__(self, name):
+        # Read through __dict__: a plain attribute access would re-enter
+        # __getattr__ for _stream_context itself and recurse forever.
+        stream_context = self.__dict__.get('_stream_context')
+        if stream_context is None:
+            raise AttributeError(
+                f"{type(self).__name__} has no attribute {name!r} before its "
+                "'async with' block is entered"
+            )
+        return getattr(stream_context, name)
+
+
 if register_patch("anthropic.resources.messages.messages.Messages.create"):
     @wrapt.patch_function_wrapper('anthropic.resources.messages.messages', 'Messages.create')
     def create_wrapper(wrapped, instance, args, kwargs):
@@ -671,13 +1003,12 @@ if register_patch("anthropic.resources.messages.messages.Messages.create"):
 
         usage_metadata, request_time, request_time_dt = extract_usage_metadata_and_timing(kwargs, "create")
 
-        if os.getenv("REVENIUM_BEDROCK_DISABLE") == "1":
-            logger.debug("Bedrock support disabled via REVENIUM_BEDROCK_DISABLE")
-            provider = Provider.ANTHROPIC
-        else:
-            client_instance = getattr(instance, '_client', None) if instance else None
-            base_url = kwargs.get('base_url', None)
-            provider = detect_provider(client=client_instance, base_url=base_url)
+        # REVENIUM_BEDROCK_DISABLE is honoured inside detect_provider (it
+        # suppresses only the Bedrock signals), so Foundry attribution survives
+        # the switch instead of collapsing to direct Anthropic.
+        client_instance = getattr(instance, '_client', None) if instance else None
+        base_url = kwargs.get('base_url', None)
+        provider = detect_provider(client=client_instance, base_url=base_url)
 
         logger.debug(f"Detected provider: {provider}")
 
@@ -821,6 +1152,7 @@ if register_patch("anthropic.resources.messages.messages.Messages.create"):
                     "ticket_id": trace_fields.get('ticket_id'),
                     "agent_version": trace_fields.get('agent_version'),
                     **_effort_payload(trace_fields),
+                    **trace_fields['prompt_context'],
                     "parent_transaction_id": trace_fields.get('parent_transaction_id'),
                     "transaction_name": trace_fields.get('transaction_name'),
                     "retry_number": trace_fields.get('retry_number'),
@@ -879,12 +1211,10 @@ if register_patch("anthropic.resources.messages.messages.AsyncMessages.create"):
         # AWS usage is not attributed to direct Anthropic. Async Bedrock calls
         # are served natively by the anthropic SDK, so only the metering
         # attribution changes -- there is no async re-routing.
-        if os.getenv("REVENIUM_BEDROCK_DISABLE") == "1":
-            detected_provider = Provider.ANTHROPIC
-        else:
-            client_instance = getattr(instance, '_client', None) if instance else None
-            detected_provider = detect_provider(client=client_instance,
-                                                base_url=kwargs.get('base_url', None))
+        # REVENIUM_BEDROCK_DISABLE is honoured inside detect_provider.
+        client_instance = getattr(instance, '_client', None) if instance else None
+        detected_provider = detect_provider(client=client_instance,
+                                            base_url=kwargs.get('base_url', None))
 
         request_kwargs = dict(kwargs)
 
@@ -998,6 +1328,7 @@ if register_patch("anthropic.resources.messages.messages.AsyncMessages.create"):
                         "ticket_id": trace_fields.get('ticket_id'),
                         "agent_version": trace_fields.get('agent_version'),
                         **_effort_payload(trace_fields),
+                        **trace_fields['prompt_context'],
                         "parent_transaction_id": trace_fields.get('parent_transaction_id'),
                         "transaction_name": trace_fields.get('transaction_name'),
                         "retry_number": trace_fields.get('retry_number'),
@@ -1051,24 +1382,29 @@ if register_patch("anthropic.resources.messages.messages.Messages.stream"):
 
         usage_metadata, request_time, request_time_dt = extract_usage_metadata_and_timing(kwargs, "stream")
 
-        if os.getenv("REVENIUM_BEDROCK_DISABLE") != "1":
-            client_instance = getattr(instance, '_client', None) if instance else None
-            base_url = kwargs.get('base_url', None)
-            provider = detect_provider(client=client_instance, base_url=base_url)
+        # REVENIUM_BEDROCK_DISABLE is honoured inside detect_provider: it
+        # suppresses only the Bedrock signals, so a Foundry stream keeps its
+        # Foundry label when Bedrock routing is switched off.
+        client_instance = getattr(instance, '_client', None) if instance else None
+        base_url = kwargs.get('base_url', None)
+        detected_provider = detect_provider(client=client_instance, base_url=base_url)
 
-            if provider == Provider.BEDROCK:
-                try:
-                    logger.debug("Routing streaming request to Bedrock handler")
-                    return _handle_bedrock_stream_request(args, kwargs, usage_metadata, request_time_dt, request_time,
-                                                          region=getattr(client_instance, 'aws_region', None))
-                except (BedrockValidationError, ImportError) as e:
-                    # The request was never sent (payload validation or missing
-                    # boto3), so the SDK-native path can still serve it.
-                    logger.error(f"Bedrock streaming fast-path unavailable: {e}. Falling back to the SDK-native call.")
-                # Any other failure -- including BedrockStreamError -- means
-                # the AWS request was (or may have been) attempted. Propagate
-                # it: silently re-invoking through a second path masks real
-                # provider errors and risks double invocation/billing.
+        if detected_provider == Provider.BEDROCK:
+            try:
+                logger.debug("Routing streaming request to Bedrock handler")
+                return _handle_bedrock_stream_request(args, kwargs, usage_metadata, request_time_dt, request_time,
+                                                      region=getattr(client_instance, 'aws_region', None))
+            except (BedrockValidationError, ImportError) as e:
+                # The request was never sent (payload validation or missing
+                # boto3), so the SDK-native path can still serve it.
+                logger.error(f"Bedrock streaming fast-path unavailable: {e}. Falling back to the SDK-native call.")
+                # Attributed to Anthropic once the SDK-native path serves
+                # it, matching the non-streaming create wrapper's fallback.
+                detected_provider = Provider.ANTHROPIC
+            # Any other failure -- including BedrockStreamError -- means
+            # the AWS request was (or may have been) attempted. Propagate
+            # it: silently re-invoking through a second path masks real
+            # provider errors and risks double invocation/billing.
 
         logger.debug("REVENIUM MIDDLEWARE: Calling client.messages.stream with model=%s, max_tokens=%s",
                      kwargs.get("model"), kwargs.get("max_tokens"))
@@ -1083,7 +1419,6 @@ if register_patch("anthropic.resources.messages.messages.Messages.stream"):
                 self.stream = stream
                 self.response_time_dt = None
                 self.response_id = None
-                self.collected_content = []
                 self.final_message = None
                 self.first_token_time = None
                 self.request_start_time = time.time() * 1000
@@ -1096,156 +1431,26 @@ if register_patch("anthropic.resources.messages.messages.Messages.stream"):
                 result = self.stream.__exit__(exc_type, exc_val, exc_tb)
 
                 try:
-                    self.final_message = self.stream_context.get_final_message()
+                    # Whatever the SDK accumulated, without draining anything
+                    # the caller left unread: a stream broken off part-way
+                    # still spent the tokens it delivered.
+                    if self.final_message is None:
+                        self.final_message = _accumulated_message(self.stream_context)
+
                     self.response_time_dt = datetime.datetime.now(datetime.timezone.utc)
                     self.response_time = self.response_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-                    request_duration = (self.response_time_dt - request_time_dt).total_seconds() * 1000
+
+                    if self.final_message is None or self.final_message.usage is None:
+                        return result
 
                     self.response_id = self.final_message.id
 
-                    if self.final_message.usage is None:
-                        return result
-
-                    prompt_tokens = self.final_message.usage.input_tokens
-                    completion_tokens = self.final_message.usage.output_tokens
-                    cache_creation_input_tokens = self.final_message.usage.cache_creation_input_tokens
-                    cache_read_input_tokens = self.final_message.usage.cache_read_input_tokens
-                    cache_creation_ttl_counts = extract_cache_creation_ttl_counts(self.final_message.usage)
-
-                    logger.debug(
-                        "Anthropic client.messages.stream token usage - prompt: %d, completion: %d, "
-                        "cache_creation_input_tokens: %d, cache_read_input_tokens: %d",
-                        prompt_tokens, completion_tokens, cache_creation_input_tokens, cache_read_input_tokens
+                    _meter_message_stream(
+                        self.final_message, usage_metadata, request_kwargs, request_time,
+                        request_time_dt, self.response_time_dt, detected_provider,
+                        first_token_time=self.first_token_time,
+                        request_start_time=self.request_start_time,
                     )
-
-                    anthropic_finish_reason = None
-                    if self.final_message.stop_reason:
-                        anthropic_finish_reason = self.final_message.stop_reason
-
-                    finish_reason_map = {
-                        "end_turn": "END",
-                        "tool_use": "END_SEQUENCE",
-                        "max_tokens": "TOKEN_LIMIT",
-                        "content_filter": "ERROR"
-                    }
-                    stop_reason = finish_reason_map.get(anthropic_finish_reason, "END")
-
-                    accumulated_content = ''.join(self.collected_content)
-                    (system_prompt, input_messages, output_response, prompts_truncated) = (
-                        extract_prompt_data_if_enabled(kwargs, accumulated_content=accumulated_content)
-                    )
-
-                    provider_metadata = get_provider_metadata(Provider.ANTHROPIC)
-
-                    async def metering_call():
-                        try:
-                            from revenium_middleware import shutdown_event
-
-                            if shutdown_event.is_set():
-                                logger.warning("Skipping metering call during shutdown")
-                                return
-                            logger.debug("Metering call to Revenium for stream completion %s", self.response_id)
-
-                            client = _get_thread_safe_client()
-                            if not client:
-                                logger.warning("No thread-safe client available for stream metering")
-                                return
-
-                            subscriber = extract_subscriber_from_metadata(usage_metadata)
-
-                            trace_fields = _extract_trace_fields(usage_metadata, request_kwargs)
-
-                            extra_body = {}
-                            if trace_fields.get('has_vision_content'):
-                                extra_body['hasVisionContent'] = True
-                            extra_body = merge_extra_body(extra_body, extract_agentic_job_fields(usage_metadata))
-
-                            organization_name, product_name = _extract_organization_and_product_names(usage_metadata)
-                            meta = extract_common_metadata(usage_metadata)
-
-                            result = submit_ai_event("completion", {
-                                "cache_creation_token_count": cache_creation_input_tokens,
-                                **cache_creation_ttl_counts,
-                                "cache_read_token_count": cache_read_input_tokens,
-                                "input_token_cost": None,
-                                "output_token_cost": None,
-                                "total_cost": None,
-                                "output_token_count": completion_tokens,
-                                "cost_type": "AI",
-                                "model": self.final_message.model,
-                                "input_token_count": prompt_tokens,
-                                "provider": provider_metadata["provider"],
-                                "model_source": provider_metadata["model_source"],
-                                "reasoning_token_count": 0,
-                                "request_time": request_time,
-                                "response_time": self.response_time,
-                                "completion_start_time": self.response_time,
-                                "request_duration": int(request_duration),
-                                "time_to_first_token": int(
-                                    self.first_token_time - self.request_start_time) if self.first_token_time else 0,
-                                "stop_reason": stop_reason,
-                                "total_token_count": prompt_tokens + completion_tokens,
-                                "transaction_id": self.response_id,
-                                "trace_id": meta["trace_id"],
-                                "task_type": meta["task_type"],
-                                "subscriber": subscriber if subscriber else None,
-                                "organization_name": organization_name,
-                                "subscription_id": meta["subscription_id"],
-                                "product_name": product_name,
-                                "agent": meta["agent"],
-                                "is_streamed": True,
-                                "operation_type": trace_fields.get('operation_type', 'CHAT'),
-                                "response_quality_score": meta["response_quality_score"],
-                                "middleware_source": "PYTHON",
-                                "environment": trace_fields.get('environment'),
-                                "region": trace_fields.get('region'),
-                                "credential_alias": trace_fields.get('credential_alias'),
-                                "trace_type": trace_fields.get('trace_type'),
-                                "trace_name": trace_fields.get('trace_name'),
-                                "ticket_id": trace_fields.get('ticket_id'),
-                                "agent_version": trace_fields.get('agent_version'),
-                                **_effort_payload(trace_fields),
-                                "parent_transaction_id": trace_fields.get('parent_transaction_id'),
-                                "transaction_name": trace_fields.get('transaction_name'),
-                                "retry_number": trace_fields.get('retry_number'),
-                                "operation_subtype": trace_fields.get('operation_subtype'),
-                                "system_prompt": system_prompt,
-                                "input_messages": input_messages,
-                                "output_response": output_response,
-                                "prompts_truncated": prompts_truncated,
-                                "extra_body": extra_body if extra_body else None,
-                            })
-                            logger.debug("Metering call result for stream: %s", result)
-                            success = False
-                            try:
-                                if result is None:
-                                    success = False
-                                elif hasattr(result, 'status_code'):
-                                    status_code = int(getattr(result, 'status_code', 0) or 0)
-                                    success = 200 <= status_code < 300
-                                elif hasattr(result, 'resource_type') or hasattr(result, 'resourceType') or hasattr(result, 'id'):
-                                    success = True
-                                else:
-                                    success = True
-                            except Exception:
-                                success = False
-
-                            if success:
-                                logger.debug("[REVENIUM SUCCESS] Streaming metering call successful for transaction %s", self.response_id)
-                            else:
-                                logger.warning(
-                                    "[REVENIUM ERROR] Streaming metering call did not return success for transaction %s: %s",
-                                    self.response_id, result
-                                )
-                        except Exception as e:
-                            from revenium_middleware import shutdown_event
-                            if not shutdown_event.is_set():
-                                logger.warning(f"Error in metering call for stream: {str(e)}")
-                                import traceback
-                                logger.warning(f"Traceback: {traceback.format_exc()}")
-
-                    thread = _safe_run_async_in_thread(metering_call)
-                    logger.debug("Metering thread started for stream: %s", thread)
 
                 except Exception as e:
                     logger.warning(f"Error processing final message from stream: {str(e)}")
@@ -1266,26 +1471,78 @@ if register_patch("anthropic.resources.messages.messages.Messages.stream"):
                     def __next__(self):
                         try:
                             chunk = next(original_text_stream)
-                            if wrapper_self.first_token_time is None and chunk:
-                                wrapper_self.first_token_time = time.time() * 1000
+                            wrapper_self._record_first_token(chunk)
                             return chunk
                         except StopIteration:
                             raise
 
                 return TextStreamWrapper()
 
+            def _record_first_token(self, text):
+                if text and self.first_token_time is None:
+                    self.first_token_time = time.time() * 1000
+
             def get_final_message(self):
-                if self.final_message:
-                    return self.final_message
-                return self.stream_context.get_final_message()
+                # Cached so the finalisation reuses it instead of asking the
+                # stream to consume itself a second time.
+                if self.final_message is None:
+                    self.final_message = self.stream_context.get_final_message()
+                return self.final_message
 
             def __iter__(self):
-                return iter(self.stream_context)
+                # Yields through rather than delegating so that iterating the
+                # events (instead of text_stream) still records the time to
+                # first token.
+                for event in self.stream_context:
+                    self._record_first_token(_text_delta_of(event))
+                    yield event
 
             def __getattr__(self, name):
                 return getattr(self.stream_context, name)
 
         return StreamWrapper(stream)
+
+
+if register_patch("anthropic.resources.messages.messages.AsyncMessages.stream"):
+    @wrapt.patch_function_wrapper('anthropic.resources.messages.messages', 'AsyncMessages.stream')
+    def async_stream_wrapper(wrapped, instance, args, kwargs):
+        if is_selective_metering_enabled() and not is_inside_decorated_function():
+            # usage_metadata is a Revenium-only kwarg that the SDK's own
+            # signature rejects, so it has to go even when nothing is metered.
+            # (The sibling wrappers drop it only after this check and therefore
+            # raise TypeError on the same call -- a separate defect, and not one
+            # worth reproducing here.)
+            kwargs.pop("usage_metadata", None)
+            return wrapped(*args, **kwargs)
+
+        logger.debug("REVENIUM MIDDLEWARE: Intercepted async client.messages.stream call - wrapper active")
+
+        usage_metadata, request_time, request_time_dt = extract_usage_metadata_and_timing(kwargs, "async_stream")
+
+        # Attribution only, no re-routing -- the same choice AsyncMessages.create
+        # makes. The sync wrapper's Bedrock fast path is a blocking boto3 call
+        # and cannot serve an async context manager, so an AsyncAnthropicBedrock
+        # stream stays on the SDK transport and is metered here under the AWS
+        # label rather than being handed to the Bedrock adapter.
+        # REVENIUM_BEDROCK_DISABLE is honoured inside detect_provider, so a
+        # Foundry stream keeps its Foundry label when Bedrock routing is off.
+        client_instance = getattr(instance, '_client', None) if instance else None
+        detected_provider = detect_provider(client=client_instance,
+                                            base_url=kwargs.get('base_url', None))
+
+        logger.debug("REVENIUM MIDDLEWARE: Calling async client.messages.stream with model=%s, max_tokens=%s",
+                     kwargs.get("model"), kwargs.get("max_tokens"))
+
+        request_kwargs = dict(kwargs)
+
+        # AsyncMessages.stream is a plain def returning an
+        # AsyncMessageStreamManager, so there is nothing to await here.
+        stream_manager = wrapped(*args, **kwargs)
+
+        return _AsyncMessageStreamMetering(
+            stream_manager, usage_metadata, request_kwargs, request_time,
+            request_time_dt, detected_provider
+        )
 
 
 logger.debug("REVENIUM MIDDLEWARE: Anthropic middleware loaded and wrappers registered")

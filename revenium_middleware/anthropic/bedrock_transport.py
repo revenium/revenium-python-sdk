@@ -126,6 +126,7 @@ def _emit_completion(
         extract_common_metadata,
         extract_effort_field,
         extract_org_and_product,
+        extract_prompt_context_fields,
         merge_extra_body,
     )
     from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
@@ -202,6 +203,7 @@ def _emit_completion(
         # explicit None would go on the wire as "effort": null instead of
         # being omitted.
         **extract_effort_field(usage_metadata),
+        **extract_prompt_context_fields(usage_metadata),
         "parent_transaction_id": (usage_metadata.get("parent_transaction_id")
                                   or usage_metadata.get("parentTransactionId")
                                   or core_trace_fields.get_parent_transaction_id()),

@@ -27,6 +27,7 @@ from revenium_middleware._core.fields import (
     extract_org_and_product,
     extract_common_metadata,
     extract_effort_field,
+    extract_prompt_context_fields,
     extract_agentic_job_fields,
     merge_extra_body,
 )
@@ -263,6 +264,7 @@ def send_metering_data(
 
             # Reasoning effort level (caller-supplied, forwarded verbatim)
             completion_args.update(extract_effort_field(usage_metadata))
+            completion_args.update(extract_prompt_context_fields(usage_metadata))
 
             agentic_fields = extract_agentic_job_fields(usage_metadata)
             extra_body = merge_extra_body(None, agentic_fields)

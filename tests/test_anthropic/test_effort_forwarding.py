@@ -196,3 +196,53 @@ class TestBedrockStreamAdapter:
 
     def test_unset_effort_is_omitted_from_the_payload(self):
         assert "effort" not in self._payload({})
+
+    def test_agent_version_is_forwarded_on_the_payload(self):
+        assert self._payload({"agent_version": "1.4.2"})["agent_version"] == "1.4.2"
+
+    def test_agent_version_camel_alias_is_forwarded_too(self):
+        assert self._payload({"agentVersion": "1.4.2"})["agent_version"] == "1.4.2"
+
+    def test_unset_agent_version_is_omitted_from_the_payload(self):
+        assert "agent_version" not in self._payload({})
+
+
+def test_every_completion_payload_site_carries_the_prompt_context():
+    """Same sweep for the BACK-3388 prompt, speed and subagent fields."""
+    import inspect
+
+    source = inspect.getsource(anthropic_middleware)
+    assert source.count("**trace_fields['prompt_context'],") == source.count(
+        "trace_fields.get('ticket_id')"
+    )
+
+
+@patch("revenium_middleware.anthropic.middleware._get_thread_safe_client", return_value=MagicMock())
+@patch("revenium_middleware.anthropic.middleware.submit_ai_event", return_value=MagicMock(status_code=201))
+@patch("revenium_middleware.anthropic.middleware._safe_run_async_in_thread", side_effect=run_metering_synchronously)
+class TestPromptContextForwarding:
+    def test_fields_are_forwarded_on_the_payload(self, mock_thread, mock_submit, mock_client):
+        create_wrapper(
+            MagicMock(return_value=message()),
+            None,
+            (),
+            request_kwargs({"promptId": "prompt-42", "speed": "fast", "subagent_type": "Explore"}),
+        )
+
+        payload = mock_submit.call_args[0][1]
+        assert payload["prompt_id"] == "prompt-42"
+        assert payload["speed"] == "fast"
+        assert payload["subagent_type"] == "Explore"
+
+    def test_unset_fields_are_omitted_from_the_payload(self, mock_thread, mock_submit, mock_client):
+        create_wrapper(MagicMock(return_value=message()), None, (), request_kwargs({}))
+
+        payload = mock_submit.call_args[0][1]
+        for name in ("prompt_id", "prompt_length", "query_source", "speed", "subagent_type"):
+            assert name not in payload, name
+
+
+def test_bedrock_stream_adapter_forwards_the_prompt_context():
+    payload = TestBedrockStreamAdapter._payload({"querySource": "sdk", "prompt_length": 12})
+    assert payload["query_source"] == "sdk"
+    assert payload["prompt_length"] == 12

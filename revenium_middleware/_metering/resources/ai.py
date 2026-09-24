@@ -76,6 +76,11 @@ class AIResource(SyncAPIResource):
         cache_read_token_count: int | NotGiven = NOT_GIVEN,
         coding_assistant_account_uuid: str | NotGiven = NOT_GIVEN,
         effort: str | NotGiven = NOT_GIVEN,
+        prompt_id: str | NotGiven = NOT_GIVEN,
+        prompt_length: int | NotGiven = NOT_GIVEN,
+        query_source: str | NotGiven = NOT_GIVEN,
+        speed: str | NotGiven = NOT_GIVEN,
+        subagent_type: str | NotGiven = NOT_GIVEN,
         error_code: int | NotGiven = NOT_GIVEN,
         error_reason: str | NotGiven = NOT_GIVEN,
         input_token_cost: float | NotGiven = NOT_GIVEN,
@@ -213,6 +218,18 @@ class AIResource(SyncAPIResource):
               an enum: the value is passed through unchanged -- it is not lowercased or
               otherwise coerced -- and the backend validates it (at most 16 characters
               matching ^[A-Za-z0-9_-]+$).
+
+          prompt_id: Identifier of the user prompt that produced this completion, so every call
+              made while serving one prompt can be grouped (max 64 chars)
+
+          prompt_length: Length of the user prompt that produced this completion
+
+          query_source: Where the query originated, as reported by the caller (max 128 chars)
+
+          speed: The speed mode the completion was served in (for example fast or normal);
+              the backend owns the vocabulary (max 16 chars)
+
+          subagent_type: Type of the subagent that issued this completion (max 128 chars)
 
           error_code: HTTP error code if the operation failed
 
@@ -377,6 +394,11 @@ class AIResource(SyncAPIResource):
                     "cache_read_token_count": cache_read_token_count,
                     "coding_assistant_account_uuid": coding_assistant_account_uuid,
                     "effort": effort,
+                    "prompt_id": prompt_id,
+                    "prompt_length": prompt_length,
+                    "query_source": query_source,
+                    "speed": speed,
+                    "subagent_type": subagent_type,
                     "error_code": error_code,
                     "error_reason": error_reason,
                     "input_token_cost": input_token_cost,
@@ -1351,6 +1373,11 @@ class AsyncAIResource(AsyncAPIResource):
         cache_read_token_count: int | NotGiven = NOT_GIVEN,
         coding_assistant_account_uuid: str | NotGiven = NOT_GIVEN,
         effort: str | NotGiven = NOT_GIVEN,
+        prompt_id: str | NotGiven = NOT_GIVEN,
+        prompt_length: int | NotGiven = NOT_GIVEN,
+        query_source: str | NotGiven = NOT_GIVEN,
+        speed: str | NotGiven = NOT_GIVEN,
+        subagent_type: str | NotGiven = NOT_GIVEN,
         error_code: int | NotGiven = NOT_GIVEN,
         error_reason: str | NotGiven = NOT_GIVEN,
         input_token_cost: float | NotGiven = NOT_GIVEN,
@@ -1488,6 +1515,18 @@ class AsyncAIResource(AsyncAPIResource):
               an enum: the value is passed through unchanged -- it is not lowercased or
               otherwise coerced -- and the backend validates it (at most 16 characters
               matching ^[A-Za-z0-9_-]+$).
+
+          prompt_id: Identifier of the user prompt that produced this completion, so every call
+              made while serving one prompt can be grouped (max 64 chars)
+
+          prompt_length: Length of the user prompt that produced this completion
+
+          query_source: Where the query originated, as reported by the caller (max 128 chars)
+
+          speed: The speed mode the completion was served in (for example fast or normal);
+              the backend owns the vocabulary (max 16 chars)
+
+          subagent_type: Type of the subagent that issued this completion (max 128 chars)
 
           error_code: HTTP error code if the operation failed
 
@@ -1652,6 +1691,11 @@ class AsyncAIResource(AsyncAPIResource):
                     "cache_read_token_count": cache_read_token_count,
                     "coding_assistant_account_uuid": coding_assistant_account_uuid,
                     "effort": effort,
+                    "prompt_id": prompt_id,
+                    "prompt_length": prompt_length,
+                    "query_source": query_source,
+                    "speed": speed,
+                    "subagent_type": subagent_type,
                     "error_code": error_code,
                     "error_reason": error_reason,
                     "input_token_cost": input_token_cost,

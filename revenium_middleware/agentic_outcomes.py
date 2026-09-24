@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import httpx
 from revenium_middleware._core import outcomes as _outcomes
+from revenium_middleware._core.trace_fields import validate_agent_version
 from revenium_middleware._metering import ReveniumMetering
 
 
@@ -132,6 +133,7 @@ class AgenticOutcomeClient:
             )
             if key in payload
         }
+        agent_version = validate_agent_version(payload.get("agentVersion"))
         self._metering().ai.create_completion(
             completion_start_time=payload["completionStartTime"],
             cost_type=payload["costType"],
@@ -147,6 +149,12 @@ class AgenticOutcomeClient:
             total_token_count=payload["totalTokenCount"],
             transaction_id=payload["transactionId"],
             agent=payload.get("agent"),
+            # The agent's own version (not agenticJobVersion, which travels in
+            # extra_body), run through the same validation as every other
+            # completion path (non-strings dropped, capped at the ingest
+            # limit). Sparse like effort: nothing valid means the key is
+            # omitted so the typed client keeps its NotGiven default.
+            **({"agent_version": agent_version} if agent_version is not None else {}),
             cache_creation_token_count=payload.get("cacheCreationTokenCount"),
             cache_read_token_count=payload.get("cacheReadTokenCount"),
             input_token_cost=payload.get("inputTokenCost"),

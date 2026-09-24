@@ -183,11 +183,18 @@ from revenium_middleware import (
 
 upsert_job_type_economics("claim", JobTypeEconomics(
     unit_metric_key="completed_claims", unit_label="claim",
-    metrics=[{
-        "key": "completed_claims", "type": "COUNT",
-        "direction": "HIGHER_IS_BETTER", "aggregation": "SUM",
-        "resolution": "PER_JOB",
-    }],
+    metrics=[
+        {
+            "key": "completed_claims", "type": "COUNT",
+            "direction": "HIGHER_IS_BETTER", "aggregation": "SUM",
+            "resolution": "PER_JOB",
+        },
+        {
+            "key": "claims_processed", "type": "COUNT",
+            "direction": "HIGHER_IS_BETTER", "aggregation": "SUM",
+            "resolution": "PERIOD",
+        },
+    ],
     dimensions=[{"key": "region", "allowedValues": ["us", "ca"]}],
     monetization={
         "metricKey": "completed_claims", "valuePerUnit": 4.25,
@@ -200,7 +207,7 @@ create_baseline("claim", Baseline(
 report_period_facts("claim", [PeriodFactEntry(
     period_start="2026-08-01T00:00:00Z", period_end="2026-09-01T00:00:00Z",
     dimension_key="region", dimension_value="us",
-    key="completed_claims", value=1280,
+    key="claims_processed", value=1280,
 )])
 ```
 
@@ -573,7 +580,31 @@ with client.messages.stream(
         print(text, end="", flush=True)
 ```
 
-**Note:** The middleware only wraps `messages.create` and `messages.stream` endpoints. Other Anthropic SDK features work normally but aren't metered.
+Async streaming is metered the same way, with the same metadata:
+
+```python
+import asyncio
+import anthropic
+import revenium_middleware.anthropic
+
+client = anthropic.AsyncAnthropic()
+
+async def main():
+    async with client.messages.stream(
+        model="claude-opus-4-7",
+        max_tokens=200,
+        messages=[{"role": "user", "content": "Tell me a story"}],
+        usage_metadata={"task_type": "creative"}
+    ) as stream:
+        async for text in stream.text_stream:
+            print(text, end="", flush=True)
+        # await stream.get_final_message() works too; either way the
+        # completion is metered once when the block exits.
+
+asyncio.run(main())
+```
+
+**Note:** The middleware wraps the `messages.create` and `messages.stream` endpoints, sync and async alike (including `create(stream=True)`). Other Anthropic SDK features work normally but aren't metered.
 
 #### AWS Bedrock
 
@@ -606,7 +637,7 @@ message = client.messages.create(
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `AWS_REGION` | AWS region for Bedrock | `us-east-1` |
-| `REVENIUM_BEDROCK_DISABLE` | Set to `1` to disable Bedrock support | Not set |
+| `REVENIUM_BEDROCK_DISABLE` | Set to `1` to disable Bedrock support (Bedrock detection only - Foundry detection is unaffected) | Not set |
 
 **AWS authentication** uses the standard credential chain: environment variables, `~/.aws/credentials`, IAM roles, AWS SSO. Required permissions: `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream`.
 
@@ -627,6 +658,32 @@ message = client.messages.create(
 | `claude-3-5-haiku-20241022` | `anthropic.claude-3-5-haiku-20241022-v1:0` |
 
 For other models, the middleware uses the format `anthropic.{model_name}`.
+
+#### Microsoft Foundry
+
+Claude served through Microsoft Foundry is metered by the same patched endpoints as the
+direct Anthropic API - the Anthropic SDK's Foundry clients need no extra setup.
+
+```python
+import anthropic
+import revenium_middleware.anthropic
+
+# Foundry is detected from the client class, so a custom base_url is fine too
+client = anthropic.AnthropicFoundry(
+    resource="your-resource",  # or ANTHROPIC_FOUNDRY_RESOURCE
+)
+
+message = client.messages.create(
+    model="claude-opus-4-7",
+    max_tokens=100,
+    messages=[{"role": "user", "content": "Hello from Foundry!"}]
+)
+```
+
+Foundry usage is reported with provider `Foundry` and model source `ANTHROPIC`, so the spend
+is separated from direct-Anthropic totals while still priced against the Anthropic rate card
+that Foundry bills at. `AsyncAnthropicFoundry` is metered the same way, as is
+`client.messages.stream()`.
 
 **Examples:** `examples/anthropic/` - `anthropic-basic.py`, `anthropic-streaming.py`, `anthropic-bedrock.py`, `anthropic-advanced.py`
 
@@ -794,15 +851,187 @@ response = litellm.completion(
 
 #### Proxy Mode
 
-Add the callback to your LiteLLM `config.yaml` for server-side integration:
+`ReveniumGuardrail` is the LiteLLM proxy integration. It is a LiteLLM
+`CustomGuardrail` that **enforces the caller's budget before** the proxied call and
+**meters usage after** it — successes, failures and streamed responses alike.
 
-```yaml
-litellm_settings:
-  callbacks: ["revenium_middleware.litellm.proxy.middleware.proxy_handler_instance"]
+```bash
+pip install "revenium-python-sdk[litellm-proxy]"   # requires Python 3.10+
 ```
 
-When using the LiteLLM proxy, pass metadata via HTTP headers (`x-revenium-*`).
-Reasoning effort travels as `x-revenium-effort` on the proxied request.
+```yaml
+guardrails:
+  - guardrail_name: "revenium"
+    litellm_params:
+      guardrail: revenium_middleware.litellm.proxy.guardrail.ReveniumGuardrail
+      mode:
+        - "pre_call"    # budget enforcement
+        - "post_call"   # usage metering
+      default_on: true
+```
+
+`guardrails` is a **top-level** key, not a member of `litellm_settings`. Nested
+under `litellm_settings` it reaches LiteLLM's legacy v1 guardrail loader, which
+expects a different shape and exits the proxy at startup with
+`GuardrailItem() argument after ** must be a mapping, not str`.
+
+`mode` must be a **list** to enable both hooks; a single string restricts the
+guardrail to that one event type. `pre_call` alone enforces without metering;
+`post_call` alone meters without enforcing.
+
+**Budget enforcement** reuses the SDK's own circuit breaker, so a proxy enforces
+exactly what every other Revenium integration enforces — including department
+(org-unit) budgets. It is opt-in via `REVENIUM_CIRCUIT_BREAKER_ENABLED=true`; see
+[Cost Controls](#cost-controls). A blocked call never reaches the provider and the
+caller receives HTTP 429:
+
+```json
+{"error": {"message": "Request blocked by Revenium enforcement rule: Team Budget",
+           "type": "budget_exceeded", "guardrail": "revenium", "model": "gpt-4o",
+           "budgets": [{"name": "Team Budget", "ruleId": 7, "threshold": 10.0,
+                        "currentValue": 11.5, "resetsAt": "2026-10-01T00:00:00Z"}]}}
+```
+
+Enforcement **fails open**: if the enforcement path is unreachable or misbehaves,
+the call proceeds. Metering is likewise non-disruptive — nothing in the post-call
+path can turn a successful LLM call into an error for the client.
+
+**Attribution** travels as `x-revenium-*` request headers (subscriber, organization,
+product, trace, task type, agent, subscription, quality score, and `x-revenium-effort`
+for reasoning effort), with the calling virtual key's metadata as the fallback —
+`revenium_user_id`, `revenium_organization_name`, `revenium_key_name`, and
+`revenium_agentic_job_*`. Agentic job tags (`x-revenium-agentic-job-id`, `-name`,
+`-type`, `-version`) ride along for cost/ROI correlation; the job id is required for
+the others to be recorded.
+
+##### Counting a Claude Code call once (shared call id)
+
+If you run Claude Code through your proxy **and** point Claude Code's own usage
+reporting at Revenium, every call is recorded twice: Claude Code files it under an
+identifier of its own making, the proxy files it under another, and the two can
+never match. `ReveniumGuardrail` makes them match, and does so by default.
+
+The guardrail mints one identifier per proxied `/v1/messages` request, returns it to
+the client as the `request-id` and `x-revenium-transaction-id` response headers, and
+reports the same value as the call's transaction id. Claude Code copies `request-id`
+onto its own record, Revenium's duplicate check sees two records with one identifier,
+and one call becomes one record.
+
+**It is on by default.** To opt out and keep LiteLLM's own response id as the
+transaction id, with no `request-id` header added:
+
+```bash
+export REVENIUM_LITELLM_SHARED_CALL_ID=false
+```
+
+New calls go straight back to two records when you do; records already merged stay
+merged. Four things have to be true for it to work:
+
+* **LiteLLM 1.93.0 or newer.** That is the floor of the `litellm-proxy` extra, which
+  is what installs the guardrail. On an older LiteLLM the guardrail logs one warning
+  at startup and behaves exactly as it does when opted out: no header is added,
+  the provider's response id is reported, and you get two records rather than none.
+* **`mode` includes `pre_call`.** The identifier is minted in the pre-call hook, and
+  LiteLLM runs that hook only when the configured mode asks for it. A
+  `mode: ["post_call"]` proxy mints nothing, and the guardrail says so at startup
+  with one warning naming this variable. Add `pre_call` to the mode, or set the
+  variable to `false` if the proxy only meters.
+* **The Anthropic messages route.** Other routes are untouched, so the provider's own
+  `request-id` on the pass-through route is never overwritten.
+* **Both sides report to the same Revenium team.** The duplicate check is
+  team-scoped.
+
+**Point Claude Code at the proxy root, not at `/anthropic`.** Set `ANTHROPIC_BASE_URL`
+to the proxy's own base URL so Claude Code calls `<proxy>/v1/messages`:
+
+```bash
+export ANTHROPIC_BASE_URL=https://proxy.example.com
+```
+
+LiteLLM also offers an Anthropic pass-through at `<proxy>/anthropic/v1/messages`, and
+its own API reference recommends that route over `/v1/messages`. The shared identifier
+is minted only on `/v1/messages`. A proxy serving the pass-through route hands the
+provider's response straight back, so nothing is minted there, no `request-id` of ours
+is returned, and the counter described below stays silent on that route by design.
+The flag will appear to be on and the calls will keep being counted twice, with
+nothing in the proxy log to say why. If your Claude Code base URL ends in
+`/anthropic`, drop that suffix.
+
+Only the guardrail mints. A proxy still on the deprecated callback alone gets no
+identifier and keeps reporting two records, which is one more reason to migrate.
+
+One caution for a proxy running **both** the guardrail and the deprecated callback
+without `default_on: true`. That configuration meters every call twice already, and
+this flag hides the symptom rather than fixing it: both rows now carry the same
+identifier and Revenium's duplicate check keeps one. The configuration is still
+wrong. Delete the `litellm_settings.callbacks` entry.
+
+Also do not register `ReveniumGuardrail` in `litellm_settings.callbacks` as well as
+in the `guardrails` block. LiteLLM keys registered callbacks on the class name plus
+its simple attributes, and the two instances differ, so both are registered and every
+logging hook runs twice.
+
+If the flag is on and an Anthropic messages call is metered with no identifier on it,
+the guardrail counts it and logs a warning at most once a minute with the running
+total, so a mint that quietly stopped shows up in the proxy log rather than as a
+return of double counting. Your other routes never carry an identifier and are never
+counted or warned about, so a proxy that also serves chat completions or embeddings
+stays quiet.
+
+##### Migrating from the callback
+
+`revenium_middleware.litellm.proxy.middleware.MiddlewareHandler` — the
+`litellm_settings.callbacks` entry `proxy_handler_instance` — is **deprecated**. It
+meters but never enforces a budget. It keeps working in this release and emits a
+`DeprecationWarning` (and a log line) when the proxy builds it.
+
+To migrate, delete the callbacks entry and add the `guardrails` block above:
+
+```diff
+ litellm_settings:
+-  callbacks: ["revenium_middleware.litellm.proxy.middleware.proxy_handler_instance"]
++
++guardrails:
++  - guardrail_name: "revenium"
++    litellm_params:
++      guardrail: revenium_middleware.litellm.proxy.guardrail.ReveniumGuardrail
++      mode: ["pre_call", "post_call"]
++      default_on: true
+```
+
+Nothing else changes: the same headers, the same metered fields. Metered rows
+record `middleware_source: "GUARDRAIL"` instead of `"PROXY"`.
+
+Leaving both enabled would meter every call twice. As a safety net for a proxy
+mid-migration, when the guardrail is configured to run on every request
+(`default_on: true` with `post_call` among its modes) it claims metering ownership
+and the deprecated callback stops submitting rows, logging once to say so. That net
+does **not** apply to a guardrail without `default_on`, without `post_call`, or
+configured with a per-tag `Mode` (which selects hooks per request): such a guardrail
+may not run on a given request, and suppressing the callback could drop metering
+entirely. A per-tag configuration logs, at info level, that it is not claiming
+ownership. Delete the callbacks entry rather than relying on the net.
+
+##### Client API and guardrails
+
+`CustomGuardrail`'s lifecycle hooks cannot be hosted by LiteLLM's client API.
+Verified against **litellm 1.100.1**: `async_pre_call_hook`,
+`async_post_call_success_hook` and `async_post_call_failure_hook` are dispatched
+only from `litellm/proxy/utils.py` (`ProxyLogging`) and
+`litellm/proxy/common_request_processing.py`. The client path
+(`litellm_core_utils/litellm_logging.py`) dispatches only the `CustomLogger`
+logging events, so a `CustomGuardrail` added to `litellm.callbacks` without the
+proxy running would be a logger with no pre-call hook and no ability to block a
+call — the enforcement half would silently not exist.
+
+So the client integration keeps its own path, unchanged: use
+`revenium_middleware.litellm.client` as documented above. Note that the LiteLLM
+client wrapper meters but does not currently run the pre-call circuit breaker —
+enforcement in client mode is available today through the OpenAI middleware, and
+through this guardrail in proxy mode. Both the guardrail and the client wrapper
+already share their metering plumbing (`revenium_middleware._core`: field
+extraction, cache-token extraction and `submit_ai_event`), so the guardrail adds no
+second copy of it.
 
 #### LiteLLM Decorators
 
@@ -1542,6 +1771,29 @@ Set `REVENIUM_CB_FAIL_MODE=closed` to refuse calls until at least one rule fetch
 
 Rules with `shadowMode: true` are observe-and-log: they are skipped by `check_enforcement`. Use shadow mode on the server side to audit a rule before flipping it to enforce.
 
+### Inspecting a Rule and Its Roster
+
+Two read-only calls answer "why was this caller blocked, and who else does this rule cover?" without going anywhere near the pre-call path. Both talk to the server directly, neither is cached, and neither reads or writes the cache `check_enforcement` evaluates — so what they report is what the server holds right now.
+
+```python
+from revenium_middleware._core import (
+    fetch_enforcement_rule,
+    fetch_enforcement_rule_roster,
+)
+
+rule = fetch_enforcement_rule("mN3xpQz")          # one rule, or None
+roster = fetch_enforcement_rule_roster("mN3xpQz")  # who it measures, or None
+
+if roster:
+    print(f"{roster['blockedCount']} over the cap, {roster['warnedCount']} warned")
+    for row in roster["rows"]:
+        print(f"{row['label']}: ${row['spend']} / ${row['limit']} ({row['band']})")
+```
+
+`fetch_enforcement_rule_roster` takes `page`, `size`, `search` and `band` (`BLOCKED`, `WARNED`, `UNDER`, `ALL`); the server does the filtering, sorting, banding and paging, and the three band counts always describe the whole roster rather than the page you asked for. Both calls return `None` rather than raising when the team has no such compiled rule, the rule has no reading yet, or the enforcement API cannot be reached — the same fail-open posture as the rest of the circuit breaker. An empty `rule_id` raises `ValueError`.
+
+The background poller is unaffected: it keeps reading the **whole team's** rules every `REVENIUM_CB_POLL_INTERVAL_SECONDS`. That is deliberate. The server computes the department-budget maps team-wide and attaches them to the team-wide read, so a poll narrowed to a single rule would stop receiving them and department budgets would quietly stop blocking anyone. Narrowing is an explicit, opt-in inspection call and never the refresh.
+
 ### End-to-End Example
 
 See [`examples/openai/openai_blocking_demo.py`](examples/openai/openai_blocking_demo.py) for a runnable end-to-end demo using a seeded budget rule.
@@ -1618,7 +1870,7 @@ print(get_buffer_stats())
 | `REVENIUM_WRITE_API_KEY` | - | Primary write-scope key (`rev_sk_`) for the agentic outcomes API (report/amend/history); falls back to `REVENIUM_OUTCOME_API_KEY` (deprecated), then `REVENIUM_METERING_API_KEY` |
 | `REVENIUM_OUTCOME_API_KEY` | - | Deprecated fallback name for the write-scope key; used only when `REVENIUM_WRITE_API_KEY` is unset |
 | `REVENIUM_PROFITSTREAM_BASE_URL` | `https://api.revenium.io` | Agentic outcomes API base URL |
-| `REVENIUM_BEDROCK_DISABLE` | - | Set to `1` to disable Bedrock auto-detection |
+| `REVENIUM_BEDROCK_DISABLE` | - | Set to `1` to disable Bedrock auto-detection; Foundry detection is unaffected |
 | `REVENIUM_BUFFER_MAX_SIZE` | `1000` | Store-and-forward buffer capacity (oldest events evicted when full) |
 | `REVENIUM_BUFFER_FLUSH_INTERVAL` | `30` | Seconds between automatic replay attempts for buffered events |
 
@@ -1663,7 +1915,7 @@ Per-call `usage_metadata` values take precedence over the `REVENIUM_AGENTIC_JOB_
 
 **Debug mode:** Set `REVENIUM_LOG_LEVEL=DEBUG` to see detailed provider detection, routing decisions, and metering payloads.
 
-**Force direct Anthropic API:** Set `REVENIUM_BEDROCK_DISABLE=1` to disable Bedrock auto-detection.
+**Force direct Anthropic API (instead of Bedrock):** Set `REVENIUM_BEDROCK_DISABLE=1` to disable Bedrock auto-detection. Foundry detection is unaffected - a Foundry client is still labelled `Foundry`.
 
 **Check initialization status (Anthropic):** Use `revenium_middleware.anthropic.is_initialized()` to verify setup.
 

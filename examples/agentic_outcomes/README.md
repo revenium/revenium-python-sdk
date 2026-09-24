@@ -40,11 +40,18 @@ from revenium_middleware import (
 
 upsert_job_type_economics("claim", JobTypeEconomics(
     unit_metric_key="completed_claims", unit_label="claim",
-    metrics=[{
-        "key": "completed_claims", "type": "COUNT",
-        "direction": "HIGHER_IS_BETTER", "aggregation": "SUM",
-        "resolution": "PER_JOB",
-    }],
+    metrics=[
+        {
+            "key": "completed_claims", "type": "COUNT",
+            "direction": "HIGHER_IS_BETTER", "aggregation": "SUM",
+            "resolution": "PER_JOB",
+        },
+        {
+            "key": "claims_processed", "type": "COUNT",
+            "direction": "HIGHER_IS_BETTER", "aggregation": "SUM",
+            "resolution": "PERIOD",
+        },
+    ],
     dimensions=[{"key": "region", "allowedValues": ["us", "ca"]}],
     monetization={
         "metricKey": "completed_claims", "valuePerUnit": 4.25,
@@ -57,7 +64,7 @@ create_baseline("claim", Baseline(
 report_period_facts("claim", [PeriodFactEntry(
     period_start="2026-08-01T00:00:00Z", period_end="2026-09-01T00:00:00Z",
     dimension_key="region", dimension_value="us",
-    key="completed_claims", value=1280,
+    key="claims_processed", value=1280,
 )])
 ```
 

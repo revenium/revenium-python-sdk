@@ -24,7 +24,9 @@ def _with_real_client(call):
     with patch.object(real_client.ai, "_post", mock_post):
         with patch("revenium_middleware._core.metering.client", real_client):
             call()
-            time.sleep(0.3)  # wait for the fire-and-forget metering thread
+            deadline = time.monotonic() + 5.0
+            while not mock_post.called and time.monotonic() < deadline:
+                time.sleep(0.01)
     assert mock_post.called, "metering call never reached the HTTP layer"
     return mock_post.call_args.kwargs["body"]
 
@@ -85,3 +87,42 @@ def test_native_sdk_path_forwards_effort(mock_openai_response):
 def test_native_sdk_path_omits_effort_when_unset(mock_openai_response):
     body = _native_sdk_body({"trace_id": "no-effort"}, mock_openai_response)
     assert "effort" not in body
+
+
+PROMPT_CONTEXT_METADATA = {
+    "prompt_id": "prompt-42",
+    "promptLength": 1834,
+    "query_source": "repl_main_thread",
+    "speed": "fast",
+    "subagentType": "Explore",
+}
+
+PROMPT_CONTEXT_WIRE = {
+    "promptId": "prompt-42",
+    "promptLength": 1834,
+    "querySource": "repl_main_thread",
+    "speed": "fast",
+    "subagentType": "Explore",
+}
+
+
+def _assert_prompt_context(body):
+    for wire_name, value in PROMPT_CONTEXT_WIRE.items():
+        assert body[wire_name] == value, wire_name
+
+
+def _assert_no_prompt_context(body):
+    for wire_name in PROMPT_CONTEXT_WIRE:
+        assert wire_name not in body, wire_name
+
+
+def test_openai_compatible_path_forwards_the_prompt_context(mock_openai_response):
+    _assert_prompt_context(_openai_compatible_body(PROMPT_CONTEXT_METADATA, mock_openai_response))
+
+
+def test_native_sdk_path_forwards_the_prompt_context(mock_openai_response):
+    _assert_prompt_context(_native_sdk_body(PROMPT_CONTEXT_METADATA, mock_openai_response))
+
+
+def test_native_sdk_path_omits_the_prompt_context_when_unset(mock_openai_response):
+    _assert_no_prompt_context(_native_sdk_body({"trace_id": "no-prompt-context"}, mock_openai_response))

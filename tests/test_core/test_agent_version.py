@@ -199,6 +199,24 @@ class TestScopedVersusDirectMetadataPrecedence:
         merged = self._merge({"agentVersion": "scoped"}, {"agent_version": "direct"})
         assert get_agent_version(merged) == "direct"
 
+    def test_distinct_custom_keys_do_not_collide(self):
+        # Only snake_case <-> its exact camelCase are the same field. A scoped
+        # foo_bar must survive a direct foobar, and a scoped agent_version must
+        # survive a direct agentversion (which is not an alias the SDK reads).
+        merged = self._merge(
+            {"foo_bar": "scoped", "agent_version": "scoped"},
+            {"foobar": "direct", "agentversion": "direct"},
+        )
+        assert merged["foo_bar"] == "scoped"
+        assert merged["foobar"] == "direct"
+        assert merged["agent_version"] == "scoped"
+        assert merged["agentversion"] == "direct"
+
+    def test_exact_camel_case_alias_still_collapses(self):
+        merged = self._merge({"ticket_id": "scoped"}, {"ticketId": "direct"})
+        assert "ticket_id" not in merged
+        assert merged["ticketId"] == "direct"
+
     def test_the_losing_spelling_is_removed_not_just_outranked(self):
         merged = self._merge({"agent_version": "scoped"}, {"agentVersion": "direct"})
         assert merged == {"agentVersion": "direct"}
