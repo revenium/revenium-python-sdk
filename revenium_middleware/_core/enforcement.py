@@ -6,15 +6,17 @@ them in memory. ``check_enforcement(...)`` is a pre-call hook that raises
 ``BudgetExceededError`` when a tripped rule matches the current
 request, blocking the outbound provider call before any spend occurs.
 
-Department (org-unit) budgets are decided by the server: the rules response
-carries a top-level ``orgUnitBudgetBlocks`` map of subscriber email ->
-blocking rule id, pre-computed from org-unit membership, an
-``orgUnitBudgetBlockBalances`` map giving the balance each of those people was
-actually judged against, and an ``orgUnitBudgetWarnings`` map of the people who
-have crossed a warn tier without being blocked. All three are keyed by the
-*normalized* address (trimmed, lower-cased), so the SDK re-keys them by that
-form as they come in and normalizes the caller's address the same way before
-looking it up; it never resolves org-unit identity itself.
+Department budgets are decided by the server: the rules response carries a
+top-level ``departmentBudgetBlocks`` map of subscriber email -> blocking rule
+id, pre-computed from department membership, a
+``departmentBudgetBlockBalances`` map giving the balance each of those people
+was actually judged against, and a ``departmentBudgetWarnings`` map of the
+people who have crossed a warn tier without being blocked (a platform predating
+BACK-3448 publishes them as ``orgUnitBudget*``, see ``_wire_value``). All three
+are keyed by the *normalized* address (trimmed, lower-cased), so the SDK
+re-keys them by that form as they come in and normalizes the caller's address
+the same way before looking it up; it never resolves department identity
+itself.
 
 Decision (BACK-3077): the warn tier surfaces as a log line and nothing else.
 A warning carries no directive a pre-call breaker can enforce -- raising on it
@@ -112,24 +114,26 @@ _RULES_CACHE_FILENAME = "revenium_enforcement_rules.json"
 # new data without being load-bearing for a downgrade.
 _ORG_UNIT_BLOCKS_CACHE_FILENAME = "revenium_enforcement_org_unit_blocks.json"
 
-# Top-level key of the server-computed department-budget map, on both the API
-# response and the disk snapshot.
-_ORG_UNIT_BLOCKS_KEY = "orgUnitBudgetBlocks"
+# Top-level keys of the server-computed department-budget map on the API
+# response, current spelling first (see ``_wire_value``).
+_ORG_UNIT_BLOCKS_KEYS = ("departmentBudgetBlocks", "orgUnitBudgetBlocks")
 # Top-level key of the per-person balance map published beside the block map:
 # normalized email -> the balance that person's threshold was compared against,
 # in dollars. Absent on a server predating it, which is why every read of it
 # falls back to the rule's own ``currentValue``.
-_ORG_UNIT_BLOCK_BALANCES_KEY = "orgUnitBudgetBlockBalances"
+_ORG_UNIT_BLOCK_BALANCES_KEYS = ("departmentBudgetBlockBalances", "orgUnitBudgetBlockBalances")
 # Top-level key of the warn-tier map published beside them: normalized email ->
 # the rule whose warn tier that person crossed, for a per-person cap scoped to
-# one department. Disjoint from _ORG_UNIT_BLOCKS_KEY (a person already blocked
+# one department. Disjoint from _ORG_UNIT_BLOCKS_KEYS (a person already blocked
 # is not warned) and never a block verdict -- see the module docstring's
 # BACK-3077 decision. Absent on a server predating it, which warns nobody.
-_ORG_UNIT_WARNINGS_KEY = "orgUnitBudgetWarnings"
-# ``groupBy`` value of an org-unit rule. Such rules are skipped by the
-# per-rule loop: their verdict comes only from _ORG_UNIT_BLOCKS_KEY, matching
+_ORG_UNIT_WARNINGS_KEYS = ("departmentBudgetWarnings", "orgUnitBudgetWarnings")
+# ``groupBy`` values of a department rule. Such rules are skipped by the
+# per-rule loop: their verdict comes only from _ORG_UNIT_BLOCKS_KEYS, matching
 # the server's own ``applicableRules`` filter.
-_ORG_UNIT_GROUP_BY = "ORG_UNIT"
+_ORG_UNIT_GROUP_BY_VALUES = frozenset({"DEPARTMENT", "ORG_UNIT"})
+# Rule field naming the department an ancestor-cap rule is scoped to.
+_ORG_UNIT_ID_KEYS = ("departmentId", "orgUnitId")
 # Reported when the email map names a rule id that is absent from the cached
 # rules (a stale or racing payload). The server deliberately fails toward
 # enforcing here, so the block still happens — just without a rule name.
@@ -623,6 +627,20 @@ def _plan_retry(response: "httpx.Response", backoff: float, budget_remaining: fl
     return _RetryPlan(retry_after, budget_remaining - retry_after)
 
 
+def _wire_value(payload: dict, keys: Tuple[str, ...]):
+    """The value under the first of ``keys`` that ``payload`` carries, else ``None``.
+
+    Each department field is read under its current name and then under its
+    org-unit spelling, which the platform served until BACK-3448 renamed it with
+    no alias; the fallback stays for one release so the SDK works on both sides.
+    """
+    for key in keys:
+        value = payload.get(key)
+        if value is not None:
+            return value
+    return None
+
+
 class _FetchedRules(NamedTuple):
     """One enforcement payload: the rules plus the department-budget maps."""
 
@@ -651,9 +669,9 @@ def _fetched_from_payload(data) -> Optional[_FetchedRules]:
     if isinstance(data, dict):
         return _FetchedRules(
             data.get("rules", []),
-            _normalize_map_keys(data.get(_ORG_UNIT_BLOCKS_KEY)),
-            _coerce_balances(data.get(_ORG_UNIT_BLOCK_BALANCES_KEY)),
-            _normalize_map_keys(data.get(_ORG_UNIT_WARNINGS_KEY)),
+            _normalize_map_keys(_wire_value(data, _ORG_UNIT_BLOCKS_KEYS)),
+            _coerce_balances(_wire_value(data, _ORG_UNIT_BLOCK_BALANCES_KEYS)),
+            _normalize_map_keys(_wire_value(data, _ORG_UNIT_WARNINGS_KEYS)),
         )
     logger.warning("Unexpected enforcement response shape: %r", type(data).__name__)
     return None
@@ -788,8 +806,8 @@ def _fetch_rules(rule_id: Optional[str] = None) -> Optional[_FetchedRules]:
             return _FetchedRules([], {}, {}, {})
         response.raise_for_status()
         # Server currently returns ``{"rules": [...], "compiledAt": ...,
-        # "orgUnitBudgetBlocks": {...}, "orgUnitBudgetBlockBalances":
-        # {...}, "orgUnitBudgetWarnings": {...}}``; a bare list is accepted
+        # "departmentBudgetBlocks": {...}, "departmentBudgetBlockBalances":
+        # {...}, "departmentBudgetWarnings": {...}}``; a bare list is accepted
         # too. See ``_fetched_from_payload``.
         return _fetched_from_payload(response.json())
     except Exception:
@@ -1095,22 +1113,23 @@ def _rule_blocks(rule: dict, usage_metadata: Optional[dict]) -> Tuple[bool, Opti
 
 
 def _is_org_unit_rule(rule: dict) -> bool:
-    """True for any org-unit-scoped or org-unit-grouped rule.
+    """True for any department-scoped or department-grouped rule.
 
     Mirrors the server's own ``applicableRules`` exclusion exactly:
-    ``orgUnitId == null && groupBy != "ORG_UNIT"`` — a rule is org-unit when
-    EITHER field says so. Ancestor-cap department rules carry
-    ``orgUnitId != null`` with a non-ORG_UNIT (typically null) ``groupBy``,
+    ``departmentId == null && groupBy != "DEPARTMENT"`` — a rule is a
+    department rule when EITHER field says so (``orgUnitId`` / ``ORG_UNIT`` on a
+    platform predating BACK-3448). Ancestor-cap department rules carry
+    ``departmentId != null`` with a non-DEPARTMENT (typically null) ``groupBy``,
     and their rule-level ``breached`` means "this department is over budget",
     not "this caller is over budget" — evaluated in the per-rule loop they
     would block every unrelated employee company-wide. Their verdict, like
-    the grouped shape's, lives solely in the ``orgUnitBudgetBlocks`` map,
-    because only the server knows which org unit the caller belongs to.
+    the grouped shape's, lives solely in the ``departmentBudgetBlocks`` map,
+    because only the server knows which department the caller belongs to.
     """
-    if rule.get("orgUnitId") is not None:
+    if _wire_value(rule, _ORG_UNIT_ID_KEYS) is not None:
         return True
     group_by = rule.get("groupBy")
-    return isinstance(group_by, str) and group_by.strip().upper() == _ORG_UNIT_GROUP_BY
+    return isinstance(group_by, str) and group_by.strip().upper() in _ORG_UNIT_GROUP_BY_VALUES
 
 
 def _normalize_email(email: str) -> str:
@@ -1134,7 +1153,7 @@ def _normalize_email(email: str) -> str:
 def _caller_emails(usage_metadata: Optional[dict]) -> List[str]:
     """The caller's normalized subscriber email(s), nested-first then flat.
 
-    Deliberately email-only: ``orgUnitBudgetBlocks`` is keyed by subscriber
+    Deliberately email-only: ``departmentBudgetBlocks`` is keyed by subscriber
     email because that is the identity the server can resolve to an org-unit
     membership. A caller who supplies no email simply has no key, and — as
     with ``_matching_group_entry`` — no sentinel is invented for them: a
@@ -1203,7 +1222,7 @@ def _caller_block_balance(balances: dict, usage_metadata: Optional[dict]) -> Opt
     """The balance the server judged *this* caller against, when it published one.
 
     Mirrors the server's own violation consumer, which reads
-    ``orgUnitBudgetBlockBalances[email] ?: rule.currentValue``. For a per-person
+    ``departmentBudgetBlockBalances[email] ?: rule.currentValue``. For a per-person
     cap scoped to one department the rule's own ``currentValue`` is the highest
     single balance in that department, so reporting it hands the blocked
     developer somebody else's spend.
@@ -1252,7 +1271,7 @@ def _raise_org_unit_block(rules: list, departments: _DepartmentBudgets,
                           usage_metadata: Optional[dict]) -> None:
     """Raise ``BudgetExceededError`` when the department map blocks the caller.
 
-    Mirrors the server's own consumer of ``orgUnitBudgetBlocks``: the map is
+    Mirrors the server's own consumer of ``departmentBudgetBlocks``: the map is
     the verdict, and the rule is looked up only to describe it. A map hit
     naming a rule that is not in the cached list — a stale or racing payload
     — still blocks, under a generic name, because the server publishes the
@@ -1425,11 +1444,11 @@ def check_enforcement(usage_metadata: Optional[dict] = None) -> None:
     from ``groupBreakdown`` rather than the rule-level aggregate; see
     ``_rule_blocks``.
 
-    Department (org-unit) budgets are decided before and independently of the
-    per-rule loop, from the server's ``orgUnitBudgetBlocks`` email map, looked
+    Department budgets are decided before and independently of the
+    per-rule loop, from the server's ``departmentBudgetBlocks`` email map, looked
     up under the normalized form of the caller's address; see
     ``_raise_org_unit_block``. A caller the server has only *warned* about
-    (``orgUnitBudgetWarnings``) is never blocked and never raised on: they get
+    (``departmentBudgetWarnings``) is never blocked and never raised on: they get
     one log line per refreshed verdict, so the block is not the first thing
     they hear about their department budget. See ``_warn_org_unit_threshold``.
 
@@ -1440,7 +1459,7 @@ def check_enforcement(usage_metadata: Optional[dict] = None) -> None:
             server provides them. For a grouped rule ``current_value`` is the
             caller's group balance while ``threshold`` stays rule-level; for a
             department budget it is the caller's own balance from
-            ``orgUnitBudgetBlockBalances`` when the server publishes one.
+            ``departmentBudgetBlockBalances`` when the server publishes one.
     """
     if is_bypass_enabled():
         return

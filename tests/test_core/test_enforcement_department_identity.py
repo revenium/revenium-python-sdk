@@ -13,11 +13,11 @@ work in BACK-2978:
 2. For a per-person cap scoped to one department, the rule's own
    ``currentValue`` is the highest single balance in that department, not the
    caller's. Each named person's own balance rides beside the block map in
-   ``orgUnitBudgetBlockBalances``. Populating ``BudgetExceededError`` from the
+   ``departmentBudgetBlockBalances``. Populating ``BudgetExceededError`` from the
    rule handed the blocked developer the department's top spender's figure.
 
 The server's own violation consumer reads
-``orgUnitBudgetBlockBalances[email] ?: rule.currentValue`` after normalizing
+``departmentBudgetBlockBalances[email] ?: rule.currentValue`` after normalizing
 the event's address once; this suite pins the SDK to the same two steps, and to
 the unchanged behaviour of a payload that carries no balance map at all.
 """
@@ -50,7 +50,7 @@ def org_unit_rule(**overrides):
         "threshold": 1000.0,
         "currentValue": DEPARTMENT_TOP_BALANCE,
         "periodType": "MONTHLY",
-        "groupBy": "ORG_UNIT",
+        "groupBy": "DEPARTMENT",
         "action": "BLOCK",
         "breached": True,
         "shadowMode": False,
@@ -132,8 +132,8 @@ class TestCallerIsFoundUnderTheNormalizedAddress:
         department_cache([], {}, {})
         stub_get(monkeypatch, [make_response(200, json_body={
             "rules": [org_unit_rule()],
-            "orgUnitBudgetBlocks": {" Dept-User@Example.Test ": ORG_UNIT_RULE_ID},
-            "orgUnitBudgetBlockBalances": {" Dept-User@Example.Test ": OWN_BALANCE},
+            "departmentBudgetBlocks": {" Dept-User@Example.Test ": ORG_UNIT_RULE_ID},
+            "departmentBudgetBlockBalances": {" Dept-User@Example.Test ": OWN_BALANCE},
         })])
 
         enforcement._refresh_cache()
@@ -280,8 +280,8 @@ class TestBalanceMapComesOffTheWire:
         monkeypatch, _ = fetch_env
         stub_get(monkeypatch, [make_response(200, json_body={
             "rules": [org_unit_rule()],
-            "orgUnitBudgetBlocks": {DEPT_EMAIL: ORG_UNIT_RULE_ID},
-            "orgUnitBudgetBlockBalances": {DEPT_EMAIL: "1120.50"},
+            "departmentBudgetBlocks": {DEPT_EMAIL: ORG_UNIT_RULE_ID},
+            "departmentBudgetBlockBalances": {DEPT_EMAIL: "1120.50"},
         })])
 
         fetched = enforcement._fetch_rules()
@@ -306,7 +306,7 @@ class TestBalanceMapComesOffTheWire:
     def test_a_malformed_map_is_ignored(self, fetch_env, balances):
         monkeypatch, _ = fetch_env
         stub_get(monkeypatch, [make_response(200, json_body={
-            "rules": [], "orgUnitBudgetBlockBalances": balances,
+            "rules": [], "departmentBudgetBlockBalances": balances,
         })])
 
         assert enforcement._fetch_rules().org_unit_block_balances == {}
@@ -315,7 +315,7 @@ class TestBalanceMapComesOffTheWire:
         monkeypatch, _ = fetch_env
         stub_get(monkeypatch, [make_response(200, json_body={
             "rules": [],
-            "orgUnitBudgetBlockBalances": {
+            "departmentBudgetBlockBalances": {
                 DEPT_EMAIL: "1120.50",
                 OTHER_EMAIL: "not-a-number",
                 "bool@example.test": True,
@@ -333,11 +333,11 @@ class TestBalanceMapComesOffTheWire:
         monkeypatch, _ = fetch_env
         stub_get(monkeypatch, [make_response(200, json_body={
             "rules": [],
-            "orgUnitBudgetBlocks": {
+            "departmentBudgetBlocks": {
                 "Dept-User@Example.Test": ORG_UNIT_RULE_ID,
                 DEPT_EMAIL: 1,
             },
-            "orgUnitBudgetBlockBalances": {
+            "departmentBudgetBlockBalances": {
                 "Dept-User@Example.Test": OWN_BALANCE,
                 DEPT_EMAIL: 1.0,
             },
@@ -353,8 +353,8 @@ class TestBalanceMapComesOffTheWire:
         against a map built in process, not against the wire."""
         fetched = enforcement._fetched_from_payload({
             "rules": [],
-            "orgUnitBudgetBlocks": {7777: 1, DEPT_EMAIL: ORG_UNIT_RULE_ID},
-            "orgUnitBudgetBlockBalances": {7777: 1.0, DEPT_EMAIL: OWN_BALANCE},
+            "departmentBudgetBlocks": {7777: 1, DEPT_EMAIL: ORG_UNIT_RULE_ID},
+            "departmentBudgetBlockBalances": {7777: 1.0, DEPT_EMAIL: OWN_BALANCE},
         })
 
         assert fetched.org_unit_blocks == {DEPT_EMAIL: ORG_UNIT_RULE_ID}
@@ -367,8 +367,8 @@ class TestBalanceMapComesOffTheWire:
         monkeypatch.setattr(enforcement, "_cache_initialized", False)
         stub_get(monkeypatch, [make_response(200, json_body={
             "rules": [org_unit_rule()],
-            "orgUnitBudgetBlocks": {DEPT_EMAIL: ORG_UNIT_RULE_ID},
-            "orgUnitBudgetBlockBalances": {DEPT_EMAIL: OWN_BALANCE},
+            "departmentBudgetBlocks": {DEPT_EMAIL: ORG_UNIT_RULE_ID},
+            "departmentBudgetBlockBalances": {DEPT_EMAIL: OWN_BALANCE},
         })])
 
         enforcement._refresh_cache()
@@ -384,6 +384,80 @@ class TestBalanceMapComesOffTheWire:
         enforcement._refresh_cache()
 
         assert enforcement._cached_org_unit_block_balances == {DEPT_EMAIL: OWN_BALANCE}
+
+
+class TestOrgUnitSpellingsStillReadAfterTheRename:
+    """BACK-3540: the platform renamed every department field with no alias
+    (BACK-3448). The SDK reads the department names and keeps reading the
+    org-unit names for one release; when both arrive, the department ones win.
+    """
+
+    def refresh_with(self, department_cache, fetch_env, body):
+        monkeypatch, _ = fetch_env
+        monkeypatch.delenv("REVENIUM_CACHE_DIR", raising=False)
+        department_cache([])
+        stub_get(monkeypatch, [make_response(200, json_body=body)])
+        enforcement._refresh_cache()
+
+    def test_a_department_only_payload_blocks_with_the_callers_own_balance(
+        self, department_cache, fetch_env
+    ):
+        self.refresh_with(department_cache, fetch_env, {
+            "rules": [org_unit_rule(departmentId=173, departmentPath="/root/eng")],
+            "departmentBudgetBlocks": {DEPT_EMAIL: ORG_UNIT_RULE_ID},
+            "departmentBudgetBlockBalances": {DEPT_EMAIL: OWN_BALANCE},
+            "departmentBudgetBlockUnits": {DEPT_EMAIL: 173},
+        })
+
+        with pytest.raises(BudgetExceededError) as excinfo:
+            enforcement.check_enforcement(nested(DEPT_EMAIL))
+
+        assert excinfo.value.rule_id == ORG_UNIT_RULE_ID
+        assert excinfo.value.current_value == OWN_BALANCE
+        assert enforcement.check_enforcement(nested(OTHER_EMAIL)) is None
+
+    def test_an_org_unit_only_payload_still_blocks(self, department_cache, fetch_env):
+        self.refresh_with(department_cache, fetch_env, {
+            "rules": [org_unit_rule(groupBy="ORG_UNIT")],
+            "orgUnitBudgetBlocks": {DEPT_EMAIL: ORG_UNIT_RULE_ID},
+            "orgUnitBudgetBlockBalances": {DEPT_EMAIL: OWN_BALANCE},
+        })
+
+        with pytest.raises(BudgetExceededError) as excinfo:
+            enforcement.check_enforcement(nested(DEPT_EMAIL))
+
+        assert excinfo.value.rule_id == ORG_UNIT_RULE_ID
+        assert excinfo.value.current_value == OWN_BALANCE
+        assert enforcement.check_enforcement(nested(OTHER_EMAIL)) is None
+
+    def test_both_spellings_present_prefers_the_department_maps(self, fetch_env):
+        monkeypatch, _ = fetch_env
+        stub_get(monkeypatch, [make_response(200, json_body={
+            "rules": [org_unit_rule()],
+            "departmentBudgetBlocks": {DEPT_EMAIL: ORG_UNIT_RULE_ID},
+            "departmentBudgetBlockBalances": {DEPT_EMAIL: OWN_BALANCE},
+            "departmentBudgetWarnings": {OTHER_EMAIL: ORG_UNIT_RULE_ID},
+            "orgUnitBudgetBlocks": {OTHER_EMAIL: 1},
+            "orgUnitBudgetBlockBalances": {OTHER_EMAIL: 1.0},
+            "orgUnitBudgetWarnings": {DEPT_EMAIL: 1},
+        })])
+
+        fetched = enforcement._fetch_rules()
+
+        assert fetched.org_unit_blocks == {DEPT_EMAIL: ORG_UNIT_RULE_ID}
+        assert fetched.org_unit_block_balances == {DEPT_EMAIL: OWN_BALANCE}
+        assert fetched.org_unit_warnings == {OTHER_EMAIL: ORG_UNIT_RULE_ID}
+
+    def test_an_empty_department_map_is_not_overridden_by_the_org_unit_one(self, fetch_env):
+        """Present-but-empty is the server saying nobody is blocked."""
+        monkeypatch, _ = fetch_env
+        stub_get(monkeypatch, [make_response(200, json_body={
+            "rules": [org_unit_rule()],
+            "departmentBudgetBlocks": {},
+            "orgUnitBudgetBlocks": {DEPT_EMAIL: ORG_UNIT_RULE_ID},
+        })])
+
+        assert enforcement._fetch_rules().org_unit_blocks == {}
 
 
 class TestBalanceMapSurvivesTheDiskSnapshot:

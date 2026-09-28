@@ -1,9 +1,9 @@
 """A developer approaching a department budget must hear about it before the block.
 
-BACK-3077. The server publishes ``orgUnitBudgetWarnings`` beside the block map
+BACK-3077. The server publishes ``departmentBudgetWarnings`` beside the block map
 -- normalized subscriber email -> the rule whose warn tier that person crossed,
 for a per-person cap scoped to one department, and disjoint from
-``orgUnitBudgetBlocks`` because a person already blocked is not warned. Until
+``departmentBudgetBlocks`` because a person already blocked is not warned. Until
 this suite the SDK read none of it: the first signal a developer got was the
 hard block, while Slack, the webhook and the audit trail had all warned
 already.
@@ -58,7 +58,7 @@ def org_unit_rule(**overrides):
         "threshold": THRESHOLD,
         "currentValue": 1450.0,
         "periodType": "MONTHLY",
-        "groupBy": "ORG_UNIT",
+        "groupBy": "DEPARTMENT",
         "action": "BLOCK",
         "breached": True,
         "shadowMode": False,
@@ -264,7 +264,7 @@ class TestANewCacheGenerationSignalsAgain:
         department_cache([org_unit_rule()], {}, {}, {WARNED_EMAIL: WARN_RULE_ID})
         stub_get(monkeypatch, [make_response(200, json_body={
             "rules": [org_unit_rule()],
-            "orgUnitBudgetWarnings": {WARNED_EMAIL: WARN_RULE_ID},
+            "departmentBudgetWarnings": {WARNED_EMAIL: WARN_RULE_ID},
         })])
 
         with caplog.at_level(logging.WARNING, logger=MIDDLEWARE_LOGGER):
@@ -284,7 +284,7 @@ class TestANewCacheGenerationSignalsAgain:
         department_cache([org_unit_rule()], {}, {}, {WARNED_EMAIL: WARN_RULE_ID})
         stub_get(monkeypatch, [make_response(200, json_body={
             "rules": [org_unit_rule(ruleId=99, name="Platform quarterly cap")],
-            "orgUnitBudgetWarnings": {WARNED_EMAIL: 99},
+            "departmentBudgetWarnings": {WARNED_EMAIL: 99},
         })])
 
         with caplog.at_level(logging.WARNING, logger=MIDDLEWARE_LOGGER):
@@ -311,7 +311,7 @@ class TestANewCacheGenerationSignalsAgain:
         department_cache([org_unit_rule()], {}, {}, {WARNED_EMAIL: WARN_RULE_ID})
         stub_get(monkeypatch, [make_response(200, json_body={
             "rules": [org_unit_rule()],
-            "orgUnitBudgetWarnings": {WARNED_EMAIL: WARN_RULE_ID},
+            "departmentBudgetWarnings": {WARNED_EMAIL: WARN_RULE_ID},
         })])
         # What the descheduled request read before the refresh.
         stale_rules, stale_departments, _ = enforcement._get_rules()
@@ -371,9 +371,9 @@ class TestTheWarningsMapComesOffTheWire:
         monkeypatch, _ = fetch_env
         stub_get(monkeypatch, [make_response(200, json_body={
             "rules": [org_unit_rule()],
-            "orgUnitBudgetBlocks": {BLOCKED_EMAIL: BLOCK_RULE_ID},
-            "orgUnitBudgetBlockBalances": {BLOCKED_EMAIL: 1450.0},
-            "orgUnitBudgetWarnings": {WARNED_EMAIL: WARN_RULE_ID},
+            "departmentBudgetBlocks": {BLOCKED_EMAIL: BLOCK_RULE_ID},
+            "departmentBudgetBlockBalances": {BLOCKED_EMAIL: 1450.0},
+            "departmentBudgetWarnings": {WARNED_EMAIL: WARN_RULE_ID},
         })])
 
         fetched = enforcement._fetch_rules()
@@ -381,10 +381,28 @@ class TestTheWarningsMapComesOffTheWire:
         assert fetched.org_unit_blocks == {BLOCKED_EMAIL: BLOCK_RULE_ID}
         assert fetched.org_unit_warnings == {WARNED_EMAIL: WARN_RULE_ID}
 
+    def test_an_org_unit_only_payload_still_warns(self, department_cache, fetch_env, caplog):
+        """BACK-3540: the pre-BACK-3448 spelling is still read for one release."""
+        monkeypatch, _ = fetch_env
+        monkeypatch.delenv("REVENIUM_CACHE_DIR", raising=False)
+        department_cache([])
+        stub_get(monkeypatch, [make_response(200, json_body={
+            "rules": [org_unit_rule(groupBy="ORG_UNIT")],
+            "orgUnitBudgetBlockBalances": {WARNED_EMAIL: OWN_BALANCE},
+            "orgUnitBudgetWarnings": {WARNED_EMAIL: WARN_RULE_ID},
+        })])
+        enforcement._refresh_cache()
+
+        with caplog.at_level(logging.WARNING, logger=MIDDLEWARE_LOGGER):
+            assert enforcement.check_enforcement(nested(WARNED_EMAIL)) is None
+
+        assert len(warn_records(caplog)) == 1
+        assert "812.50" in caplog.text
+
     def test_an_un_normalized_key_is_re_keyed_on_the_way_in(self):
         fetched = enforcement._fetched_from_payload({
             "rules": [],
-            "orgUnitBudgetWarnings": {" Warned-User@Example.Test ": WARN_RULE_ID},
+            "departmentBudgetWarnings": {" Warned-User@Example.Test ": WARN_RULE_ID},
         })
 
         assert fetched.org_unit_warnings == {WARNED_EMAIL: WARN_RULE_ID}
@@ -411,7 +429,7 @@ class TestTheWarningsMapComesOffTheWire:
     def test_a_malformed_map_is_ignored(self, fetch_env, warnings):
         monkeypatch, _ = fetch_env
         stub_get(monkeypatch, [make_response(200, json_body={
-            "rules": [], "orgUnitBudgetWarnings": warnings,
+            "rules": [], "departmentBudgetWarnings": warnings,
         })])
 
         assert enforcement._fetch_rules().org_unit_warnings == {}
@@ -419,7 +437,7 @@ class TestTheWarningsMapComesOffTheWire:
     def test_a_non_string_key_is_dropped_rather_than_normalized(self):
         fetched = enforcement._fetched_from_payload({
             "rules": [],
-            "orgUnitBudgetWarnings": {8888: 1, WARNED_EMAIL: WARN_RULE_ID},
+            "departmentBudgetWarnings": {8888: 1, WARNED_EMAIL: WARN_RULE_ID},
         })
 
         assert fetched.org_unit_warnings == {WARNED_EMAIL: WARN_RULE_ID}
@@ -465,7 +483,7 @@ class TestTheWarningsMapComesOffTheWire:
         monkeypatch.setattr(enforcement, "_cache_initialized", False)
         stub_get(monkeypatch, [make_response(200, json_body={
             "rules": [org_unit_rule()],
-            "orgUnitBudgetWarnings": {WARNED_EMAIL: WARN_RULE_ID},
+            "departmentBudgetWarnings": {WARNED_EMAIL: WARN_RULE_ID},
         })])
 
         enforcement._refresh_cache()

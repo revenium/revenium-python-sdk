@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-09-28
+
+### Fixed
+- Department budgets block and warn again. On 2026-09-27 the Revenium platform renamed the department fields of the enforcement payload (`orgUnitBudgetBlocks`, `orgUnitBudgetBlockBalances` and `orgUnitBudgetWarnings` became `departmentBudgetBlocks`, `departmentBudgetBlockBalances` and `departmentBudgetWarnings`; a department rule's `groupBy` became `DEPARTMENT` and its `orgUnitId` became `departmentId`). 0.9.0 and earlier only read the old names and enforcement fails open on a missing field, so a developer over their department cap was let through with no error and no warning. The SDK now reads the department names. It still reads the org-unit names when a platform serves only those, and prefers the department names when both are present; that compatibility will be dropped in a later release. No configuration change is needed.
+
 ## [0.9.0] - 2026-09-24
 
 ### Added
@@ -277,5 +282,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Selective metering via `REVENIUM_SELECTIVE_METERING` environment variable
 - Configurable logging with `REVENIUM_LOG_LEVEL`
 
+[0.9.1]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.9.1
 [0.9.0]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.9.0
 [0.8.0]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.8.0
