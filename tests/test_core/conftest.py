@@ -140,7 +140,7 @@ def department_cache(monkeypatch):
     fetch or a disk load does.
 
     The sibling ``load_rules`` in ``test_enforcement_group_breakdown.py``
-    predates ``orgUnitBudgetBlockBalances`` and seeds only the block map; tests
+    predates ``departmentBudgetBlockBalances`` and seeds only the block map; tests
     that need the balances or the warnings take this one.
     """
     monkeypatch.setenv("REVENIUM_CIRCUIT_BREAKER_ENABLED", "true")

@@ -9,8 +9,8 @@ must never become a customer traffic outage. The Retry-After bound itself is
 covered in ``test_enforcement_retry_after_bound.py``.
 
 A successful fetch returns the whole payload: the rules plus the server's
-top-level ``orgUnitBudgetBlocks`` map (normalized subscriber email -> blocking
-rule id) that decides department budgets, and the ``orgUnitBudgetBlockBalances``
+top-level ``departmentBudgetBlocks`` map (normalized subscriber email -> blocking
+rule id) that decides department budgets, and the ``departmentBudgetBlockBalances``
 map of what each of those people was judged against. Bodies that predate either
 map -- a bare list, a dict without the key, an HTTP 204 -- yield empty maps,
 which block nobody and report the rule's own value.
@@ -193,7 +193,7 @@ class TestOrgUnitBudgetBlocks:
         stub_get(monkeypatch, [make_response(200, json_body={
             "rules": [{"ruleId": 7777, "name": "Engineering budget"}],
             "compiledAt": "2026-08-24T00:00:00Z",
-            "orgUnitBudgetBlocks": {"dept-user@example.test": 7777},
+            "departmentBudgetBlocks": {"dept-user@example.test": 7777},
         })])
 
         fetched = enforcement._fetch_rules()
@@ -222,7 +222,7 @@ class TestOrgUnitBudgetBlocks:
         """Garbage in the map field must not become a blocking verdict."""
         monkeypatch, _ = fetch_env
         stub_get(monkeypatch, [make_response(200, json_body={
-            "rules": [], "orgUnitBudgetBlocks": blocks,
+            "rules": [], "departmentBudgetBlocks": blocks,
         })])
 
         assert enforcement._fetch_rules().org_unit_blocks == {}
@@ -248,7 +248,7 @@ class TestOrgUnitBudgetBlocks:
         monkeypatch.setattr(enforcement, "_cache_initialized", False)
         stub_get(monkeypatch, [make_response(200, json_body={
             "rules": [{"ruleId": 7777}],
-            "orgUnitBudgetBlocks": {"dept-user@example.test": 7777},
+            "departmentBudgetBlocks": {"dept-user@example.test": 7777},
         })])
 
         enforcement._refresh_cache()
@@ -291,7 +291,7 @@ class TestRuleIdFilter:
         monkeypatch, _ = fetch_env
         stub = stub_get(monkeypatch, [make_response(200, json_body={
             "rules": [{"ruleId": 1}],
-            "orgUnitBudgetBlocks": {"dept-user@example.test": 1},
+            "departmentBudgetBlocks": {"dept-user@example.test": 1},
         })])
 
         enforcement._refresh_cache()

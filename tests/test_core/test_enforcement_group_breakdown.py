@@ -10,10 +10,10 @@ absent, or empty ``groupBreakdown`` -- keep the rule-level behaviour
 unchanged, including across the disk-snapshot round trip.
 
 Department (org-unit) budgets are a separate path. The server pre-computes
-org-unit membership and publishes a flat ``orgUnitBudgetBlocks`` map of
+org-unit membership and publishes a flat ``departmentBudgetBlocks`` map of
 subscriber email -> blocking rule id next to the rules; that map is the
 entire verdict. The SDK never resolves the caller's org unit, so
-``groupBy=ORG_UNIT`` rules are skipped by the per-rule loop.
+``groupBy=DEPARTMENT`` rules are skipped by the per-rule loop.
 """
 import json
 import os
@@ -62,7 +62,7 @@ def grouped_rule(entries, breached=False, **overrides):
 
 
 def org_unit_rule(**overrides):
-    """A ``groupBy=ORG_UNIT`` rule, as the department map references it."""
+    """A ``groupBy=DEPARTMENT`` rule, as the department map references it."""
     rule = {
         "ruleId": ORG_UNIT_RULE_ID,
         "name": DEPARTMENT_NAME,
@@ -70,7 +70,7 @@ def org_unit_rule(**overrides):
         "threshold": 1000.0,
         "currentValue": 1450.0,
         "periodType": "MONTHLY",
-        "groupBy": "ORG_UNIT",
+        "groupBy": "DEPARTMENT",
         "action": "BLOCK",
         "breached": True,
         "shadowMode": False,
@@ -573,6 +573,19 @@ class TestOrgUnitRulesSkipThePerRuleLoop:
 
         assert enforcement.check_enforcement(subscriber_metadata(email=DEPT_EMAIL)) is None
 
+    @pytest.mark.parametrize("department_fields", [
+        {"groupBy": "ORG_UNIT"},
+        {"groupBy": None, "orgUnitId": "ou-42", "orgUnitPath": "/root/eng"},
+        {"groupBy": "department"},
+    ], ids=["legacy-group-by", "legacy-org-unit-id", "lower-case-group-by"])
+    def test_every_department_spelling_is_skipped_by_the_loop(
+        self, load_rules, department_fields
+    ):
+        """BACK-3540: the pre-BACK-3448 spellings still classify for one release."""
+        load_rules([org_unit_rule(breached=True, **department_fields)], {})
+
+        assert enforcement.check_enforcement(subscriber_metadata(email=OTHER_EMAIL)) is None
+
     def test_breached_org_unit_rule_does_not_block_an_unmapped_colleague(self, load_rules):
         load_rules([org_unit_rule()], {DEPT_EMAIL: ORG_UNIT_RULE_ID})
 
@@ -580,14 +593,14 @@ class TestOrgUnitRulesSkipThePerRuleLoop:
 
     def test_breached_ancestor_cap_rule_does_not_block_the_whole_team(self, load_rules):
         # hypercurrent#101 review (cross-repo): ancestor-cap department rules
-        # carry orgUnitId != null with a null groupBy, and rule-level breached
+        # carry departmentId != null with a null groupBy, and rule-level breached
         # means "this department is over budget" — not "this caller is". The
-        # server excludes them from applicableRules on orgUnitId alone; so
+        # server excludes them from applicableRules on departmentId alone; so
         # must the SDK, or one department's breach blocks every colleague.
         ancestor_cap = org_unit_rule(
             groupBy=None,
-            orgUnitId="ou-42",
-            orgUnitPath="/root/eng",
+            departmentId="ou-42",
+            departmentPath="/root/eng",
             breached=True,
         )
         load_rules([ancestor_cap], {DEPT_EMAIL: ORG_UNIT_RULE_ID})
@@ -597,8 +610,8 @@ class TestOrgUnitRulesSkipThePerRuleLoop:
     def test_ancestor_cap_map_hit_still_blocks_the_department_member(self, load_rules):
         ancestor_cap = org_unit_rule(
             groupBy=None,
-            orgUnitId="ou-42",
-            orgUnitPath="/root/eng",
+            departmentId="ou-42",
+            departmentPath="/root/eng",
             breached=True,
         )
         load_rules([ancestor_cap], {DEPT_EMAIL: ORG_UNIT_RULE_ID})

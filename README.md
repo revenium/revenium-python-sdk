@@ -881,7 +881,7 @@ guardrail to that one event type. `pre_call` alone enforces without metering;
 
 **Budget enforcement** reuses the SDK's own circuit breaker, so a proxy enforces
 exactly what every other Revenium integration enforces — including department
-(org-unit) budgets. It is opt-in via `REVENIUM_CIRCUIT_BREAKER_ENABLED=true`; see
+budgets. It is opt-in via `REVENIUM_CIRCUIT_BREAKER_ENABLED=true`; see
 [Cost Controls](#cost-controls). A blocked call never reaches the provider and the
 caller receives HTTP 429:
 
