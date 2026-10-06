@@ -269,6 +269,37 @@ class TestModuleSingleton:
         assert buf.stats()["max_size"] == 7
         assert buf._flush_interval == 1.5
 
+    @pytest.mark.parametrize("raw, expected", [("500", 500), ("500.0", 500), ("1e3", 1000)])
+    def test_max_size_accepts_any_whole_number_spelling(self, monkeypatch, raw, expected):
+        monkeypatch.setenv("REVENIUM_BUFFER_MAX_SIZE", raw)
+        monkeypatch.setattr(metering_buffer, "_buffer", None)
+
+        assert metering_buffer.get_buffer().stats()["max_size"] == expected
+
+    @pytest.mark.parametrize("raw", ["0", "-5", "inf", "nan"])
+    def test_max_size_below_one_or_not_finite_uses_the_default(self, monkeypatch, caplog, raw):
+        monkeypatch.setenv("REVENIUM_BUFFER_MAX_SIZE", raw)
+        monkeypatch.setattr(metering_buffer, "_buffer", None)
+
+        with caplog.at_level("WARNING"):
+            buf = metering_buffer.get_buffer()
+
+        assert buf.stats()["max_size"] == metering_buffer.DEFAULT_MAX_SIZE
+        assert "REVENIUM_BUFFER_MAX_SIZE" in caplog.text
+
+    @pytest.mark.parametrize("raw", ["", "lots"])
+    def test_empty_or_malformed_env_uses_defaults(self, monkeypatch, caplog, raw):
+        monkeypatch.setenv("REVENIUM_BUFFER_MAX_SIZE", raw)
+        monkeypatch.setenv("REVENIUM_BUFFER_FLUSH_INTERVAL", raw)
+        monkeypatch.setattr(metering_buffer, "_buffer", None)
+
+        with caplog.at_level("WARNING"):
+            buf = metering_buffer.get_buffer()
+
+        assert buf.stats()["max_size"] == metering_buffer.DEFAULT_MAX_SIZE
+        assert buf._flush_interval == metering_buffer.DEFAULT_FLUSH_INTERVAL
+        assert ("REVENIUM_BUFFER_MAX_SIZE" in caplog.text) == bool(raw)
+
 
 @pytest.fixture()
 def fresh_buffer(monkeypatch):
@@ -341,7 +372,8 @@ class TestSubmitAiEventIntegration:
         buf.flush()
 
         assert buf.stats()["size"] == 0
-        call = healthy.ai.create_completion.call_args
+        healthy.with_options.assert_called_once_with(max_retries=0)
+        call = healthy.with_options.return_value.ai.create_completion.call_args
         assert call.kwargs["extra_headers"]["Idempotency-Key"] == "replay-me"
         assert call.kwargs["model"] == "gpt-test"
 
@@ -553,6 +585,60 @@ class TestMeteringStatusIntegration:
         status = get_metering_status()
         assert status.success_count == 0
         assert status.error_count == 0
+
+
+def test_deadline_bounds_the_wait_for_a_flush_already_in_progress():
+    replayer = RecordingReplayer()
+    buf = MeteringBuffer(max_size=10, flush_interval=9999.0, replay_fn=replayer)
+    buf.push("ai", {"seq": 0})
+    buf._flush_lock.acquire()
+
+    try:
+        started = time.monotonic()
+        result = buf.flush(deadline_seconds=0.2)
+        elapsed = time.monotonic() - started
+    finally:
+        buf._flush_lock.release()
+
+    assert 0.15 <= elapsed < 0.7
+    assert result == {"sent": 0, "expired": 0, "discarded": 0, "remaining": 1}
+    assert replayer.calls == []
+
+
+class _SlowOverflowTask:
+    def __init__(self, seconds):
+        self._seconds = seconds
+
+    def materialize(self, enqueued_at):
+        time.sleep(self._seconds)
+
+    def discard(self):
+        pass
+
+
+@pytest.mark.parametrize("build_seconds, deadline, low, high", [
+    # The build spends 0.3s, so the lock wait gets the remaining 0.1s, not another 0.4s.
+    (0.3, 0.4, 0.35, 0.6),
+    # The build outlasts the whole deadline, so the held lock is not waited on at all.
+    (1.0, 0.2, 0.15, 0.45),
+])
+def test_lock_wait_after_a_slow_overflow_build_uses_only_the_remaining_budget(build_seconds, deadline, low, high):
+    replayer = RecordingReplayer()
+    buf = MeteringBuffer(max_size=10, flush_interval=9999.0, replay_fn=replayer)
+    buf.push_overflow(_SlowOverflowTask(build_seconds))
+    buf.push("ai", {"seq": 0})
+    buf._flush_lock.acquire()
+
+    try:
+        started = time.monotonic()
+        result = buf.flush(deadline_seconds=deadline)
+        elapsed = time.monotonic() - started
+    finally:
+        buf._flush_lock.release()
+
+    assert low <= elapsed < high
+    assert result["sent"] == 0
+    assert replayer.calls == []
 
 
 def test_tiny_deadline_strictly_bounds_per_call_timeout():

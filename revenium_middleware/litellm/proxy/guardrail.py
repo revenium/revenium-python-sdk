@@ -104,7 +104,7 @@ from revenium_middleware._core.cache_tokens import (
     total_priced_tokens,
 )
 from revenium_middleware._core.config import is_shared_call_id_enabled
-from revenium_middleware._core.enforcement import check_enforcement
+from revenium_middleware._core.enforcement import check_enforcement, normalize_email
 from revenium_middleware._core.exceptions import BudgetExceededError
 from revenium_middleware._core.fields import merge_extra_body
 
@@ -115,8 +115,11 @@ from .middleware import (
     _extract_agentic_job_from_headers,
     _extract_organization_name,
     _extract_product_name,
+    SUBSCRIBER_EMAIL_HEADER,
+    SUBSCRIBER_ID_HEADER,
     extract_request_headers,
     format_utc_timestamp,
+    header_then_metadata,
     read_shared_call_id,
     record_shared_call_id,
     resolve_transaction_id,
@@ -508,26 +511,55 @@ def _key_metadata(metadata, user_api_key_dict):
     return key_metadata
 
 
+def _key_owner_id(key_metadata):
+    return str(key_metadata.get("revenium_user_id", "") or "")
+
+
+def _key_owner_email(metadata, user_api_key_dict, key_metadata):
+    return (
+        metadata.get("user_api_key_user_email", "")
+        or getattr(user_api_key_dict, "user_email", "")
+        or key_metadata.get("email", "")
+        or ""
+    )
+
+
+def _same_email(first, second):
+    return (
+        isinstance(first, str)
+        and isinstance(second, str)
+        and normalize_email(first) == normalize_email(second)
+    )
+
+
 def _build_subscriber(headers, metadata, user_api_key_dict, key_metadata):
     """Build the metering subscriber block.
 
     Fallback chain, most explicit first: ``x-revenium-*`` headers, then LiteLLM
     request metadata, then the ``UserAPIKeyAuth`` fields, then the virtual key's
     own ``revenium_*`` custom metadata.
+
+    ``x-revenium-subscriber-id`` and ``x-revenium-subscriber-email`` are taken
+    as the caller states them, with no check against the key: a virtual key
+    shared by several people trusts each of them to name themselves, and
+    budget enforcement keys per-person and department caps on that email.
+    Without either, the call is attributed to the key's owner.
+
+    The key owner's ``revenium_user_id`` is used only while the subscriber is
+    still the key owner: no per-call email, or one that normalizes to the
+    owner's own. A per-call email naming someone else gets no id, because
+    grouped enforcement matches ``subscriber.id`` before the email, so the
+    owner's id would check the owner's balance instead of the caller's.
     """
     subscriber = {}
-    subscriber_id = (
-        metadata.get("x-revenium-subscriber-id", "")
-        or headers.get("x-revenium-subscriber-id")
-        or str(key_metadata.get("revenium_user_id", "") or "")
-        or ""
+    per_call_id = header_then_metadata(headers, metadata, SUBSCRIBER_ID_HEADER)
+    per_call_email = header_then_metadata(headers, metadata, SUBSCRIBER_EMAIL_HEADER)
+    owner_email = _key_owner_email(metadata, user_api_key_dict, key_metadata)
+    names_someone_else = per_call_email and not _same_email(per_call_email, owner_email)
+    subscriber_id = per_call_id or (
+        "" if names_someone_else else _key_owner_id(key_metadata)
     )
-    subscriber_email = (
-        metadata.get("user_api_key_user_email", "")
-        or getattr(user_api_key_dict, "user_email", "")
-        or key_metadata.get("email", "")
-        or ""
-    )
+    subscriber_email = per_call_email or owner_email
     credential_name = (
         metadata.get("user_api_key_alias", "")
         or getattr(user_api_key_dict, "key_alias", "")

@@ -2,8 +2,11 @@
 Revenium Middleware for fal.ai Python Client.
 
 When you install and import this library, it will automatically hook
-fal_client.run, fal_client.subscribe, and fal_client.stream using wrapt,
-and meter usage to Revenium for image, video, and audio generation tracking.
+fal_client's SyncClient and AsyncClient (run, subscribe, stream and the
+submit / status / result queue) using wrapt, which covers the module-level
+functions bound to the default clients too, and meter usage to Revenium for
+image, video, and audio generation tracking. A queued job is metered once,
+when its result is fetched.
 """
 
 import logging

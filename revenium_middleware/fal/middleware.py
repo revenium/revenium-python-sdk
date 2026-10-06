@@ -6,229 +6,164 @@ to be installed — the __init__.py handles graceful fallback when it is not.
 """
 
 import logging
-import datetime
-import wrapt
-from typing import Any, Dict, Iterator, AsyncIterator
+from typing import Any, AsyncIterator, Dict, Iterator
 
-from revenium_middleware import merge_metadata
-from revenium_middleware._core.config import is_selective_metering_enabled
-from revenium_middleware._core.context import is_inside_decorated_function
+import fal_client
+import wrapt
+
 from revenium_middleware._core.patch_registry import register_patch
-from ._metering import generate_transaction_id, handle_metering
+from ._call import FalCall
+from ._queue import application_from_queue_url, queued_jobs
 
 logger = logging.getLogger("revenium_middleware.fal")
 
 
-# =============================================================================
-# Sync Wrappers
-# =============================================================================
+def run_wrapper(wrapped, instance, args, kwargs):
+    call = FalCall.from_request(args, kwargs)
+    result = wrapped(*args, **kwargs)
+    call.meter(result)
+    return result
 
 
-if register_patch("fal_client.run"):
-    @wrapt.patch_function_wrapper("fal_client", "run")
-    def run_wrapper(wrapped, instance, args, kwargs):
-        if is_selective_metering_enabled() and not is_inside_decorated_function():
-            return wrapped(*args, **kwargs)
-
-        logger.debug("fal_client.run wrapper called")
-
-        api_metadata = kwargs.pop("usage_metadata", {}) if "usage_metadata" in kwargs else {}
-        usage_metadata = merge_metadata(api_metadata)
-
-        request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-        transaction_id = generate_transaction_id()
-        application = args[0] if args else kwargs.get("application", "unknown")
-
-        result = wrapped(*args, **kwargs)
-
-        handle_metering(
-            application=application,
-            arguments=kwargs.get("arguments", {}),
-            result=result,
-            request_time_dt=request_time_dt,
-            usage_metadata=usage_metadata,
-            transaction_id=transaction_id,
-            is_streamed=False,
-        )
-
-        return result
+async def run_async_wrapper(wrapped, instance, args, kwargs):
+    call = FalCall.from_request(args, kwargs)
+    result = await wrapped(*args, **kwargs)
+    call.meter(result)
+    return result
 
 
-if register_patch("fal_client.subscribe"):
-    @wrapt.patch_function_wrapper("fal_client", "subscribe")
-    def subscribe_wrapper(wrapped, instance, args, kwargs):
-        if is_selective_metering_enabled() and not is_inside_decorated_function():
-            return wrapped(*args, **kwargs)
-
-        logger.debug("fal_client.subscribe wrapper called")
-
-        api_metadata = kwargs.pop("usage_metadata", {}) if "usage_metadata" in kwargs else {}
-        usage_metadata = merge_metadata(api_metadata)
-
-        request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-        transaction_id = generate_transaction_id()
-        application = args[0] if args else kwargs.get("application", "unknown")
-
-        result = wrapped(*args, **kwargs)
-
-        handle_metering(
-            application=application,
-            arguments=kwargs.get("arguments", {}),
-            result=result,
-            request_time_dt=request_time_dt,
-            usage_metadata=usage_metadata,
-            transaction_id=transaction_id,
-            is_streamed=False,
-        )
-
-        return result
+def stream_wrapper(wrapped, instance, args, kwargs):
+    call = FalCall.from_request(args, kwargs)
+    return _metered_events(wrapped(*args, **kwargs), call)
 
 
-if register_patch("fal_client.stream"):
-    @wrapt.patch_function_wrapper("fal_client", "stream")
-    def stream_wrapper(wrapped, instance, args, kwargs):
-        if is_selective_metering_enabled() and not is_inside_decorated_function():
-            return wrapped(*args, **kwargs)
-
-        logger.debug("fal_client.stream wrapper called")
-
-        api_metadata = kwargs.pop("usage_metadata", {}) if "usage_metadata" in kwargs else {}
-        usage_metadata = merge_metadata(api_metadata)
-
-        request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-        transaction_id = generate_transaction_id()
-        application = args[0] if args else kwargs.get("application", "unknown")
-
-        stream = wrapped(*args, **kwargs)
-
-        def wrapped_generator() -> Iterator[Dict[str, Any]]:
-            events = []
-            final_result = None
-
-            for event in stream:
-                events.append(event)
-                yield event
-
-            if events:
-                final_result = events[-1]
-
-            handle_metering(
-                application=application,
-                arguments=kwargs.get("arguments", {}),
-                result=final_result or {},
-                request_time_dt=request_time_dt,
-                usage_metadata=usage_metadata,
-                transaction_id=transaction_id,
-                is_streamed=True,
-            )
-
-        return wrapped_generator()
+def stream_async_wrapper(wrapped, instance, args, kwargs):
+    call = FalCall.from_request(args, kwargs)
+    return _metered_async_events(wrapped(*args, **kwargs), call)
 
 
-# =============================================================================
-# Async Wrappers
-# =============================================================================
+def _metered_events(events: Iterator[Dict[str, Any]], call: FalCall) -> Iterator[Dict[str, Any]]:
+    last_event = None
+    for event in events:
+        last_event = event
+        yield event
+    call.meter(last_event or {}, is_streamed=True)
 
 
-if register_patch("fal_client.run_async"):
-    @wrapt.patch_function_wrapper("fal_client", "run_async")
-    async def run_async_wrapper(wrapped, instance, args, kwargs):
-        if is_selective_metering_enabled() and not is_inside_decorated_function():
-            return await wrapped(*args, **kwargs)
-
-        logger.debug("fal_client.run_async wrapper called")
-
-        api_metadata = kwargs.pop("usage_metadata", {}) if "usage_metadata" in kwargs else {}
-        usage_metadata = merge_metadata(api_metadata)
-
-        request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-        transaction_id = generate_transaction_id()
-        application = args[0] if args else kwargs.get("application", "unknown")
-
-        result = await wrapped(*args, **kwargs)
-
-        handle_metering(
-            application=application,
-            arguments=kwargs.get("arguments", {}),
-            result=result,
-            request_time_dt=request_time_dt,
-            usage_metadata=usage_metadata,
-            transaction_id=transaction_id,
-            is_streamed=False,
-        )
-
-        return result
+async def _metered_async_events(events: AsyncIterator[Dict[str, Any]], call: FalCall) -> AsyncIterator[Dict[str, Any]]:
+    last_event = None
+    async for event in events:
+        last_event = event
+        yield event
+    call.meter(last_event or {}, is_streamed=True)
 
 
-if register_patch("fal_client.subscribe_async"):
-    @wrapt.patch_function_wrapper("fal_client", "subscribe_async")
-    async def subscribe_async_wrapper(wrapped, instance, args, kwargs):
-        if is_selective_metering_enabled() and not is_inside_decorated_function():
-            return await wrapped(*args, **kwargs)
-
-        logger.debug("fal_client.subscribe_async wrapper called")
-
-        api_metadata = kwargs.pop("usage_metadata", {}) if "usage_metadata" in kwargs else {}
-        usage_metadata = merge_metadata(api_metadata)
-
-        request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-        transaction_id = generate_transaction_id()
-        application = args[0] if args else kwargs.get("application", "unknown")
-
-        result = await wrapped(*args, **kwargs)
-
-        handle_metering(
-            application=application,
-            arguments=kwargs.get("arguments", {}),
-            result=result,
-            request_time_dt=request_time_dt,
-            usage_metadata=usage_metadata,
-            transaction_id=transaction_id,
-            is_streamed=False,
-        )
-
-        return result
+def submit_wrapper(wrapped, instance, args, kwargs):
+    call = FalCall.from_request(args, kwargs)
+    handle = wrapped(*args, **kwargs)
+    queued_jobs.track(handle.request_id, call)
+    return handle
 
 
-if register_patch("fal_client.stream_async"):
-    @wrapt.patch_function_wrapper("fal_client", "stream_async")
-    async def stream_async_wrapper(wrapped, instance, args, kwargs):
-        if is_selective_metering_enabled() and not is_inside_decorated_function():
-            return wrapped(*args, **kwargs)
+async def submit_async_wrapper(wrapped, instance, args, kwargs):
+    call = FalCall.from_request(args, kwargs)
+    handle = await wrapped(*args, **kwargs)
+    queued_jobs.track(handle.request_id, call)
+    return handle
 
-        logger.debug("fal_client.stream_async wrapper called")
 
-        api_metadata = kwargs.pop("usage_metadata", {}) if "usage_metadata" in kwargs else {}
-        usage_metadata = merge_metadata(api_metadata)
+def subscribe_wrapper(wrapped, instance, args, kwargs):
+    call = FalCall.from_request(args, kwargs)
+    # With client_timeout, SyncClient.subscribe runs submit on fal's executor
+    # thread, where the caller's context variables (injected metadata,
+    # @revenium_meter scope) are not visible. on_enqueue is how fal hands the
+    # request id back, so the caller-side context is attached to the job there.
+    kwargs["on_enqueue"] = _tracking_on_enqueue(call, kwargs.get("on_enqueue"))
+    return wrapped(*args, **kwargs)
 
-        request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-        transaction_id = generate_transaction_id()
-        application = args[0] if args else kwargs.get("application", "unknown")
 
-        stream = wrapped(*args, **kwargs)
+subscribe_async_wrapper = subscribe_wrapper
 
-        async def wrapped_async_generator() -> AsyncIterator[Dict[str, Any]]:
-            events = []
-            final_result = None
 
-            async for event in stream:
-                events.append(event)
-                yield event
+def _tracking_on_enqueue(call: FalCall, on_enqueue):
+    def track_then_notify(request_id):
+        queued_jobs.track(request_id, call)
+        if on_enqueue is not None:
+            return on_enqueue(request_id)
+        return None
+    return track_then_notify
 
-            if events:
-                final_result = events[-1]
 
-            handle_metering(
-                application=application,
-                arguments=kwargs.get("arguments", {}),
-                result=final_result or {},
-                request_time_dt=request_time_dt,
-                usage_metadata=usage_metadata,
-                transaction_id=transaction_id,
-                is_streamed=True,
-            )
+def get_handle_wrapper(wrapped, instance, args, kwargs):
+    application, request_id = _handle_target(*args, **kwargs)
+    queued_jobs.remember_application(request_id, application)
+    return wrapped(*args, **kwargs)
 
-        return wrapped_async_generator()
 
+def _handle_target(application, request_id):
+    return application, request_id
+
+
+def result_wrapper(wrapped, instance, args, kwargs):
+    untracked = _untracked_job_call(instance)
+    result = wrapped(*args, **kwargs)
+    _meter_job_once(instance, result, untracked)
+    return result
+
+
+async def result_async_wrapper(wrapped, instance, args, kwargs):
+    untracked = _untracked_job_call(instance)
+    result = await wrapped(*args, **kwargs)
+    _meter_job_once(instance, result, untracked)
+    return result
+
+
+def _untracked_job_call(handle) -> FalCall:
+    application = queued_jobs.application_of(handle.request_id)
+    return FalCall.start(application or application_from_queue_url(handle.response_url))
+
+
+def _meter_job_once(handle, result, untracked: FalCall) -> None:
+    call = queued_jobs.claim(handle.request_id, untracked)
+    if call is not None:
+        call.meter(result)
+
+
+CLASS_WRAPPERS = (
+    ("SyncClient.run", run_wrapper),
+    ("AsyncClient.run", run_async_wrapper),
+    ("SyncClient.stream", stream_wrapper),
+    ("AsyncClient.stream", stream_async_wrapper),
+    ("SyncClient.submit", submit_wrapper),
+    ("AsyncClient.submit", submit_async_wrapper),
+    ("SyncClient.subscribe", subscribe_wrapper),
+    ("AsyncClient.subscribe", subscribe_async_wrapper),
+    ("SyncClient.get_handle", get_handle_wrapper),
+    ("AsyncClient.get_handle", get_handle_wrapper),
+    ("SyncRequestHandle.get", result_wrapper),
+    ("AsyncRequestHandle.get", result_async_wrapper),
+)
+
+DEFAULT_CLIENT_ALIASES = (
+    ("run", "sync_client", "run"),
+    ("subscribe", "sync_client", "subscribe"),
+    ("submit", "sync_client", "submit"),
+    ("stream", "sync_client", "stream"),
+    ("run_async", "async_client", "run"),
+    ("subscribe_async", "async_client", "subscribe"),
+    ("submit_async", "async_client", "submit"),
+    ("stream_async", "async_client", "stream"),
+)
+
+for _target, _wrapper in CLASS_WRAPPERS:
+    if register_patch(f"fal_client.client.{_target}"):
+        wrapt.wrap_function_wrapper("fal_client.client", _target, _wrapper)
+
+# fal_client binds its module-level functions to a default client when it is
+# imported, before the class methods above are wrapped, so each alias is
+# re-read from its default client to pick the wrapped method up.
+for _alias, _client_name, _method in DEFAULT_CLIENT_ALIASES:
+    if register_patch(f"fal_client.{_alias}"):
+        setattr(fal_client, _alias, getattr(getattr(fal_client, _client_name), _method))
 
 logger.debug("REVENIUM MIDDLEWARE: fal.ai middleware loaded and wrappers registered")

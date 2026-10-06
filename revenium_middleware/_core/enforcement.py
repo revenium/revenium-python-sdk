@@ -57,7 +57,7 @@ from urllib.parse import quote, urlparse
 
 import httpx
 
-from .config import Config
+from .config import Config, env_flag_enabled
 from .exceptions import BudgetExceededError
 from .subscriber import extract_subscriber_from_metadata
 
@@ -203,18 +203,14 @@ _team_id_warned = False
 _disk_load_attempted = False
 
 
-def _env_truthy(name: str) -> bool:
-    return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
-
-
 def is_circuit_breaker_enabled() -> bool:
     """Return True when the operator has opted in to enforcement."""
-    return _env_truthy(Config.ENV_CIRCUIT_BREAKER_ENABLED)
+    return env_flag_enabled(Config.ENV_CIRCUIT_BREAKER_ENABLED)
 
 
 def is_bypass_enabled() -> bool:
     """``REVENIUM_BYPASS=true`` short-circuits enforcement at every callsite."""
-    return _env_truthy(Config.ENV_REVENIUM_BYPASS)
+    return env_flag_enabled(Config.ENV_REVENIUM_BYPASS)
 
 
 def _poll_interval_seconds() -> int:
@@ -1132,7 +1128,7 @@ def _is_org_unit_rule(rule: dict) -> bool:
     return isinstance(group_by, str) and group_by.strip().upper() in _ORG_UNIT_GROUP_BY_VALUES
 
 
-def _normalize_email(email: str) -> str:
+def normalize_email(email: str) -> str:
     """The one canonical form of an address, as the server writes its map keys.
 
     ``EmailNormalizer.normalize`` on the platform side is ``trim().lowercase()``
@@ -1148,6 +1144,9 @@ def _normalize_email(email: str) -> str:
     (ß -> ss) would build a key the server never wrote.
     """
     return email.strip().lower()
+
+
+_normalize_email = normalize_email
 
 
 def _caller_emails(usage_metadata: Optional[dict]) -> List[str]:

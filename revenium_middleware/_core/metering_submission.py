@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 
 from revenium_middleware._core.context import get_idempotency_key
 from revenium_middleware._core.metering import get_client
+from revenium_middleware._core import metering_buffer
 from revenium_middleware._core.metering_status import (
     record_metering_error,
     record_metering_success,
@@ -16,6 +17,10 @@ logger = logging.getLogger("revenium_middleware")
 
 
 _AI_OPERATIONS = frozenset({"completion", "image", "video", "audio"})
+
+
+def _replay_payload(operation: str, merged_args: Dict[str, Any]) -> Dict[str, Any]:
+    return {"operation": operation, "args": merged_args}
 
 
 def submit_ai_event(
@@ -35,9 +40,10 @@ def submit_ai_event(
 
     Returns:
         Whatever client.ai.create_<operation> returns. Returns None when
-        the metering client is not configured (no API key), or when delivery
+        the metering client is not configured (no API key), when delivery
         failed with a retryable error and the event was placed in the
-        store-and-forward buffer for automatic replay.
+        store-and-forward buffer for automatic replay, or when it runs under
+        ``delivery_deferred_to_buffer`` and the event was buffered unsent.
 
     Raises:
         ValueError: if operation is not one of the recognized AI operations.
@@ -74,14 +80,16 @@ def submit_ai_event(
         "extra_headers": {**existing_headers, "Idempotency-Key": key},
     }
 
+    if metering_buffer.is_delivery_deferred_to_buffer():
+        metering_buffer.buffer_deferred_event("ai", _replay_payload(operation, merged_args))
+        return None
+
     method = getattr(client.ai, f"create_{operation}")
     try:
         result = method(**merged_args)
     except Exception as exc:
-        from revenium_middleware._core.metering_buffer import get_buffer, is_retryable_failure
-
         record_metering_error(exc, operation=operation)
-        if is_retryable_failure(exc):
+        if metering_buffer.is_retryable_failure(exc):
             # Retries are exhausted inside the client; keep the event (with
             # its frozen Idempotency-Key) for background replay instead of
             # discarding it.
@@ -91,7 +99,7 @@ def submit_ai_event(
                 operation,
                 exc,
             )
-            get_buffer().push("ai", {"operation": operation, "args": merged_args})
+            metering_buffer.get_buffer().push("ai", _replay_payload(operation, merged_args))
             return None
         logger.error(
             "Metering %s event delivery failed permanently: %s", operation, exc

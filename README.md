@@ -18,8 +18,8 @@ The official Revenium Python SDK — unified AI metering middleware for deeply a
 - **Prompt Capture**: Optional capture of prompts and responses for analytics and debugging
 - **Terminal Summary**: Real-time cost and usage summaries in your terminal (human-readable or JSON)
 - **Distributed Tracing**: Built-in trace visualization fields for cross-service observability
-- **Asynchronous Processing**: Background thread management for non-blocking metering operations
-- **Graceful Shutdown**: Ensures all metering data is properly sent even during application shutdown
+- **Asynchronous Processing**: Usage records are sent from a fixed pool of background threads, never on your request path
+- **Graceful Shutdown**: Flushes pending metering data when the process exits, within a bounded time, without taking over your application's signal handling
 - **Thread-Safe**: Production-ready with `contextvars`-based context management for concurrent applications
 
 ## Supported Providers
@@ -691,7 +691,7 @@ that Foundry bills at. `AsyncAnthropicFoundry` is metered the same way, as is
 
 ### Google AI (Gemini / Vertex AI)
 
-Supports chat completions, streaming, embeddings, image generation (Imagen), video generation, and vision/multimodal. Choose between Google AI SDK (simple API key setup) or Vertex AI SDK (production-grade with full token counting).
+Supports chat completions, streaming, embeddings, image generation (Imagen), and vision/multimodal. Choose between Google AI SDK (simple API key setup) or Vertex AI SDK (production-grade with full token counting).
 
 ```bash
 # Google AI SDK only (Gemini Developer API)
@@ -798,7 +798,7 @@ response = ollama.embed(model='nomic-embed-text', input='Hello world')
 response = ollama.embed(model='nomic-embed-text', input=['Text 1', 'Text 2', 'Text 3'])
 ```
 
-**Supported endpoints:** `ollama.chat()`, `ollama.generate()`, `ollama.embed()`
+**Supported endpoints:** `chat()`, `generate()`, `embed()` and the legacy `embeddings()`, whether called at module level (`ollama.chat()`) or on an explicit client such as `ollama.Client(host="http://my-ollama:11434")` or `ollama.AsyncClient(...)`, streamed or not.
 
 **OpenAI compatibility mode:** You can also use Ollama with the OpenAI SDK:
 
@@ -848,6 +848,8 @@ response = litellm.completion(
     }
 )
 ```
+
+Client mode meters `completion`, `acompletion`, `text_completion`, `atext_completion`, `completion_with_retries` and `acompletion_with_retries`, streamed or not, and `embedding` / `aembedding` as embedding calls. When you stream without `stream_options={"include_usage": True}`, the middleware asks LiteLLM for the usage chunk itself and keeps it out of your stream. LiteLLM adds that chunk for every provider, including ones it does not send `stream_options` to. `litellm.responses` and `litellm.aresponses` are not metered, except on providers LiteLLM serves through `completion`.
 
 #### Proxy Mode
 
@@ -903,6 +905,27 @@ for reasoning effort), with the calling virtual key's metadata as the fallback �
 `revenium_agentic_job_*`. Agentic job tags (`x-revenium-agentic-job-id`, `-name`,
 `-type`, `-version`) ride along for cost/ROI correlation; the job id is required for
 the others to be recorded.
+
+**Who made the call.** By default a proxied call is metered and budget-checked as the
+owner of the virtual key it used, which is right when every person has their own key.
+When several people share one key, have each client send
+`x-revenium-subscriber-email` (and optionally `x-revenium-subscriber-id`) naming the
+person making the call. Per-person and department budgets are looked up by that email,
+so without it a shared key's calls all count against its owner, and a blocked
+developer keeps getting through on the owner's budget. A call that sends someone
+else's email without an id carries no id at all, rather than the key's
+`revenium_user_id`, so it is checked against that person's balance and not the owner's. The captured header wins over a
+copy of the same key in the request's `metadata`; a blank value is ignored. Both are
+taken as the caller sends them: a shared key trusts its users to name themselves. On
+a team with strict ingestion enabled, the email must belong to a registered user, or
+the call's metering row is rejected instead of falling back to the key owner.
+
+```bash
+curl http://localhost:4000/v1/messages \
+  -H "x-api-key: sk-shared-team-key" \
+  -H "x-revenium-subscriber-email: dev@acme.com" \
+  ...
+```
 
 ##### Counting a Claude Code call once (shared call id)
 
@@ -1179,7 +1202,9 @@ for image in result.get("images", []):
     print(f"Image URL: {image['url']}")
 ```
 
-**Supported methods:** `fal_client.run`, `fal_client.subscribe`, `fal_client.stream` (and their async variants: `run_async`, `subscribe_async`, `stream_async`)
+**Supported methods:** `run`, `subscribe`, `stream` and the queue flow (`submit`, then `status` and `result` or the handle's `get()`), on the module-level functions (`fal_client.run`, `fal_client.run_async`, and so on) and on clients you construct yourself (`fal_client.SyncClient(key=...)`, `fal_client.AsyncClient(key=...)`). Pass `usage_metadata` to `run`, `subscribe`, `stream` or `submit`.
+
+**Queued jobs** are metered once, when the result is fetched: `submit` and `status` send nothing, fetching the same result again sends nothing more, and a job whose result is never fetched is not metered. A stream is metered from its last event once you have read it to the end.
 
 **Media type detection:** The middleware automatically detects the type of media being generated (image, video, audio) based on the application name for accurate cost tracking.
 
@@ -1829,6 +1854,33 @@ revenium_middleware.initialize_metering(
 `initialize_metering()` returns `True` when metering is enabled after the
 call; invoke it with no arguments to re-read the environment.
 
+### Metering Delivery and Timeouts
+
+Usage records are never sent on your request path. A metered call puts its
+record on a bounded in-process queue and returns at once; a fixed pool of
+background threads sends queued records to Revenium. The number of threads
+does not grow with traffic, so a slow or unreachable metering endpoint costs
+a few idle threads and the queue's memory, never a thread per call.
+
+| Variable | Default | What it sets |
+|----------|---------|--------------|
+| `REVENIUM_METERING_WORKERS` | `8` | Background threads that send records |
+| `REVENIUM_METERING_QUEUE_SIZE` | `1000` | Records that can wait for a thread |
+| `REVENIUM_METERING_TIMEOUT_SECONDS` | `10` | Seconds one attempt waits for a response |
+| `REVENIUM_METERING_CONNECT_TIMEOUT_SECONDS` | `5` | Seconds one attempt waits for a connection |
+| `REVENIUM_METERING_MAX_RETRIES` | `2` | Retries after the first attempt |
+
+Each thread sends one record at a time, so eight threads keep up with about
+eight records per round trip to Revenium: roughly 75 records a second at a
+100 ms round trip, or 30 a second at 250 ms. Raise
+`REVENIUM_METERING_WORKERS` for a service that meters more than that
+steadily; the queue absorbs short bursts. When the
+queue is full, new records go straight to the store-and-forward buffer below
+instead of waiting, and `get_buffer_stats()["total_overflowed"]` counts them.
+
+At exit, queued records get the first share of the shutdown budget (see
+[Shutdown](#shutdown)).
+
 ### Delivery Resilience (Store-and-Forward)
 
 Metering events that still fail after the client's own retries (network
@@ -1837,7 +1889,7 @@ in-memory buffer and replayed automatically in the background every 30
 seconds, reusing each event's original `Idempotency-Key` so replays can
 never double-bill. Permanent failures (401/403/404/422) are never buffered.
 The buffer holds up to 1000 events (oldest evicted first) for at most 24
-hours, and is drained on graceful shutdown. Inspect it programmatically:
+hours, and is drained on shutdown (see below). Inspect it programmatically:
 
 ```python
 from revenium_middleware import get_buffer_stats
@@ -1845,6 +1897,28 @@ from revenium_middleware import get_buffer_stats
 print(get_buffer_stats())
 # {'size': 0, 'max_size': 1000, 'total_buffered': 3, 'total_replayed': 3, ...}
 ```
+
+### Shutdown
+
+The SDK does not install signal handlers: SIGTERM and SIGINT reach your
+application or server exactly as they would without it. When the interpreter
+exits normally, including after Ctrl+C, an `atexit` hook works through three
+steps against one budget of `REVENIUM_SHUTDOWN_TIMEOUT_SECONDS` (5 seconds by
+default), each using whatever time the previous ones left: it waits for the
+background threads to send the records still queued, builds the records that
+overflowed to the store-and-forward buffer, then flushes the buffer with one
+attempt per record. Records still queued, being sent or unbuilt when the budget
+runs out are dropped and logged once, as a warning with a count.
+
+A process ended by SIGTERM's default action skips `atexit`, and with it that
+final flush. uvicorn, and so the LiteLLM proxy, ends that way once its own
+graceful shutdown has finished. For a script or worker with no SIGTERM handling
+of its own, set `REVENIUM_INSTALL_SIGNAL_HANDLERS=1`: SIGTERM then flushes
+first and ends the process the same way. A SIGTERM handler your code installed
+before importing the SDK is called unchanged, and one installed afterwards
+replaces the SDK's. The flush then happens only if that handler exits
+normally: a handler that restores SIGTERM's default action and re-raises it,
+as uvicorn does after its own shutdown, ends the process before `atexit` runs.
 
 ### Optional Environment Variables
 
@@ -1873,6 +1947,13 @@ print(get_buffer_stats())
 | `REVENIUM_BEDROCK_DISABLE` | - | Set to `1` to disable Bedrock auto-detection; Foundry detection is unaffected |
 | `REVENIUM_BUFFER_MAX_SIZE` | `1000` | Store-and-forward buffer capacity (oldest events evicted when full) |
 | `REVENIUM_BUFFER_FLUSH_INTERVAL` | `30` | Seconds between automatic replay attempts for buffered events |
+| `REVENIUM_METERING_WORKERS` | `8` | Background threads that send usage records (see [Metering Delivery and Timeouts](#metering-delivery-and-timeouts)) |
+| `REVENIUM_METERING_QUEUE_SIZE` | `1000` | Usage records that can wait for a sending thread; overflow goes to the store-and-forward buffer |
+| `REVENIUM_METERING_TIMEOUT_SECONDS` | `10` | Seconds one attempt to send a usage record waits for a response |
+| `REVENIUM_METERING_CONNECT_TIMEOUT_SECONDS` | `5` | Seconds one attempt waits for a connection |
+| `REVENIUM_METERING_MAX_RETRIES` | `2` | Retries after the first attempt before a record moves to the buffer |
+| `REVENIUM_SHUTDOWN_TIMEOUT_SECONDS` | `5` | Total seconds the exit hook may spend sending queued usage records, building overflowed ones and flushing the buffer |
+| `REVENIUM_INSTALL_SIGNAL_HANDLERS` | `false` | Set to `1` to flush metering before SIGTERM's default action ends the process (see [Shutdown](#shutdown)) |
 
 Per-call `usage_metadata` values take precedence over the `REVENIUM_AGENTIC_JOB_*` environment variables, and the LiteLLM proxy path sources job fields from `x-revenium-*` headers only — these process-level env fallbacks do not apply to proxied traffic.
 

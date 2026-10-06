@@ -181,6 +181,27 @@ def extract_request_headers(container):
     return {}
 
 
+SUBSCRIBER_ID_HEADER = "x-revenium-subscriber-id"
+SUBSCRIBER_EMAIL_HEADER = "x-revenium-subscriber-email"
+
+
+def header_then_metadata(headers, metadata, name):
+    """The caller's non-blank ``name`` value, the captured header ahead of metadata.
+
+    The captured header is what the proxy itself received, so it wins over the
+    request-metadata copy of the same key.
+
+    Returns:
+        The stripped value, or an empty string when neither source carries a
+        non-blank string.
+    """
+    for source in (headers, metadata):
+        value = source.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 # The keys the shared per-call id is stamped under, in both metadata dicts.
 # Public rather than underscored: guardrail.py imports all four, the way it
 # already imports resolve_transaction_id and extract_request_headers.
@@ -424,8 +445,11 @@ class MiddlewareHandler(CustomLogger):
         subscriber = {}
 
         # Extract subscriber information from metadata and headers
-        subscriber_id = metadata.get('x-revenium-subscriber-id', '') or headers.get("x-revenium-subscriber-id")
-        subscriber_email = metadata.get('user_api_key_user_email', '')
+        subscriber_id = header_then_metadata(headers, metadata, SUBSCRIBER_ID_HEADER)
+        subscriber_email = (
+            header_then_metadata(headers, metadata, SUBSCRIBER_EMAIL_HEADER)
+            or metadata.get('user_api_key_user_email', '')
+        )
         credential_name = metadata.get('user_api_key_alias', '')
         credential_value = metadata.get('user_api_key_alias', '')
 
@@ -562,8 +586,11 @@ class MiddlewareHandler(CustomLogger):
         subscriber = {}
 
         # Extract subscriber information from metadata and headers
-        subscriber_id = metadata.get('x-revenium-subscriber-id', '') or headers.get("x-revenium-subscriber-id")
-        subscriber_email = metadata.get('user_api_key_user_email', '')
+        subscriber_id = header_then_metadata(headers, metadata, SUBSCRIBER_ID_HEADER)
+        subscriber_email = (
+            header_then_metadata(headers, metadata, SUBSCRIBER_EMAIL_HEADER)
+            or metadata.get('user_api_key_user_email', '')
+        )
         credential_name = metadata.get('user_api_key_alias', '')
         credential_value = metadata.get('user_api_key_hash', '')
 

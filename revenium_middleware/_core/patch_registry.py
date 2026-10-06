@@ -19,3 +19,8 @@ def register_patch(function_path: str) -> bool:
 def is_patched(function_path: str) -> bool:
     with _lock:
         return function_path in _patched
+
+
+def unregister_patch(function_path: str) -> None:
+    with _lock:
+        _patched.discard(function_path)

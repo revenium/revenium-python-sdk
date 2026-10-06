@@ -5,16 +5,54 @@ import asyncio
 import threading
 import contextvars
 import atexit
-import signal
-from typing import Literal, Awaitable, Any, Optional, Callable
+import math
+from typing import Literal, Awaitable, Any, Dict, Optional, Callable
+
+import httpx
+
 from revenium_middleware._metering import ReveniumMetering
-from revenium_middleware._core.config import validate_api_key
+from revenium_middleware._core.config import Config, read_env_number, validate_api_key
+from revenium_middleware._core import metering_buffer, metering_pool
+from revenium_middleware._core.metering_pool import MeteringTask
+from revenium_middleware._core.shutdown_signals import install_requested_signal_handlers
 
 # Get the logger that was configured in __init__.py
 logger = logging.getLogger("revenium_middleware")
 
 # Define a StopReason literal type for strict typing of stop_reason
 StopReason = Literal["END", "END_SEQUENCE", "TIMEOUT", "TOKEN_LIMIT", "COST_LIMIT", "COMPLETION_LIMIT", "ERROR"]
+
+TIMEOUT_ENV = "REVENIUM_METERING_TIMEOUT_SECONDS"
+CONNECT_TIMEOUT_ENV = "REVENIUM_METERING_CONNECT_TIMEOUT_SECONDS"
+MAX_RETRIES_ENV = "REVENIUM_METERING_MAX_RETRIES"
+# Metering runs off the request path, so a dead endpoint should release a
+# worker in seconds rather than the generated client's 60s default.
+DEFAULT_TIMEOUT_SECONDS = 10.0
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 5.0
+DEFAULT_MAX_RETRIES = 2
+
+
+def _is_positive_finite(value: float) -> bool:
+    return value > 0 and math.isfinite(value)
+
+
+def metering_client_timeout() -> httpx.Timeout:
+    """Read/write/pool timeout and connect timeout for the metering client, from the environment."""
+    read = read_env_number(TIMEOUT_ENV, DEFAULT_TIMEOUT_SECONDS, float, _is_positive_finite)
+    connect = read_env_number(CONNECT_TIMEOUT_ENV, DEFAULT_CONNECT_TIMEOUT_SECONDS, float, _is_positive_finite)
+    return httpx.Timeout(read, connect=connect)
+
+
+def metering_client_max_retries() -> int:
+    return read_env_number(MAX_RETRIES_ENV, DEFAULT_MAX_RETRIES, int, lambda retries: retries >= 0)
+
+
+def _new_client(api_key: str, base_url: Optional[str]) -> ReveniumMetering:
+    options: Dict[str, Any] = {"timeout": metering_client_timeout(), "max_retries": metering_client_max_retries()}
+    if base_url is not None:
+        options["base_url"] = base_url
+    return ReveniumMetering(api_key=api_key, **options)
+
 
 def _build_metering_client(
     api_key: Optional[str],
@@ -49,10 +87,10 @@ def _build_metering_client(
 
     validate_api_key(api_key)
     if validated_base_url is not None:
-        return ReveniumMetering(api_key=api_key, base_url=validated_base_url)
+        return _new_client(api_key, validated_base_url)
     if base_url_raw is not None:
-        return ReveniumMetering(api_key=api_key, base_url="https://api.revenium.ai/meter/")
-    return ReveniumMetering(api_key=api_key)
+        return _new_client(api_key, "https://api.revenium.ai/meter/")
+    return _new_client(api_key, None)
 
 
 api_key = os.environ.get("REVENIUM_METERING_API_KEY")
@@ -128,196 +166,129 @@ def get_client() -> Optional[ReveniumMetering]:
                 _last_failed_key = env_key
     return client
 
-_threads_lock = threading.Lock()
-active_threads = []
 shutdown_event = threading.Event()
 
-def handle_exit(signum=None, frame=None):
-    # Check if shutdown is already initiated to prevent redundant logging/actions
+DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+
+
+def _is_valid_budget(budget: float) -> bool:
+    return math.isfinite(budget) and budget >= 0
+
+
+def shutdown_budget_seconds() -> float:
+    """Total seconds the exit drain may spend, from ``REVENIUM_SHUTDOWN_TIMEOUT_SECONDS``."""
+    return read_env_number(
+        Config.ENV_REVENIUM_SHUTDOWN_TIMEOUT_SECONDS, DEFAULT_SHUTDOWN_TIMEOUT_SECONDS, float, _is_valid_budget
+    )
+
+
+def handle_exit() -> None:
+    """Deliver queued metering, build overflowed events and flush the buffer, within one shared budget."""
     if shutdown_event.is_set():
         return
 
     logger.debug("Shutdown initiated, waiting for metering calls to complete...")
+    budget = shutdown_budget_seconds()
+    deadline = time.monotonic() + budget
+
+    # Both run before shutdown_event is set: every integration's metering
+    # coroutine returns early once it sees the event, so a queued event, or
+    # an overflowed one the buffer has not built yet, would be dropped.
+    undelivered = _drain_worker_queue(deadline) + _build_overflow(deadline)
     shutdown_event.set()
+    # Last, so events that exhausted retries, including those of the queue
+    # drain above, get a final attempt.
+    _drain_buffer(deadline)
+    if undelivered:
+        logger.warning(
+            "%d metering event(s) still queued, in flight or unbuilt after the %ss shutdown budget (%s); "
+            "their usage may not be delivered.",
+            undelivered, budget, Config.ENV_REVENIUM_SHUTDOWN_TIMEOUT_SECONDS,
+        )
+    logger.debug("Shutdown complete")
 
-    # Give threads a chance to notice the shutdown event
-    # Use a small delay, but avoid blocking excessively if called from signal handler
+
+def _seconds_left(deadline: float) -> float:
+    return max(0.0, deadline - time.monotonic())
+
+
+def _drain_worker_queue(deadline: float) -> int:
+    """Let the worker pool deliver its queued events until ``deadline``; return how many are left."""
+    return metering_pool.drain(_seconds_left(deadline))
+
+
+def _build_overflow(deadline: float) -> int:
+    """Build the buffer's overflowed tasks until ``deadline``; return how many are left unbuilt."""
     try:
-        time.sleep(0.1)
-    except InterruptedError:
-        # Handle potential interruption if called from a signal handler during sleep
-        logger.debug("Sleep interrupted during shutdown.")
-        # Ensure the event is still set
-        shutdown_event.set()
-
-
-    # Drain the store-and-forward buffer (bounded) before joining metering
-    # threads, so events that already exhausted retries get a final attempt.
-    try:
-        from revenium_middleware._core import metering_buffer
-
         if metering_buffer._buffer is not None:
-            metering_buffer._buffer.flush(deadline_seconds=5.0)
+            return metering_buffer._buffer.build_all_overflow(deadline_seconds=_seconds_left(deadline))
+    except Exception as e:
+        logger.debug("Building overflowed metering events during shutdown failed: %s", e)
+    return 0
+
+
+def _drain_buffer(deadline: float) -> None:
+    try:
+        if metering_buffer._buffer is not None:
+            metering_buffer._buffer.flush(deadline_seconds=_seconds_left(deadline))
     except Exception as e:
         logger.debug("Metering buffer drain during shutdown failed: %s", e)
 
-    with _threads_lock:
-        threads_to_join = list(active_threads)
-    for thread in threads_to_join:
-        if thread.is_alive():
-            logger.debug(f"Waiting for metering thread {thread.name} to finish...")
-            thread.join(timeout=5.0)
-            if thread.is_alive():
-                logger.warning(f"Metering thread {thread.name} did not complete in time.")
-            else:
-                logger.debug(f"Metering thread {thread.name} finished.")
-        with _threads_lock:
-            if thread in active_threads:
-                active_threads.remove(thread)
 
-
-    logger.debug("Shutdown complete")
-    
-    # If called from a signal handler, exit the program
-    if signum is not None:
-        logger.debug(f"Exiting due to signal {signum}")
-        os._exit(0)
-
-# Always register atexit handler, works in any thread
 atexit.register(handle_exit)
+install_requested_signal_handlers(handle_exit)
 
-# Only register signal handlers if in the main thread
-if threading.current_thread() is threading.main_thread():
+
+async def _run_sync_callable(func: Callable[[], Any]) -> Any:
+    if shutdown_event.is_set():
+        logger.debug("Skipping sync function execution due to shutdown.")
+        return None
     try:
-        signal.signal(signal.SIGINT, handle_exit)
-        signal.signal(signal.SIGTERM, handle_exit)
-        logger.debug("SIGINT and SIGTERM handlers registered.")
-    except ValueError as e:
-        # This can happen in environments where signal handling is restricted (e.g., mod_wsgi)
-        logger.warning(f"Could not register signal handlers: {e}. Shutdown will rely on atexit.")
-else:
-    logger.debug("Not running in main thread, skipping signal handler registration. Shutdown will rely on atexit.")
+        return func()
+    except Exception as e:
+        logger.warning(f"Exception in wrapped sync function: {e}", exc_info=True)
+        raise
 
 
-class MeteringThread(threading.Thread):
-    def __init__(self, coro, *args, ctx: Optional[contextvars.Context] = None, **kwargs):
-        # Default to non-daemon threads so atexit handlers wait for them
-        daemon = kwargs.pop('daemon', False)
-        super().__init__(*args, **kwargs)
-        self.coro = coro
-        self.ctx = ctx
-        self.daemon = daemon # Store daemon status
-        self.error = None
-        self.loop = None
-        # Assign a more descriptive name if not provided
-        if self.name is None:
-             self.name = f"MeteringThread-{id(self)}"
+def run_async_in_thread(coroutine_or_func) -> Optional[MeteringTask]:
+    """Queue a metering coroutine (or sync callable) for background delivery.
 
-
-    def run(self):
-        # Check shutdown event *before* starting the loop
-        if shutdown_event.is_set():
-            logger.debug(f"Metering thread {self.name} not starting due to shutdown.")
-            with _threads_lock:
-                if self in active_threads:
-                    active_threads.remove(self)
-            return
-
-        try:
-            # Create and set a new event loop for this thread
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
-            logger.debug(f"Metering thread {self.name} started with loop {id(self.loop)}")
-            try:
-                # Run the coroutine until it completes, inside the captured context if available
-                if self.ctx is not None:
-                    self.ctx.run(self.loop.run_until_complete, self.coro)
-                else:
-                    self.loop.run_until_complete(self.coro)
-            finally:
-                # Ensure async generators are properly shut down
-                logger.debug(f"Shutting down async generators for loop {id(self.loop)} in thread {self.name}")
-                self.loop.run_until_complete(self.loop.shutdown_asyncgens())
-                # Close the event loop
-                logger.debug(f"Closing event loop {id(self.loop)} in thread {self.name}")
-                self.loop.close()
-                logger.debug(f"Event loop {id(self.loop)} closed in thread {self.name}")
-        except Exception as e:
-            # Log errors unless it's during shutdown
-            if not shutdown_event.is_set():
-                self.error = e
-                from revenium_middleware._core.metering_status import record_metering_error
-                record_metering_error(e)
-                # Use exc_info=True to include traceback in the log
-                logger.error(f"Error in metering thread {self.name}: {str(e)}", exc_info=True)
-            else:
-                logger.debug(f"Exception ignored in metering thread {self.name} during shutdown: {str(e)}")
-        finally:
-            with _threads_lock:
-                if self in active_threads:
-                    active_threads.remove(self)
-                    logger.debug(f"Removed thread {self.name} from active list.")
-
-
-def run_async_in_thread(coroutine_or_func):
-    """
-    Helper function to run an async coroutine or a regular function in a background thread
-    with better handling of interpreter shutdown.
+    Returns immediately. A fixed pool of daemon workers delivers queued
+    events; when the queue is full the event goes to the store-and-forward
+    buffer instead, so no call ever blocks on metering or starts a thread.
 
     Args:
         coroutine_or_func: Either an awaitable coroutine or a regular function
 
     Returns:
-        Optional[threading.Thread]: The thread running the task, or None if shutdown initiated.
+        Optional[MeteringTask]: A handle whose ``join``/``is_alive`` follow the
+        event's delivery, or None if shutdown initiated or the input is invalid.
     """
     if shutdown_event.is_set():
-        logger.warning("Not starting new metering thread during shutdown")
+        logger.warning("Not queueing metering event during shutdown")
         return None
 
-    # Check if we received a coroutine or a regular function
     if asyncio.iscoroutine(coroutine_or_func):
-        # It's a coroutine, use it directly
         coro = coroutine_or_func
     elif callable(coroutine_or_func):
-         # It's a callable (sync function), wrap it
-         async def wrapper():
-             # Check shutdown again before potentially long-running sync call
-             if shutdown_event.is_set():
-                 logger.debug("Skipping sync function execution due to shutdown.")
-                 return None # Or raise an exception? Returning None seems safer.
-             try:
-                 return coroutine_or_func()
-             except Exception as e:
-                 logger.warning(f"Exception in wrapped sync function: {e}", exc_info=True)
-                 # Propagate or handle error as needed
-                 raise # Re-raise the exception to be caught by MeteringThread run method
-         coro = wrapper()
+        coro = _run_sync_callable(coroutine_or_func)
     else:
-         # If it's neither a coroutine nor callable, it's likely an error or unexpected input
-         logger.error(f"Invalid type passed to run_async_in_thread: {type(coroutine_or_func)}. Expected coroutine or callable.")
-         # Decide how to handle this: return None, raise TypeError, etc.
-         # Returning None might be safest to avoid crashing the caller unexpectedly.
-         return None
-
-
-    # Capture the current context so contextvars (e.g. idempotency_key) propagate
-    # into the worker thread, which otherwise starts with an empty context.
-    ctx = contextvars.copy_context()
-
-    # Create and start the thread
-    # Pass daemon=False explicitly if that's the desired default
-    thread = MeteringThread(coro, ctx=ctx, daemon=False)
-    with _threads_lock:
-        active_threads.append(thread)
-    logger.debug(f"Starting and adding thread {thread.name} to active list.")
-    try:
-        thread.start()
-    except RuntimeError as e:
-        logger.error(f"Failed to start thread {thread.name}: {e}", exc_info=True)
-        # Clean up: remove the thread we failed to start
-        with _threads_lock:
-            if thread in active_threads:
-                active_threads.remove(thread)
+        logger.error(
+            "Invalid type passed to run_async_in_thread: %s. Expected coroutine or callable.",
+            type(coroutine_or_func),
+        )
         return None
 
-    return thread
+    # Capture the current context so contextvars (e.g. idempotency_key) propagate
+    # into the worker thread, which otherwise runs in its own context.
+    pool = metering_pool.get_pool(shutdown_event.is_set)
+    task = pool.new_task(coro, contextvars.copy_context())
+    try:
+        pool.submit(task)
+    except RuntimeError as e:
+        # Raised when a worker cannot start, e.g. during interpreter shutdown.
+        logger.error(f"Failed to queue metering event {task.name}: {e}", exc_info=True)
+        task.discard()
+        return None
+    logger.debug(f"Queued metering event {task.name}.")
+    return task

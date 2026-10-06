@@ -33,10 +33,12 @@ class TestLiteLLMClientEarlyTermination:
         assert mock_handle.call_args[0][3] is True  # is_streaming
 
     def test_full_consumption_meters_exactly_once(self, mock_handle):
-        gen = mw.handle_streaming_response(iter(make_chunks(3)), NOW, {})
+        usage_chunk = SimpleNamespace(usage=SimpleNamespace(prompt_tokens=9, completion_tokens=2), choices=[])
+        gen = mw.handle_streaming_response(iter(make_chunks(3) + [usage_chunk]), NOW, {})
         for _ in gen:
             pass
         del gen
         gc.collect()
 
         assert mock_handle.call_count == 1
+        assert mock_handle.call_args[0][0] is usage_chunk

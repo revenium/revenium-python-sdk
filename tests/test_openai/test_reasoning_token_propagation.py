@@ -18,6 +18,8 @@ from revenium_middleware.openai.middleware import (
     log_token_usage,
 )
 
+from .responses_stream_events import MODEL, typed_events, usage_payload
+
 
 def _chat_response(reasoning_tokens=None, details_as_dict=False):
     """Chat Completions response; reasoning detail block omitted when None."""
@@ -326,17 +328,19 @@ def test_streaming_responses_api_forwards_reasoning_token_count(
     )
     mock_run_async.side_effect = _run_coro_in_thread
 
-    final_chunk = _responses_response(reasoning_tokens=72)
+    events = typed_events(usage=usage_payload(reasoning_tokens=72))
 
     wrapped_stream = handle_streaming_responses(
-        [final_chunk],
+        events,
         datetime.datetime.now(datetime.timezone.utc),
         {"trace_id": "responses-stream-reasoning-test"},
     )
 
-    assert list(wrapped_stream) == [final_chunk]
+    assert list(wrapped_stream) == events
+    assert mock_submit.call_count == 1
     payload = mock_submit.call_args[0][1]
     assert payload["is_streamed"] is True
+    assert payload["model"] == MODEL
     assert payload["reasoning_token_count"] == 72
 
 

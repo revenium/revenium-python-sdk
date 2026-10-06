@@ -8,10 +8,9 @@ to Revenium.
 import datetime
 import logging
 import uuid
-from typing import Dict, Any, Optional, Iterator
+from typing import Dict, Any, Optional
 from enum import Enum
 
-import wrapt
 from revenium_middleware import (
     client,
     get_client,
@@ -20,9 +19,6 @@ from revenium_middleware import (
     merge_metadata,
 )
 from revenium_middleware._core import submit_ai_event
-from revenium_middleware._core.config import is_selective_metering_enabled
-from revenium_middleware._core.context import is_inside_decorated_function
-from revenium_middleware._core.patch_registry import register_patch
 from revenium_middleware._core.fields import (
     extract_org_and_product,
     extract_common_metadata,
@@ -32,7 +28,10 @@ from revenium_middleware._core.fields import (
     merge_extra_body,
 )
 
+from ._metering_scope import metering_skipped
+from .patching import wrap_registered
 from .provider import Provider, detect_provider, get_provider_metadata
+from .streaming import AsyncMeteredStream, MeteredStream, StreamMeter
 from .trace_fields import (
     get_environment,
     get_region,
@@ -285,52 +284,47 @@ def send_metering_data(
     logger.debug(f"Metering thread started: {thread}")
 
 
-def handle_streaming_response(
-    stream: Iterator[Any],
-    request_time_dt: datetime.datetime,
-    usage_metadata: Dict[str, Any],
-    model: str,
-    provider: Provider,
-    transaction_id: str,
-) -> Iterator[Any]:
-    """
-    Wrap a streaming response to collect usage data.
+def _perplexity_client(instance) -> Optional[Any]:
+    """The OpenAI client behind ``instance`` when its base URL is Perplexity's, else None."""
+    client_instance = getattr(instance, '_client', None)
+    base_url = getattr(client_instance, 'base_url', None) if client_instance else None
+    if base_url and "perplexity" in str(base_url).lower():
+        return client_instance
+    return None
 
-    Args:
-        stream: Original stream iterator
-        request_time_dt: Request start time
-        usage_metadata: User-provided metadata
-        model: Model name
-        provider: Provider enum
-        transaction_id: Transaction ID for tracking
 
-    Yields:
-        Stream chunks from the original stream
-    """
-    accumulated_response = None
+class _CompatibleCall:
+    """The request-side facts of one Perplexity call made through the OpenAI client."""
 
-    try:
-        for chunk in stream:
-            # Accumulate the final chunk with usage data
-            if hasattr(chunk, 'usage') and chunk.usage:
-                accumulated_response = chunk
-            yield chunk
-    finally:
-        # Send metering data after stream completes
-        if accumulated_response:
-            send_metering_data(
-                accumulated_response,
-                request_time_dt,
-                usage_metadata,
-                model,
-                provider,
-                is_streaming=True,
-                transaction_id=transaction_id,
-            )
+    def __init__(self, client_instance, kwargs):
+        api_metadata = kwargs.pop("usage_metadata", {})
+
+        extra_body = kwargs.get('extra_body', {})
+        if isinstance(extra_body, dict) and 'usage_metadata' in extra_body:
+            extra_metadata = extra_body.pop('usage_metadata', {})
+            api_metadata = {**extra_metadata, **api_metadata}
+
+        self.usage_metadata = merge_metadata(api_metadata)
+        self.provider = detect_provider(client=client_instance, base_url=client_instance.base_url)
+        self.model = kwargs.get('model', 'unknown')
+        self.is_streaming = kwargs.get('stream', False)
+        self.request_time_dt = datetime.datetime.now(datetime.timezone.utc)
+        self.transaction_id = f"perplexity-{self.request_time_dt.timestamp()}"
+
+    def meter(self, response) -> None:
+        send_metering_data(
+            response,
+            self.request_time_dt,
+            self.usage_metadata,
+            self.model,
+            self.provider,
+            is_streaming=bool(self.is_streaming),
+            transaction_id=self.transaction_id,
+        )
 
 
 def create_wrapper(wrapped, instance, args, kwargs):
-    if is_selective_metering_enabled() and not is_inside_decorated_function():
+    if metering_skipped():
         return wrapped(*args, **kwargs)
 
     # The Perplexity API is OpenAI-compatible, so this wrapper patches the same
@@ -338,57 +332,43 @@ def create_wrapper(wrapped, instance, args, kwargs):
     # middleware. Without this guard, calls made by a plain OpenAI client would
     # be metered and tagged as PERPLEXITY. Defer non-Perplexity calls to the
     # next wrapper (or original).
-    client_instance = getattr(instance, '_client', None)
-    base_url = getattr(client_instance, 'base_url', None) if client_instance else None
-    if not (base_url and "perplexity" in str(base_url).lower()):
+    client_instance = _perplexity_client(instance)
+    if client_instance is None:
         return wrapped(*args, **kwargs)
 
-    logger.debug("Perplexity chat completion wrapper called")
-
-    api_metadata = kwargs.pop("usage_metadata", {})
-
-    extra_body = kwargs.get('extra_body', {})
-    if isinstance(extra_body, dict) and 'usage_metadata' in extra_body:
-        extra_metadata = extra_body.pop('usage_metadata', {})
-        api_metadata = {**extra_metadata, **api_metadata}
-
-    usage_metadata = merge_metadata(api_metadata)
-
-    provider = detect_provider(client=client_instance, base_url=base_url)
-
-    model = kwargs.get('model', 'unknown')
-    is_streaming = kwargs.get('stream', False)
-
-    request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-    transaction_id = f"perplexity-{request_time_dt.timestamp()}"
-
-    logger.debug(f"Calling original create with model: {model}, streaming: {is_streaming}")
+    call = _CompatibleCall(client_instance, kwargs)
     response = wrapped(*args, **kwargs)
+    if call.is_streaming:
+        return MeteredStream(response, StreamMeter(call.meter))
+    call.meter(response)
+    return response
 
-    if is_streaming:
-        return handle_streaming_response(
-            response,
-            request_time_dt,
-            usage_metadata,
-            model,
-            provider,
-            transaction_id,
-        )
-    else:
-        send_metering_data(
-            response,
-            request_time_dt,
-            usage_metadata,
-            model,
-            provider,
-            is_streaming=False,
-            transaction_id=transaction_id,
-        )
+
+def async_create_wrapper(wrapped, instance, args, kwargs):
+    if metering_skipped():
+        return wrapped(*args, **kwargs)
+
+    # Same guard as create_wrapper: the OpenAI middleware wraps this
+    # AsyncCompletions.create slot too and defers Perplexity-bound calls here.
+    client_instance = _perplexity_client(instance)
+    if client_instance is None:
+        return wrapped(*args, **kwargs)
+
+    call = _CompatibleCall(client_instance, kwargs)
+
+    async def invoke():
+        response = await wrapped(*args, **kwargs)
+        if call.is_streaming:
+            return AsyncMeteredStream(response, StreamMeter(call.meter))
+        call.meter(response)
         return response
 
+    return invoke()
 
-if register_patch("perplexity:openai.resources.chat.completions.Completions.create"):
-    wrapt.wrap_function_wrapper(
-        'openai.resources.chat.completions', 'Completions.create', create_wrapper
-    )
 
+OPENAI_COMPLETIONS_MODULE = "openai.resources.chat.completions"
+
+wrap_registered(f"perplexity:{OPENAI_COMPLETIONS_MODULE}.Completions.create",
+                OPENAI_COMPLETIONS_MODULE, "Completions.create", create_wrapper)
+wrap_registered(f"perplexity:{OPENAI_COMPLETIONS_MODULE}.AsyncCompletions.create",
+                OPENAI_COMPLETIONS_MODULE, "AsyncCompletions.create", async_create_wrapper)

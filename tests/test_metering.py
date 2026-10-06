@@ -4,7 +4,6 @@ import asyncio
 from unittest.mock import patch, AsyncMock
 
 from revenium_middleware._core.metering import (
-    active_threads,
     shutdown_event,
     handle_exit,
     run_async_in_thread
@@ -15,8 +14,6 @@ class TestMetering:
     @pytest.fixture
     def reset_state(self):
         """Fixture to reset global state before each test."""
-        # Clear any active threads
-        active_threads.clear()
         shutdown_event.clear()
         yield
         # Cleanup: make sure threads get stopped
@@ -28,19 +25,23 @@ class TestMetering:
         with caplog.at_level(logging.WARNING):
             thread = run_async_in_thread(asyncio.sleep(0.01))
             assert thread is None
-            assert "Not starting new metering thread during shutdown" in caplog.text
+            assert "Not queueing metering event during shutdown" in caplog.text
 
     def test_run_async_in_thread_normal(self, reset_state):
-        """Check that run_async_in_thread starts a thread and runs the coroutine."""
-        coro_mock = AsyncMock()
-        thread = run_async_in_thread(coro_mock)
+        """run_async_in_thread queues the coroutine and its handle completes once it ran."""
+        ran = []
+
+        async def record():
+            ran.append(True)
+
+        thread = run_async_in_thread(record())
         assert thread is not None
         thread.join(timeout=1.0)
-        # Ensure the thread is removed from active_threads once done
-        assert thread not in active_threads
+        assert not thread.is_alive()
+        assert ran == [True]
 
     def test_metering_thread_error_handling(self, reset_state, caplog):
-        """Ensure MeteringThread logs a warning if an exception occurs."""
+        """A failing metering coroutine is logged as an error."""
 
         async def fail_coro():
             raise ValueError("Test error")
@@ -52,8 +53,7 @@ class TestMetering:
             assert "Error in metering thread" in caplog.text
             assert "Test error" in caplog.text
 
-    @patch("signal.signal")
-    def test_handle_exit(self, mock_signal, reset_state, caplog):
+    def test_handle_exit(self, reset_state, caplog):
         """handle_exit should set the shutdown_event and wait for threads to complete."""
 
         # Create a long-running coroutine

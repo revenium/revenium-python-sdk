@@ -3,13 +3,32 @@ Unified LangChain callback handler implementation for Revenium middleware.
 
 This module implements the unified architecture documented in LANGCHAIN_ARCHITECTURE.md,
 providing a single ReveniumCallbackHandler that supports both sync and async operations.
+
+Exactly-once metering: when a Revenium transport wrap (the OpenAI or Anthropic
+client patch) also meters the model call, the handler sends nothing and the
+transport's record is the one kept. The handler takes a claim mark when the
+call starts and, before sending, asks whether the transport claimed the call
+since then (see ``revenium_middleware._core.call_ownership`` for the
+semantics). It also checks from ``on_llm_new_token``: that hook is a coroutine,
+so langchain-core awaits it in the model call's own task, which is the only
+place a claim made by a streamed call inside ``ainvoke`` can be seen. The
+handler sends its own record only for calls no transport wrap metered, under
+the provider LangChain reports for the model class.
 """
 
 import logging
 import time
 from typing import Any, Dict, List, Optional
 
+from revenium_middleware._core.call_ownership import claimed_by_transport, transport_claim_mark
+
+from ._model_call import (
+    is_streamed_result, is_streaming_request, provider_metadata_for, provider_response_ids,
+    response_model_name, transport_scope_for,
+)
+
 logger = logging.getLogger("revenium_middleware.langchain")
+
 
 # Version compatibility pattern - support both LangChain 0.x and 1.0+
 try:
@@ -135,13 +154,22 @@ class UnifiedReveniumCallbackHandler(AsyncCallbackHandler):
         if not run_id:
             return
 
-        # Store run information for later processing
+        invocation_params = kwargs.get('invocation_params') or {}
         run_info = {
             'start_time': time.time(),
             'serialized': serialized,
             'prompts': prompts,
             'is_async': is_async,
-            'usage_metadata': self.usage_metadata.copy()
+            'usage_metadata': self.usage_metadata.copy(),
+            'transport_claim_mark': transport_claim_mark(),
+            'transport_claimed': False,
+            'is_streaming': is_streaming_request(invocation_params),
+            'provider_metadata': provider_metadata_for(
+                serialized, invocation_params, kwargs.get('metadata')
+            ),
+            'transport_scope': transport_scope_for(
+                serialized, invocation_params, kwargs.get('metadata')
+            ),
         }
         
         self._active_runs[run_id] = run_info
@@ -164,13 +192,25 @@ class UnifiedReveniumCallbackHandler(AsyncCallbackHandler):
             return
 
         run_info = self._active_runs.pop(run_id)
-        
-        # Process the response and create metering call
+
+        if self._transport_metered(response, run_info):
+            if self.enable_debug_logging:
+                logger.debug(f"Transport metered run {run_id}; callback record skipped")
+            return
+
+        run_info['is_streaming'] = run_info['is_streaming'] or is_streamed_result(response)
+        run_info['response_model'] = response_model_name(response)
         self._process_llm_response(response, run_info)
         
         if self.enable_debug_logging:
             context = "async" if is_async else "sync"
             logger.debug(f"LLM ended ({context}) - run_id: {run_id}")
+
+    @staticmethod
+    def _transport_metered(response: Any, run_info: Dict[str, Any]) -> bool:
+        return run_info['transport_claimed'] or claimed_by_transport(
+            run_info['transport_claim_mark'], run_info['transport_scope'], provider_response_ids(response)
+        )
 
     def _process_llm_response(self, response: Any, run_info: Dict[str, Any]) -> None:
         """
@@ -330,7 +370,8 @@ class UnifiedReveniumCallbackHandler(AsyncCallbackHandler):
                     run_info['usage_metadata'],  # usage_metadata
                     None,  # client_instance - LangChain doesn't provide direct client access
                     0,  # time_to_first_token - Not available from LangChain callbacks
-                    run_info.get('is_streaming', False)  # is_streamed
+                    run_info.get('is_streaming', False),  # is_streamed
+                    provider_metadata=run_info.get('provider_metadata'),
                 )
 
                 if self.enable_debug_logging:
@@ -441,7 +482,7 @@ class UnifiedReveniumCallbackHandler(AsyncCallbackHandler):
                 })()
                 self.choices = [choice]
 
-        model_name = self._extract_model_name(run_info['serialized'])
+        model_name = run_info.get('response_model') or self._extract_model_name(run_info['serialized'])
         return MockResponse(usage_data, model_name)
 
     def _extract_model_name(self, serialized: Dict[str, Any]) -> str:
@@ -505,6 +546,21 @@ class UnifiedReveniumCallbackHandler(AsyncCallbackHandler):
     def on_llm_end(self, response: Any, **kwargs) -> None:
         """Sync callback for LLM end."""
         self._handle_llm_end(response, is_async=False, **kwargs)
+
+    async def on_llm_new_token(self, token: str, **kwargs) -> None:
+        """Marks the run as streamed and notes a transport claim made in the
+        model call's own context (a coroutine hook runs there)."""
+        try:
+            run_info = self._active_runs.get(kwargs.get('run_id'))
+            if run_info is None:
+                return
+            run_info['is_streaming'] = True
+            if not run_info['transport_claimed']:
+                run_info['transport_claimed'] = claimed_by_transport(
+                    run_info['transport_claim_mark'], run_info['transport_scope']
+                )
+        except Exception as e:
+            logger.exception(f"Revenium callback failed in on_llm_new_token: {e}")
 
     @_safe
     def on_llm_error(self, error: Exception, **kwargs) -> None:

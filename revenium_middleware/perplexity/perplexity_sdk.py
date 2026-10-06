@@ -7,7 +7,6 @@ import datetime
 import logging
 from typing import Dict, Any
 
-import wrapt
 from revenium_middleware import (
     client,
     get_client,
@@ -16,9 +15,6 @@ from revenium_middleware import (
     merge_metadata,
 )
 from revenium_middleware._core import submit_ai_event
-from revenium_middleware._core.config import is_selective_metering_enabled
-from revenium_middleware._core.context import is_inside_decorated_function
-from revenium_middleware._core.patch_registry import register_patch
 from revenium_middleware._core.fields import (
     extract_org_and_product,
     extract_common_metadata,
@@ -28,7 +24,10 @@ from revenium_middleware._core.fields import (
     merge_extra_body,
 )
 
+from ._metering_scope import metering_skipped
+from .patching import wrap_registered
 from .provider import get_provider_metadata, Provider
+from .streaming import AsyncMeteredStream, MeteredStream, StreamMeter
 from .trace_fields import (
     get_environment,
     get_region,
@@ -51,98 +50,57 @@ from .middleware import (
 logger = logging.getLogger("revenium_middleware.perplexity.sdk")
 
 
-def perplexity_create_wrapper(wrapped, instance, args, kwargs):
-    if is_selective_metering_enabled() and not is_inside_decorated_function():
-        return wrapped(*args, **kwargs)
+class _NativeCall:
+    """The request-side facts of one native chat completion call."""
 
-    logger.debug("Native Perplexity SDK chat completion wrapper called")
+    def __init__(self, kwargs):
+        extra_body = kwargs.get('extra_body', {})
+        api_metadata = extra_body.pop('usage_metadata', {}) if isinstance(extra_body, dict) else {}
+        self.usage_metadata = merge_metadata(api_metadata)
+        self.model = kwargs.get('model', 'sonar')
+        self.is_streaming = bool(kwargs.get('stream', False))
+        self.request_time_dt = datetime.datetime.now(datetime.timezone.utc)
+        self.transaction_id = f"perplexity-sdk-{self.request_time_dt.timestamp()}"
 
-    # Get usage_metadata from extra_body if present
-    extra_body = kwargs.get('extra_body', {})
-    api_metadata = extra_body.pop('usage_metadata', {}) if isinstance(extra_body, dict) else {}
-
-    # Merge with decorator metadata (API metadata takes precedence)
-    usage_metadata = merge_metadata(api_metadata)
-
-    # Get model from kwargs
-    model = kwargs.get('model', 'sonar')
-
-    # Check if streaming
-    is_streaming = kwargs.get('stream', False)
-
-    # Record request time
-    request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-
-    # Generate transaction ID
-    transaction_id = f"perplexity-sdk-{request_time_dt.timestamp()}"
-
-    # Call original method
-    logger.debug(
-        f"Calling original Perplexity SDK create with model: {model}, "
-        f"streaming: {is_streaming}"
-    )
-    response = wrapped(*args, **kwargs)
-
-    # Handle response based on streaming
-    if is_streaming:
-        # For streaming, wrap the iterator
-        logger.debug("Wrapping streaming response")
-        return PerplexityStreamWrapper(
-            response,
-            model,
-            request_time_dt,
-            transaction_id,
-            usage_metadata
-        )
-    else:
-        # For non-streaming, send metering data
-        logger.debug("Sending metering data for non-streaming response")
+    def meter(self, response) -> None:
         run_async_in_thread(
             send_perplexity_metering_data(
                 response=response,
-                model=model,
-                request_time_dt=request_time_dt,
-                transaction_id=transaction_id,
-                usage_metadata=usage_metadata,
-                is_streaming=False
-            )
-        )
-
-        return response
-
-
-class PerplexityStreamWrapper:
-    """Wrapper for Perplexity streaming responses to track usage."""
-
-    def __init__(self, stream, model, request_time_dt, transaction_id, usage_metadata):
-        self.stream = stream
-        self.model = model
-        self.request_time_dt = request_time_dt
-        self.transaction_id = transaction_id
-        self.usage_metadata = usage_metadata
-        self.chunks = []
-        self.last_chunk = None
-
-    def __iter__(self):
-        """Iterate over stream chunks and collect usage data."""
-        for chunk in self.stream:
-            self.chunks.append(chunk)
-            self.last_chunk = chunk
-            yield chunk
-
-        # After stream completes, send metering data
-        logger.debug("Stream completed, sending metering data")
-        run_async_in_thread(
-            send_perplexity_metering_data(
-                response=self.last_chunk,
                 model=self.model,
                 request_time_dt=self.request_time_dt,
                 transaction_id=self.transaction_id,
                 usage_metadata=self.usage_metadata,
-                is_streaming=True,
-                chunks=self.chunks
+                is_streaming=self.is_streaming,
             )
         )
+
+
+def perplexity_create_wrapper(wrapped, instance, args, kwargs):
+    if metering_skipped():
+        return wrapped(*args, **kwargs)
+
+    call = _NativeCall(kwargs)
+    response = wrapped(*args, **kwargs)
+    if call.is_streaming:
+        return MeteredStream(response, StreamMeter(call.meter))
+    call.meter(response)
+    return response
+
+
+def async_perplexity_create_wrapper(wrapped, instance, args, kwargs):
+    if metering_skipped():
+        return wrapped(*args, **kwargs)
+
+    call = _NativeCall(kwargs)
+
+    async def invoke():
+        response = await wrapped(*args, **kwargs)
+        if call.is_streaming:
+            return AsyncMeteredStream(response, StreamMeter(call.meter))
+        call.meter(response)
+        return response
+
+    return invoke()
 
 
 async def send_perplexity_metering_data(
@@ -152,7 +110,6 @@ async def send_perplexity_metering_data(
     transaction_id: str,
     usage_metadata: Dict[str, Any],
     is_streaming: bool,
-    chunks=None
 ):
     """
     Send metering data to Revenium for native Perplexity SDK.
@@ -163,17 +120,9 @@ async def send_perplexity_metering_data(
     if get_client() is None:
         return  # metering disabled (no API key configured)
     try:
-        # Extract usage data from response
-        if hasattr(response, 'usage') and response.usage:
-            usage = response.usage
-            input_tokens = getattr(usage, 'prompt_tokens', 0)
-            output_tokens = getattr(usage, 'completion_tokens', 0)
-            total_tokens = getattr(usage, 'total_tokens', input_tokens + output_tokens)
-        else:
+        if not getattr(response, 'usage', None):
             logger.warning("No usage data found in response")
-            input_tokens = 0
-            output_tokens = 0
-            total_tokens = 0
+        token_usage = extract_token_usage(response)
 
         # Get finish reason
         finish_reason = None
@@ -205,9 +154,9 @@ async def send_perplexity_metering_data(
             "model": model,
             "provider": provider_metadata["provider"],
             "operation_type": operation_type.value,
-            "input_token_count": input_tokens,
-            "output_token_count": output_tokens,
-            "total_token_count": total_tokens,
+            "input_token_count": token_usage["prompt_tokens"],
+            "output_token_count": token_usage["completion_tokens"],
+            "total_token_count": token_usage["total_tokens"],
             "stop_reason": stop_reason,
             "request_time": request_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "response_time": response_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -263,15 +212,21 @@ async def send_perplexity_metering_data(
             logger.warning(f"Error in metering call: {str(e)}")
 
 
-try:
-    import perplexity.resources.chat.completions  # noqa: F401
+NATIVE_COMPLETIONS_MODULE = "perplexity.resources.chat.completions"
+NATIVE_COMPLETIONS_WRAPPERS = (
+    ("CompletionsResource", perplexity_create_wrapper),
+    ("AsyncCompletionsResource", async_perplexity_create_wrapper),
+)
 
-    if register_patch("perplexity.resources.chat.completions.Completions.create"):
-        wrapt.wrap_function_wrapper(
-            'perplexity.resources.chat.completions',
-            'Completions.create',
-            perplexity_create_wrapper
+
+def patch_native_client() -> None:
+    for class_name, wrapper in NATIVE_COMPLETIONS_WRAPPERS:
+        wrap_registered(
+            f"{NATIVE_COMPLETIONS_MODULE}.{class_name}.create",
+            NATIVE_COMPLETIONS_MODULE,
+            f"{class_name}.create",
+            wrapper,
         )
-        logger.debug("Successfully patched native Perplexity SDK")
-except (ImportError, AttributeError) as e:
-    logger.debug(f"Native Perplexity SDK not available or incompatible: {e}")
+
+
+patch_native_client()

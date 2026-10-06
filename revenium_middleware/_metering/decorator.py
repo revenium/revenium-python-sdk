@@ -269,6 +269,17 @@ async def _send_tool_event_async(
     event_payload = _build_event_payload(
         tool_id, operation, duration_ms, success, error_message, usage_metadata, context
     )
+    tool_event = {"url": url, "key": key, "event_payload": event_payload}
+
+    from revenium_middleware._core.metering_buffer import (
+        buffer_deferred_event,
+        get_buffer,
+        is_delivery_deferred_to_buffer,
+    )
+
+    if is_delivery_deferred_to_buffer():
+        buffer_deferred_event("tool", tool_event)
+        return
 
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -290,12 +301,10 @@ async def _send_tool_event_async(
     except Exception as e:
         record_metering_error(e, operation="tool")
         try:
-            from revenium_middleware._core.metering_buffer import get_buffer, is_retryable_failure
+            from revenium_middleware._core.metering_buffer import is_retryable_failure
 
             if is_retryable_failure(e):
-                get_buffer().push(
-                    "tool", {"url": url, "key": key, "event_payload": event_payload}
-                )
+                get_buffer().push("tool", tool_event)
                 logger.error("metering error (event buffered for replay): %s", e)
                 return
         except Exception as buffer_exc:  # buffering must never mask the original error

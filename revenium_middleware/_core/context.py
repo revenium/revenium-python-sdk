@@ -134,26 +134,29 @@ def merge_metadata(api_metadata: Optional[Dict[str, Any]] = None) -> Dict[str, A
     Returns:
         Merged metadata dictionary with API-level metadata taking precedence
     """
-    injected = get_injected_metadata() or {}
-    api = api_metadata or {}
+    return overlay_metadata(get_injected_metadata(), api_metadata)
 
-    if injected and api:
+
+def overlay_metadata(base: Optional[Dict[str, Any]], override: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """``base`` with every field of ``override`` taking precedence, under either spelling."""
+    base = base or {}
+    override = override or {}
+
+    if base and override:
         # Merging by literal key alone keeps a scoped ``agent_version``
         # alongside a direct ``agentVersion``. The alias precedence applied
         # downstream then picks whichever spelling it looks for first, which
-        # can resolve the scoped value and invert the precedence documented
-        # above. Drop scoped keys the direct call already supplies under any
-        # spelling, so the direct value is the only one left to resolve.
-        api_keys = {_canonical_metadata_key(key) for key in api}
-        injected = {
+        # can resolve the base value and invert the precedence. Drop base
+        # keys the override already supplies under any spelling, so the
+        # override is the only one left to resolve.
+        override_keys = {_canonical_metadata_key(key) for key in override}
+        base = {
             key: value
-            for key, value in injected.items()
-            if _canonical_metadata_key(key) not in api_keys
+            for key, value in base.items()
+            if _canonical_metadata_key(key) not in override_keys
         }
 
-    # Start with injected metadata, then override with API-level metadata
-    merged = {**injected, **api}
-    return merged
+    return {**base, **override}
 
 
 def get_idempotency_key() -> Optional[str]:
