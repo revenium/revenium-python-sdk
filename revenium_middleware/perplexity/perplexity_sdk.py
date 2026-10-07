@@ -68,6 +68,7 @@ class _NativeCall:
                 response=response,
                 model=self.model,
                 request_time_dt=self.request_time_dt,
+                response_time_dt=datetime.datetime.now(datetime.timezone.utc),
                 transaction_id=self.transaction_id,
                 usage_metadata=self.usage_metadata,
                 is_streaming=self.is_streaming,
@@ -107,6 +108,7 @@ async def send_perplexity_metering_data(
     response,
     model: str,
     request_time_dt: datetime.datetime,
+    response_time_dt: datetime.datetime,
     transaction_id: str,
     usage_metadata: Dict[str, Any],
     is_streaming: bool,
@@ -132,8 +134,6 @@ async def send_perplexity_metering_data(
         # Map to Revenium stop reason
         stop_reason = get_stop_reason(finish_reason)
 
-        # Calculate duration
-        response_time_dt = datetime.datetime.now(datetime.timezone.utc)
         duration_ms = int((response_time_dt - request_time_dt).total_seconds() * 1000)
 
         # Get provider metadata

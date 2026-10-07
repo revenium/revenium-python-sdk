@@ -45,7 +45,7 @@ import pytest
 pytest.importorskip("litellm")
 pytest.importorskip("fastapi")
 
-from unittest.mock import MagicMock, patch  # noqa: E402
+from unittest.mock import AsyncMock, MagicMock, patch  # noqa: E402
 
 import litellm  # noqa: E402
 from litellm.proxy.common_request_processing import (  # noqa: E402
@@ -137,6 +137,35 @@ def logging_kwargs(
     }
 
 
+CHAT_COMPLETIONS_ROUTE = "/v1/chat/completions"
+
+
+async def run_deferred_stream(captured_data, assembled_response):
+    """Play the proxy finishing a ``/v1/chat/completions`` stream.
+
+    This is the vendor's own closure body, so the guardrail is reached only if
+    LiteLLM still dispatches the assembled response to it.
+    """
+    await ProxyBaseLLMRequestProcessing._run_deferred_stream_guardrails(
+        captured_data=captured_data,
+        captured_user_api_key_dict=make_key_dict(request_route=CHAT_COMPLETIONS_ROUTE),
+        captured_logging_obj=success_dispatcher(),
+        assembled_response=assembled_response,
+        cache_hit=False,
+    )
+
+
+def success_dispatcher():
+    """The logging object the vendor hands success logging to once the hooks ran.
+
+    Its ``dispatch_success_handlers`` must return a coroutine, because the
+    vendor schedules it with ``asyncio.create_task``.
+    """
+    logging_obj = MagicMock()
+    logging_obj.dispatch_success_handlers = AsyncMock()
+    return logging_obj
+
+
 @pytest.fixture
 def guardrail():
     from revenium_middleware.litellm.proxy import _metering_owner
@@ -208,12 +237,9 @@ class TestStreamedCallIsMeteredOnce:
         response = GuardrailResponse(
             response_id="chatcmpl-stream", usage=AssembledUsage()
         )
-        await ProxyBaseLLMRequestProcessing._run_deferred_stream_guardrails(
+        await run_deferred_stream(
             captured_data=data,
-            captured_user_api_key_dict=make_key_dict(),
-            captured_logging_obj=MagicMock(),
             assembled_response=response,
-            cache_hit=False,
         )
         args = submitted_args(submit)
         assert args["input_token_count"] == 21
@@ -227,12 +253,9 @@ class TestStreamedCallIsMeteredOnce:
     async def test_streamed_rows_are_flagged_as_streamed(self, registered, submit):
         """``is_streamed`` is what separates a stream from a plain completion."""
         data = guardrail_data(stream=True)
-        await ProxyBaseLLMRequestProcessing._run_deferred_stream_guardrails(
+        await run_deferred_stream(
             captured_data=data,
-            captured_user_api_key_dict=make_key_dict(),
-            captured_logging_obj=MagicMock(),
             assembled_response=GuardrailResponse(usage=AssembledUsage()),
-            cache_hit=False,
         )
         assert submitted_args(submit)["is_streamed"] is True
 
@@ -256,13 +279,12 @@ class TestStreamedCallIsMeteredOnce:
         not escape.
         """
         submit.side_effect = Exception("metering API down")
-        await ProxyBaseLLMRequestProcessing._run_deferred_stream_guardrails(
+        await run_deferred_stream(
             captured_data=guardrail_data(stream=True),
-            captured_user_api_key_dict=make_key_dict(),
-            captured_logging_obj=MagicMock(),
             assembled_response=GuardrailResponse(usage=AssembledUsage()),
-            cache_hit=False,
         )
+
+        assert submit.call_count == 1
 
 
 @pytest.mark.skipif(
@@ -476,12 +498,9 @@ class TestOneRowPerCallAcrossBothHooks:
         kwargs, data = self._one_call(call_type="acompletion")
         response = GuardrailResponse(response_id="chatcmpl-stream", usage=AssembledUsage())
 
-        await ProxyBaseLLMRequestProcessing._run_deferred_stream_guardrails(
+        await run_deferred_stream(
             captured_data=data,
-            captured_user_api_key_dict=make_key_dict(),
-            captured_logging_obj=MagicMock(),
             assembled_response=response,
-            cache_hit=False,
         )
         await registered.async_log_success_event(kwargs, response, NOW, LATER)
 

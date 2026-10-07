@@ -38,16 +38,7 @@ def _configure_logging():
 
     log_level = level_mapping.get(log_level_str, logging.INFO)
 
-    # Configure the revenium middleware logger
-    revenium_logger = logging.getLogger("revenium_middleware")
-    revenium_logger.setLevel(log_level)
-
-    # Only add handler if none exists to avoid duplicate logs
-    if not revenium_logger.handlers:
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter("%(name)s - %(levelname)s - %(message)s")
-        handler.setFormatter(formatter)
-        revenium_logger.addHandler(handler)
+    logging.getLogger("revenium_middleware").setLevel(log_level)
 
     return log_level
 

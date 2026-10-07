@@ -6,7 +6,7 @@ import threading
 import contextvars
 import atexit
 import math
-from typing import Literal, Awaitable, Any, Dict, Optional, Callable
+from typing import Literal, Awaitable, Any, Dict, Optional, Callable, Tuple
 
 import httpx
 
@@ -14,7 +14,7 @@ from revenium_middleware._metering import ReveniumMetering
 from revenium_middleware._core.config import Config, read_env_number, validate_api_key
 from revenium_middleware._core import metering_buffer, metering_pool
 from revenium_middleware._core.metering_pool import MeteringTask
-from revenium_middleware._core.shutdown_signals import install_requested_signal_handlers
+from revenium_middleware._core.shutdown_signals import install_requested_signal_handlers, terminate_if_deferred
 
 # Get the logger that was configured in __init__.py
 logger = logging.getLogger("revenium_middleware")
@@ -182,26 +182,88 @@ def shutdown_budget_seconds() -> float:
     )
 
 
+class _ExitDrain:
+    """The one exit drain: its budget and deadline, the thread running it, and when it is over."""
+
+    def __init__(self, budget: float):
+        self.budget = budget
+        self.deadline = time.monotonic() + budget
+        self.thread = threading.current_thread()
+        self.over = threading.Event()
+
+
+# Reentrant because the opt-in SIGTERM handler runs on the main thread,
+# possibly inside this lock.
+_exit_lock = threading.RLock()
+_running_exit_drain: Optional[_ExitDrain] = None
+
+
 def handle_exit() -> None:
-    """Deliver queued metering, build overflowed events and flush the buffer, within one shared budget."""
-    if shutdown_event.is_set():
-        return
+    """Deliver queued metering, build overflowed events and flush the buffer, within one shared budget.
 
+    Runs once. A call made while the drain runs on another thread waits for
+    it, until its deadline; one made on the drain's own thread returns at once.
+    """
+    drain_or_await_exit()
+
+
+def drain_or_await_exit() -> bool:
+    """Run the exit drain, or wait for the one running; False when it runs underneath this call, on this thread.
+
+    That is the opt-in SIGTERM handler interrupting the drain: it must not
+    end the process before the interrupted drain finishes.
+    """
+    drain, started_here = _start_or_join_exit_drain()
+    if drain is None:
+        return True
+    if not started_here:
+        if drain.thread is threading.current_thread():
+            return False
+        drain.over.wait(_seconds_left(drain.deadline))
+        return True
+    try:
+        _drain_within(drain.budget, drain.deadline)
+    finally:
+        drain.over.set()
+        _end_exit_drain()
+        terminate_if_deferred()
+    return True
+
+
+def _start_or_join_exit_drain() -> Tuple[Optional[_ExitDrain], bool]:
+    global _running_exit_drain
+    with _exit_lock:
+        if _running_exit_drain is not None:
+            return _running_exit_drain, False
+        if shutdown_event.is_set():
+            return None, False
+        _running_exit_drain = _ExitDrain(shutdown_budget_seconds())
+        return _running_exit_drain, True
+
+
+def _end_exit_drain() -> None:
+    global _running_exit_drain
+    with _exit_lock:
+        _running_exit_drain = None
+
+
+def _drain_within(budget: float, deadline: float) -> None:
     logger.debug("Shutdown initiated, waiting for metering calls to complete...")
-    budget = shutdown_budget_seconds()
-    deadline = time.monotonic() + budget
-
-    # Both run before shutdown_event is set: every integration's metering
-    # coroutine returns early once it sees the event, so a queued event, or
-    # an overflowed one the buffer has not built yet, would be dropped.
-    undelivered = _drain_worker_queue(deadline) + _build_overflow(deadline)
+    # Both run before shutdown_event is set: the provider integrations'
+    # metering coroutines return early once they see it, so a queued event,
+    # or an overflowed one the buffer has not built yet, would be dropped.
+    # The LiteLLM guardrail and proxy callbacks and tool events do not check
+    # it and are sent whenever they run.
+    queued = _drain_worker_queue(deadline)
+    lost_before = _overflow_lost_to_deadlines()
+    _build_overflow(deadline)
     shutdown_event.set()
     # Last, so events that exhausted retries, including those of the queue
     # drain above, get a final attempt.
-    _drain_buffer(deadline)
+    undelivered = queued + _drain_buffer(deadline) + _overflow_lost_to_deadlines() - lost_before
     if undelivered:
         logger.warning(
-            "%d metering event(s) still queued, in flight or unbuilt after the %ss shutdown budget (%s); "
+            "%d metering event(s) still queued, in flight, unbuilt or unsent after the %ss shutdown budget (%s); "
             "their usage may not be delivered.",
             undelivered, budget, Config.ENV_REVENIUM_SHUTDOWN_TIMEOUT_SECONDS,
         )
@@ -217,26 +279,35 @@ def _drain_worker_queue(deadline: float) -> int:
     return metering_pool.drain(_seconds_left(deadline))
 
 
-def _build_overflow(deadline: float) -> int:
-    """Build the buffer's overflowed tasks until ``deadline``; return how many are left unbuilt."""
+def _build_overflow(deadline: float) -> None:
+    """Build the buffer's overflowed tasks until ``deadline``; the final flush counts any left unbuilt."""
     try:
         if metering_buffer._buffer is not None:
-            return metering_buffer._buffer.build_all_overflow(deadline_seconds=_seconds_left(deadline))
+            metering_buffer._buffer.build_all_overflow(deadline_seconds=_seconds_left(deadline))
     except Exception as e:
         logger.debug("Building overflowed metering events during shutdown failed: %s", e)
-    return 0
 
 
-def _drain_buffer(deadline: float) -> None:
+def _overflow_lost_to_deadlines() -> int:
+    buffer = metering_buffer._buffer
+    return 0 if buffer is None else buffer.overflow_lost_to_deadlines()
+
+
+def _drain_buffer(deadline: float) -> int:
+    """Flush the buffer until ``deadline``; return how many events it still holds or is still building."""
+    buffer = metering_buffer._buffer
+    if buffer is None:
+        return 0
     try:
-        if metering_buffer._buffer is not None:
-            metering_buffer._buffer.flush(deadline_seconds=_seconds_left(deadline))
+        remaining = buffer.flush(deadline_seconds=_seconds_left(deadline))["remaining"]
     except Exception as e:
         logger.debug("Metering buffer drain during shutdown failed: %s", e)
+        remaining = buffer.undelivered()
+    return remaining + buffer.overflow_in_build()
 
 
 atexit.register(handle_exit)
-install_requested_signal_handlers(handle_exit)
+install_requested_signal_handlers(drain_or_await_exit)
 
 
 async def _run_sync_callable(func: Callable[[], Any]) -> Any:

@@ -1,5 +1,6 @@
 """A LangChain Ollama model with the Revenium callback is metered once, by
-the Ollama transport wrap (BACK-3604 on top of BACK-3582).
+the Ollama transport wrap (BACK-3604 on top of BACK-3582), and that record
+keeps the attribution given to the callback (BACK-3913).
 
 ChatOllama calls ``ollama.Client``/``AsyncClient``, which the Ollama
 middleware now meters, so the callback must stand down. ``OllamaClientChatModel``
@@ -158,3 +159,13 @@ def test_an_ollama_model_the_transport_never_sees_keeps_its_callback_record(stub
     assert len(all_records) == 1
     assert all_records[0]["provider"] == "OLLAMA"
     assert all_records[0]["transaction_id"].startswith("langchain-")
+
+
+@pytest.mark.parametrize("call, _streamed", MODES, ids=[mode.__name__ for mode, _ in MODES])
+def test_the_transport_record_carries_the_callback_attribution(stub, all_records, call, _streamed):
+    handler = ReveniumCallbackHandler(usage_metadata={"organizationName": "org-callback", "traceId": "trace-callback"})
+    model = OllamaClientChatModel(transport=httpx.MockTransport(stub.respond), callbacks=[handler])
+    assert call(model) == "hi"
+    assert_one_transport_record(stub, all_records)
+    assert all_records[0]["organization_name"] == "org-callback"
+    assert all_records[0]["trace_id"] == "trace-callback"

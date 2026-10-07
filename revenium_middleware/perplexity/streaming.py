@@ -2,9 +2,12 @@
 
 Both clients return a Stainless ``Stream`` / ``AsyncStream`` of OpenAI-shaped chunks
 with usage on the last one. The proxies keep that object's interface (iteration,
-context manager, ``close()``, ``.response``) and meter the call once.
+context manager, ``close()``, ``.response``) and meter the call once: when a read
+reaches the end, on ``close()``, or when the caller drops the stream part-way.
 """
+import contextvars
 import logging
+import weakref
 from types import SimpleNamespace
 from typing import Any, Callable
 
@@ -33,6 +36,23 @@ class StreamMeter:
         for choice in getattr(chunk, 'choices', None) or ():
             self._finish_reason = getattr(choice, 'finish_reason', None) or self._finish_reason
 
+    def meter_when_dropped(self, proxy) -> None:
+        """Meter once ``proxy`` is collected, for a caller that stops reading without closing it.
+
+        The record is built in the context the stream was created in, not the one that happens to drop it,
+        so it keeps the caller's job and trace fields.
+        """
+        finalizer = weakref.finalize(proxy, self._meter_dropped, contextvars.copy_context())
+        # A stream still referenced at exit was not abandoned, and its record could only be refused by the
+        # SDK's own exit flush, which may already have run.
+        finalizer.atexit = False
+
+    def _meter_dropped(self, creation_context: contextvars.Context) -> None:
+        try:
+            creation_context.run(self.meter)
+        except Exception as e:
+            logger.warning("Error metering a dropped Perplexity stream: %s", e)
+
     def meter(self) -> None:
         if self._metered or not self._saw_chunk:
             return
@@ -48,6 +68,7 @@ class MeteredStream:
         self._stream = stream
         self._iterator = iter(stream)
         self._meter = meter
+        meter.meter_when_dropped(self)
 
     def __iter__(self):
         return self
@@ -83,6 +104,7 @@ class AsyncMeteredStream:
         self._stream = stream
         self._iterator = stream.__aiter__()
         self._meter = meter
+        meter.meter_when_dropped(self)
 
     def __aiter__(self):
         return self

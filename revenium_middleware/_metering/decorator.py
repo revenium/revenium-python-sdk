@@ -150,10 +150,11 @@ def _build_event_payload(
     error_message: Optional[str],
     usage_metadata: Optional[Dict[str, Any]],
     context: ReveniumContext,
+    occurred_at: datetime,
 ) -> Dict[str, Any]:
     """Build the event payload for the metering API."""
     transaction_id = context.transaction_id or str(uuid.uuid4())
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    timestamp = occurred_at.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     event_payload: Dict[str, Any] = {
         "transactionId": transaction_id,
@@ -205,8 +206,7 @@ def _dispatch_tool_event(**event_kwargs: Any) -> None:
 
     Tool metering must never block the wrapped call -- the same guarantee
     AI-completion metering provides by dispatching via run_async_in_thread.
-    The metering thread is joined during SDK shutdown, so events still flush
-    on process exit.
+    At exit the shutdown drain gives queued events its budget to be sent.
     """
     try:
         # Imported lazily: this module is part of revenium_middleware's import
@@ -227,7 +227,7 @@ def _dispatch_tool_event(**event_kwargs: Any) -> None:
                 "(set REVENIUM_METERING_API_KEY or call configure())"
             )
             return
-        coro = _send_tool_event_async(url, key, **event_kwargs)
+        coro = _send_tool_event_async(url, key, occurred_at=datetime.now(timezone.utc), **event_kwargs)
     except Exception as e:
         record_metering_error(e, operation="tool")
         # Non-blocking - just log and continue
@@ -259,15 +259,17 @@ async def _send_tool_event_async(
     error_message: Optional[str],
     usage_metadata: Optional[Dict[str, Any]],
     context: ReveniumContext,
+    occurred_at: datetime,
 ) -> None:
     """
     Async version of _send_tool_event for use in async contexts.
 
-    Uses httpx.AsyncClient to avoid blocking the event loop. The endpoint and
-    key are resolved by the dispatcher at enqueue time and passed in.
+    Uses httpx.AsyncClient to avoid blocking the event loop. The endpoint, the
+    key and the event's ``occurred_at`` are resolved by the dispatcher at
+    enqueue time and passed in.
     """
     event_payload = _build_event_payload(
-        tool_id, operation, duration_ms, success, error_message, usage_metadata, context
+        tool_id, operation, duration_ms, success, error_message, usage_metadata, context, occurred_at
     )
     tool_event = {"url": url, "key": key, "event_payload": event_payload}
 
@@ -281,8 +283,10 @@ async def _send_tool_event_async(
         buffer_deferred_event("tool", tool_event)
         return
 
+    from revenium_middleware._core.metering import metering_client_timeout
+
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=metering_client_timeout()) as client:
             response = await client.post(
                 url,
                 headers={

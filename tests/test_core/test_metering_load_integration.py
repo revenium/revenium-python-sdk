@@ -27,8 +27,9 @@ QUEUE_SIZE = 10
 RATE_PER_SECOND = 20
 SECONDS = 3.0
 NON_ROUTABLE = "http://10.255.255.1:81/meter/"
-# The buffer's flush thread, started by the first buffered event.
-OTHER_THREADS = 1
+# The buffer's flush thread, started by the first buffered event, and its
+# overflow build thread, started by the first overflowed one.
+OTHER_THREADS = 2
 
 
 @pytest.fixture

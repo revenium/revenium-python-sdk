@@ -6,6 +6,8 @@ own graceful shutdown (uvicorn, the LiteLLM proxy's spend-log flush). The
 exit drain also joined each metering thread for 5s, one after another; since
 BACK-3904 it waits for the worker pool's queue within the same single budget.
 """
+import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -16,12 +18,13 @@ import textwrap
 import threading
 import time
 
+import httpx
 import pytest
 
 from revenium_middleware._core import metering, metering_buffer, metering_pool
 from revenium_middleware._core.config import Config
 from revenium_middleware._core.metering_buffer import MeteringBuffer
-from revenium_middleware._core.metering_pool import MeteringWorkerPool
+from revenium_middleware._core.metering_pool import MeteringTask, MeteringWorkerPool
 from revenium_middleware._core.shutdown_signals import chain_sigterm
 
 BUDGET_ENV = Config.ENV_REVENIUM_SHUTDOWN_TIMEOUT_SECONDS
@@ -151,6 +154,91 @@ def test_default_sigterm_without_opt_in_terminates_without_a_drain():
     assert lines == []
 
 
+SIGTERM_WHILE_HOLDING_CHILD = textwrap.dedent("""
+    import os, signal, sys, time
+
+    from revenium_middleware._core import metering_buffer, metering_status
+    from revenium_middleware._core.metering_buffer import MeteringBuffer
+
+    def say(word):
+        os.write(1, (word + "\\n").encode())
+
+    buffer = MeteringBuffer(max_size=10, flush_interval=9999.0, replay_fn=lambda event, timeout: say("replayed"))
+    buffer.push("ai", {"seq": "pending"})
+    metering_buffer._buffer = buffer
+    in_progress = metering_buffer._OverflowBuild([])
+    buffer._active_builds.add(in_progress)
+    held = {"buffer": buffer._lock, "status": metering_status._lock, "overflow-build": in_progress._lock}[sys.argv[1]]
+
+    with held:
+        signal.raise_signal(signal.SIGTERM)
+    say("survived")
+""")
+
+
+@posix_signals
+@pytest.mark.parametrize("held", ["buffer", "status", "overflow-build"])
+def test_opt_in_sigterm_drains_even_when_it_interrupts_the_main_thread_inside_a_drain_lock(held):
+    """The handler runs the drain on the main thread, which may be inside one of the locks the drain takes."""
+    env = _child_env(**{OPT_IN_ENV: "1", BUDGET_ENV: "2"})
+    completed = subprocess.run([sys.executable, "-c", SIGTERM_WHILE_HOLDING_CHILD, held], capture_output=True,
+                               text=True, timeout=30, env=env)
+
+    assert completed.returncode == -signal.SIGTERM, completed.stderr[-2000:]
+    assert completed.stdout.split() == ["replayed"]
+
+
+SIGTERM_DURING_DRAIN_CHILD = textwrap.dedent("""
+    import os, sys, threading, time
+
+    from revenium_middleware._core import metering, metering_buffer
+    from revenium_middleware._core.metering_buffer import MeteringBuffer
+
+    def say(word):
+        os.write(1, (word + "\\n").encode())
+
+    def slow_replay(event, timeout):
+        seq = event.payload["seq"]
+        say("replaying-%d" % seq)
+        time.sleep(0.5)
+        say("replayed-%d" % seq)
+
+    buffer = MeteringBuffer(max_size=10, flush_interval=9999.0, replay_fn=slow_replay)
+    for seq in range(3):
+        buffer.push("ai", {"seq": seq})
+    metering_buffer._buffer = buffer
+
+    if sys.argv[1] == "drain-on-another-thread":
+        threading.Thread(target=metering.handle_exit).start()
+        while True:
+            time.sleep(0.05)
+""")
+
+
+@posix_signals
+@pytest.mark.parametrize("drain_runs", ["atexit-on-the-main-thread", "drain-on-another-thread"])
+def test_a_sigterm_during_the_exit_drain_lets_it_send_the_remaining_records_first(drain_runs):
+    """The opt-in handler used to run a second drain under the interrupted one, which waited on the
+    flush lock its own thread held until the deadline, then ended the process before the rest were sent."""
+    env = _child_env(**{OPT_IN_ENV: "1", BUDGET_ENV: "10"})
+    child = subprocess.Popen([sys.executable, "-c", SIGTERM_DURING_DRAIN_CHILD, drain_runs], stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, env=env)
+    try:
+        assert child.stdout.readline().strip() == "replaying-0"
+        signalled = time.monotonic()
+        child.send_signal(signal.SIGTERM)
+        stdout, stderr = child.communicate(timeout=60)
+        elapsed = time.monotonic() - signalled
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.communicate()
+
+    assert stdout.split() == ["replayed-0", "replaying-1", "replayed-1", "replaying-2", "replayed-2"], stderr[-2000:]
+    assert child.returncode == -signal.SIGTERM
+    assert elapsed < 5
+
+
 UVICORN_HOST = textwrap.dedent("""
     import os, uvicorn
 
@@ -245,7 +333,8 @@ def test_drain_with_many_queued_events_finishes_within_one_budget(isolated_shutd
     assert budget - 0.05 <= elapsed < budget + 0.5
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
-    assert warnings[0].startswith("10 metering event(s) still queued, in flight or unbuilt after the 0.5s shutdown budget")
+    assert warnings[0].startswith(
+        "10 metering event(s) still queued, in flight, unbuilt or unsent after the 0.5s shutdown budget")
 
 
 def test_drain_waits_for_events_that_finish_inside_the_budget(isolated_shutdown, monkeypatch, caplog):
@@ -317,6 +406,131 @@ def test_drain_gives_up_on_a_flush_still_running_at_the_deadline(isolated_shutdo
     assert buffer.stats()["size"] == 1
 
 
+def _unreachable(event, timeout):
+    raise httpx.ConnectError("metering endpoint unreachable")
+
+
+def _shutdown_warnings(caplog):
+    return [r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and "shutdown budget" in r.getMessage()]
+
+
+def test_a_failed_final_replay_is_counted_in_the_shutdown_warning(isolated_shutdown, monkeypatch, caplog):
+    monkeypatch.setenv(BUDGET_ENV, "1")
+    buffer = MeteringBuffer(max_size=10, flush_interval=9999.0, replay_fn=_unreachable)
+    buffer.push("ai", {"seq": "unsent"})
+    monkeypatch.setattr(metering_buffer, "_buffer", buffer)
+
+    with caplog.at_level(logging.WARNING, logger="revenium_middleware"):
+        metering.handle_exit()
+
+    assert [w.split(" metering event(s)")[0] for w in _shutdown_warnings(caplog)] == ["1"]
+
+
+def test_records_a_background_replay_still_holds_at_the_deadline_are_counted_in_the_shutdown_warning(
+    isolated_shutdown, monkeypatch, caplog
+):
+    monkeypatch.setenv(BUDGET_ENV, "0.3")
+    release = threading.Event()
+    replaying = threading.Barrier(5)
+
+    def stuck(event, timeout):
+        replaying.wait(5)
+        release.wait(10)
+
+    buffer = MeteringBuffer(max_size=10, flush_interval=9999.0, replay_fn=stuck, replay_concurrency=4)
+    for seq in range(4):
+        buffer.push("ai", {"seq": seq})
+    monkeypatch.setattr(metering_buffer, "_buffer", buffer)
+    background = threading.Thread(target=buffer.flush, daemon=True)
+    background.start()
+    replaying.wait(5)
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="revenium_middleware"):
+            metering.handle_exit()
+    finally:
+        release.set()
+        background.join(5)
+
+    assert [w.split(" metering event(s)")[0] for w in _shutdown_warnings(caplog)] == ["4"]
+    assert buffer.undelivered() == 0
+
+
+def test_the_final_flush_stops_at_the_first_refused_record_and_the_warning_counts_the_rest(
+    isolated_shutdown, monkeypatch, caplog
+):
+    monkeypatch.setenv(BUDGET_ENV, "1")
+    attempts = []
+
+    def unreachable(event, timeout):
+        attempts.append(event.payload["seq"])
+        _unreachable(event, timeout)
+
+    buffer = MeteringBuffer(max_size=10, flush_interval=9999.0, replay_fn=unreachable)
+    for seq in range(3):
+        buffer.push("ai", {"seq": seq})
+    monkeypatch.setattr(metering_buffer, "_buffer", buffer)
+
+    with caplog.at_level(logging.WARNING, logger="revenium_middleware"):
+        metering.handle_exit()
+
+    assert attempts == [0]
+    assert [w.split(" metering event(s)")[0] for w in _shutdown_warnings(caplog)] == ["3"]
+
+
+def test_the_shutdown_warning_counts_queued_unbuilt_and_unsent_events_once_each(isolated_shutdown, monkeypatch, caplog):
+    monkeypatch.setenv(BUDGET_ENV, "0.3")
+    release = threading.Event()
+    _queue_blocked_events(monkeypatch, 3, release, workers=1)
+    buffer = MeteringBuffer(max_size=10, flush_interval=9999.0, replay_fn=_unreachable)
+    buffer.push("ai", {"seq": "unsent"})
+
+    async def blocked_build():
+        release.wait(10)
+
+    overflowed = [MeteringTask(blocked_build(), contextvars.copy_context()) for _ in range(2)]
+    for task in overflowed:
+        buffer.push_overflow(task)
+    monkeypatch.setattr(metering_buffer, "_buffer", buffer)
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="revenium_middleware"):
+            metering.handle_exit()
+    finally:
+        release.set()
+        for task in overflowed:
+            task.discard()
+
+    assert [w.split(" metering event(s)")[0] for w in _shutdown_warnings(caplog)] == ["6"]
+
+
+def test_a_build_the_deadline_cuts_short_on_the_exiting_thread_is_counted_in_the_shutdown_warning(
+    isolated_shutdown, monkeypatch, caplog
+):
+    monkeypatch.setenv(BUDGET_ENV, "0.3")
+
+    def refuse(thread):
+        raise RuntimeError("can't create new thread at interpreter shutdown")
+
+    monkeypatch.setattr(threading.Thread, "start", refuse)
+    buffer = MeteringBuffer(max_size=10, flush_interval=9999.0, replay_fn=lambda event, timeout: None)
+
+    async def awaits_past_the_budget():
+        await asyncio.sleep(5)
+
+    task = MeteringTask(awaits_past_the_budget(), contextvars.copy_context())
+    buffer.push_overflow(task)
+    monkeypatch.setattr(metering_buffer, "_buffer", buffer)
+
+    with caplog.at_level(logging.WARNING, logger="revenium_middleware"):
+        metering.handle_exit()
+
+    assert not task.is_alive()
+    assert buffer.stats()["size"] == 0
+    assert [w.split(" metering event(s)")[0] for w in _shutdown_warnings(caplog)] == ["1"]
+
+
 COMPLETION_ARGS = {
     "completion_start_time": "2026-10-06T00:00:00Z", "cost_type": "AI", "input_token_count": 1,
     "is_streamed": False, "model": "gpt-test", "output_token_count": 1, "provider": "OPENAI",
@@ -329,7 +543,6 @@ COMPLETION_ARGS = {
 def test_drain_against_a_failing_endpoint_sends_once_and_stays_within_the_budget(isolated_shutdown, monkeypatch):
     """The metering client retries a 503 twice with backoff, which alone
     outlasts a one-second budget; the replay must make a single attempt."""
-    import httpx
     from revenium_middleware._metering import ReveniumMetering
 
     budget = 1.0
@@ -380,3 +593,261 @@ def test_invalid_shutdown_budget_falls_back_to_the_default(monkeypatch, caplog, 
 
     assert budget == metering.DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
     assert f"Invalid {BUDGET_ENV}" in caplog.text
+
+
+class _MeteringStub:
+    """A local metering endpoint that records the transaction id of every completion it receives."""
+
+    def __init__(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        received = self.received = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                received.append(body["transactionId"])
+                reply = json.dumps({"id": "m", "label": "m", "resourceType": "metering", "signature": "s"}).encode()
+                self.send_response(201)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(reply)))
+                self.end_headers()
+                self.wfile.write(reply)
+
+            def log_message(self, *args):
+                pass
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self.base_url = f"http://127.0.0.1:{self._server.server_address[1]}/meter/"
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._server.shutdown()
+        self._server.server_close()
+
+
+OVERFLOW_AT_EXIT_CHILD = textwrap.dedent("""
+    import atexit, sys, threading, time
+
+    drain_started = []
+    atexit.register(lambda: print("drain-seconds %.3f" % (time.monotonic() - drain_started[0])))
+
+    from revenium_middleware._core import metering, metering_pool
+    from revenium_middleware._core.metering_buffer import get_buffer_stats
+    from revenium_middleware._core.metering_submission import submit_ai_event
+
+    ARGS = {args}
+    OVERFLOWED = {overflowed}
+
+    async def occupy_the_worker():
+        time.sleep(0.3)
+
+    async def integration_style_call(n):
+        if metering.shutdown_event.is_set():
+            return
+        submit_ai_event("completion", dict(ARGS, transaction_id="txn-%d" % n))
+
+    def overflow():
+        metering.run_async_in_thread(occupy_the_worker())
+        pool = metering_pool.get_pool(metering.shutdown_event.is_set)
+        while pool._queue.qsize():
+            time.sleep(0.01)
+        for n in range(OVERFLOWED + 1):
+            metering.run_async_in_thread(integration_style_call(n))
+        assert get_buffer_stats()["total_overflowed"] == OVERFLOWED, get_buffer_stats()
+
+    def refuse_new_threads_like_python_3_12_0_to_3_12_2():
+        def refuse(thread):
+            raise RuntimeError("can't create new thread at interpreter shutdown")
+        threading.Thread.start = refuse
+
+    atexit.register(lambda: drain_started.append(time.monotonic()))
+    if sys.argv[1] == "while-running":
+        overflow()
+    else:
+        metering.run_async_in_thread(integration_style_call(-1)).join(5)
+        atexit.register(overflow)
+    atexit.register(refuse_new_threads_like_python_3_12_0_to_3_12_2)
+""")
+
+
+STUCK_DELIVERY_CHILD = textwrap.dedent("""
+    import contextvars, time
+
+    from revenium_middleware._core import metering
+    from revenium_middleware._core.metering_buffer import get_buffer
+    from revenium_middleware._core.metering_pool import MeteringTask
+
+    async def never_finishes():
+        time.sleep(3600)
+
+    metering.run_async_in_thread(never_finishes())
+    get_buffer().push_overflow(MeteringTask(never_finishes(), contextvars.copy_context()))
+""")
+
+
+def test_the_interpreter_exits_with_a_delivery_stuck_on_every_metering_thread():
+    """Worker, build and flush threads are daemons: a stuck one cannot hold the process past the exit budget."""
+    started = time.monotonic()
+    completed = subprocess.run([sys.executable, "-c", STUCK_DELIVERY_CHILD], capture_output=True, text=True,
+                               timeout=60, env=_child_env(REVENIUM_METERING_WORKERS="1", **{BUDGET_ENV: "0.5"}))
+
+    assert completed.returncode == 0, completed.stderr[-2000:]
+    assert time.monotonic() - started < 30
+
+
+@pytest.mark.parametrize("overflowed_when", ["while-running", "during-atexit"])
+def test_records_overflowed_before_exit_are_delivered_when_exit_cannot_start_a_thread(overflowed_when):
+    """Python 3.12.0 to 3.12.2 refuse to start a thread from atexit, where the drain used to build overflowed records."""
+    overflowed, budget = 5, 2.0
+    args = {key: value for key, value in COMPLETION_ARGS.items() if key not in ("transaction_id", "extra_headers")}
+    child_source = OVERFLOW_AT_EXIT_CHILD.format(args=repr(args), overflowed=overflowed)
+    with _MeteringStub() as stub:
+        env = _child_env(REVENIUM_METERING_BASE_URL=stub.base_url, REVENIUM_METERING_WORKERS="1",
+                         REVENIUM_METERING_QUEUE_SIZE="1", **{BUDGET_ENV: str(budget)})
+        completed = subprocess.run([sys.executable, "-c", child_source, overflowed_when], capture_output=True,
+                                   text=True, timeout=60, env=env)
+
+    assert completed.returncode == 0, completed.stderr[-2000:]
+    first = 0 if overflowed_when == "while-running" else -1
+    assert sorted(stub.received) == sorted(f"txn-{n}" for n in range(first, overflowed + 1)), completed.stderr[-2000:]
+    assert "still queued" not in completed.stderr
+    drain_seconds = float(completed.stdout.split("drain-seconds")[-1])
+    assert drain_seconds < budget
+
+
+class _RecordsWhenBuilt:
+    """An overflowed task that, like an integration's coroutine, skips itself once shutdown_event is set."""
+
+    def __init__(self, seq):
+        self.seq = seq
+        self.outcome = None
+
+    def materialize(self, enqueued_at, timeout=None):
+        if metering.shutdown_event.is_set():
+            self.outcome = "skipped"
+            return
+        self.outcome = "built"
+        with metering_buffer.delivery_deferred_to_buffer(enqueued_at):
+            metering_buffer.buffer_deferred_event("ai", {"seq": self.seq})
+
+    def discard(self):
+        self.outcome = "discarded"
+
+
+def test_shutdown_builds_a_task_a_running_flush_took_out_of_the_buffer(isolated_shutdown, monkeypatch, caplog):
+    """A periodic flush moves an overflow task it meets mid-replay aside, to build after replaying;
+    shutdown must take it over then, or it is built after shutdown_event, skips itself and goes uncounted."""
+    monkeypatch.setenv(BUDGET_ENV, "0.5")
+    replaying = {seq: threading.Event() for seq in ("first", "second")}
+    release = {seq: threading.Event() for seq in ("first", "second")}
+
+    def gated_replay(event, timeout):
+        seq = event.payload["seq"]
+        if seq in replaying:
+            replaying[seq].set()
+            release[seq].wait(10)
+
+    buffer = MeteringBuffer(max_size=10, flush_interval=9999.0, replay_fn=gated_replay)
+    monkeypatch.setattr(metering_buffer, "_buffer", buffer)
+    buffer.push("ai", {"seq": "first"})
+    periodic_flush = threading.Thread(target=buffer.flush, daemon=True)
+    periodic_flush.start()
+    assert replaying["first"].wait(5)
+    late = _RecordsWhenBuilt("late")
+    buffer.push_overflow(late)
+    buffer.push("ai", {"seq": "second"})
+    release["first"].set()
+    assert replaying["second"].wait(5)
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="revenium_middleware"):
+            metering.handle_exit()
+    finally:
+        release["second"].set()
+        periodic_flush.join(5)
+
+    assert late.outcome == "built"
+    assert [w.split(" metering event(s)")[0] for w in _shutdown_warnings(caplog)] == ["2"]
+
+
+def test_an_overflow_after_the_exit_build_stays_buffered_and_counted(isolated_shutdown):
+    buffer = MeteringBuffer(max_size=10, flush_interval=9999.0, replay_fn=lambda event, timeout: None)
+    buffer.build_all_overflow(deadline_seconds=0.5)
+    straggler = _RecordsWhenBuilt("straggler")
+    buffer.push_overflow(straggler)
+    metering.shutdown_event.set()
+
+    result = buffer.flush(deadline_seconds=0.5)
+
+    assert straggler.outcome is None
+    assert result["remaining"] == 1
+
+
+@posix_signals
+def test_a_drain_interrupted_by_the_sigterm_handler_keeps_its_one_deadline(isolated_shutdown, monkeypatch):
+    """The opt-in handler runs handle_exit on the main thread, which may already be in the atexit drain."""
+    budget = 1.0
+    monkeypatch.setenv(BUDGET_ENV, str(budget))
+    release = threading.Event()
+    _queue_blocked_events(monkeypatch, 1, release)
+    interrupted = []
+
+    def drain_again(signum, frame):
+        interrupted.append(signum)
+        metering.handle_exit()
+
+    previous = signal.signal(signal.SIGUSR1, drain_again)
+    threading.Timer(budget / 2, os.kill, (os.getpid(), signal.SIGUSR1)).start()
+    try:
+        started = time.monotonic()
+        metering.handle_exit()
+        elapsed = time.monotonic() - started
+    finally:
+        signal.signal(signal.SIGUSR1, previous)
+        release.set()
+
+    assert interrupted == [signal.SIGUSR1]
+    assert elapsed < budget + 0.3
+
+
+def test_shutdown_does_not_wait_past_its_budget_on_a_reclaimed_task_that_blocks_synchronously(
+    isolated_shutdown, monkeypatch, caplog
+):
+    """With the build thread stuck, reclaimed tasks build on a thread of their own: a synchronous callable
+    run through run_async_in_thread blocks where asyncio.wait_for cannot interrupt it."""
+    budget = 0.5
+    monkeypatch.setenv(BUDGET_ENV, str(budget))
+    release = threading.Event()
+    stuck_started = threading.Event()
+
+    async def stuck_call():
+        stuck_started.set()
+        release.wait(10)
+
+    def blocks_on_io():
+        release.wait(10)
+
+    buffer = MeteringBuffer(max_size=10, flush_interval=9999.0, replay_fn=lambda event, timeout: None)
+    monkeypatch.setattr(metering_buffer, "_buffer", buffer)
+    buffer.push_overflow(MeteringTask(stuck_call(), contextvars.copy_context()))
+    buffer.push_overflow(MeteringTask(metering._run_sync_callable(blocks_on_io), contextvars.copy_context()))
+    periodic_build = threading.Thread(target=buffer.materialize_overflow, daemon=True)
+    periodic_build.start()
+    assert stuck_started.wait(5)
+
+    try:
+        started = time.monotonic()
+        with caplog.at_level(logging.WARNING, logger="revenium_middleware"):
+            metering.handle_exit()
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+        periodic_build.join(5)
+
+    assert elapsed < budget + 0.3
+    assert [w.split(" metering event(s)")[0] for w in _shutdown_warnings(caplog)] == ["2"]

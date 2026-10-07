@@ -70,6 +70,7 @@ def _native_sdk_body(usage_metadata, response):
                 response=response,
                 model="sonar-pro",
                 request_time_dt=datetime.datetime.now(datetime.timezone.utc),
+                response_time_dt=datetime.datetime.now(datetime.timezone.utc),
                 transaction_id="perplexity-native-effort-test",
                 usage_metadata=usage_metadata,
                 is_streaming=False,

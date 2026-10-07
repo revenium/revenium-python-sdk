@@ -28,7 +28,7 @@ from revenium_middleware._core.fields import extract_org_and_product, extract_co
 from revenium_middleware._core.config import is_selective_metering_enabled, is_capture_prompts_enabled
 from revenium_middleware._core.context import is_inside_decorated_function
 from revenium_middleware._core.patch_registry import register_patch
-from revenium_middleware._core.call_ownership import ANTHROPIC, claim_call_for_transport
+from revenium_middleware._core.call_ownership import ANTHROPIC, claim_call_for_transport, with_callback_metadata
 
 # Import trace visualization functions
 from .trace_fields import (
@@ -450,7 +450,7 @@ def extract_usage_metadata_and_timing(kwargs: dict, operation_name: str = "opera
         api_metadata = {}
 
     # Merge with decorator metadata (API-level takes precedence)
-    usage_metadata = merge_metadata(api_metadata)
+    usage_metadata = merge_metadata(with_callback_metadata(ANTHROPIC, api_metadata))
     logger.debug(f"Merged decorator metadata for {operation_name}: {usage_metadata}")
 
     # Sanitize metadata structure (defensive programming)

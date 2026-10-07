@@ -24,11 +24,22 @@ callback reads:
   callback also asks (without ids) from ``on_llm_new_token``, a coroutine hook
   that langchain-core awaits in the model call's own task.
 
-The signal cannot run the other way: during ``ainvoke``/``astream``
-langchain-core runs a sync handler method on a copy of the caller's context
-(``run_in_executor(copy_context().run, ...)``), so nothing the callback writes
-reaches the transport, while what the transport writes in the caller's task
-is visible to the callback's later ``on_llm_end``.
+Because the transport's record is the one kept, it has to carry the
+attribution the caller gave the callback (subscriber, organization, trace,
+task). The callback calls ``publish_callback_metadata(metadata, providers)``
+when the model call starts and withdraws the publication when the call ends
+or fails; a transport wrap reads it with ``with_callback_metadata(provider,
+call_metadata)``, where the call's own metadata wins field by field. That
+direction only works because the callback runs inline (``run_inline``):
+otherwise, during ``ainvoke``/``astream``, langchain-core runs a sync handler
+method on a copy of the caller's context (``run_in_executor(copy_context().run,
+...)``) and nothing the callback writes reaches the transport. A publication
+is seen in the context it was made in and in tasks started from it, which is
+where the model call runs. Withdrawing marks the publication itself, so a
+call that ends in another task (an abandoned ``astream`` closed by the event
+loop's finalizer) still stops the context it started in from using it. When
+several started calls are still open in one context, the most recent one in
+the provider's scope that carries metadata is used.
 
 The counters cover every call whose transport runs in that caller context:
 sync calls in a thread and ``stream``/``astream``. ``agenerate`` (behind
@@ -58,7 +69,9 @@ calls in different threads or tasks.
 import threading
 from collections import OrderedDict
 from contextvars import ContextVar
-from typing import AbstractSet, Iterable, Mapping, Optional
+from typing import Any, AbstractSet, Dict, Iterable, Mapping, Optional, Tuple
+
+from revenium_middleware._core.context import overlay_metadata
 
 OPENAI = "openai"
 ANTHROPIC = "anthropic"
@@ -127,6 +140,58 @@ def claimed_by_transport(mark: Mapping[str, int], providers: Optional[AbstractSe
     if providers is None:
         return claims != mark
     return any(claims.get(provider, 0) != mark.get(provider, 0) for provider in providers)
+
+
+class CallbackMetadata:
+    """Attribution a LangChain callback published for one model call."""
+
+    __slots__ = ("metadata", "providers", "withdrawn")
+
+    def __init__(self, metadata: Mapping[str, Any], providers: Optional[AbstractSet[str]]):
+        self.metadata = dict(metadata)
+        self.providers = providers
+        self.withdrawn = False
+
+    def serves(self, provider: str) -> bool:
+        return bool(self.metadata) and not self.withdrawn and (self.providers is None or provider in self.providers)
+
+    def withdraw(self) -> None:
+        self.withdrawn = True
+        _published_in_context.set(_open_publications())
+
+
+# Replaced, never mutated, for the same reason as ``_claims_in_context``.
+_published_in_context: ContextVar[Tuple[CallbackMetadata, ...]] = ContextVar(
+    "revenium_callback_metadata", default=()
+)
+
+
+def _open_publications() -> Tuple[CallbackMetadata, ...]:
+    return tuple(publication for publication in _published_in_context.get() if not publication.withdrawn)
+
+
+def publish_callback_metadata(metadata: Mapping[str, Any],
+                              providers: Optional[AbstractSet[str]] = None) -> CallbackMetadata:
+    """Offer ``metadata`` to the transport wraps in ``providers`` (any, when
+    None) for the model call starting in this context."""
+    publication = CallbackMetadata(metadata, providers)
+    _published_in_context.set(_open_publications() + (publication,))
+    return publication
+
+
+def callback_metadata_for(provider: str) -> Dict[str, Any]:
+    """The metadata of the latest open, non-empty callback publication that
+    ``provider``'s transport serves, or an empty dict. Skipping empty ones keeps
+    a handler attached without metadata from hiding one attached with it."""
+    for publication in reversed(_published_in_context.get()):
+        if publication.serves(provider):
+            return dict(publication.metadata)
+    return {}
+
+
+def with_callback_metadata(provider: str, call_metadata: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """``call_metadata`` laid over the callback's metadata for this call."""
+    return overlay_metadata(callback_metadata_for(provider), dict(call_metadata or {}))
 
 
 def reset_claimed_response_ids() -> None:

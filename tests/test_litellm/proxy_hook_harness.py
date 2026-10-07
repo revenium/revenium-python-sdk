@@ -105,12 +105,18 @@ def drive_metering(coro):
     return SimpleNamespace(name="inline-metering")
 
 
-def make_key_dict(user_email="", key_alias="", team_alias=None, metadata=None):
+def make_key_dict(user_email="", key_alias="", team_alias=None, metadata=None,
+                  request_route=None):
     """Stand-in for LiteLLM's UserAPIKeyAuth.
 
     Plain attributes rather than a MagicMock: a bare MagicMock attribute is
     truthy, so every fallback chain in the payload builder would stop at the
     mock instead of falling through to the value under test.
+
+    request_route is the route the proxy's auth step stamps on the key. The
+    vendor's deferred-stream dispatch reads it before calling any guardrail
+    (litellm 1.104.0), so a stand-in without it fails there and never reaches
+    the hook under test.
     """
     return SimpleNamespace(
         user_email=user_email,
@@ -119,6 +125,7 @@ def make_key_dict(user_email="", key_alias="", team_alias=None, metadata=None):
         metadata=metadata if metadata is not None else {},
         token="a" * 64,
         api_key=None,
+        request_route=request_route,
     )
 
 

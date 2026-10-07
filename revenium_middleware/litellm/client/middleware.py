@@ -13,6 +13,7 @@ from revenium_middleware._core.context import is_inside_decorated_function
 from revenium_middleware._core import submit_ai_event
 from revenium_middleware._core.log_sanitize import sanitize_for_logging
 from revenium_middleware._core.patch_registry import register_patch
+from revenium_middleware.litellm.proxy._metering_owner import guardrail_meters_request
 from .context import metadata_context
 from .hooks import execute_metadata_hooks
 from . import trace_fields
@@ -110,15 +111,48 @@ def _meter_completion(response, call):
     return handle_response(response, call.request_time_dt, call.usage_metadata, False)
 
 
+def _stream_for_caller(stream, caller_requested_usage):
+    if caller_requested_usage:
+        return stream
+    return _ObservedStream(stream, _ForcedUsageHider())
+
+
+def _leave_to_guardrail(wrapped, args, kwargs):
+    """Make a call the proxy guardrail meters, without metering it here.
+
+    The guardrail meters a stream from the response LiteLLM assembles, which
+    holds the provider's token counts only if the stream ended with a usage
+    chunk, and a proxy configured with ``always_include_stream_usage: false``
+    does not ask for one. So the stream still gets the usage request this
+    wrapper adds to the streams it meters itself, hidden from the caller the
+    same way.
+    """
+    if not kwargs.get("stream"):
+        return wrapped(*args, **kwargs)
+    forced_kwargs, caller_requested_usage = _with_forced_usage_reporting(kwargs)
+    return _stream_for_caller(wrapped(*args, **forced_kwargs), caller_requested_usage)
+
+
+async def _aleave_to_guardrail(wrapped, args, kwargs):
+    forced_kwargs, caller_requested_usage = _with_forced_usage_reporting(kwargs)
+    return _stream_for_caller(await wrapped(*args, **forced_kwargs), caller_requested_usage)
+
+
 def completion_wrapper(wrapped, _, args, kwargs):
     if _should_pass_through():
         return wrapped(*args, **kwargs)
+    if guardrail_meters_request(kwargs):
+        return _leave_to_guardrail(wrapped, args, kwargs)
     call = _prepare_call(args, kwargs)
     return _meter_completion(_call_owning_metering(wrapped, args, call.kwargs), call)
 
 
 def acompletion_wrapper(wrapped, _, args, kwargs):
     if _should_pass_through():
+        return wrapped(*args, **kwargs)
+    if guardrail_meters_request(kwargs):
+        if kwargs.get("stream"):
+            return _aleave_to_guardrail(wrapped, args, kwargs)
         return wrapped(*args, **kwargs)
     return _metered_acompletion(wrapped, args, kwargs)
 
@@ -129,7 +163,7 @@ async def _metered_acompletion(wrapped, args, kwargs):
 
 
 def embedding_wrapper(wrapped, _, args, kwargs):
-    if _should_pass_through():
+    if _should_pass_through() or guardrail_meters_request(kwargs):
         return wrapped(*args, **kwargs)
     call = _prepare_call(args, kwargs)
     response = _call_owning_metering(wrapped, args, call.kwargs)
@@ -137,7 +171,7 @@ def embedding_wrapper(wrapped, _, args, kwargs):
 
 
 def aembedding_wrapper(wrapped, _, args, kwargs):
-    if _should_pass_through():
+    if _should_pass_through() or guardrail_meters_request(kwargs):
         return wrapped(*args, **kwargs)
     return _metered_aembedding(wrapped, args, kwargs)
 
@@ -201,6 +235,25 @@ def _usage_litellm_attached(chunk):
     return None
 
 
+def _belongs_to_caller(chunk, caller_requested_usage):
+    if getattr(chunk, "usage", None) is None:
+        return True
+    # LiteLLM moves provider usage off content chunks and appends it as a
+    # chunk of its own only when include_usage is set, so a usage-only chunk
+    # exists because we asked for it unless the caller did too.
+    return caller_requested_usage or _carries_content(chunk)
+
+
+class _ForcedUsageHider:
+    """Hides the usage chunk this wrapper requested from a stream the proxy guardrail meters."""
+
+    def observe(self, chunk):
+        return _belongs_to_caller(chunk, False)
+
+    def finish(self, completed):
+        pass
+
+
 class _StreamMeter:
     """Collects a LiteLLM stream's chunks and meters the call once."""
 
@@ -215,13 +268,9 @@ class _StreamMeter:
     def observe(self, chunk):
         """Record ``chunk`` and return whether it belongs to the caller."""
         self._last_chunk = chunk
-        if getattr(chunk, "usage", None) is None:
-            return True
-        self._usage_chunk = chunk
-        # LiteLLM moves provider usage off content chunks and appends it as a
-        # chunk of its own only when include_usage is set, so a usage-only chunk
-        # exists because we asked for it unless the caller did too.
-        return self._caller_requested_usage or _carries_content(chunk)
+        if getattr(chunk, "usage", None) is not None:
+            self._usage_chunk = chunk
+        return _belongs_to_caller(chunk, self._caller_requested_usage)
 
     def finish(self, completed):
         if self._finished:
@@ -240,8 +289,11 @@ class _StreamMeter:
             logger.warning("Error metering interrupted/completed stream: %s", e)
 
 
-class _MeteredStream(wrapt.ObjectProxy):
-    """A LiteLLM stream that meters itself once it ends, is closed, or is abandoned.
+class _ObservedStream(wrapt.ObjectProxy):
+    """A LiteLLM stream that shows each chunk to an observer and tells it when the stream ends.
+
+    The observer decides which chunks reach the caller; a ``_StreamMeter``
+    meters the call once the stream ends, is closed, or is abandoned.
 
     It proxies the stream LiteLLM returned, so ``isinstance(stream,
     CustomStreamWrapper)`` still holds for the Router and the Responses bridge.
@@ -314,7 +366,7 @@ class _MeteredStream(wrapt.ObjectProxy):
 
 def handle_streaming_response(stream, request_time_dt, usage_metadata, caller_requested_usage=True):
     """Wrap a LiteLLM stream so the call is metered once, from its usage chunk."""
-    return _MeteredStream(stream, _StreamMeter(request_time_dt, usage_metadata, caller_requested_usage))
+    return _ObservedStream(stream, _StreamMeter(request_time_dt, usage_metadata, caller_requested_usage))
 
 
 def handle_response(response, request_time_dt, usage_metadata, is_streaming, operation_type=CHAT_OPERATION,
@@ -326,15 +378,13 @@ def handle_response(response, request_time_dt, usage_metadata, is_streaming, ope
     if get_client() is None:
         return response  # metering disabled (no API key configured)
 
+    response_time_dt = datetime.datetime.now(datetime.timezone.utc)
+    response_time = response_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    request_duration = (response_time_dt - request_time_dt).total_seconds() * 1000
+    request_time = request_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    response_id = getattr(response, 'id', None) or f"litellm_client-{response_time_dt.timestamp()}"
+
     async def metering_call():
-        response_time_dt = datetime.datetime.now(datetime.timezone.utc)
-        response_time = response_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        request_duration = (response_time_dt - request_time_dt).total_seconds() * 1000
-        request_time = request_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        # Generate a unique ID if not present in response
-        response_id = getattr(response, 'id', None) or f"litellm_client-{datetime.datetime.now().timestamp()}"
-
         # Extract token counts from LiteLLM response
         reported_usage = usage if usage is not None else getattr(response, 'usage', None)
         prompt_tokens = getattr(reported_usage, 'prompt_tokens', 0) or 0

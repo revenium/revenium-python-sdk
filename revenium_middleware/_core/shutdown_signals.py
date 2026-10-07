@@ -8,7 +8,10 @@ host's own SIGTERM handler exits through ``sys.exit``.
 
 The exit ``atexit`` cannot see is SIGTERM with the default disposition: the
 kernel ends the process immediately. With the flag set, that case drains
-first and then terminates through the same default disposition. A handler
+first and then terminates through the same default disposition; a SIGTERM
+that arrives while the drain runs lets it finish first, waiting for a drain on
+another thread and, when it interrupts the drain on the main thread, ending
+the process once that drain returns. A handler
 installed before this import is chained to unchanged and without a drain.
 When it exits normally the ``atexit`` drain runs; when it restores the
 default disposition and re-raises SIGTERM, as uvicorn does after its own
@@ -26,8 +29,12 @@ from revenium_middleware._core.config import Config, env_flag_enabled
 
 logger = logging.getLogger(__name__)
 
-Drain = Callable[[], None]
+# Returns False when the drain is running underneath the handler, on its
+# thread: the process must end only once that drain has finished.
+Drain = Callable[[], bool]
 SignalHandler = Union[Callable[[int, Optional[FrameType]], object], int, signal.Handlers, None]
+
+_deferred_signal: Optional[int] = None
 
 
 def install_requested_signal_handlers(drain: Drain) -> None:
@@ -57,11 +64,24 @@ def chain_sigterm(previous: SignalHandler, drain: Drain) -> Callable[[int, Optio
     """Build a handler that defers to ``previous``, draining first only on a default termination."""
 
     def handle_sigterm(signum: int, frame: Optional[FrameType]) -> None:
+        global _deferred_signal
         if callable(previous):
             previous(signum, frame)
             return
-        drain()
-        signal.signal(signum, signal.SIG_DFL)
-        signal.raise_signal(signum)
+        if drain():
+            _terminate(signum)
+        else:
+            _deferred_signal = signum
 
     return handle_sigterm
+
+
+def terminate_if_deferred() -> None:
+    """End the process with the signal a handler deferred until the drain it interrupted finished, if any."""
+    if _deferred_signal is not None:
+        _terminate(_deferred_signal)
+
+
+def _terminate(signum: int) -> None:
+    signal.signal(signum, signal.SIG_DFL)
+    signal.raise_signal(signum)

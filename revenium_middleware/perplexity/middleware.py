@@ -183,11 +183,11 @@ def send_metering_data(
     """
     if get_client() is None:
         return  # metering disabled (no API key configured)
+    response_time_dt = datetime.datetime.now(datetime.timezone.utc)
+    request_duration = (response_time_dt - request_time_dt).total_seconds() * 1000
+
     async def metering_call():
         try:
-            response_time_dt = datetime.datetime.now(datetime.timezone.utc)
-            request_duration = (response_time_dt - request_time_dt).total_seconds() * 1000
-
             # Generate transaction ID if not provided
             if transaction_id is None:
                 txn_id = getattr(response, 'id', str(uuid.uuid4()))

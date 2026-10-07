@@ -10,7 +10,7 @@ import wrapt
 
 from revenium_middleware import get_client, run_async_in_thread, shutdown_event, merge_metadata
 from revenium_middleware._core import submit_ai_event
-from revenium_middleware._core.call_ownership import OLLAMA, claim_call_for_transport
+from revenium_middleware._core.call_ownership import OLLAMA, claim_call_for_transport, with_callback_metadata
 from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
 from revenium_middleware._core.fields import (
     extract_agentic_job_fields,
@@ -88,7 +88,7 @@ def start_call(endpoint, args, kwargs, api_metadata) -> OllamaCall:
     )
     return OllamaCall(
         endpoint=endpoint,
-        usage_metadata=merge_metadata(api_metadata),
+        usage_metadata=merge_metadata(with_callback_metadata(OLLAMA, api_metadata)),
         request_kwargs=kwargs,
         request_time_dt=request_time_dt,
         transaction_id=f"ollama-{request_time_dt.timestamp()}",
@@ -395,15 +395,12 @@ def _dispatch_metering(response, request_time_dt, usage_metadata, transaction_id
         return  # metering disabled (no API key configured)
 
     model = getattr(response, 'model', None) or request_model or DEFAULT_MODEL
+    response_time_dt = datetime.datetime.now(datetime.timezone.utc)
+    response_time = response_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    request_duration = (response_time_dt - request_time_dt).total_seconds() * 1000
+    request_time = request_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     async def metering_call():
-        response_time_dt = datetime.datetime.now(datetime.timezone.utc)
-        response_time = response_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        request_duration = (
-            (response_time_dt - request_time_dt).total_seconds() * 1000
-        )
-        request_time = request_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
         try:
             if shutdown_event.is_set():
                 logger.warning("Skipping metering call during shutdown")

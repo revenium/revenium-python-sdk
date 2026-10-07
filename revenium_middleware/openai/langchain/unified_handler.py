@@ -14,13 +14,20 @@ so langchain-core awaits it in the model call's own task, which is the only
 place a claim made by a streamed call inside ``ainvoke`` can be seen. The
 handler sends its own record only for calls no transport wrap metered, under
 the provider LangChain reports for the model class.
+
+The transport's record carries the handler's ``usage_metadata``: the handler
+publishes it for the transport when the call starts and withdraws it when the
+call ends. The handler runs inline (``run_inline``) so that the publication
+lands in the caller's context during async calls too.
 """
 
 import logging
 import time
 from typing import Any, Dict, List, Optional
 
-from revenium_middleware._core.call_ownership import claimed_by_transport, transport_claim_mark
+from revenium_middleware._core.call_ownership import (
+    claimed_by_transport, publish_callback_metadata, transport_claim_mark,
+)
 
 from ._model_call import (
     is_streamed_result, is_streaming_request, provider_metadata_for, provider_response_ids,
@@ -83,6 +90,8 @@ class UnifiedReveniumCallbackHandler(AsyncCallbackHandler):
     - LangChain's callback manager handles sync/async routing automatically
     - Transport hooks handle embeddings (no callback overhead)
     """
+
+    run_inline = True
 
     def __init__(self,
                  usage_metadata: Optional[dict] = None,
@@ -155,6 +164,7 @@ class UnifiedReveniumCallbackHandler(AsyncCallbackHandler):
             return
 
         invocation_params = kwargs.get('invocation_params') or {}
+        transport_scope = transport_scope_for(serialized, invocation_params, kwargs.get('metadata'))
         run_info = {
             'start_time': time.time(),
             'serialized': serialized,
@@ -167,11 +177,10 @@ class UnifiedReveniumCallbackHandler(AsyncCallbackHandler):
             'provider_metadata': provider_metadata_for(
                 serialized, invocation_params, kwargs.get('metadata')
             ),
-            'transport_scope': transport_scope_for(
-                serialized, invocation_params, kwargs.get('metadata')
-            ),
+            'transport_scope': transport_scope,
+            'published_metadata': publish_callback_metadata(self.usage_metadata, transport_scope),
         }
-        
+
         self._active_runs[run_id] = run_info
         
         if self.enable_debug_logging:
@@ -191,7 +200,7 @@ class UnifiedReveniumCallbackHandler(AsyncCallbackHandler):
         if not run_id or run_id not in self._active_runs:
             return
 
-        run_info = self._active_runs.pop(run_id)
+        run_info = self._end_run(run_id)
 
         if self._transport_metered(response, run_info):
             if self.enable_debug_logging:
@@ -205,6 +214,12 @@ class UnifiedReveniumCallbackHandler(AsyncCallbackHandler):
         if self.enable_debug_logging:
             context = "async" if is_async else "sync"
             logger.debug(f"LLM ended ({context}) - run_id: {run_id}")
+
+    def _end_run(self, run_id: Any) -> Optional[Dict[str, Any]]:
+        run_info = self._active_runs.pop(run_id, None)
+        if run_info is not None:
+            run_info['published_metadata'].withdraw()
+        return run_info
 
     @staticmethod
     def _transport_metered(response: Any, run_info: Dict[str, Any]) -> bool:
@@ -566,8 +581,7 @@ class UnifiedReveniumCallbackHandler(AsyncCallbackHandler):
     def on_llm_error(self, error: Exception, **kwargs) -> None:
         """Sync callback for LLM error."""
         run_id = kwargs.get('run_id')
-        if run_id and run_id in self._active_runs:
-            self._active_runs.pop(run_id)
+        self._end_run(run_id)
         logger.warning(f"LLM error in run {run_id}: {error}")
 
     @_safe
@@ -606,8 +620,7 @@ class UnifiedReveniumCallbackHandler(AsyncCallbackHandler):
     async def on_llm_error_async(self, error: Exception, **kwargs) -> None:
         """Async callback for LLM error."""
         run_id = kwargs.get('run_id')
-        if run_id and run_id in self._active_runs:
-            self._active_runs.pop(run_id)
+        self._end_run(run_id)
         logger.warning(f"LLM error in async run {run_id}: {error}")
 
     @_safe

@@ -151,6 +151,7 @@ print(status.success_count)   # events delivered successfully
 print(status.error_count)     # delivery failures
 print(status.last_error)      # most recent exception, or None
 print(status.last_error_at)   # UTC datetime of the most recent failure
+print(status.evicted_count)   # undelivered events dropped because the buffer was full
 ```
 
 `reset_metering_status()` zeroes the counters and clears registered
@@ -851,6 +852,8 @@ response = litellm.completion(
 
 Client mode meters `completion`, `acompletion`, `text_completion`, `atext_completion`, `completion_with_retries` and `acompletion_with_retries`, streamed or not, and `embedding` / `aembedding` as embedding calls. When you stream without `stream_options={"include_usage": True}`, the middleware asks LiteLLM for the usage chunk itself and keeps it out of your stream. LiteLLM adds that chunk for every provider, including ones it does not send `stream_options` to. `litellm.responses` and `litellm.aresponses` are not metered, except on providers LiteLLM serves through `completion`.
 
+Inside a LiteLLM proxy running `ReveniumGuardrail` with `default_on: true` and `post_call` among its modes, client mode leaves each proxied request to the guardrail, so the request is recorded once, with the guardrail's subscriber and model naming. Client mode still records the proxied calls the guardrail does not meter, which today are streamed `/v1/completions` and `/v1/responses` calls, and every call your own code in the proxy's process makes to LiteLLM directly.
+
 #### Proxy Mode
 
 `ReveniumGuardrail` is the LiteLLM proxy integration. It is a LiteLLM
@@ -895,8 +898,15 @@ caller receives HTTP 429:
 ```
 
 Enforcement **fails open**: if the enforcement path is unreachable or misbehaves,
-the call proceeds. Metering is likewise non-disruptive — nothing in the post-call
-path can turn a successful LLM call into an error for the client.
+the call proceeds, and it proceeds without waiting. The pre-call check reads the
+rules the SDK already has cached and refreshes them on a background thread, so a
+Revenium endpoint that hangs, refuses connections, returns errors or rejects your
+key (403) neither blocks nor slows the proxy. A failed refresh is retried once
+per `REVENIUM_CB_POLL_INTERVAL_SECONDS`, not once per request. Right after the
+proxy starts, before the first rules fetch completes, no rules are cached and
+calls go through; see [Fail-Open vs Fail-Closed](#fail-open-vs-fail-closed).
+Metering is likewise non-disruptive — nothing in the post-call path can turn a
+successful LLM call into an error for the client.
 
 **Attribution** travels as `x-revenium-*` request headers (subscriber, organization,
 product, trace, task type, agent, subscription, quality score, and `x-revenium-effort`
@@ -1748,8 +1758,9 @@ The pre-call check fires before every chat / embeddings / responses call. When t
 
 1. A daemon thread (`revenium-enforcement-poll`) starts on first use.
 2. It polls `GET {REVENIUM_ENFORCEMENT_BASE_URL}/v2/api/ai/enforcement-rules/{REVENIUM_TEAM_ID}` every `REVENIUM_CB_POLL_INTERVAL_SECONDS` with the `x-api-key` header.
-3. Rules are cached in-process (120 s TTL, refresh-on-stale with thundering-herd guard).
-4. `204 No Content` is treated as "no rules configured" — the cache is cleared.
+3. Rules are cached in-process. The pre-call check only reads that cache: it never makes a network request and never sleeps, so it is safe on an event loop (LiteLLM proxy, `AsyncOpenAI`). When the cache is more than 120 s old the check wakes the poller to refresh it early and carries on with the rules it has. Only one refresh runs at a time per process.
+4. A refresh that fails (timeout, refused connection, 5xx, or any 4xx such as a 403 for a wrong key or team id) keeps the cached rules, logs a warning, and is not retried for one `REVENIUM_CB_POLL_INTERVAL_SECONDS`, however much traffic arrives meanwhile.
+5. `204 No Content` is treated as "no rules configured" — the cache is cleared.
 
 ### Exception Contract
 
@@ -1788,9 +1799,9 @@ except BudgetExceededError as exc:
 
 ### Fail-Open vs Fail-Closed
 
-By default (`REVENIUM_CB_FAIL_MODE=open`) enforcement failures never propagate to user code. If the rule fetch errors (network, 5xx, auth), the previous in-memory cache is preserved and a debug log line is emitted. If there is no cache yet, enforcement behaves as if no rules are configured and the request continues.
+By default (`REVENIUM_CB_FAIL_MODE=open`) enforcement failures never propagate to user code and never delay it. If the rule fetch errors (network, 5xx, auth), the previous in-memory cache is preserved, a warning is logged, and the next attempt waits one poll interval. If there is no cache yet — the first moments after a process starts, or the whole of an outage that began before the first successful fetch — enforcement behaves as if no rules are configured and the request continues immediately; it does not wait for the fetch.
 
-Set `REVENIUM_CB_FAIL_MODE=closed` to refuse calls until at least one rule fetch (or `REVENIUM_CACHE_DIR` snapshot) succeeds. Pair with `REVENIUM_CACHE_DIR` so a process restart loads the last-known rules rather than blocking every call until the first poll completes.
+Set `REVENIUM_CB_FAIL_MODE=closed` to refuse calls until at least one rule fetch (or `REVENIUM_CACHE_DIR` snapshot) succeeds. The refusal is immediate too: a call made before the first fetch completes raises `BudgetExceededError` rather than waiting for it. Pair with `REVENIUM_CACHE_DIR` so a process restart loads the last-known rules rather than refusing every call until the first poll completes.
 
 ### Shadow Mode
 
@@ -1864,19 +1875,40 @@ a few idle threads and the queue's memory, never a thread per call.
 
 | Variable | Default | What it sets |
 |----------|---------|--------------|
-| `REVENIUM_METERING_WORKERS` | `8` | Background threads that send records |
+| `REVENIUM_METERING_WORKERS` | `32` | Background threads that send records |
 | `REVENIUM_METERING_QUEUE_SIZE` | `1000` | Records that can wait for a thread |
 | `REVENIUM_METERING_TIMEOUT_SECONDS` | `10` | Seconds one attempt waits for a response |
 | `REVENIUM_METERING_CONNECT_TIMEOUT_SECONDS` | `5` | Seconds one attempt waits for a connection |
 | `REVENIUM_METERING_MAX_RETRIES` | `2` | Retries after the first attempt |
 
-Each thread sends one record at a time, so eight threads keep up with about
-eight records per round trip to Revenium: roughly 75 records a second at a
-100 ms round trip, or 30 a second at 250 ms. Raise
-`REVENIUM_METERING_WORKERS` for a service that meters more than that
-steadily; the queue absorbs short bursts. When the
-queue is full, new records go straight to the store-and-forward buffer below
-instead of waiting, and `get_buffer_stats()["total_overflowed"]` counts them.
+The two timeouts also apply to tool events, which are sent once without
+retries, and a replay from the store-and-forward buffer is a single attempt
+that waits at most `REVENIUM_METERING_TIMEOUT_SECONDS`.
+
+Each thread sends one record at a time, so the threads keep up with about one
+record per thread per round trip to Revenium. The 32 default threads send
+about 100 records a second at a 300 ms round trip and keep up with 30 a
+second until a round trip takes about a second. Measured against a local
+endpoint answering in 250 ms and 300 ms, 30 calls a second for five minutes
+delivered every record within 0.35 seconds of the call, and so did 60
+records a second at 250 ms (a service that sends two records per call).
+From one client in Brazil to a US East Revenium API host, a request on an
+open connection took 113 ms (p50) and 123 ms (p99), and one that also opened
+the connection 333 ms and 462 ms;
+measure from your own region before sizing for a slower path. Idle, the 32
+threads cost about 1.4 MB of memory. Raise `REVENIUM_METERING_WORKERS` for a
+service that meters more than 30 records a second against a slow round trip;
+the queue absorbs short bursts. When the queue is full, new records go
+straight to the store-and-forward buffer below instead of waiting, and
+`get_buffer_stats()["total_overflowed"]` counts them; one warning marks the
+start of each such episode and one, with a count, its end.
+
+When Revenium stops answering, the threads stop waiting on it. After three
+records in a row fail with a retryable error, new records go straight to the
+store-and-forward buffer without being sent, and one record every 5 seconds
+is still sent to find out whether Revenium is back. The first one that
+succeeds resumes sending and starts replaying the buffer at once. A warning
+marks each change.
 
 At exit, queued records get the first share of the shutdown budget (see
 [Shutdown](#shutdown)).
@@ -1884,18 +1916,33 @@ At exit, queued records get the first share of the shutdown budget (see
 ### Delivery Resilience (Store-and-Forward)
 
 Metering events that still fail after the client's own retries (network
-outages, 5xx, rate limiting) are not lost: they are held in a bounded
-in-memory buffer and replayed automatically in the background every 30
-seconds, reusing each event's original `Idempotency-Key` so replays can
-never double-bill. Permanent failures (401/403/404/422) are never buffered.
-The buffer holds up to 1000 events (oldest evicted first) for at most 24
-hours, and is drained on shutdown (see below). Inspect it programmatically:
+outages, 5xx, rate limiting), and the records held back while Revenium is not
+answering, are not lost: they are held in a bounded in-memory buffer and
+replayed automatically in the background every 30 seconds, or as soon as a
+delivery succeeds again, reusing each event's original `Idempotency-Key` so
+replays can never double-bill. A backlog replays 16 records at a time, about
+50 a second at a 300 ms round trip next to your live traffic. Permanent
+failures (401/403/404/422) are never buffered, and buffered events expire
+after 24 hours. The buffer is drained on shutdown (see below).
+
+The buffer holds up to 20,000 events, eleven minutes of an outage at 30
+records a second. A typical LiteLLM record takes about 2.3 KB in memory, so a
+full buffer holds about 45 MB; with `REVENIUM_CAPTURE_PROMPTS` each record
+can also carry up to 50,000 characters per captured prompt field, so lower
+`REVENIUM_BUFFER_MAX_SIZE` if you capture prompts. In a five-minute outage at
+30 calls a second against the defaults, all 9,000 records were held and then
+delivered within two and a half minutes of Revenium answering again, while
+new traffic kept flowing. When the buffer is full the oldest
+events are evicted and their usage is lost: one warning marks the first
+eviction, the flush thread logs how many were evicted at most once per flush
+interval, and `get_metering_status().evicted_count` and
+`get_buffer_stats()["total_evicted"]` count them. Inspect it programmatically:
 
 ```python
 from revenium_middleware import get_buffer_stats
 
 print(get_buffer_stats())
-# {'size': 0, 'max_size': 1000, 'total_buffered': 3, 'total_replayed': 3, ...}
+# {'size': 0, 'max_size': 20000, 'total_buffered': 3, 'total_replayed': 3, 'total_evicted': 0, ...}
 ```
 
 ### Shutdown
@@ -1906,9 +1953,11 @@ exits normally, including after Ctrl+C, an `atexit` hook works through three
 steps against one budget of `REVENIUM_SHUTDOWN_TIMEOUT_SECONDS` (5 seconds by
 default), each using whatever time the previous ones left: it waits for the
 background threads to send the records still queued, builds the records that
-overflowed to the store-and-forward buffer, then flushes the buffer with one
-attempt per record. Records still queued, being sent or unbuilt when the budget
-runs out are dropped and logged once, as a warning with a count.
+overflowed to the store-and-forward buffer, then flushes the buffer, oldest
+first and one attempt per record. The flush stops at the first record the
+endpoint still cannot take (unreachable, timed out, 429 or 5xx), leaving that
+record and the ones behind it unsent. Records still queued, being sent, unbuilt
+or unsent at the end are dropped and logged once, as a warning with a count.
 
 A process ended by SIGTERM's default action skips `atexit`, and with it that
 final flush. uvicorn, and so the LiteLLM proxy, ends that way once its own
@@ -1945,9 +1994,9 @@ as uvicorn does after its own shutdown, ends the process before `atexit` runs.
 | `REVENIUM_OUTCOME_API_KEY` | - | Deprecated fallback name for the write-scope key; used only when `REVENIUM_WRITE_API_KEY` is unset |
 | `REVENIUM_PROFITSTREAM_BASE_URL` | `https://api.revenium.io` | Agentic outcomes API base URL |
 | `REVENIUM_BEDROCK_DISABLE` | - | Set to `1` to disable Bedrock auto-detection; Foundry detection is unaffected |
-| `REVENIUM_BUFFER_MAX_SIZE` | `1000` | Store-and-forward buffer capacity (oldest events evicted when full) |
+| `REVENIUM_BUFFER_MAX_SIZE` | `20000` | Store-and-forward buffer capacity (oldest events evicted when full) |
 | `REVENIUM_BUFFER_FLUSH_INTERVAL` | `30` | Seconds between automatic replay attempts for buffered events |
-| `REVENIUM_METERING_WORKERS` | `8` | Background threads that send usage records (see [Metering Delivery and Timeouts](#metering-delivery-and-timeouts)) |
+| `REVENIUM_METERING_WORKERS` | `32` | Background threads that send usage records (see [Metering Delivery and Timeouts](#metering-delivery-and-timeouts)) |
 | `REVENIUM_METERING_QUEUE_SIZE` | `1000` | Usage records that can wait for a sending thread; overflow goes to the store-and-forward buffer |
 | `REVENIUM_METERING_TIMEOUT_SECONDS` | `10` | Seconds one attempt to send a usage record waits for a response |
 | `REVENIUM_METERING_CONNECT_TIMEOUT_SECONDS` | `5` | Seconds one attempt waits for a connection |

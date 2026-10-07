@@ -13,11 +13,11 @@ from revenium_middleware._core.metering import (
 class TestMetering:
     @pytest.fixture
     def reset_state(self):
-        """Fixture to reset global state before each test."""
+        """Clear the shutdown flag around each test; handle_exit sets it, and later tests would queue nothing."""
         shutdown_event.clear()
         yield
-        # Cleanup: make sure threads get stopped
         handle_exit()
+        shutdown_event.clear()
 
     def test_run_async_in_thread_when_shutdown(self, reset_state, caplog):
         """If shutdown_event is set, run_async_in_thread should log a warning and return None."""

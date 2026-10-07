@@ -95,16 +95,22 @@ def _reap_enforcement_poller(monkeypatch):
 
     Requesting ``monkeypatch`` orders this teardown before the stubs are
     restored, so a thread on its way out cannot fall through to real ``httpx``.
+
+    ``_poll_wakeup`` is set as well as ``_stop_event`` because the poller
+    sleeps on the wake-up event between refreshes; it is cleared afterwards so
+    a wake-up a test asked for cannot leak into the next one.
     """
     from revenium_middleware._core import enforcement
 
     def reap():
         thread = enforcement._poll_thread
         enforcement._stop_event.set()
+        enforcement._poll_wakeup.set()
         if thread is not None and thread.is_alive():
             thread.join(timeout=5)
         enforcement._poll_thread = None
         enforcement._stop_event.clear()
+        enforcement._poll_wakeup.clear()
 
     reap()
     yield
@@ -120,3 +126,14 @@ def _clear_deprecated_field_warning_cache():
     _fields_module._WARNED_DEPRECATED_FIELDS.clear()
     yield
     _fields_module._WARNED_DEPRECATED_FIELDS.clear()
+
+
+@pytest.fixture(autouse=True)
+def _close_delivery_circuit():
+    """The delivery circuit is process-wide: a test whose stub fails three
+    deliveries opens it, and every later test's metering would then be
+    buffered unsent instead of reaching that test's stub."""
+    from revenium_middleware._core import delivery_circuit
+    delivery_circuit.reset()
+    yield
+    delivery_circuit.reset()

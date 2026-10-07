@@ -1,5 +1,6 @@
 """Every LangChain model call is metered exactly once, under the right
-provider (BACK-3582, and BACK-3583's callback-plus-middleware criterion).
+provider (BACK-3582, and BACK-3583's callback-plus-middleware criterion), and
+the one record keeps the attribution given to the callback (BACK-3913).
 
 Real langchain-openai and langchain-anthropic run over stubbed transports, so
 no call leaves the process: OpenAI traffic is answered by a patched httpx
@@ -7,6 +8,7 @@ transport and Anthropic traffic by an httpx2 mock client. Every stub response
 carries a fresh provider id, as the live APIs do.
 """
 import asyncio
+import contextvars
 import json
 import threading
 import uuid
@@ -24,13 +26,16 @@ langchain_anthropic = pytest.importorskip("langchain_anthropic")
 from langchain_core.language_models.chat_models import BaseChatModel  # noqa: E402
 from langchain_core.messages import AIMessage  # noqa: E402
 from langchain_core.outputs import ChatGeneration, ChatResult  # noqa: E402
+from pydantic import BaseModel  # noqa: E402
 
 import revenium_middleware.openai  # noqa: E402,F401  installs the OpenAI patches
 import revenium_middleware.anthropic  # noqa: E402,F401  installs the Anthropic patches
 from revenium_middleware._core.call_ownership import (  # noqa: E402
-    ANTHROPIC, OLLAMA, OPENAI, claim_call_for_transport, claimed_by_transport, reset_claimed_response_ids,
-    transport_claim_mark, _ClaimedResponseIds,
+    ANTHROPIC, OLLAMA, OPENAI, callback_metadata_for, claim_call_for_transport, claimed_by_transport,
+    publish_callback_metadata, reset_claimed_response_ids, transport_claim_mark, with_callback_metadata,
+    _ClaimedResponseIds,
 )
+from revenium_middleware.openai import middleware as openai_middleware  # noqa: E402
 from revenium_middleware.openai.langchain import ReveniumCallbackHandler, wrap  # noqa: E402
 from revenium_middleware.openai.langchain import _model_call  # noqa: E402
 
@@ -51,6 +56,7 @@ def _sse(events):
 class StubOpenAI:
     def __init__(self):
         self.ids = []
+        self.content = "hi"
         self._lock = threading.Lock()
 
     def respond(self, request):
@@ -64,7 +70,7 @@ class StubOpenAI:
         if not body.get("stream"):
             response = httpx.Response(200, json={
                 "id": response_id, "object": "chat.completion", "created": 1, "model": OPENAI_DATED,
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"},
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": self.content},
                              "finish_reason": "stop"}],
                 "usage": usage})
         else:
@@ -509,3 +515,213 @@ class TestOllamaLabelledModels:
         assert record["transaction_id"].startswith("langchain-")
         assert record["input_token_count"] == INPUT_TOKENS
         assert record["model"] == "llama3:8b"
+
+
+CALLBACK_METADATA = {
+    "subscriber": {"id": "sub-callback", "email": "callback@example.com"},
+    "organizationName": "org-callback",
+    "traceId": "trace-callback",
+    "taskType": "task-callback",
+    "prompt_id": "prompt-callback",
+}
+
+
+def attributed_handler():
+    return ReveniumCallbackHandler(usage_metadata=CALLBACK_METADATA)
+
+
+def assert_callback_attribution(record, *, trace_id="trace-callback"):
+    assert record["subscriber"] == CALLBACK_METADATA["subscriber"]
+    assert record["organization_name"] == "org-callback"
+    assert record["trace_id"] == trace_id
+    assert record["task_type"] == "task-callback"
+    assert record["prompt_id"] == "prompt-callback"
+
+
+def assert_no_callback_attribution(record):
+    assert not record.get("subscriber")
+    assert not record.get("organization_name")
+    assert not record.get("trace_id")
+
+
+def attributed_openai(**kwargs):
+    return chat_openai(callbacks=[attributed_handler()], **kwargs)
+
+
+class Answer(BaseModel):
+    answer: str
+
+
+class TestCallbackMetadataOnTheTransportRecord:
+    @pytest.mark.parametrize("call, build, streamed", [
+        pytest.param(invoke, attributed_openai, False, id="invoke"),
+        pytest.param(ainvoke, attributed_openai, False, id="ainvoke"),
+        pytest.param(stream, attributed_openai, True, id="stream"),
+        pytest.param(astream, attributed_openai, True, id="astream"),
+        pytest.param(ainvoke, lambda: attributed_openai(streaming=True), True, id="ainvoke-streaming-true"),
+        pytest.param(invoke, lambda: attributed_openai(include_response_headers=True), False,
+                     id="invoke-with-raw-response"),
+        pytest.param(ainvoke, lambda: attributed_openai(include_response_headers=True), False,
+                     id="ainvoke-with-raw-response"),
+        pytest.param(invoke, lambda: wrap(chat_openai(), usage_metadata=CALLBACK_METADATA), False,
+                     id="invoke-via-wrap"),
+    ])
+    def test_chat_openai(self, openai_stub, records, call, build, streamed):
+        assert call(build()) == "hi"
+        assert_callback_attribution(
+            assert_one_record(openai_stub, records, provider="OPENAI", streamed=streamed, transport=True))
+
+    def test_callbacks_in_config(self, openai_stub, records):
+        assert chat_openai().invoke("hi", config={"callbacks": [attributed_handler()]}).text == "hi"
+        assert_callback_attribution(
+            assert_one_record(openai_stub, records, provider="OPENAI", streamed=False, transport=True))
+
+    @pytest.mark.parametrize("handlers", [
+        pytest.param(lambda: [attributed_handler(), ReveniumCallbackHandler()], id="attributed-first"),
+        pytest.param(lambda: [ReveniumCallbackHandler(), attributed_handler()], id="attributed-last"),
+    ])
+    @pytest.mark.parametrize("call", [invoke, ainvoke])
+    def test_a_handler_without_metadata_does_not_hide_one_with_it(self, openai_stub, records, call, handlers):
+        assert call(chat_openai(callbacks=handlers())) == "hi"
+        assert_callback_attribution(
+            assert_one_record(openai_stub, records, provider="OPENAI", streamed=False, transport=True))
+
+    @pytest.mark.parametrize("run", [
+        pytest.param(lambda model: model.invoke("hi"), id="invoke"),
+        pytest.param(lambda model: asyncio.run(model.ainvoke("hi")), id="ainvoke"),
+    ])
+    def test_chat_openai_structured_output_through_parse(self, openai_stub, records, run):
+        openai_stub.content = '{"answer": "hi"}'
+        model = attributed_openai().with_structured_output(Answer, method="json_schema")
+        assert run(model) == Answer(answer="hi")
+        assert_callback_attribution(
+            assert_one_record(openai_stub, records, provider="OPENAI", streamed=False, transport=True))
+
+    @pytest.mark.parametrize("chat_kwargs", [
+        pytest.param({}, id="messages"),
+        pytest.param({"betas": ["token-efficient-tools-2025-02-19"]}, id="beta-messages"),
+    ])
+    @pytest.mark.parametrize("call, streamed", [(invoke, False), (ainvoke, False), (stream, True), (astream, True)])
+    def test_chat_anthropic(self, anthropic_stub, records, call, streamed, chat_kwargs):
+        model = anthropic_stub.chat(callbacks=[attributed_handler()], **chat_kwargs)
+        assert call(model) == "hi"
+        assert_callback_attribution(
+            assert_one_record(anthropic_stub, records, provider="ANTHROPIC", streamed=streamed, transport=True))
+
+    @pytest.mark.usefixtures("without_anthropic_middleware")
+    def test_the_callback_record_still_carries_it_when_no_transport_meters(self, anthropic_stub, records):
+        assert invoke(anthropic_stub.chat(callbacks=[attributed_handler()])) == "hi"
+        assert_callback_attribution(
+            assert_one_record(anthropic_stub, records, provider="ANTHROPIC", streamed=False, transport=False))
+
+    @pytest.mark.parametrize("call", [invoke, ainvoke, stream, astream])
+    def test_metadata_on_the_openai_call_wins(self, openai_stub, records, call):
+        model = attributed_openai().bind(usage_metadata={"trace_id": "trace-call"})
+        assert call(model) == "hi"
+        record = assert_one_record(openai_stub, records, provider="OPENAI",
+                                   streamed=call in (stream, astream), transport=True)
+        assert_callback_attribution(record, trace_id="trace-call")
+
+    @pytest.mark.parametrize("call", [invoke, ainvoke, stream, astream])
+    def test_metadata_on_the_anthropic_call_wins(self, anthropic_stub, records, call):
+        model = anthropic_stub.chat(callbacks=[attributed_handler()]).bind(usage_metadata={"trace_id": "trace-call"})
+        assert call(model) == "hi"
+        record = assert_one_record(anthropic_stub, records, provider="ANTHROPIC",
+                                   streamed=call in (stream, astream), transport=True)
+        assert_callback_attribution(record, trace_id="trace-call")
+
+    def test_a_later_call_without_the_callback_does_not_inherit_it(self, openai_stub, records):
+        assert invoke(attributed_openai()) == "hi"
+        assert invoke(chat_openai()) == "hi"
+        assert len(records) == 2
+        assert_callback_attribution(records[0])
+        assert_no_callback_attribution(records[1])
+
+    def test_a_later_async_call_in_the_same_task_does_not_inherit_it(self, openai_stub, records):
+        async def calls():
+            await attributed_openai().ainvoke("hi")
+            async for _ in attributed_openai().astream("hi"):
+                pass
+            await chat_openai().ainvoke("hi")
+
+        asyncio.run(calls())
+        assert len(records) == 3
+        assert_callback_attribution(records[0])
+        assert_callback_attribution(records[1])
+        assert_no_callback_attribution(records[2])
+
+    def test_an_anthropic_callback_does_not_attribute_an_openai_call(self, openai_stub, anthropic_stub, records):
+        anthropic_model = anthropic_stub.chat(callbacks=[attributed_handler()])
+        for chunk in anthropic_model.stream("hi"):
+            if chunk.text:
+                assert invoke(chat_openai()) == "hi"
+        by_provider = {record["provider"]: record for record in records}
+        assert_callback_attribution(by_provider["ANTHROPIC"])
+        assert_no_callback_attribution(by_provider["OPENAI"])
+
+
+class TestCallbackMetadataPublication:
+    def test_nothing_is_published_outside_a_callback_run(self):
+        assert callback_metadata_for(OPENAI) == {}
+
+    def test_the_providers_in_scope_receive_it(self):
+        publication = publish_callback_metadata({"traceId": "t"}, frozenset({OLLAMA, OPENAI}))
+        try:
+            assert callback_metadata_for(OPENAI) == {"traceId": "t"}
+            assert callback_metadata_for(OLLAMA) == {"traceId": "t"}
+            assert callback_metadata_for(ANTHROPIC) == {}
+        finally:
+            publication.withdraw()
+        assert callback_metadata_for(OPENAI) == {}
+
+    def test_an_unknown_scope_serves_every_provider(self):
+        publication = publish_callback_metadata({"traceId": "t"})
+        try:
+            assert callback_metadata_for(ANTHROPIC) == {"traceId": "t"}
+        finally:
+            publication.withdraw()
+
+    def test_an_empty_publication_is_passed_over(self):
+        first = publish_callback_metadata({"traceId": "t"}, frozenset({OPENAI}))
+        second = publish_callback_metadata({}, frozenset({OPENAI}))
+        try:
+            assert callback_metadata_for(OPENAI) == {"traceId": "t"}
+        finally:
+            second.withdraw()
+            first.withdraw()
+
+    def test_the_latest_open_publication_wins(self):
+        first = publish_callback_metadata({"traceId": "first"}, frozenset({OPENAI}))
+        second = publish_callback_metadata({"traceId": "second"}, frozenset({OPENAI}))
+        assert callback_metadata_for(OPENAI) == {"traceId": "second"}
+        second.withdraw()
+        assert callback_metadata_for(OPENAI) == {"traceId": "first"}
+        first.withdraw()
+        assert callback_metadata_for(OPENAI) == {}
+
+    def test_withdrawing_from_another_context_still_closes_it(self):
+        publication = publish_callback_metadata({"traceId": "t"}, frozenset({OPENAI}))
+        contextvars.copy_context().run(publication.withdraw)
+        assert callback_metadata_for(OPENAI) == {}
+
+    def test_a_publication_does_not_leak_out_of_its_context(self):
+        contextvars.copy_context().run(publish_callback_metadata, {"traceId": "t"})
+        assert callback_metadata_for(OPENAI) == {}
+
+    def test_the_call_metadata_wins_under_either_spelling(self):
+        publication = publish_callback_metadata({"traceId": "callback", "organizationName": "org"})
+        try:
+            assert with_callback_metadata(OPENAI, {"trace_id": "call"}) == {"organizationName": "org",
+                                                                            "trace_id": "call"}
+            assert with_callback_metadata(OPENAI, None) == {"traceId": "callback", "organizationName": "org"}
+        finally:
+            publication.withdraw()
+
+    def test_the_responses_api_call_reads_it(self):
+        publication = publish_callback_metadata({"traceId": "t"}, frozenset({OPENAI}))
+        try:
+            call = openai_middleware._begin_responses_call(MagicMock(), {"usage_metadata": {"taskType": "x"}})
+        finally:
+            publication.withdraw()
+        assert call.usage_metadata["traceId"] == "t"
+        assert call.usage_metadata["taskType"] == "x"

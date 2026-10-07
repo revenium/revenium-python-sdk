@@ -6,8 +6,9 @@ module gives customers two ways to learn about metering failures
 programmatically:
 
 - ``on_metering_error(callback)`` — subscribe to failures as they happen.
-- ``get_metering_status()`` — poll a snapshot of success/error counters and
-  the most recent error.
+- ``get_metering_status()`` — poll a snapshot of success/error counters, the
+  most recent error, and how many undelivered events the full
+  store-and-forward buffer evicted.
 
 Both are re-exported from the top-level ``revenium_middleware`` package.
 """
@@ -39,11 +40,17 @@ class MeteringStatus:
     success_count: int
     last_error: Optional[BaseException]
     last_error_at: Optional[datetime]
+    evicted_count: int = 0
 
 
-_lock = threading.Lock()
+# Reentrant for two reasons: a garbage-collector finalizer that meters can
+# record a status change on a thread that is already recording one, and the
+# opt-in SIGTERM handler can run the exit drain, which records replay
+# outcomes, on a main thread that holds it.
+_lock = threading.RLock()
 _error_count = 0
 _success_count = 0
+_evicted_count = 0
 _last_error: Optional[BaseException] = None
 _last_error_at: Optional[datetime] = None
 _error_callbacks: List[Callable[[MeteringErrorEvent], None]] = []
@@ -57,6 +64,7 @@ def get_metering_status() -> MeteringStatus:
             success_count=_success_count,
             last_error=_last_error,
             last_error_at=_last_error_at,
+            evicted_count=_evicted_count,
         )
 
 
@@ -89,10 +97,11 @@ def remove_metering_error_callback(
 
 def reset_metering_status() -> None:
     """Reset counters, last error, and registered callbacks."""
-    global _error_count, _success_count, _last_error, _last_error_at
+    global _error_count, _success_count, _last_error, _last_error_at, _evicted_count
     with _lock:
         _error_count = 0
         _success_count = 0
+        _evicted_count = 0
         _last_error = None
         _last_error_at = None
         _error_callbacks.clear()
@@ -103,6 +112,13 @@ def record_metering_success() -> None:
     global _success_count
     with _lock:
         _success_count += 1
+
+
+def record_metering_eviction(count: int) -> None:
+    """Record ``count`` undelivered events the full store-and-forward buffer dropped."""
+    global _evicted_count
+    with _lock:
+        _evicted_count += count
 
 
 _SENSITIVE_HEADERS = ("x-api-key", "authorization")

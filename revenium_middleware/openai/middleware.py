@@ -21,7 +21,7 @@ from revenium_middleware._core.fields import extract_org_and_product, extract_co
 from revenium_middleware._core.config import is_selective_metering_enabled, is_capture_prompts_enabled
 from revenium_middleware._core.context import is_inside_decorated_function
 from revenium_middleware._core.patch_registry import register_patch
-from revenium_middleware._core.call_ownership import OPENAI, claim_call_for_transport
+from revenium_middleware._core.call_ownership import OPENAI, claim_call_for_transport, with_callback_metadata
 from revenium_middleware._core import submit_ai_event
 from revenium_middleware._core.log_sanitize import sanitize_for_logging
 
@@ -600,7 +600,8 @@ async def log_token_usage(
         # The client.ai.create_completion method is not async, so don't use await
         result = submit_ai_event("completion", completion_args)
         logger.debug("Metering call result: %s", result)
-        logger.debug(f"✅ REVENIUM SUCCESS: Metering call successful: {result.id}")
+        if result is not None:  # None: submit_ai_event buffered the record instead of sending it
+            logger.debug("REVENIUM SUCCESS: Metering call successful: %s", result.id)
     except Exception as e:
         if not shutdown_event.is_set():
             # Categorize the exception for better error handling
@@ -1033,7 +1034,7 @@ def _begin_chat_call(instance, kwargs) -> _MeteredCall:
     api_metadata = kwargs.pop("usage_metadata", {})
     if not api_metadata:
         api_metadata = _extract_langchain_usage_metadata()
-    usage_metadata = merge_metadata(api_metadata)
+    usage_metadata = merge_metadata(with_callback_metadata(OPENAI, api_metadata))
     client_instance = getattr(instance, '_client', None)
     _validate_azure_configuration(client_instance)
     request_time_dt = datetime.datetime.now(datetime.timezone.utc)
@@ -1434,7 +1435,7 @@ def _begin_responses_call(instance, kwargs) -> _MeteredCall:
     api_metadata = kwargs.pop("usage_metadata", {})
     if not api_metadata:
         api_metadata = _extract_langchain_usage_metadata()
-    usage_metadata = merge_metadata(api_metadata)
+    usage_metadata = merge_metadata(with_callback_metadata(OPENAI, api_metadata))
     request_time_dt = datetime.datetime.now(datetime.timezone.utc)
     check_enforcement(usage_metadata)
     return _MeteredCall(usage_metadata, request_time_dt, getattr(instance, '_client', None), None)

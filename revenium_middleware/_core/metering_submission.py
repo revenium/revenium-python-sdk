@@ -6,6 +6,7 @@ import uuid
 from typing import Any, Dict, Optional
 
 from revenium_middleware._core.context import get_idempotency_key
+from revenium_middleware._core.delivery_circuit import get_circuit
 from revenium_middleware._core.metering import get_client
 from revenium_middleware._core import metering_buffer
 from revenium_middleware._core.metering_status import (
@@ -90,6 +91,7 @@ def submit_ai_event(
     except Exception as exc:
         record_metering_error(exc, operation=operation)
         if metering_buffer.is_retryable_failure(exc):
+            get_circuit().record_failure()
             # Retries are exhausted inside the client; keep the event (with
             # its frozen Idempotency-Key) for background replay instead of
             # discarding it.
@@ -105,5 +107,11 @@ def submit_ai_event(
             "Metering %s event delivery failed permanently: %s", operation, exc
         )
         raise
-    record_metering_success()
+    _record_delivered()
     return result
+
+
+def _record_delivered() -> None:
+    record_metering_success()
+    if get_circuit().record_success():
+        metering_buffer.request_replay()

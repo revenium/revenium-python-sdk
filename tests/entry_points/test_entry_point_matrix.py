@@ -4,14 +4,21 @@ Rows come from manifest.yaml. Each executable row runs against a stubbed provide
 transport, and the payload recorded at the metering client must satisfy the
 row's per-operation oracle. Known gaps are strict xfails keyed by their ticket.
 A row runs only in the test environment its ``env`` names (``default`` when
-absent); see ``entry_points.instrumented``.
+absent); see ``entry_points.instrumented``. The same rows also serve as a
+timing oracle: with the metering worker busy, a payload's ``request_duration``
+must still match the call it measured.
 """
+import contextlib
+import contextvars
 import json
 import os
 import pathlib
 import re
 import subprocess
 import sys
+import threading
+import time
+from unittest.mock import DEFAULT, MagicMock, patch
 
 import pytest
 import yaml
@@ -210,6 +217,101 @@ def test_entry_point_emits_one_payload(row, mock_revenium_client, request):
     if error is not None:
         pytest.fail(_attribute_crash(row, error, request.getfixturevalue("differential")))
     check_oracle(row, payloads)
+
+
+LATENCY_BUDGET_MS = 100
+QUEUE_WAIT_SECONDS = 0.5
+LATENCY_ROWS = [row for row in ROWS_IN_THIS_ENVIRONMENT
+                if row["status"] == "metered" and not row.get("isolate") and not _metered_after_verified_release(row)]
+_row_of_event = contextvars.ContextVar("row_of_event", default=None)
+
+
+class RowTiming:
+    def __init__(self):
+        self.error = None
+        self.elapsed_ms = None
+        self.recorded_durations = []
+
+
+def _row_stamping_pool():
+    """A one-worker pool that stamps each queued event with the row that was running when it was queued.
+
+    Stamped at enqueue rather than read from the caller's context because some
+    entry points (litellm.batch_completion) meter from their own thread pool.
+    """
+    from revenium_middleware._core.metering_pool import MeteringWorkerPool
+
+    class RowStampingPool(MeteringWorkerPool):
+        row_id = None
+
+        def new_task(self, coro, ctx):
+            ctx.run(_row_of_event.set, self.row_id)
+            return super().new_task(coro, ctx)
+
+    return RowStampingPool(1, 10 * len(LATENCY_ROWS) + 10, lambda task: None)
+
+
+@contextlib.contextmanager
+def _busy_metering_worker(pool, recorder):
+    """Route metering through ``pool`` with its only worker blocked until the block exits."""
+    from revenium_middleware._core import metering, metering_pool
+
+    released = threading.Event()
+
+    async def occupy_the_worker():
+        released.wait(60)
+
+    with patch.object(metering_pool, "_pool", pool), \
+            patch("revenium_middleware._core.metering.client", recorder), \
+            patch("revenium_middleware.client", recorder):
+        metering.shutdown_event.clear()
+        pool.submit(pool.new_task(occupy_the_worker(), contextvars.copy_context()))
+        try:
+            yield
+            time.sleep(QUEUE_WAIT_SECONDS)
+        finally:
+            released.set()
+            pool.wait_until_idle(60)
+            pool.stop(timeout=5)
+
+
+def _recording_client(timings):
+    def record(**kwargs):
+        timings[_row_of_event.get()].recorded_durations.append(kwargs.get("request_duration"))
+        return DEFAULT
+
+    recorder = MagicMock()
+    for operation in calls.OPERATIONS:
+        getattr(recorder.ai, f"create_{operation}").side_effect = record
+    return recorder
+
+
+@pytest.fixture(scope="module")
+def timings_behind_a_busy_worker():
+    timings = {row["id"]: RowTiming() for row in LATENCY_ROWS}
+    pool = _row_stamping_pool()
+    with _busy_metering_worker(pool, _recording_client(timings)):
+        for row in LATENCY_ROWS:
+            timing = timings[row["id"]]
+            pool.row_id = row["id"]
+            started = time.monotonic()
+            try:
+                calls.run_call(_call_id(row))
+            except Exception as exc:  # noqa: BLE001
+                timing.error = f"{type(exc).__name__}: {exc}"
+            finally:
+                timing.elapsed_ms = (time.monotonic() - started) * 1000
+    return timings
+
+
+@pytest.mark.parametrize("row", [pytest.param(row, id=row["id"]) for row in LATENCY_ROWS])
+def test_recorded_duration_excludes_the_metering_queue_wait(row, timings_behind_a_busy_worker):
+    timing = timings_behind_a_busy_worker[row["id"]]
+    assert timing.error is None
+    assert timing.recorded_durations, "no payload was recorded for this call"
+    for duration in timing.recorded_durations:
+        assert abs(duration - timing.elapsed_ms) <= LATENCY_BUDGET_MS, (
+            f"request_duration {duration} ms, call took {timing.elapsed_ms:.0f} ms")
 
 
 def test_every_stub_runs_cleanly_without_our_middleware(differential):
