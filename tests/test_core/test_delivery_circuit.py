@@ -11,6 +11,7 @@ from revenium_middleware._core.delivery_circuit import DeliveryCircuit
 from revenium_middleware._core.metering_buffer import MeteringBuffer
 from revenium_middleware._core.metering_pool import MeteringTask, MeteringWorkerPool
 from revenium_middleware._core.metering_submission import submit_ai_event
+from revenium_middleware._metering import decorator as tool_metering
 from revenium_middleware._metering._exceptions import APIConnectionError
 
 COMPLETION_ARGS = {"model": "gpt-4o-mini", "input_token_count": 3, "output_token_count": 2}
@@ -115,6 +116,44 @@ class TestCircuit:
         assert sum("answering again" in message for message in messages) == 1
 
 
+class ToolEndpoint:
+    """Stands in for the httpx module the tool-event sender posts through; records each URL it is sent to."""
+
+    def __init__(self):
+        self.urls = []
+        endpoint = self
+
+        class AsyncClient:
+            def __init__(self, timeout=None):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def post(self, url, headers=None, json=None):
+                endpoint.urls.append(url)
+                return httpx.Response(202, request=httpx.Request("POST", url))
+
+        self.AsyncClient = AsyncClient
+
+    def wait_for_post(self, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while not self.urls and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+
+@pytest.fixture
+def tool_endpoint(monkeypatch):
+    endpoint = ToolEndpoint()
+    monkeypatch.setattr(tool_metering, "httpx", endpoint)
+    tool_metering.configure(metering_url="http://tools.test", api_key="rev_mk_test")
+    yield endpoint
+    tool_metering.configure()
+
+
 class TestWorkersWhileOpen:
     @pytest.fixture
     def pool(self):
@@ -153,6 +192,33 @@ class TestWorkersWhileOpen:
 
         assert mock_revenium_client.ai.create_completion.call_count == 1
         assert buffer.stats()["size"] == 5
+
+    def test_a_tool_event_is_sent_not_buffered(self, buffer, mock_revenium_client, tool_endpoint):
+        mock_revenium_client.ai.create_completion.side_effect = connection_error()
+        for _ in range(delivery_circuit.FAILURES_TO_OPEN):
+            submit_ai_event("completion", dict(COMPLETION_ARGS))
+        assert delivery_circuit.get_circuit().is_open()
+
+        tool_metering.report_tool_call(tool_id="search", duration_ms=5)
+        tool_endpoint.wait_for_post()
+
+        assert tool_endpoint.urls == ["http://tools.test/meter/v2/tool/events"]
+        assert [event.kind for event in buffer._events] == ["ai"] * delivery_circuit.FAILURES_TO_OPEN
+        assert delivery_circuit.get_circuit().is_open()
+
+    def test_a_tool_event_does_not_spend_the_probe(self, pool, buffer, mock_revenium_client):
+        open_circuit(delivery_circuit.get_circuit())
+        delivery_circuit.get_circuit()._next_probe_at = 0.0
+
+        async def tool_event():
+            pass
+
+        tool_task = pool.new_task(tool_event(), contextvars.copy_context(), gated_by_circuit=False)
+        pool.submit(tool_task)
+        tool_task.join(5)
+        self.submit(pool).join(5)
+
+        mock_revenium_client.ai.create_completion.assert_called_once()
 
     def test_the_first_success_reopens_delivery(self, pool, buffer, mock_revenium_client):
         open_circuit(delivery_circuit.get_circuit())

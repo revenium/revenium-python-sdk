@@ -531,6 +531,88 @@ def test_a_build_the_deadline_cuts_short_on_the_exiting_thread_is_counted_in_the
     assert [w.split(" metering event(s)")[0] for w in _shutdown_warnings(caplog)] == ["1"]
 
 
+def _overflow_with_no_thread_to_start(monkeypatch, buffer, coroutine_or_func):
+    """Overflow one event through run_async_in_thread, then leave the process unable to start a thread."""
+    monkeypatch.setattr(metering_buffer, "_buffer", buffer)
+    pool = MeteringWorkerPool(1, queue_size=1, overflow=metering_pool._overflow_to_buffer)
+    monkeypatch.setattr(metering_pool, "_pool", pool)
+    picked_up, release = threading.Event(), threading.Event()
+
+    async def occupy_the_worker():
+        picked_up.set()
+        release.wait(10)
+
+    async def fill_the_queue():
+        release.wait(10)
+
+    metering.run_async_in_thread(occupy_the_worker())
+    assert picked_up.wait(5)
+    queued = metering.run_async_in_thread(fill_the_queue())
+
+    def refuse(thread):
+        raise RuntimeError("can't create new thread at interpreter shutdown")
+
+    monkeypatch.setattr(threading.Thread, "start", refuse)
+    overflowed = metering.run_async_in_thread(coroutine_or_func)
+    release.set()
+    queued.join(5)
+    assert not queued.is_alive()
+    assert buffer.stats()["total_overflowed"] == 1
+    return overflowed
+
+
+def test_with_no_thread_to_start_shutdown_leaves_an_overflowed_synchronous_callable_unbuilt_and_counts_it(
+    isolated_shutdown, monkeypatch, caplog
+):
+    """asyncio.wait_for cannot interrupt a synchronous callable queued through run_async_in_thread,
+    so the exiting thread must not build one when no other thread can."""
+    budget = 0.3
+    monkeypatch.setenv(BUDGET_ENV, str(budget))
+    started, release = threading.Event(), threading.Event()
+
+    def blocks_past_the_budget():
+        started.set()
+        release.wait(5)
+
+    buffer = MeteringBuffer(max_size=10, flush_interval=9999.0, replay_fn=lambda event, timeout: None)
+    overflowed = _overflow_with_no_thread_to_start(monkeypatch, buffer, blocks_past_the_budget)
+
+    try:
+        drain_started = time.monotonic()
+        with caplog.at_level(logging.WARNING, logger="revenium_middleware"):
+            metering.handle_exit()
+        elapsed = time.monotonic() - drain_started
+    finally:
+        release.set()
+        overflowed.discard()
+
+    assert not started.is_set()
+    assert elapsed < budget + 0.3
+    assert [w.split(" metering event(s)")[0] for w in _shutdown_warnings(caplog)] == ["1"]
+
+
+def test_with_no_thread_to_start_shutdown_still_builds_an_overflowed_coroutine_on_the_exiting_thread(
+    isolated_shutdown, monkeypatch, caplog
+):
+    monkeypatch.setenv(BUDGET_ENV, "0.5")
+    built_on, replayed = [], []
+
+    async def integration_style_call():
+        built_on.append(threading.current_thread())
+        metering_buffer.buffer_deferred_event("ai", {"seq": "overflowed"})
+
+    buffer = MeteringBuffer(max_size=10, flush_interval=9999.0,
+                            replay_fn=lambda event, timeout: replayed.append(event.payload["seq"]))
+    _overflow_with_no_thread_to_start(monkeypatch, buffer, integration_style_call())
+
+    with caplog.at_level(logging.WARNING, logger="revenium_middleware"):
+        metering.handle_exit()
+
+    assert built_on == [threading.current_thread()]
+    assert replayed == ["overflowed"]
+    assert _shutdown_warnings(caplog) == []
+
+
 COMPLETION_ARGS = {
     "completion_start_time": "2026-10-06T00:00:00Z", "cost_type": "AI", "input_token_count": 1,
     "is_streamed": False, "model": "gpt-test", "output_token_count": 1, "provider": "OPENAI",

@@ -238,7 +238,7 @@ def _dispatch_tool_event(**event_kwargs: Any) -> None:
     # that fails to hand it off must close() it, otherwise garbage collection
     # emits a "coroutine was never awaited" RuntimeWarning.
     try:
-        thread = run_async_in_thread(coro)
+        thread = run_async_in_thread(coro, gated_by_circuit=False)
         if thread is None:
             # Not scheduled (e.g. shutdown won the race after our pre-check).
             coro.close()

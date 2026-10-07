@@ -16,9 +16,11 @@ handler sends its own record only for calls no transport wrap metered, under
 the provider LangChain reports for the model class.
 
 The transport's record carries the handler's ``usage_metadata``: the handler
-publishes it for the transport when the call starts and withdraws it when the
-call ends. The handler runs inline (``run_inline``) so that the publication
-lands in the caller's context during async calls too.
+publishes it for the model call's own transport call when the call starts and
+withdraws it at the first token and when the call ends, so a client call the
+caller makes between a stream's chunks never inherits it. The handler runs
+inline (``run_inline``) so that the publication lands in the caller's context
+during async calls too.
 """
 
 import logging
@@ -178,7 +180,7 @@ class UnifiedReveniumCallbackHandler(AsyncCallbackHandler):
                 serialized, invocation_params, kwargs.get('metadata')
             ),
             'transport_scope': transport_scope,
-            'published_metadata': publish_callback_metadata(self.usage_metadata, transport_scope),
+            'published_metadata': publish_callback_metadata(self.usage_metadata, transport_scope, run_id),
         }
 
         self._active_runs[run_id] = run_info
@@ -563,13 +565,15 @@ class UnifiedReveniumCallbackHandler(AsyncCallbackHandler):
         self._handle_llm_end(response, is_async=False, **kwargs)
 
     async def on_llm_new_token(self, token: str, **kwargs) -> None:
-        """Marks the run as streamed and notes a transport claim made in the
-        model call's own context (a coroutine hook runs there)."""
+        """Marks the run as streamed, withdraws its metadata (the transport
+        call is already made) and notes a transport claim made in the model
+        call's own context (a coroutine hook runs there)."""
         try:
             run_info = self._active_runs.get(kwargs.get('run_id'))
             if run_info is None:
                 return
             run_info['is_streaming'] = True
+            run_info['published_metadata'].withdraw()
             if not run_info['transport_claimed']:
                 run_info['transport_claimed'] = claimed_by_transport(
                     run_info['transport_claim_mark'], run_info['transport_scope']

@@ -8,9 +8,9 @@ Idempotency-Key window.
 
 It also holds metering tasks the delivery queue had no room for: each flush
 first runs them with delivery deferred, so they build and buffer their event
-instead of sending it, and the event then replays like any other. Records the
-delivery circuit holds back during an outage arrive here the same way, and the
-first delivery that succeeds afterwards wakes the flush thread to replay them.
+instead of sending it, and the event then replays like any other. AI records
+the delivery circuit holds back during an outage arrive here the same way, and
+the first delivery that succeeds afterwards wakes the flush thread to replay them.
 """
 from __future__ import annotations
 
@@ -57,6 +57,8 @@ REPLAY_CONCURRENCY = 16
 _RETRYABLE_STATUS_CODES = frozenset({408, 429})
 
 
+AI_KIND = "ai"
+TOOL_KIND = "tool"
 OVERFLOW_KIND = "overflow"
 
 
@@ -103,7 +105,13 @@ class BuildDeadlineExceeded(Exception):
 
 
 class OverflowTask(Protocol):
-    """A metering task that overflowed the delivery queue before building its payload."""
+    """A metering task that overflowed the delivery queue before building its payload.
+
+    ``blocks_synchronously``: building it runs synchronous code that a build
+    timeout cannot cut short.
+    """
+
+    blocks_synchronously: bool
 
     def materialize(self, enqueued_at: float, timeout: Optional[float] = None) -> None:
         """Build the event and buffer it (under ``delivery_deferred_to_buffer(enqueued_at)``).
@@ -122,7 +130,7 @@ class BufferedEvent:
     __slots__ = ("kind", "payload", "enqueued_at")
 
     def __init__(self, kind: str, payload: Dict[str, Any], enqueued_at: float):
-        self.kind = kind  # "ai" | "tool" | OVERFLOW_KIND
+        self.kind = kind  # AI_KIND | TOOL_KIND | OVERFLOW_KIND
         self.payload = payload
         self.enqueued_at = enqueued_at
 
@@ -207,6 +215,16 @@ class _OverflowBuild:
             unstarted = self._overflow[self._next:]
             self._overflow = self._overflow[:self._next]
             return unstarted
+
+    def set_aside_blocking(self) -> List[BufferedEvent]:
+        """Hand back the unstarted tasks that block synchronously; the others stay in this build."""
+        with self._lock:
+            unstarted = self._overflow[self._next:]
+            blocking = [event for event in unstarted if event.payload["task"].blocks_synchronously]
+            if blocking:
+                kept = [event for event in unstarted if not event.payload["task"].blocks_synchronously]
+                self._overflow = self._overflow[:self._next] + kept
+            return blocking
 
     def unbuilt(self) -> int:
         """Tasks this build took on and has not finished, excluding any reclaimed."""
@@ -390,9 +408,9 @@ def _replay_tool_event(payload: Dict[str, Any], timeout_seconds: float) -> None:
 
 
 def _default_replay(event: BufferedEvent, timeout_seconds: float) -> None:
-    if event.kind == "ai":
+    if event.kind == AI_KIND:
         _replay_ai_event(event.payload, timeout_seconds)
-    elif event.kind == "tool":
+    elif event.kind == TOOL_KIND:
         _replay_tool_event(event.payload, timeout_seconds)
     else:  # unknown kinds are a programming error; treat as permanent
         raise ValueError(f"Unknown buffered event kind: {event.kind!r}")
@@ -400,6 +418,7 @@ def _default_replay(event: BufferedEvent, timeout_seconds: float) -> None:
 
 class _ReplayOutcome(NamedTuple):
     sent: int
+    ai_sent: int
     discarded: int
     retry: List[BufferedEvent]
     status: List[Optional[Tuple[BaseException, str]]]
@@ -433,21 +452,30 @@ def _replay_concurrently(
 
 
 def _sort_outcomes(batch: List[BufferedEvent], errors: List[Optional[Exception]]) -> _ReplayOutcome:
-    sent = discarded = 0
+    sent = ai_sent = discarded = 0
     retry: List[BufferedEvent] = []
     status: List[Optional[Tuple[BaseException, str]]] = []
     for event, error in zip(batch, errors):
         if error is None:
             sent += 1
+            ai_sent += event.kind == AI_KIND
             status.append(None)
         elif is_retryable_failure(error):
-            logger.debug("Buffer flush stopped; backend still unreachable: %s", error)
+            logger.debug("Buffer flush stopped replaying %s events; their endpoint is still unreachable: %s",
+                         event.kind, error)
             retry.append(event)
         else:
             discarded += 1
             status.append((error, event.kind))
             logger.debug("Discarded buffered event after permanent failure: %s", error)
-    return _ReplayOutcome(sent, discarded, retry, status)
+    return _ReplayOutcome(sent, ai_sent, discarded, retry, status)
+
+
+class _BatchLimits(NamedTuple):
+    """How many events one replay batch takes, and how many of those may be AI events."""
+
+    size: int
+    ai: int
 
 
 def _expiry_error(kind: str, max_age_seconds: float) -> TimeoutError:
@@ -494,6 +522,9 @@ class MeteringBuffer:
         self._now_fn = now_fn
 
         self._events: Deque[BufferedEvent] = deque()
+        # Records of a kind whose endpoint failed during the running flush,
+        # ahead of everything in _events; the flush returns them when it ends.
+        self._parked: Deque[BufferedEvent] = deque()
         self._lock = threading.RLock()
         self._flush_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
@@ -530,18 +561,22 @@ class MeteringBuffer:
             self._events.append(BufferedEvent(kind, payload, enqueued_at))
             if not counted:
                 self._total_buffered += 1
-            depth = len(self._events)
+            depth = self._held()
         _settle_evicted(evicted)
         logger.debug("Buffered undelivered %s metering event (buffer depth: %d)", kind, depth)
         self._ensure_flush_thread()
 
     def flush(self, deadline_seconds: Optional[float] = None) -> Dict[str, int]:
-        """Replay buffered events oldest-first.
+        """Replay buffered events oldest-first within each kind.
 
-        Stops at the first retryable failure (backend still unreachable), on
-        the deadline, or when the buffer is drained. Permanent failures and
-        expired events are discarded. Without a deadline, up to
-        ``replay_concurrency`` events are replayed at once, or one while the
+        AI and tool events go to endpoints that can fail apart, so a retryable
+        failure (endpoint still unreachable) stops replaying that kind only:
+        its events are parked, each visited once, and go back to the front in
+        order when the flush ends, while the other kind's events behind them
+        are still replayed. Stops when every kind has failed, on the deadline,
+        or when the buffer is drained. Permanent failures and expired events
+        are discarded. Without a deadline, up to ``replay_concurrency`` events
+        are replayed at once, no more than one of them an AI event while the
         delivery circuit is open; with a deadline (the exit drain), one at a
         time. Serialized: concurrent flushes queue up, and one with a deadline
         stops waiting for the flush in progress when the deadline passes,
@@ -573,9 +608,12 @@ class MeteringBuffer:
             return {"sent": 0, "expired": 0, "discarded": 0, "remaining": self.undelivered()}
         with self._lock:
             late_overflow = self._register_build([])
+        unreachable_kinds: Set[str] = set()
         try:
             while deadline_seconds is None or time.monotonic() - started < deadline_seconds:
-                batch, expired_events = self._take_replay_batch(self._batch_size(deadline_seconds), late_overflow)
+                batch, expired_events = self._take_replay_batch(
+                    self._batch_limits(deadline_seconds), unreachable_kinds, late_overflow
+                )
                 deferred_outcomes.extend(self._expire(expired_events))
                 expired += len(expired_events)
                 if not batch:
@@ -587,9 +625,9 @@ class MeteringBuffer:
                 sent += outcome.sent
                 discarded += outcome.discarded
                 deferred_outcomes.extend(outcome.status)
-                if outcome.retry:
-                    break
+                unreachable_kinds.update(event.kind for event in outcome.retry)
         finally:
+            self._unpark()
             self._flush_lock.release()
 
         for status in deferred_outcomes:
@@ -612,10 +650,12 @@ class MeteringBuffer:
             )
         return {"sent": sent, "expired": expired, "discarded": discarded, "remaining": remaining}
 
-    def _batch_size(self, deadline_seconds: Optional[float]) -> int:
-        if deadline_seconds is not None or get_circuit().is_open():
-            return 1
-        return self._replay_concurrency
+    def _batch_limits(self, deadline_seconds: Optional[float]) -> _BatchLimits:
+        if deadline_seconds is not None:
+            return _BatchLimits(size=1, ai=1)
+        if get_circuit().is_open():
+            return _BatchLimits(size=self._replay_concurrency, ai=1)
+        return _BatchLimits(size=self._replay_concurrency, ai=self._replay_concurrency)
 
     def _replay_timeout(self, deadline_seconds: Optional[float], started: float) -> float:
         """Cap each replay call so a single slow network call cannot blow through the flush deadline.
@@ -630,28 +670,37 @@ class MeteringBuffer:
         return max(MIN_REPLAY_TIMEOUT_SECONDS, min(self._replay_timeout_seconds, remaining))
 
     def _take_replay_batch(
-        self, size: int, late_overflow: _OverflowBuild
+        self, limits: _BatchLimits, unreachable_kinds: Set[str], late_overflow: _OverflowBuild
     ) -> Tuple[List[BufferedEvent], List[BufferedEvent]]:
-        """Take up to ``size`` of the oldest replayable events, plus the expired ones met on the way.
+        """Take the oldest replayable events ``limits`` allows, plus the expired ones met on the way.
 
-        Overflowed tasks met on the way join ``late_overflow``, a registered
-        build the exit drain can take over.
+        Events of ``unreachable_kinds`` are parked; an AI event beyond
+        ``limits.ai`` ends the batch in front of it. Either way no event is
+        visited twice in one flush. Overflowed tasks met on the way join
+        ``late_overflow``, a registered build the exit drain can take over.
         Taken events are out of the buffer while they replay, so a push at
         capacity cannot evict one that is being delivered, and counted in
         ``undelivered`` until ``_settle_replays`` accounts for them.
         """
         batch: List[BufferedEvent] = []
         expired: List[BufferedEvent] = []
+        ai_taken = 0
         with self._lock:
-            while self._events and len(batch) < size:
+            while self._events and len(batch) < limits.size:
+                front = self._events[0]
+                if front.kind == AI_KIND and AI_KIND not in unreachable_kinds and ai_taken == limits.ai:
+                    break
                 event = self._events.popleft()
                 if self._now_fn() - event.enqueued_at > self._max_age_seconds:
                     self._total_expired += 1
                     expired.append(event)
                 elif event.kind == OVERFLOW_KIND:
                     late_overflow.add(event)
+                elif event.kind in unreachable_kinds:
+                    self._parked.append(event)
                 else:
                     batch.append(event)
+                    ai_taken += event.kind == AI_KIND
             self._replays_in_flight += len(batch)
         return batch, expired
 
@@ -662,32 +711,46 @@ class MeteringBuffer:
         return [(_expiry_error(event.kind, self._max_age_seconds), event.kind) for event in expired]
 
     def _settle_replays(self, outcome: _ReplayOutcome) -> None:
-        """Count a batch's outcome, put its retryable failures back in front and tell the delivery circuit."""
+        """Count a batch's outcome, park its retryable failures and report AI ones to the circuit.
+
+        A failure parks its kind for the rest of the flush, and no event of
+        that kind is parked before it, so parking keeps each kind in order.
+        """
         with self._lock:
             self._replays_in_flight -= outcome.sent + outcome.discarded + len(outcome.retry)
             self._total_replayed += outcome.sent
             self._total_discarded += outcome.discarded
-            self._events.extendleft(reversed(outcome.retry))
+            self._parked.extend(outcome.retry)
             evicted = self._evict_down_to(self._max_size)
-            if outcome.sent and len(self._events) < self._max_size:
+            if outcome.sent and self._held() < self._max_size:
                 self._was_full = False
         _settle_evicted(evicted)
-        # A batch that delivered anything shows the endpoint answering; the
+        # A batch that delivered any AI event shows the endpoint answering; the
         # records that failed in it go back to the front and are retried.
-        if outcome.sent:
+        if outcome.ai_sent:
             get_circuit().record_success()
-        elif outcome.retry:
+        elif any(event.kind == AI_KIND for event in outcome.retry):
             get_circuit().record_failure()
 
+    def _unpark(self) -> None:
+        """Put the events the flush parked back in front, in the order they were parked."""
+        with self._lock:
+            self._events.extendleft(reversed(self._parked))
+            self._parked.clear()
+
+    def _held(self) -> int:
+        """Events in the buffer, parked ones included; caller holds ``_lock``."""
+        return len(self._events) + len(self._parked)
+
     def _evict_down_to(self, size: int) -> List[BufferedEvent]:
-        """Evict oldest-first until at most ``size`` events remain; caller holds ``_lock``.
+        """Evict oldest-first, parked events before the rest, until at most ``size`` remain; caller holds ``_lock``.
 
         The caller hands the result to ``_settle_evicted`` once it has released
         the lock.
         """
         evicted: List[BufferedEvent] = []
-        while len(self._events) > size:
-            evicted.append(self._events.popleft())
+        while self._held() > size:
+            evicted.append((self._parked or self._events).popleft())
             self._total_evicted += 1
             self._evicted_unreported += 1
             if not self._was_full:
@@ -701,7 +764,7 @@ class MeteringBuffer:
     def undelivered(self) -> int:
         """Events buffered plus those a flush has taken out to replay and not yet accounted for."""
         with self._lock:
-            return len(self._events) + self._replays_in_flight
+            return self._held() + self._replays_in_flight
 
     def report_evictions(self) -> None:
         """Log how many events were evicted since the last report, if any."""
@@ -812,6 +875,11 @@ class MeteringBuffer:
         return True
 
     def _build_on_this_thread(self, build: _OverflowBuild, deadline_seconds: Optional[float]) -> int:
+        """Build here, by the deadline if there is one.
+
+        With a deadline, tasks that block synchronously stay buffered unbuilt;
+        on a thread running an event loop, every task does.
+        """
         if _event_loop_running_here():
             self._forget_build(build)
             unstarted = build.reclaim()
@@ -819,7 +887,18 @@ class MeteringBuffer:
                            "they stay buffered unbuilt", len(unstarted))
             self._return_to_front(unstarted)
             return len(unstarted)
-        until = None if deadline_seconds is None else time.monotonic() + deadline_seconds
+        if deadline_seconds is None:
+            return self._build_here_until(build, None)
+        until = time.monotonic() + deadline_seconds
+        blocking = build.set_aside_blocking()
+        self._return_to_front(blocking)
+        if blocking:
+            logger.warning("No thread could build %d overflowed metering event(s) that run synchronous code, which "
+                           "the %.3fs deadline could not cut short; they stay buffered unbuilt",
+                           len(blocking), deadline_seconds)
+        return self._build_here_until(build, until) + len(blocking)
+
+    def _build_here_until(self, build: _OverflowBuild, until: Optional[float]) -> int:
         try:
             build.run(until)
         finally:
@@ -879,7 +958,7 @@ class MeteringBuffer:
         """
         with self._lock:
             return {
-                "size": len(self._events) + self._replays_in_flight,
+                "size": self._held() + self._replays_in_flight,
                 "max_size": self._max_size,
                 "total_buffered": self._total_buffered,
                 "total_replayed": self._total_replayed,

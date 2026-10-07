@@ -1908,7 +1908,10 @@ records in a row fail with a retryable error, new records go straight to the
 store-and-forward buffer without being sent, and one record every 5 seconds
 is still sent to find out whether Revenium is back. The first one that
 succeeds resumes sending and starts replaying the buffer at once. A warning
-marks each change.
+marks each change. Tool events from `@meter_tool` and `report_tool_call` are
+not held back: `configure()` can send them to another endpoint, so they keep
+being sent, and the buffer replays them even while the AI records ahead of
+them are still failing.
 
 At exit, queued records get the first share of the shutdown budget (see
 [Shutdown](#shutdown)).
@@ -1954,9 +1957,10 @@ steps against one budget of `REVENIUM_SHUTDOWN_TIMEOUT_SECONDS` (5 seconds by
 default), each using whatever time the previous ones left: it waits for the
 background threads to send the records still queued, builds the records that
 overflowed to the store-and-forward buffer, then flushes the buffer, oldest
-first and one attempt per record. The flush stops at the first record the
-endpoint still cannot take (unreachable, timed out, 429 or 5xx), leaving that
-record and the ones behind it unsent. Records still queued, being sent, unbuilt
+first and one attempt per record. Once a usage record or a tool event fails
+in a way worth retrying (unreachable, timed out, 429 or 5xx), the flush sends
+no more records of that kind, leaving them unsent, and keeps sending the other
+kind, since tool events can go to a different endpoint. Records still queued, being sent, unbuilt
 or unsent at the end are dropped and logged once, as a warning with a count.
 
 A process ended by SIGTERM's default action skips `atexit`, and with it that

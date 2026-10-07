@@ -321,7 +321,7 @@ async def _run_sync_callable(func: Callable[[], Any]) -> Any:
         raise
 
 
-def run_async_in_thread(coroutine_or_func) -> Optional[MeteringTask]:
+def run_async_in_thread(coroutine_or_func, *, gated_by_circuit: bool = True) -> Optional[MeteringTask]:
     """Queue a metering coroutine (or sync callable) for background delivery.
 
     Returns immediately. A fixed pool of daemon workers delivers queued
@@ -330,6 +330,8 @@ def run_async_in_thread(coroutine_or_func) -> Optional[MeteringTask]:
 
     Args:
         coroutine_or_func: Either an awaitable coroutine or a regular function
+        gated_by_circuit: False for an event the AI delivery circuit must not
+            hold back, such as a tool event, which may go to another endpoint
 
     Returns:
         Optional[MeteringTask]: A handle whose ``join``/``is_alive`` follow the
@@ -340,9 +342,9 @@ def run_async_in_thread(coroutine_or_func) -> Optional[MeteringTask]:
         return None
 
     if asyncio.iscoroutine(coroutine_or_func):
-        coro = coroutine_or_func
+        coro, blocks_synchronously = coroutine_or_func, False
     elif callable(coroutine_or_func):
-        coro = _run_sync_callable(coroutine_or_func)
+        coro, blocks_synchronously = _run_sync_callable(coroutine_or_func), True
     else:
         logger.error(
             "Invalid type passed to run_async_in_thread: %s. Expected coroutine or callable.",
@@ -353,7 +355,10 @@ def run_async_in_thread(coroutine_or_func) -> Optional[MeteringTask]:
     # Capture the current context so contextvars (e.g. idempotency_key) propagate
     # into the worker thread, which otherwise runs in its own context.
     pool = metering_pool.get_pool(shutdown_event.is_set)
-    task = pool.new_task(coro, contextvars.copy_context())
+    task = pool.new_task(
+        coro, contextvars.copy_context(),
+        blocks_synchronously=blocks_synchronously, gated_by_circuit=gated_by_circuit,
+    )
     try:
         pool.submit(task)
     except RuntimeError as e:

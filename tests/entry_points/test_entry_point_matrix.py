@@ -244,9 +244,9 @@ def _row_stamping_pool():
     class RowStampingPool(MeteringWorkerPool):
         row_id = None
 
-        def new_task(self, coro, ctx):
+        def new_task(self, coro, ctx, blocks_synchronously=False, gated_by_circuit=True):
             ctx.run(_row_of_event.set, self.row_id)
-            return super().new_task(coro, ctx)
+            return super().new_task(coro, ctx, blocks_synchronously, gated_by_circuit)
 
     return RowStampingPool(1, 10 * len(LATENCY_ROWS) + 10, lambda task: None)
 

@@ -6,8 +6,10 @@ each worker running coroutines on an event loop it owns for its whole life.
 When the queue is full the task goes to the store-and-forward buffer instead,
 so a slow or unreachable metering endpoint can never grow the thread count,
 block the caller, or hold more than ``queue size + buffer size`` events.
-While the delivery circuit is open the workers build each record into the
-buffer without sending it, so an outage does not hold them.
+While the delivery circuit is open the workers build each AI record into the
+buffer without sending it, so an outage does not hold them. Tasks queued
+outside the circuit, such as tool events, which may go to another endpoint,
+are always sent.
 """
 from __future__ import annotations
 
@@ -52,6 +54,8 @@ class MeteringTask:
 
     Joinable like the per-call thread it replaces, so callers that wait for
     delivery (tests, scripts) keep calling ``join``/``is_alive``.
+    ``blocks_synchronously`` marks a coroutine that only wraps a synchronous
+    callable, which a build timeout cannot cut short.
     """
 
     def __init__(
@@ -59,10 +63,14 @@ class MeteringTask:
         coro: Coroutine[Any, Any, Any],
         ctx: contextvars.Context,
         is_shutting_down: Callable[[], bool] = _never,
+        blocks_synchronously: bool = False,
+        gated_by_circuit: bool = True,
     ):
         self._coro = coro
+        self.blocks_synchronously = blocks_synchronously
         self._ctx = ctx
         self._is_shutting_down = is_shutting_down
+        self.gated_by_circuit = gated_by_circuit
         self._done = threading.Event()
         self._settle_lock = threading.Lock()
         self._settled_callbacks: List[Callable[[], None]] = []
@@ -210,9 +218,15 @@ class MeteringWorkerPool:
     def queue_size(self) -> int:
         return self._slots.size
 
-    def new_task(self, coro: Coroutine[Any, Any, Any], ctx: contextvars.Context) -> MeteringTask:
+    def new_task(
+        self,
+        coro: Coroutine[Any, Any, Any],
+        ctx: contextvars.Context,
+        blocks_synchronously: bool = False,
+        gated_by_circuit: bool = True,
+    ) -> MeteringTask:
         """A task for ``coro`` that, like this pool, knows when the process is shutting down."""
-        return MeteringTask(coro, ctx, self._is_shutting_down)
+        return MeteringTask(coro, ctx, self._is_shutting_down, blocks_synchronously, gated_by_circuit)
 
     def submit(self, task: MeteringTask) -> None:
         """Queue ``task`` without blocking; a full queue sends it to the overflow."""
@@ -349,11 +363,16 @@ class MeteringWorkerPool:
                 if self._overflowing and self._slots.all_free():
                     self._end_overflow_episode()
                 try:
-                    task.run(loop, send=get_circuit().allows_send())
+                    task.run(loop, send=_may_send(task))
                 finally:
                     self._mark_finished()
         finally:
             loop.close()
+
+
+def _may_send(task: MeteringTask) -> bool:
+    """Whether to send ``task`` now; only a gated one asks the circuit, so it never spends a probe."""
+    return not task.gated_by_circuit or get_circuit().allows_send()
 
 
 _pool: Optional[MeteringWorkerPool] = None

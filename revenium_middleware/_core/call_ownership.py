@@ -26,20 +26,34 @@ callback reads:
 
 Because the transport's record is the one kept, it has to carry the
 attribution the caller gave the callback (subscriber, organization, trace,
-task). The callback calls ``publish_callback_metadata(metadata, providers)``
-when the model call starts and withdraws the publication when the call ends
-or fails; a transport wrap reads it with ``with_callback_metadata(provider,
+task). The callback calls ``publish_callback_metadata(metadata, providers,
+call_id)`` when the model call starts, with LangChain's run id as
+``call_id``; a transport wrap takes it with ``with_callback_metadata(provider,
 call_metadata)``, where the call's own metadata wins field by field. That
 direction only works because the callback runs inline (``run_inline``):
 otherwise, during ``ainvoke``/``astream``, langchain-core runs a sync handler
 method on a copy of the caller's context (``run_in_executor(copy_context().run,
 ...)``) and nothing the callback writes reaches the transport. A publication
 is seen in the context it was made in and in tasks started from it, which is
-where the model call runs. Withdrawing marks the publication itself, so a
-call that ends in another task (an abandoned ``astream`` closed by the event
-loop's finalizer) still stops the context it started in from using it. When
-several started calls are still open in one context, the most recent one in
-the provider's scope that carries metadata is used.
+where the model call runs.
+
+A publication belongs to the one model call it was made for, and a stream's
+consumer loop runs in the same context as the stream, so a provider-wide
+offer would hand a stream's attribution to every unrelated client call made
+between its chunks. Each publication is therefore offered to one transport
+call only. LangChain makes exactly one transport call per model call (one
+``create``, ``parse`` or ``stream`` on the OpenAI, Anthropic or Ollama
+client, the client's retries running below the wrap), so the first transport
+call of a provider in scope takes the latest open model call and closes every
+publication made for it, one per attached handler. The publication also
+closes when the callback withdraws it: on the model call's first token,
+which langchain-core dispatches before the chunk reaches the caller, and when
+the call ends or fails. That covers a model call whose transport never takes
+it (a client the SDK does not meter, or one selective metering lets through).
+Closing marks the publication itself, so a call that ends in another task (an
+abandoned ``astream`` closed by the event loop's finalizer, or the child task
+``agenerate`` runs the transport in) still closes it in the context it
+started in.
 
 The counters cover every call whose transport runs in that caller context:
 sync calls in a thread and ``stream``/``astream``. ``agenerate`` (behind
@@ -145,18 +159,22 @@ def claimed_by_transport(mark: Mapping[str, int], providers: Optional[AbstractSe
 class CallbackMetadata:
     """Attribution a LangChain callback published for one model call."""
 
-    __slots__ = ("metadata", "providers", "withdrawn")
+    __slots__ = ("metadata", "providers", "call_id", "closed")
 
-    def __init__(self, metadata: Mapping[str, Any], providers: Optional[AbstractSet[str]]):
+    def __init__(self, metadata: Mapping[str, Any], providers: Optional[AbstractSet[str]], call_id: Any):
         self.metadata = dict(metadata)
         self.providers = providers
-        self.withdrawn = False
+        self.call_id = call_id
+        self.closed = False
 
     def serves(self, provider: str) -> bool:
-        return bool(self.metadata) and not self.withdrawn and (self.providers is None or provider in self.providers)
+        return not self.closed and (self.providers is None or provider in self.providers)
+
+    def belongs_with(self, other: "CallbackMetadata") -> bool:
+        return self is other or (self.call_id is not None and self.call_id == other.call_id)
 
     def withdraw(self) -> None:
-        self.withdrawn = True
+        self.closed = True
         _published_in_context.set(_open_publications())
 
 
@@ -167,31 +185,43 @@ _published_in_context: ContextVar[Tuple[CallbackMetadata, ...]] = ContextVar(
 
 
 def _open_publications() -> Tuple[CallbackMetadata, ...]:
-    return tuple(publication for publication in _published_in_context.get() if not publication.withdrawn)
+    return tuple(publication for publication in _published_in_context.get() if not publication.closed)
 
 
-def publish_callback_metadata(metadata: Mapping[str, Any],
-                              providers: Optional[AbstractSet[str]] = None) -> CallbackMetadata:
-    """Offer ``metadata`` to the transport wraps in ``providers`` (any, when
-    None) for the model call starting in this context."""
-    publication = CallbackMetadata(metadata, providers)
+def publish_callback_metadata(metadata: Mapping[str, Any], providers: Optional[AbstractSet[str]] = None,
+                              call_id: Any = None) -> CallbackMetadata:
+    """Offer ``metadata`` to the next transport call in ``providers`` (any,
+    when None) for the model call ``call_id`` starting in this context."""
+    publication = CallbackMetadata(metadata, providers, call_id)
     _published_in_context.set(_open_publications() + (publication,))
     return publication
 
 
-def callback_metadata_for(provider: str) -> Dict[str, Any]:
-    """The metadata of the latest open, non-empty callback publication that
-    ``provider``'s transport serves, or an empty dict. Skipping empty ones keeps
-    a handler attached without metadata from hiding one attached with it."""
-    for publication in reversed(_published_in_context.get()):
-        if publication.serves(provider):
-            return dict(publication.metadata)
-    return {}
+def take_callback_metadata(provider: str) -> Dict[str, Any]:
+    """The metadata published for the latest open model call that
+    ``provider``'s transport serves, or an empty dict, closing every
+    publication made for that call. Among the call's publications the latest
+    non-empty one wins, so a handler attached without metadata never hides
+    one attached with it."""
+    publications = _open_publications()
+    serving = [publication for publication in publications if publication.serves(provider)]
+    if not serving:
+        return {}
+    model_call = [publication for publication in publications if publication.belongs_with(serving[-1])]
+    for publication in model_call:
+        publication.closed = True
+    _published_in_context.set(_open_publications())
+    return next((dict(publication.metadata) for publication in reversed(model_call) if publication.metadata), {})
 
 
 def with_callback_metadata(provider: str, call_metadata: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
-    """``call_metadata`` laid over the callback's metadata for this call."""
-    return overlay_metadata(callback_metadata_for(provider), dict(call_metadata or {}))
+    """``call_metadata`` laid over the callback's metadata for this call.
+
+    Takes the callback's publication, so a transport wrap calls it exactly once
+    per transport call and reuses the result for the budget check and the
+    record; a second call in the same context gets no callback metadata.
+    """
+    return overlay_metadata(take_callback_metadata(provider), dict(call_metadata or {}))
 
 
 def reset_claimed_response_ids() -> None:

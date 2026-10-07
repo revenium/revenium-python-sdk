@@ -208,7 +208,7 @@ def test_dispatch_failure_does_not_leak_unawaited_coroutine(slow_endpoint, monke
     # so capture the coroutine and assert on its state directly.
     captured = []
 
-    def raiser(coro):
+    def raiser(coro, gated_by_circuit=True):
         captured.append(coro)
         raise RuntimeError("thread pool exploded")
 
@@ -241,7 +241,7 @@ class FrozenClock:
 def test_queued_tool_event_is_stamped_when_the_tool_ran_not_when_delivered(endpoint, monkeypatch):
     queued = []
 
-    def hold_in_queue(coro):
+    def hold_in_queue(coro, gated_by_circuit=True):
         queued.append(coro)
         return object()
 

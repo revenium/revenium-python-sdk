@@ -883,6 +883,199 @@ class TestConcurrentReplay:
         assert buf.stats()["size"] == 0
 
 
+class KindReplayer:
+    """Replays events whose kind's endpoint answers; ``unreachable`` kinds, and ``failing`` seqs, fail with a 503."""
+
+    def __init__(self, unreachable=(), failing=()):
+        self.unreachable = set(unreachable)
+        self.failing = set(failing)
+        self.calls = []
+
+    def __call__(self, event, timeout_seconds):
+        self.calls.append(event)
+        if event.kind in self.unreachable or event.payload["seq"] in self.failing:
+            raise make_status_error(503)
+
+    def delivered(self):
+        return [
+            e.payload["seq"] for e in self.calls
+            if e.kind not in self.unreachable and e.payload["seq"] not in self.failing
+        ]
+
+
+def open_delivery_circuit():
+    from revenium_middleware._core import delivery_circuit
+    for _ in range(delivery_circuit.FAILURES_TO_OPEN):
+        delivery_circuit.get_circuit().record_failure()
+    return delivery_circuit.get_circuit()
+
+
+class TestReplayPerKind:
+    """An unreachable AI endpoint never holds back the tool events behind its records (BACK-3919)."""
+
+    @pytest.mark.parametrize("circuit_open", [False, True], ids=["circuit closed", "circuit open"])
+    @pytest.mark.parametrize("concurrency", [1, 16])
+    def test_tool_records_behind_a_failing_ai_record_are_replayed(self, circuit_open, concurrency):
+        if circuit_open:
+            open_delivery_circuit()
+        replayer = KindReplayer(unreachable={"ai"})
+        buf = make_buffer(max_size=100, replay_fn=replayer, replay_concurrency=concurrency)
+        buf.push("ai", {"seq": "ai-0"})
+        for i in range(3):
+            buf.push("tool", {"seq": f"tool-{i}"})
+
+        result = buf.flush()
+
+        assert replayer.delivered() == ["tool-0", "tool-1", "tool-2"]
+        assert [(e.kind, e.payload["seq"]) for e in buf._events] == [("ai", "ai-0")]
+        assert result["sent"] == 3
+
+    def test_a_flush_with_a_deadline_also_replays_past_a_failing_ai_record(self):
+        replayer = KindReplayer(unreachable={"ai"})
+        buf = make_buffer(max_size=100, replay_fn=replayer)
+        buf.push("ai", {"seq": "ai-0"})
+        buf.push("tool", {"seq": "tool-0"})
+
+        buf.flush(deadline_seconds=5)
+
+        assert replayer.delivered() == ["tool-0"]
+        assert [e.payload["seq"] for e in buf._events] == ["ai-0"]
+
+    def test_an_unreachable_kind_is_tried_once_per_flush(self):
+        replayer = KindReplayer(unreachable={"ai"})
+        buf = make_buffer(max_size=100, replay_fn=replayer)
+        for i in range(3):
+            buf.push("ai", {"seq": f"ai-{i}"})
+            buf.push("tool", {"seq": f"tool-{i}"})
+
+        buf.flush()
+
+        assert [e.payload["seq"] for e in replayer.calls if e.kind == "ai"] == ["ai-0"]
+        assert [e.payload["seq"] for e in buf._events] == ["ai-0", "ai-1", "ai-2"]
+
+    def test_records_keep_their_order_within_each_kind_when_both_endpoints_fail(self):
+        replayer = KindReplayer(unreachable={"ai"}, failing={"tool-1"})
+        buf = make_buffer(max_size=100, replay_fn=replayer)
+        buf.push("ai", {"seq": "ai-0"})
+        for i in range(3):
+            buf.push("tool", {"seq": f"tool-{i}"})
+        buf.push("ai", {"seq": "ai-1"})
+
+        buf.flush()
+
+        assert replayer.delivered() == ["tool-0"]
+        remaining = [(e.kind, e.payload["seq"]) for e in buf._events]
+        assert [seq for kind, seq in remaining if kind == "ai"] == ["ai-0", "ai-1"]
+        assert [seq for kind, seq in remaining if kind == "tool"] == ["tool-1", "tool-2"]
+
+    def test_a_flush_examines_each_blocked_record_once(self):
+        examined = []
+
+        def counting_clock():
+            examined.append(None)
+            return time.time()
+
+        buf = make_buffer(max_size=5000, replay_fn=KindReplayer(unreachable={"ai"}), replay_concurrency=16,
+                          now_fn=counting_clock)
+        for i in range(2000):
+            buf.push("ai", {"seq": f"ai-{i}"})
+        for i in range(2000):
+            buf.push("tool", {"seq": f"tool-{i}"})
+        examined.clear()
+
+        result = buf.flush()
+
+        assert result["sent"] == 2000
+        assert len(examined) <= 4000
+        assert [e.payload["seq"] for e in buf._events] == [f"ai-{i}" for i in range(2000)]
+
+    def test_parked_records_count_toward_capacity_and_are_evicted_first(self):
+        seen = {}
+
+        def replay(event, timeout_seconds):
+            if event.kind == "ai":
+                raise make_status_error(503)
+            for i in range(4):
+                buf.push("ai", {"seq": f"new-{i}"})
+                if i == 1:
+                    seen["undelivered"] = buf.undelivered()
+
+        buf = make_buffer(max_size=5, replay_fn=replay)
+        buf.push("ai", {"seq": "ai-0"})
+        buf.push("ai", {"seq": "ai-1"})
+        buf.push("tool", {"seq": "tool-0"})
+
+        buf.flush()
+
+        assert seen["undelivered"] == 5
+        assert [e.payload["seq"] for e in buf._events] == ["ai-1", "new-0", "new-1", "new-2", "new-3"]
+        assert buf.stats()["total_evicted"] == 1
+
+    def test_parked_records_return_in_order_when_the_deadline_ends_the_flush(self):
+        def replay(event, timeout_seconds):
+            if event.kind == "ai":
+                raise make_status_error(503)
+            time.sleep(0.3)
+
+        buf = make_buffer(max_size=100, replay_fn=replay)
+        buf.push("ai", {"seq": "ai-0"})
+        buf.push("ai", {"seq": "ai-1"})
+        buf.push("tool", {"seq": "tool-0"})
+        buf.push("tool", {"seq": "tool-1"})
+
+        buf.flush(deadline_seconds=0.2)
+
+        assert [e.payload["seq"] for e in buf._events] == ["ai-0", "ai-1", "tool-1"]
+        assert buf.undelivered() == 3
+
+    def test_parked_records_return_in_order_when_the_flush_raises(self):
+        class Interrupted(BaseException):
+            pass
+
+        def replay(event, timeout_seconds):
+            if event.kind == "ai":
+                raise make_status_error(503)
+            raise Interrupted()
+
+        buf = make_buffer(max_size=100, replay_fn=replay)
+        buf.push("ai", {"seq": "ai-0"})
+        buf.push("ai", {"seq": "ai-1"})
+        buf.push("tool", {"seq": "tool-0"})
+        buf.push("ai", {"seq": "ai-2"})
+
+        with pytest.raises(Interrupted):
+            buf.flush()
+
+        assert [e.payload["seq"] for e in buf._events] == ["ai-0", "ai-1", "ai-2"]
+
+    def test_while_the_circuit_is_open_a_batch_still_probes_with_one_ai_record(self):
+        open_delivery_circuit()
+        replayer = KindReplayer(unreachable={"ai"})
+        buf = make_buffer(max_size=100, replay_fn=replayer, replay_concurrency=16)
+        for i in range(10):
+            buf.push("ai", {"seq": f"ai-{i}"})
+
+        buf.flush()
+
+        assert len(replayer.calls) == 1
+        assert buf.stats()["size"] == 10
+
+    def test_tool_replays_neither_close_nor_open_the_circuit(self):
+        circuit = open_delivery_circuit()
+        buf = make_buffer(max_size=100, replay_fn=KindReplayer())
+        buf.push("tool", {"seq": "tool-0"})
+        buf.flush()
+        assert circuit.is_open()
+
+        from revenium_middleware._core import delivery_circuit
+        delivery_circuit.reset()
+        failing = make_buffer(max_size=100, replay_fn=KindReplayer(unreachable={"tool"}))
+        failing.push("tool", {"seq": "tool-1"})
+        for _ in range(delivery_circuit.FAILURES_TO_OPEN):
+            failing.flush()
+        assert not delivery_circuit.get_circuit().is_open()
+
+
 class TestReplayTimeout:
     """A replay near or past its flush deadline still gets a timeout httpx accepts."""
 
