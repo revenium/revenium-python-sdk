@@ -37,7 +37,7 @@ jobs:
           REVENIUM_METERING_API_KEY: "hak_test_dummy_key_for_ci_testing_only"
           REVENIUM_METERING_BASE_URL: "https://api.test.revenium.ai"
         run: |
-          pytest tests/ -v --tb=short -m "not e2e"
+          pytest tests/ -v --tb=short -m "not e2e and not integration"
 
       - name: Run linting
         if: matrix.python-version == '3.12'
@@ -69,7 +69,7 @@ jobs:
           REVENIUM_METERING_API_KEY: "hak_test_dummy_key_for_ci_testing_only"
           REVENIUM_METERING_BASE_URL: "https://api.test.revenium.ai"
         run: |
-          pytest tests/ -v --tb=short -m "not e2e" --cov=revenium_middleware --cov-report=term-missing --cov-report=html
+          pytest tests/ -v --tb=short -m "not e2e and not integration" --cov=revenium_middleware --cov-report=term-missing --cov-report=html
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v4

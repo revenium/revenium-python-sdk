@@ -70,6 +70,12 @@ def calculate_duration_ms(
     return int((end_time - start_time).total_seconds() * 1000)
 
 
+def _log_sent(label: str, result: Any) -> None:
+    """Log the id of a record Revenium accepted; ``submit_ai_event`` returns None for one it buffered instead."""
+    if result is not None:
+        logger.info(" REVENIUM SUCCESS: %s successful: %s", label, result.id)
+
+
 async def log_token_usage(
     transaction_id: str,
     model: str,
@@ -355,7 +361,7 @@ async def log_token_usage(
     try:
         result = submit_ai_event("completion", completion_args)
         logger.debug("Metering call result: %s", result)
-        logger.info(" REVENIUM SUCCESS: Metering call successful: %s", result.id)
+        _log_sent("Metering call", result)
     except Exception as e:
         if not shutdown_event.is_set():
             # Create a structured error for better handling
@@ -654,7 +660,7 @@ async def log_image_usage(
     try:
         result = submit_ai_event("image", image_args)
         logger.debug("Image metering call result: %s", result)
-        logger.info(" REVENIUM SUCCESS: Image metering call successful: %s", result.id)
+        _log_sent("Image metering call", result)
     except Exception as e:
         if not shutdown_event.is_set():
             error_details = {
@@ -773,7 +779,7 @@ async def log_video_usage(
     try:
         result = submit_ai_event("video", video_args)
         logger.debug("Video metering call result: %s", result)
-        logger.info(" REVENIUM SUCCESS: Video metering call successful: %s", result.id)
+        _log_sent("Video metering call", result)
     except Exception as e:
         if not shutdown_event.is_set():
             error_details = {

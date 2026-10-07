@@ -11,14 +11,18 @@ Key advantages over Google AI SDK:
 - Better integration with Google Cloud services
 """
 
+import contextlib
+import contextvars
 import datetime
+import importlib
 import logging
+import re
 from typing import Dict, Any, Optional, List, Tuple
 
 import wrapt
 from revenium_middleware import run_async_in_thread
 from revenium_middleware._core.config import is_selective_metering_enabled
-from revenium_middleware._core.context import is_inside_decorated_function
+from revenium_middleware._core.context import is_inside_decorated_function, overlay_metadata
 from revenium_middleware._core.log_sanitize import sanitize_for_logging
 from revenium_middleware._core.patch_registry import register_patch
 
@@ -32,7 +36,6 @@ from ..common import (
     Provider,
     create_metering_call,
     create_image_metering_call,
-    create_video_metering_call,
     create_usage_data,
     extract_model_name,
     extract_token_counts,
@@ -47,6 +50,35 @@ from .provider import detect_provider, get_provider_metadata
 from ..prompt_extractor import extract_prompt_data_if_enabled
 
 logger = logging.getLogger("revenium_middleware.extension")
+
+_GOOGLE_MODEL_PATH_PREFIXES = (
+    "publishers/google/models/",
+    "models/",
+    "google/models/",
+    "projects/",
+)
+_MODEL_NAME_ATTRIBUTES = ("_model_name", "model_name", "_model_id", "model_id", "_model", "model")
+_MODEL_NAME_IN_REPR = (re.compile(r"model_name='([^']+)'"), re.compile(r"models/([^'\s)]+)"))
+
+
+def _strip_model_path(model_name: str) -> str:
+    for prefix in _GOOGLE_MODEL_PATH_PREFIXES:
+        if model_name.startswith(prefix):
+            return model_name[len(prefix):]
+    return model_name
+
+
+def _model_name_of(instance: Any) -> Optional[str]:
+    """The model a Vertex AI model object calls, without Google's resource-path prefix."""
+    for attribute in _MODEL_NAME_ATTRIBUTES:
+        value = getattr(instance, attribute, None)
+        if isinstance(value, str) and value:
+            return _strip_model_path(value)
+    for pattern in _MODEL_NAME_IN_REPR:
+        match = pattern.search(str(instance))
+        if match:
+            return match.group(1)
+    return None
 
 
 def extract_vertex_ai_usage_data(
@@ -85,22 +117,8 @@ def extract_vertex_ai_usage_data(
     if not model_name:
         model_name = model_name_fallback or "unknown-model"
 
-    # Clean up model name - remove Google's path prefixes
-    if model_name and isinstance(model_name, str):
-        # Remove common Google path prefixes
-        prefixes_to_remove = [
-            "publishers/google/models/",
-            "models/",
-            "google/models/",
-            "projects/",
-        ]
-        for prefix in prefixes_to_remove:
-            if model_name.startswith(prefix):
-                model_name = model_name[len(prefix) :]
-                logger.debug(
-                    f"Cleaned model name, removed prefix '{prefix}': {model_name}"
-                )
-                break
+    if isinstance(model_name, str):
+        model_name = _strip_model_path(model_name)
 
     # Extract token counts with Vertex AI specific handling
     if operation_type == OperationType.EMBED:
@@ -315,567 +333,563 @@ def create_vertex_ai_metering_call(
     )
 
 
-# Dynamic wrapper discovery and application for Vertex AI GenerativeModel.generate_content
-def _apply_generate_content_wrappers():
-    """
-    Dynamically discover and wrap all Vertex AI GenerativeModel.generate_content methods.
-    This handles current and future module path variations like:
-    - vertexai.generative_models.GenerativeModel
-    - vertexai.preview.generative_models.GenerativeModel
-    - vertexai.v1.generative_models.GenerativeModel
-    - etc.
-    """
-    import sys
-    import importlib
-
-    # Known module patterns to try
-    module_patterns = [
-        "vertexai.generative_models",
-        "vertexai.preview.generative_models",
-        "vertexai.v1.generative_models",
-        "vertexai.v1beta1.generative_models",
-        "vertexai.v2.generative_models",
-        "vertexai.beta.generative_models",
-        "vertexai.alpha.generative_models",
-    ]
-
-    wrapped_modules = []
-
-    for module_path in module_patterns:
-        try:
-            # Try to import the module
-            module = importlib.import_module(module_path)
-
-            # Check if GenerativeModel class exists
-            if hasattr(module, "GenerativeModel"):
-                generative_model_class = getattr(module, "GenerativeModel")
-
-                # Check if generate_content method exists
-                if hasattr(generative_model_class, "generate_content"):
-                    patch_key = f"{module_path}.GenerativeModel.generate_content"
-                    if register_patch(patch_key):
-                        logger.debug(
-                            f"Found GenerativeModel.generate_content in {module_path}"
-                        )
-
-                        @wrapt.patch_function_wrapper(
-                            module_path, "GenerativeModel.generate_content"
-                        )
-                        def generate_content_wrapper_dynamic(
-                            wrapped, instance, args, kwargs
-                        ):
-                            return generate_content_wrapper_impl(
-                                wrapped, instance, args, kwargs
-                            )
-
-                    wrapped_modules.append(module_path)
-                    logger.debug(
-                        f" Applied wrapper to {module_path}.GenerativeModel.generate_content"
-                    )
-                else:
-                    logger.debug(
-                        f"  {module_path}.GenerativeModel exists but no generate_content method"
-                    )
-            else:
-                logger.debug(f"  {module_path} exists but no GenerativeModel class")
-
-        except ImportError:
-            logger.debug(f"  Module {module_path} not available")
-        except Exception as e:
-            logger.debug(f"  Error checking {module_path}: {e}")
-
-    if wrapped_modules:
-        logger.info(
-            f" Vertex AI GenerativeModel wrappers applied to: {', '.join(wrapped_modules)}"
-        )
-    else:
-        logger.warning("  No Vertex AI GenerativeModel modules found to wrap")
-
-    return wrapped_modules
+# ChatSession sends through the model's private _generate_content today. Should a
+# vertexai release route it through a wrapped public method instead, the inner
+# wrap sees this flag and lets the call through, so one request stays one record.
+_inside_metered_call: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "revenium_vertex_inside_metered_call", default=False
+)
 
 
-def generate_content_wrapper_impl(wrapped, instance, args, kwargs):
-    if is_selective_metering_enabled() and not is_inside_decorated_function():
-        return wrapped(*args, **kwargs)
+@contextlib.contextmanager
+def _metering_this_call():
+    token = _inside_metered_call.set(True)
+    try:
+        yield
+    finally:
+        _inside_metered_call.reset(token)
 
-    logger.debug("Enhanced Vertex AI generate_content wrapper called!")
-    logger.debug("Wrapper args: %s", sanitize_for_logging(args))
-    logger.debug("Wrapper kwargs: %s", sanitize_for_logging(kwargs))
-    logger.debug(f"Instance type: {type(instance)}")
 
-    # Extract usage metadata from instance or kwargs
-    usage_metadata = getattr(instance, "_revenium_usage_metadata", {}) or kwargs.pop(
-        "usage_metadata", {}
-    )
-    logger.debug(f"Captured usage metadata for generate_content: {usage_metadata}")
-    logger.debug(
-        f"Instance has _revenium_usage_metadata: {hasattr(instance, '_revenium_usage_metadata')}"
-    )
-    if hasattr(instance, "_revenium_usage_metadata"):
+def _passes_through() -> bool:
+    if _inside_metered_call.get():
+        return True
+    return is_selective_metering_enabled() and not is_inside_decorated_function()
+
+
+def _pop_usage_metadata(kwargs: Dict[str, Any], *owners: Any) -> Dict[str, Any]:
+    """The owners' ``_revenium_usage_metadata``, least specific first, overlaid by the call's own."""
+    merged: Dict[str, Any] = {}
+    for owner in owners:
+        from_owner = getattr(owner, "_revenium_usage_metadata", None)
+        merged = overlay_metadata(merged, from_owner if isinstance(from_owner, dict) else None)
+    return overlay_metadata(merged, kwargs.pop("usage_metadata", None))
+
+
+def _as_turns(contents: Any) -> List[Any]:
+    if contents is None:
+        return []
+    return list(contents) if isinstance(contents, (list, tuple)) else [contents]
+
+
+def _first_argument(args: Tuple, kwargs: Dict[str, Any], name: str) -> Any:
+    return kwargs.get(name) or (args[0] if args else None)
+
+
+class _GenerationCall:
+    """A generation request as metering needs it, captured before the SDK sees it."""
+
+    def __init__(self, model: Any, contents: Any, args: Tuple, kwargs: Dict[str, Any],
+                 usage_metadata: Dict[str, Any], history: Tuple[Any, ...] = ()):
         logger.debug(
-            f"Instance._revenium_usage_metadata value: {getattr(instance, '_revenium_usage_metadata')}"
+            "Vertex AI generation request: args=%s kwargs=%s",
+            sanitize_for_logging(args),
+            sanitize_for_logging(kwargs),
         )
+        self.usage_metadata = usage_metadata
+        self.model_name = _model_name_of(model)
+        if detect_vision_content(contents):
+            self.usage_metadata["has_vision_content"] = True
+        self.is_streaming = bool(kwargs.get("stream", False))
+        prompt = [*history, *_as_turns(contents)] if history else contents
+        self.request_kwargs = {**kwargs, "contents": prompt}
+        self.request_args = args
+        self.request_time = datetime.datetime.now(datetime.timezone.utc)
 
-    # Try to extract model name from the instance
-    model_name_from_instance = None
-    for attr in [
-        "_model_name",
-        "model_name",
-        "_model_id",
-        "model_id",
-        "_model",
-        "model",
-    ]:
-        if hasattr(instance, attr):
-            model_name_from_instance = getattr(instance, attr)
-            logger.debug(
-                f"Found model name in instance.{attr}: {model_name_from_instance}"
-            )
-            break
+    def metered(self, response: Any) -> Any:
+        if self.is_streaming:
+            return VertexAIStreamWrapper(response, **self._stream_context())
+        self._meter(response)
+        return response
 
-    # Clean up the instance model name too
-    if model_name_from_instance and isinstance(model_name_from_instance, str):
-        # Remove common Google path prefixes
-        prefixes_to_remove = [
-            "publishers/google/models/",
-            "models/",
-            "google/models/",
-            "projects/",
-        ]
-        for prefix in prefixes_to_remove:
-            if model_name_from_instance.startswith(prefix):
-                model_name_from_instance = model_name_from_instance[len(prefix) :]
-                logger.debug(
-                    f"Cleaned instance model name, removed prefix '{prefix}': {model_name_from_instance}"
-                )
-                break
+    def metered_async(self, response: Any) -> Any:
+        if self.is_streaming:
+            return VertexAIAsyncStreamWrapper(response, **self._stream_context())
+        self._meter(response)
+        return response
 
-    if not model_name_from_instance:
-        logger.debug(
-            f"Could not find model name in instance. Available attributes: {dir(instance)}"
-        )
-        # Try to get it from the instance string representation
-        instance_str = str(instance)
-        if "model_name=" in instance_str:
-            # Extract from string like "GenerativeModel(model_name='gemini-2.0-flash-lite-001')"
-            import re
+    def _stream_context(self) -> Dict[str, Any]:
+        return {
+            "request_time_dt": self.request_time,
+            "usage_metadata": self.usage_metadata,
+            "model_name_fallback": self.model_name,
+            "request_kwargs": self.request_kwargs,
+            "request_args": self.request_args,
+        }
 
-            match = re.search(r"model_name='([^']+)'", instance_str)
-            if match:
-                model_name_from_instance = match.group(1)
-                logger.debug(
-                    f"Extracted model name from instance string: {model_name_from_instance}"
-                )
-        elif "models/" in instance_str:
-            # Extract from string like "models/gemini-2.0-flash-lite-001"
-            import re
-
-            match = re.search(r"models/([^'\s)]+)", instance_str)
-            if match:
-                model_name_from_instance = match.group(1)
-                logger.debug(
-                    f"Extracted model name from instance string (models/): {model_name_from_instance}"
-                )
-
-    # Detect vision content in the request
-    # Vertex AI generate_content takes contents as first positional arg or 'contents' kwarg
-    contents = kwargs.get("contents") or (args[0] if args else None)
-    has_vision = detect_vision_content(contents)
-    if has_vision:
-        usage_metadata["has_vision_content"] = True
-        logger.debug("Vision content detected in Vertex AI generate_content request")
-
-    # Check if this is a streaming call
-    is_streaming = kwargs.get("stream", False)
-
-    # Store kwargs and args for prompt extraction
-    request_kwargs = kwargs.copy()
-    request_args = args
-
-    # Record request time
-    request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-    logger.debug(
-        "Calling wrapped Vertex AI generate_content function (streaming=%s) with args: %s, kwargs: %s",
-        is_streaming,
-        sanitize_for_logging(args),
-        sanitize_for_logging(kwargs),
-    )
-
-    # Call the original Vertex AI function
-    response = wrapped(*args, **kwargs)
-
-    if is_streaming:
-        logger.debug("Handling Vertex AI streaming response")
-        # Return wrapped stream that will meter usage when complete
-        return handle_vertex_ai_streaming_response(
-            stream=response,
-            request_time_dt=request_time_dt,
-            usage_metadata=usage_metadata,
-            model_name_fallback=model_name_from_instance,
-            request_kwargs=request_kwargs,
-            request_args=request_args,
-        )
-    else:
-        logger.debug("Handling Vertex AI non-streaming response: %s", response)
-
-        # Extract prompt data if capture is enabled
+    def _meter(self, response: Any) -> None:
         system_prompt, input_messages, output_response, prompts_truncated = (
-            extract_prompt_data_if_enabled(request_kwargs, args=request_args, response=response)
+            extract_prompt_data_if_enabled(
+                self.request_kwargs, args=self.request_args, response=response
+            )
         )
-
-        # Handle non-streaming response immediately
         create_vertex_ai_metering_call(
             response=response,
             operation_type=OperationType.CHAT,
-            request_time_dt=request_time_dt,
-            usage_metadata=usage_metadata,
-            model_name_fallback=model_name_from_instance,
-            # Prompt capture fields
+            request_time_dt=self.request_time,
+            usage_metadata=self.usage_metadata,
+            model_name_fallback=self.model_name,
             system_prompt=system_prompt,
             input_messages=input_messages,
             output_response=output_response,
             prompts_truncated=prompts_truncated,
         )
-        return response
 
 
-if register_patch("vertexai.language_models.TextEmbeddingModel.get_embeddings"):
-    @wrapt.patch_function_wrapper(
-        "vertexai.language_models", "TextEmbeddingModel.get_embeddings"
-    )
-    def get_embeddings_wrapper(wrapped, instance, args, kwargs):
-        if is_selective_metering_enabled() and not is_inside_decorated_function():
-            return wrapped(*args, **kwargs)
+def _generate_content_call(instance, args, kwargs) -> _GenerationCall:
+    usage_metadata = _pop_usage_metadata(kwargs, instance)
+    contents = _first_argument(args, kwargs, "contents")
+    return _GenerationCall(instance, contents, args, kwargs, usage_metadata)
 
-        logger.debug("Vertex AI get_embeddings wrapper called")
 
-        usage_metadata = getattr(instance, "_revenium_usage_metadata", {}) or kwargs.pop(
-            "usage_metadata", {}
-        )
+def _send_message_call(instance, args, kwargs) -> _GenerationCall:
+    model = getattr(instance, "_model", None)
+    usage_metadata = _pop_usage_metadata(kwargs, model, instance)
+    content = _first_argument(args, kwargs, "content")
+    # Read before the call: the SDK appends this turn to the history only once the response is in.
+    history = tuple(getattr(instance, "history", None) or ())
+    return _GenerationCall(model, content, args, kwargs, usage_metadata, history)
 
-        model_name_from_instance = None
-        for attr in [
-            "_model_name",
-            "model_name",
-            "_model_id",
-            "model_id",
-            "_model",
-            "model",
-        ]:
-            if hasattr(instance, attr):
-                model_name_from_instance = getattr(instance, attr)
-                logger.debug(
-                    f"Found model name in embeddings instance.{attr}: {model_name_from_instance}"
-                )
-                break
 
-        if not model_name_from_instance:
-            logger.debug(
-                f"Could not find model name in embeddings instance. Available attributes: {dir(instance)}"
-            )
-            instance_str = str(instance)
-            if "model_name=" in instance_str:
-                import re
-
-                match = re.search(r"model_name='([^']+)'", instance_str)
-                if match:
-                    model_name_from_instance = match.group(1)
-                    logger.debug(
-                        f"Extracted model name from embeddings instance string: {model_name_from_instance}"
-                    )
-            elif "models/" in instance_str:
-                import re
-
-                match = re.search(r"models/([^'\s)]+)", instance_str)
-                if match:
-                    model_name_from_instance = match.group(1)
-                    logger.debug(
-                        f"Extracted model name from embeddings instance string (models/): {model_name_from_instance}"
-                    )
-
-        logger.debug(
-            f"Final captured model name from Vertex AI embeddings instance: {model_name_from_instance}"
-        )
-
-        request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-        logger.debug(
-            "Calling wrapped Vertex AI get_embeddings function with args: %s, kwargs: %s",
-            sanitize_for_logging(args),
-            sanitize_for_logging(kwargs),
-        )
-
+def _call_and_meter(call, wrapped, args, kwargs):
+    with _metering_this_call():
         response = wrapped(*args, **kwargs)
+    return call.metered(response)
 
-        logger.debug("Handling Vertex AI get_embeddings response: %s", response)
 
+async def _await_and_meter(call, wrapped, args, kwargs):
+    with _metering_this_call():
+        response = await wrapped(*args, **kwargs)
+    return call.metered_async(response)
+
+
+def _sync_metered(build_call):
+    """A wrapt wrapper that meters a sync Vertex AI method through the call object ``build_call`` returns."""
+    def wrapper(wrapped, instance, args, kwargs):
+        if _passes_through():
+            return wrapped(*args, **kwargs)
+        return _call_and_meter(build_call(instance, args, kwargs), wrapped, args, kwargs)
+    return wrapper
+
+
+def _async_metered(build_call):
+    """The same for a method whose result is awaited."""
+    def wrapper(wrapped, instance, args, kwargs):
+        if _passes_through():
+            return wrapped(*args, **kwargs)
+        return _await_and_meter(build_call(instance, args, kwargs), wrapped, args, kwargs)
+    return wrapper
+
+
+generate_content_wrapper_impl = _sync_metered(_generate_content_call)
+generate_content_async_wrapper_impl = _async_metered(_generate_content_call)
+send_message_wrapper_impl = _sync_metered(_send_message_call)
+send_message_async_wrapper_impl = _async_metered(_send_message_call)
+
+
+_GENERATIVE_MODULE_PATHS = (
+    "vertexai.generative_models",
+    "vertexai.preview.generative_models",
+    "vertexai.v1.generative_models",
+    "vertexai.v1beta1.generative_models",
+    "vertexai.v2.generative_models",
+    "vertexai.beta.generative_models",
+    "vertexai.alpha.generative_models",
+)
+
+_WRAPPERS_BY_CLASS = {
+    "GenerativeModel": {
+        "generate_content": generate_content_wrapper_impl,
+        "generate_content_async": generate_content_async_wrapper_impl,
+    },
+    "ChatSession": {
+        "send_message": send_message_wrapper_impl,
+        "send_message_async": send_message_async_wrapper_impl,
+    },
+}
+
+
+def _is_our_wrapper(attribute: Any) -> bool:
+    return isinstance(attribute, wrapt.FunctionWrapper) and attribute._self_wrapper.__module__ == __name__
+
+
+def _inherits_our_wrapper(cls: type, method_name: str) -> bool:
+    defining_class = next(base for base in cls.__mro__ if method_name in vars(base))
+    return defining_class is not cls and _is_our_wrapper(vars(defining_class)[method_name])
+
+
+def _wrap_methods(module, class_name: str, wrappers: Dict[str, Any]) -> List[str]:
+    cls = getattr(module, class_name, None)
+    if cls is None:
+        return []
+    applied = []
+    for method_name, wrapper in wrappers.items():
+        # vertexai.preview.generative_models.ChatSession inherits send_message from
+        # the ChatSession wrapped first; a second wrap would stack on the same method.
+        if not hasattr(cls, method_name) or _inherits_our_wrapper(cls, method_name):
+            continue
+        patch_key = f"{module.__name__}.{class_name}.{method_name}"
+        if register_patch(patch_key):
+            wrapt.wrap_function_wrapper(module, f"{class_name}.{method_name}", wrapper)
+            applied.append(patch_key)
+    return applied
+
+
+def _apply_generative_model_wrappers() -> List[str]:
+    """Wrap GenerativeModel and ChatSession in every vertexai module path that defines them."""
+    applied = []
+    for module_path in _GENERATIVE_MODULE_PATHS:
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError:
+            logger.debug("Module %s not available", module_path)
+            continue
+        for class_name, wrappers in _WRAPPERS_BY_CLASS.items():
+            applied += _wrap_methods(module, class_name, wrappers)
+
+    if applied:
+        logger.info(" Vertex AI generation wrappers applied to: %s", ", ".join(applied))
+    else:
+        logger.warning("  No Vertex AI GenerativeModel modules found to wrap")
+    return applied
+
+
+class _EmbeddingCall:
+    """An embedding request as metering needs it, captured before the SDK sees it."""
+
+    def __init__(self, instance: Any, args: Tuple, kwargs: Dict[str, Any]):
+        self.usage_metadata = _pop_usage_metadata(kwargs, instance)
+        self.model_name = _model_name_of(instance)
+        self.request_time = datetime.datetime.now(datetime.timezone.utc)
+
+    def metered(self, response: Any) -> Any:
         create_vertex_ai_metering_call(
             response=response,
             operation_type=OperationType.EMBED,
-            request_time_dt=request_time_dt,
-            usage_metadata=usage_metadata,
-            model_name_fallback=model_name_from_instance,
+            request_time_dt=self.request_time,
+            usage_metadata=self.usage_metadata,
+            model_name_fallback=self.model_name,
         )
-
         return response
+
+    metered_async = metered
+
+
+if register_patch("vertexai.language_models.TextEmbeddingModel.get_embeddings"):
+    wrapt.wrap_function_wrapper(
+        "vertexai.language_models", "TextEmbeddingModel.get_embeddings", _sync_metered(_EmbeddingCall)
+    )
+
+if register_patch("vertexai.language_models.TextEmbeddingModel.get_embeddings_async"):
+    wrapt.wrap_function_wrapper(
+        "vertexai.language_models", "TextEmbeddingModel.get_embeddings_async", _async_metered(_EmbeddingCall)
+    )
+
+
+class VertexAIStreamWrapper:
+    """Passes a Vertex AI stream through and meters it once, when it ends or is closed."""
+
+    def __init__(self, stream, request_time_dt, usage_metadata, model_name_fallback=None,
+                 request_kwargs=None, request_args=None):
+        self.stream = stream
+        self._request_time_dt = request_time_dt
+        self._metering_metadata = usage_metadata
+        self._request_kwargs = request_kwargs
+        self._request_args = request_args
+        self.chunks = []
+        self.accumulated_text = []  # For prompt capture
+        self.model = model_name_fallback
+        self.finish_reason = None
+        self.usage_metadata = None
+        self.first_chunk_time = None
+        self._closed = False
+        self._usage_logged = False
+        self.streaming_truncated = False  # Track if streaming response was truncated
+
+        # Limit chunk storage to prevent memory issues
+        self._max_chunks = 1000
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._closed:
+            raise StopIteration("Stream has been closed")
+
+        try:
+            with _metering_this_call():
+                chunk = next(self.stream)
+            self._process_chunk(chunk)
+            return chunk
+        except StopIteration:
+            self._finalize()
+            raise
+        except Exception as e:
+            self._handle_error(e)
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False  # Don't suppress exceptions
+
+    def close(self):
+        """Properly close the stream and clean up resources."""
+        if not self._closed:
+            self._closed = True
+            if not self._usage_logged:
+                try:
+                    self._log_usage()
+                except Exception as e:
+                    logger.error(
+                        "Error logging usage during Vertex AI stream cleanup: %s", e
+                    )
+
+            # Clear chunks to free memory
+            self.chunks.clear()
+
+            # Close underlying stream if it has a close method
+            if hasattr(self.stream, "close"):
+                try:
+                    self.stream.close()
+                except Exception as e:
+                    logger.debug("Error closing underlying Vertex AI stream: %s", e)
+
+    def _finalize(self):
+        """Finalize the stream and log usage."""
+        if not self._usage_logged:
+            self._log_usage()
+            self._usage_logged = True
+
+    def __del__(self):
+        # Last-resort cleanup: a broken-out-of loop leaves the wrapper to
+        # the GC with no StopIteration/__exit__ ever firing.
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _handle_error(self, error: Exception):
+        """Handle errors during streaming."""
+        logger.error("Error in Vertex AI streaming response: %s", error)
+        if not self._usage_logged:
+            # Try to log partial usage data
+            try:
+                self._log_usage()
+                self._usage_logged = True
+            except Exception as log_error:
+                logger.error(
+                    "Failed to log Vertex AI usage after stream error: %s",
+                    log_error,
+                )
+
+    def _process_chunk(self, chunk):
+        """Process each chunk to extract metadata"""
+        # Limit chunk storage to prevent memory issues
+        if len(self.chunks) < self._max_chunks:
+            self.chunks.append(chunk)
+        elif len(self.chunks) == self._max_chunks:
+            logger.warning(
+                "Reached maximum chunk limit (%d) for Vertex AI stream, not storing additional chunks",
+                self._max_chunks,
+            )
+
+        # Record time of first chunk
+        if self.first_chunk_time is None:
+            self.first_chunk_time = datetime.datetime.now(datetime.timezone.utc)
+
+        # Extract model name from chunk if available using safe access
+        if self.model is None:
+            self.model = extract_model_name(chunk, self.model)
+
+        # Accumulate text for prompt capture (with early truncation to prevent unbounded memory growth)
+        from ..config import Config
+        current_len = sum(len(t) for t in self.accumulated_text)
+
+        if hasattr(chunk, 'text') and chunk.text:
+            # Check if adding this chunk would exceed the limit
+            chunk_len = len(chunk.text)
+            if current_len + chunk_len <= Config.MAX_PROMPT_LENGTH:
+                self.accumulated_text.append(chunk.text)
+            elif current_len < Config.MAX_PROMPT_LENGTH:
+                # Partial append: only add what fits
+                remaining = Config.MAX_PROMPT_LENGTH - current_len
+                self.accumulated_text.append(chunk.text[:remaining])
+                self.streaming_truncated = True
+            else:
+                # Already at limit, mark as truncated
+                self.streaming_truncated = True
+        elif hasattr(chunk, 'candidates') and chunk.candidates:
+            for candidate in chunk.candidates:
+                if hasattr(candidate, 'content') and candidate.content:
+                    if hasattr(candidate.content, 'parts'):
+                        for part in candidate.content.parts:
+                            if hasattr(part, 'text') and part.text:
+                                part_len = len(part.text)
+                                if current_len + part_len <= Config.MAX_PROMPT_LENGTH:
+                                    self.accumulated_text.append(part.text)
+                                    current_len += part_len
+                                elif current_len < Config.MAX_PROMPT_LENGTH:
+                                    # Partial append: only add what fits
+                                    remaining = Config.MAX_PROMPT_LENGTH - current_len
+                                    self.accumulated_text.append(part.text[:remaining])
+                                    current_len = Config.MAX_PROMPT_LENGTH
+                                    self.streaming_truncated = True
+                                    break
+                                else:
+                                    # Already at limit
+                                    self.streaming_truncated = True
+                                    break
+
+        # Check for finish reason and usage metadata in the chunk using safe access
+        candidates = safe_getattr(chunk, "candidates")
+        if candidates and len(candidates) > 0:
+            candidate = candidates[0]
+            finish_reason = safe_getattr(candidate, "finish_reason")
+            if finish_reason:
+                self.finish_reason = finish_reason
+
+        # Check for usage metadata in the chunk (final chunk typically has this)
+        usage_metadata = safe_getattr(chunk, "usage_metadata")
+        if usage_metadata:
+            self.usage_metadata = usage_metadata
+
+    def _log_usage(self):
+        """Log usage after stream completion"""
+        try:
+            if not self.chunks:
+                logger.warning("No chunks received in Vertex AI streaming response")
+                return
+
+            # Calculate time to first token
+            time_to_first_token = 0
+            if self.first_chunk_time:
+                time_to_first_token = int(
+                    (self.first_chunk_time - self._request_time_dt).total_seconds() * 1000
+                )
+
+            # Extract prompt data if capture is enabled
+            accumulated_content = ''.join(self.accumulated_text) if self.accumulated_text else None
+            # Append truncation marker if streaming was truncated
+            if self.streaming_truncated and accumulated_content:
+                accumulated_content += "...[TRUNCATED]"
+
+            system_prompt, input_messages, output_response, prompts_truncated = (
+                extract_prompt_data_if_enabled(
+                    self._request_kwargs or {},
+                    args=self._request_args,
+                    accumulated_content=accumulated_content
+                )
+            )
+
+            # Update truncation flag if streaming was truncated
+            if self.streaming_truncated:
+                prompts_truncated = True
+
+            # Create a synthetic response object for usage extraction
+            class SyntheticResponse:
+                def __init__(self, model_name, usage_metadata, candidates):
+                    self.model_name = model_name
+                    self.usage_metadata = usage_metadata
+                    self.candidates = candidates
+
+            # Create synthetic response from collected data
+            synthetic_response = SyntheticResponse(
+                model_name=self.model,
+                usage_metadata=self.usage_metadata,
+                candidates=(
+                    [
+                        type(
+                            "obj", (object,), {"finish_reason": self.finish_reason}
+                        )()
+                    ]
+                    if self.finish_reason
+                    else []
+                ),
+            )
+
+            # Create metering call for streaming response
+            create_vertex_ai_metering_call(
+                response=synthetic_response,
+                operation_type=OperationType.CHAT,
+                request_time_dt=self._request_time_dt,
+                usage_metadata=self._metering_metadata,
+                time_to_first_token=time_to_first_token,
+                is_streamed=True,
+                model_name_fallback=self.model,
+                # Prompt capture fields
+                system_prompt=system_prompt,
+                input_messages=input_messages,
+                output_response=output_response,
+                prompts_truncated=prompts_truncated,
+            )
+
+            logger.debug(
+                "Vertex AI streaming usage logged: model=%s, chunks=%d, time_to_first_token=%dms",
+                self.model,
+                len(self.chunks),
+                time_to_first_token,
+            )
+
+        except Exception as e:
+            # Don't let logging errors break the stream
+            logger.error("Error logging Vertex AI streaming usage: %s", e)
+            raise StreamingError(
+                f"Failed to log Vertex AI streaming usage: {str(e)}",
+                chunk_count=len(self.chunks) if self.chunks else 0,
+                stream_state="completed",
+            ) from e
+
+
+class VertexAIAsyncStreamWrapper(VertexAIStreamWrapper):
+    """The async-iterator form, for generate_content_async and send_message_async with stream=True."""
+
+    def __iter__(self):
+        raise TypeError("a Vertex AI async stream is consumed with async for")
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._closed:
+            raise StopAsyncIteration
+        try:
+            with _metering_this_call():
+                chunk = await self.stream.__anext__()
+            self._process_chunk(chunk)
+            return chunk
+        except StopAsyncIteration:
+            self._finalize()
+            raise
+        except Exception as e:
+            self._handle_error(e)
+            raise
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.aclose()
+        return False
+
+    async def aclose(self):
+        underlying_aclose = getattr(self.stream, "aclose", None)
+        self.close()
+        if underlying_aclose is not None:
+            try:
+                await underlying_aclose()
+            except Exception as e:
+                logger.debug("Error closing underlying Vertex AI async stream: %s", e)
 
 
 def handle_vertex_ai_streaming_response(
     stream, request_time_dt, usage_metadata, model_name_fallback=None, request_kwargs=None, request_args=None
 ):
-    """
-    Handle streaming responses from Vertex AI.
-    Wraps the stream to collect metrics and log them after completion.
-    """
-
-    class VertexAIStreamWrapper:
-        def __init__(self, stream):
-            self.stream = stream
-            self.chunks = []
-            self.accumulated_text = []  # For prompt capture
-            self.model = model_name_fallback
-            self.finish_reason = None
-            self.usage_metadata = None
-            self.first_chunk_time = None
-            self._closed = False
-            self._usage_logged = False
-            self.streaming_truncated = False  # Track if streaming response was truncated
-
-            # Limit chunk storage to prevent memory issues
-            self._max_chunks = 1000
-
-        def __iter__(self):
-            return self
-
-        def __next__(self):
-            if self._closed:
-                raise StopIteration("Stream has been closed")
-
-            try:
-                chunk = next(self.stream)
-                self._process_chunk(chunk)
-                return chunk
-            except StopIteration:
-                self._finalize()
-                raise
-            except Exception as e:
-                self._handle_error(e)
-                raise
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            self.close()
-            return False  # Don't suppress exceptions
-
-        def close(self):
-            """Properly close the stream and clean up resources."""
-            if not self._closed:
-                self._closed = True
-                if not self._usage_logged:
-                    try:
-                        self._log_usage()
-                    except Exception as e:
-                        logger.error(
-                            "Error logging usage during Vertex AI stream cleanup: %s", e
-                        )
-
-                # Clear chunks to free memory
-                self.chunks.clear()
-
-                # Close underlying stream if it has a close method
-                if hasattr(self.stream, "close"):
-                    try:
-                        self.stream.close()
-                    except Exception as e:
-                        logger.debug("Error closing underlying Vertex AI stream: %s", e)
-
-        def _finalize(self):
-            """Finalize the stream and log usage."""
-            if not self._usage_logged:
-                self._log_usage()
-                self._usage_logged = True
-
-        def __del__(self):
-            # Last-resort cleanup: a broken-out-of loop leaves the wrapper to
-            # the GC with no StopIteration/__exit__ ever firing.
-            try:
-                self.close()
-            except Exception:
-                pass
-
-        def _handle_error(self, error: Exception):
-            """Handle errors during streaming."""
-            logger.error("Error in Vertex AI streaming response: %s", error)
-            if not self._usage_logged:
-                # Try to log partial usage data
-                try:
-                    self._log_usage()
-                    self._usage_logged = True
-                except Exception as log_error:
-                    logger.error(
-                        "Failed to log Vertex AI usage after stream error: %s",
-                        log_error,
-                    )
-
-        def _process_chunk(self, chunk):
-            """Process each chunk to extract metadata"""
-            # Limit chunk storage to prevent memory issues
-            if len(self.chunks) < self._max_chunks:
-                self.chunks.append(chunk)
-            elif len(self.chunks) == self._max_chunks:
-                logger.warning(
-                    "Reached maximum chunk limit (%d) for Vertex AI stream, not storing additional chunks",
-                    self._max_chunks,
-                )
-
-            # Record time of first chunk
-            if self.first_chunk_time is None:
-                self.first_chunk_time = datetime.datetime.now(datetime.timezone.utc)
-
-            # Extract model name from chunk if available using safe access
-            if self.model is None:
-                self.model = extract_model_name(chunk, self.model)
-
-            # Accumulate text for prompt capture (with early truncation to prevent unbounded memory growth)
-            from ..config import Config
-            current_len = sum(len(t) for t in self.accumulated_text)
-
-            if hasattr(chunk, 'text') and chunk.text:
-                # Check if adding this chunk would exceed the limit
-                chunk_len = len(chunk.text)
-                if current_len + chunk_len <= Config.MAX_PROMPT_LENGTH:
-                    self.accumulated_text.append(chunk.text)
-                elif current_len < Config.MAX_PROMPT_LENGTH:
-                    # Partial append: only add what fits
-                    remaining = Config.MAX_PROMPT_LENGTH - current_len
-                    self.accumulated_text.append(chunk.text[:remaining])
-                    self.streaming_truncated = True
-                else:
-                    # Already at limit, mark as truncated
-                    self.streaming_truncated = True
-            elif hasattr(chunk, 'candidates') and chunk.candidates:
-                for candidate in chunk.candidates:
-                    if hasattr(candidate, 'content') and candidate.content:
-                        if hasattr(candidate.content, 'parts'):
-                            for part in candidate.content.parts:
-                                if hasattr(part, 'text') and part.text:
-                                    part_len = len(part.text)
-                                    if current_len + part_len <= Config.MAX_PROMPT_LENGTH:
-                                        self.accumulated_text.append(part.text)
-                                        current_len += part_len
-                                    elif current_len < Config.MAX_PROMPT_LENGTH:
-                                        # Partial append: only add what fits
-                                        remaining = Config.MAX_PROMPT_LENGTH - current_len
-                                        self.accumulated_text.append(part.text[:remaining])
-                                        current_len = Config.MAX_PROMPT_LENGTH
-                                        self.streaming_truncated = True
-                                        break
-                                    else:
-                                        # Already at limit
-                                        self.streaming_truncated = True
-                                        break
-
-            # Check for finish reason and usage metadata in the chunk using safe access
-            candidates = safe_getattr(chunk, "candidates")
-            if candidates and len(candidates) > 0:
-                candidate = candidates[0]
-                finish_reason = safe_getattr(candidate, "finish_reason")
-                if finish_reason:
-                    self.finish_reason = finish_reason
-
-            # Check for usage metadata in the chunk (final chunk typically has this)
-            usage_metadata = safe_getattr(chunk, "usage_metadata")
-            if usage_metadata:
-                self.usage_metadata = usage_metadata
-
-        def _log_usage(self):
-            """Log usage after stream completion"""
-            try:
-                if not self.chunks:
-                    logger.warning("No chunks received in Vertex AI streaming response")
-                    return
-
-                # Calculate time to first token
-                time_to_first_token = 0
-                if self.first_chunk_time:
-                    time_to_first_token = int(
-                        (self.first_chunk_time - request_time_dt).total_seconds() * 1000
-                    )
-
-                # Extract prompt data if capture is enabled
-                accumulated_content = ''.join(self.accumulated_text) if self.accumulated_text else None
-                # Append truncation marker if streaming was truncated
-                if self.streaming_truncated and accumulated_content:
-                    accumulated_content += "...[TRUNCATED]"
-
-                system_prompt, input_messages, output_response, prompts_truncated = (
-                    extract_prompt_data_if_enabled(
-                        request_kwargs or {},
-                        args=request_args,
-                        accumulated_content=accumulated_content
-                    )
-                )
-
-                # Update truncation flag if streaming was truncated
-                if self.streaming_truncated:
-                    prompts_truncated = True
-
-                # Create a synthetic response object for usage extraction
-                class SyntheticResponse:
-                    def __init__(self, model_name, usage_metadata, candidates):
-                        self.model_name = model_name
-                        self.usage_metadata = usage_metadata
-                        self.candidates = candidates
-
-                # Create synthetic response from collected data
-                synthetic_response = SyntheticResponse(
-                    model_name=self.model,
-                    usage_metadata=self.usage_metadata,
-                    candidates=(
-                        [
-                            type(
-                                "obj", (object,), {"finish_reason": self.finish_reason}
-                            )()
-                        ]
-                        if self.finish_reason
-                        else []
-                    ),
-                )
-
-                # Create metering call for streaming response
-                create_vertex_ai_metering_call(
-                    response=synthetic_response,
-                    operation_type=OperationType.CHAT,
-                    request_time_dt=request_time_dt,
-                    usage_metadata=usage_metadata,
-                    time_to_first_token=time_to_first_token,
-                    is_streamed=True,
-                    model_name_fallback=self.model,
-                    # Prompt capture fields
-                    system_prompt=system_prompt,
-                    input_messages=input_messages,
-                    output_response=output_response,
-                    prompts_truncated=prompts_truncated,
-                )
-
-                logger.debug(
-                    "Vertex AI streaming usage logged: model=%s, chunks=%d, time_to_first_token=%dms",
-                    self.model,
-                    len(self.chunks),
-                    time_to_first_token,
-                )
-
-            except Exception as e:
-                # Don't let logging errors break the stream
-                logger.error("Error logging Vertex AI streaming usage: %s", e)
-                raise StreamingError(
-                    f"Failed to log Vertex AI streaming usage: {str(e)}",
-                    chunk_count=len(self.chunks) if self.chunks else 0,
-                    stream_state="completed",
-                ) from e
-
-    return VertexAIStreamWrapper(stream)
+    """Wrap a sync Vertex AI stream so its usage is metered once it completes."""
+    return VertexAIStreamWrapper(
+        stream, request_time_dt, usage_metadata, model_name_fallback, request_kwargs, request_args
+    )
 
 
 # --- Vertex AI ImageGenerationModel wrapper (Imagen) ---
@@ -885,8 +899,6 @@ def _apply_imagen_wrappers():
     Dynamically discover and wrap Vertex AI ImageGenerationModel.generate_images.
     Handles multiple module paths for forward compatibility.
     """
-    import importlib
-
     module_patterns = [
         "vertexai.preview.vision_models",
         "vertexai.vision_models",
@@ -936,25 +948,6 @@ def _apply_imagen_wrappers():
     return wrapped_modules
 
 
-def _extract_model_name_from_instance(instance) -> Optional[str]:
-    """Extract and clean model name from a Vertex AI model instance."""
-    model_name = None
-    for attr in ["_model_id", "model_id", "_model_name", "model_name", "_model", "model"]:
-        if hasattr(instance, attr):
-            model_name = getattr(instance, attr)
-            if model_name:
-                break
-
-    if model_name and isinstance(model_name, str):
-        prefixes = ["publishers/google/models/", "models/", "google/models/", "projects/"]
-        for prefix in prefixes:
-            if model_name.startswith(prefix):
-                model_name = model_name[len(prefix):]
-                break
-
-    return model_name
-
-
 def _imagen_generate_images_impl(wrapped, instance, args, kwargs):
     if is_selective_metering_enabled() and not is_inside_decorated_function():
         return wrapped(*args, **kwargs)
@@ -965,7 +958,7 @@ def _imagen_generate_images_impl(wrapped, instance, args, kwargs):
         "usage_metadata", {}
     )
 
-    model_name = _extract_model_name_from_instance(instance) or "imagen-3.0-generate-001"
+    model_name = _model_name_of(instance) or "imagen-3.0-generate-001"
 
     # Extract image count from kwargs
     number_of_images = kwargs.get("number_of_images", 1)
@@ -1017,7 +1010,7 @@ def _imagen_edit_image_impl(wrapped, instance, args, kwargs):
         "usage_metadata", {}
     )
 
-    model_name = _extract_model_name_from_instance(instance) or "imagen-3.0-generate-001"
+    model_name = _model_name_of(instance) or "imagen-3.0-generate-001"
 
     number_of_images = kwargs.get("number_of_images", 1)
 
@@ -1047,134 +1040,9 @@ def _imagen_edit_image_impl(wrapped, instance, args, kwargs):
     return response
 
 
-# --- Vertex AI Veo video generation wrapper ---
-
-def _apply_veo_wrappers():
-    """
-    Dynamically discover and wrap Vertex AI video generation models.
-    Handles multiple module paths for forward compatibility.
-    """
-    import importlib
-
-    module_patterns = [
-        "vertexai.preview.vision_models",
-        "vertexai.vision_models",
-    ]
-
-    wrapped_modules = []
-
-    for module_path in module_patterns:
-        try:
-            module = importlib.import_module(module_path)
-
-            if hasattr(module, "VideoGenerationModel"):
-                video_model_class = getattr(module, "VideoGenerationModel")
-
-                if hasattr(video_model_class, "generate_content"):
-                    patch_key = f"{module_path}.VideoGenerationModel.generate_content"
-                    if register_patch(patch_key):
-                        @wrapt.patch_function_wrapper(
-                            module_path, "VideoGenerationModel.generate_content"
-                        )
-                        def veo_generate_wrapper(wrapped, instance, args, kwargs):
-                            return _veo_generate_impl(wrapped, instance, args, kwargs)
-
-                        wrapped_modules.append(patch_key)
-
-                if hasattr(video_model_class, "generate"):
-                    patch_key = f"{module_path}.VideoGenerationModel.generate"
-                    if register_patch(patch_key):
-                        @wrapt.patch_function_wrapper(
-                            module_path, "VideoGenerationModel.generate"
-                        )
-                        def veo_generate_alt_wrapper(wrapped, instance, args, kwargs):
-                            return _veo_generate_impl(wrapped, instance, args, kwargs)
-
-                        wrapped_modules.append(patch_key)
-
-        except ImportError:
-            logger.debug(f"  Module {module_path} not available for Veo")
-        except Exception as e:
-            logger.debug(f"  Error applying Veo wrapper to {module_path}: {e}")
-
-    if wrapped_modules:
-        logger.info(f" Vertex AI Veo wrappers applied to: {', '.join(wrapped_modules)}")
-
-    return wrapped_modules
-
-
-def _veo_generate_impl(wrapped, instance, args, kwargs):
-    if is_selective_metering_enabled() and not is_inside_decorated_function():
-        return wrapped(*args, **kwargs)
-
-    logger.debug("Vertex AI VideoGenerationModel wrapper called (Veo)")
-
-    usage_metadata = getattr(instance, "_revenium_usage_metadata", {}) or kwargs.pop(
-        "usage_metadata", {}
-    )
-
-    model_name = _extract_model_name_from_instance(instance) or "veo-2.0-generate-001"
-
-    # Extract video generation params
-    duration = kwargs.get("duration", 5)  # Default 5 seconds for Veo
-    aspect_ratio = kwargs.get("aspect_ratio")
-
-    request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-
-    # Call original
-    response = wrapped(*args, **kwargs)
-
-    response_time_dt = datetime.datetime.now(datetime.timezone.utc)
-
-    # Extract video duration from response if available
-    video_duration = float(duration)
-    if hasattr(response, "duration_seconds"):
-        video_duration = float(response.duration_seconds)
-    elif hasattr(response, "duration"):
-        video_duration = float(response.duration)
-
-    # Extract resolution if available
-    resolution = None
-    if hasattr(response, "resolution"):
-        resolution = str(response.resolution)
-
-    # Extract video job ID for async operations
-    video_job_id = None
-    if hasattr(response, "operation_name"):
-        video_job_id = str(response.operation_name)
-    elif hasattr(response, "name"):
-        video_job_id = str(response.name)
-
-    logger.debug(
-        f"Vertex AI Veo generation: model={model_name}, "
-        f"duration={video_duration}s, aspect_ratio={aspect_ratio}"
-    )
-
-    # Auto-detect async operation when a job ID is present
-    async_operation = video_job_id is not None
-
-    try:
-        create_video_metering_call(
-            model=model_name,
-            duration_seconds=video_duration,
-            request_time_dt=request_time_dt,
-            response_time_dt=response_time_dt,
-            usage_metadata=usage_metadata,
-            operation_subtype="generation",
-            resolution=resolution,
-            aspect_ratio=aspect_ratio,
-            video_job_id=video_job_id,
-            async_operation=async_operation,
-        )
-    except Exception as e:
-        logger.error(f"Error in Vertex AI Veo metering: {e}")
-
-    return response
-
-
 # Apply the dynamic wrappers when this module is imported
 try:
-    _apply_generate_content_wrappers()
+    _apply_generative_model_wrappers()
 except Exception as e:
     logger.error(f"Failed to apply dynamic Vertex AI wrappers: {e}")
 
@@ -1182,8 +1050,3 @@ try:
     _apply_imagen_wrappers()
 except Exception as e:
     logger.error(f"Failed to apply Vertex AI Imagen wrappers: {e}")
-
-try:
-    _apply_veo_wrappers()
-except Exception as e:
-    logger.error(f"Failed to apply Vertex AI Veo wrappers: {e}")

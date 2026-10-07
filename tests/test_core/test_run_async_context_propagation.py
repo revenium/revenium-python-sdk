@@ -7,7 +7,6 @@ import pytest
 from revenium_middleware import idempotency_key
 from revenium_middleware._core.context import get_idempotency_key
 from revenium_middleware._core.metering import (
-    active_threads,
     run_async_in_thread,
     shutdown_event,
 )
@@ -17,7 +16,6 @@ from revenium_middleware._core.metering import (
 def reset_state():
     """Reset module-level state between tests."""
     was_set = shutdown_event.is_set()
-    active_threads.clear()
     shutdown_event.clear()
     yield
     if was_set:

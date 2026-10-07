@@ -2,7 +2,8 @@
 Revenium LiteLLM Client Middleware
 
 When you install and import this library, it will automatically hook
-litellm.completion using wrapt, and log token usage after each request.
+litellm's completion, text-completion and embedding calls, sync and async,
+using wrapt, and log token usage after each request.
 
 New in v0.2.0:
 - Context-based metadata injection via metadata_context

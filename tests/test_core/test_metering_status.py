@@ -1,11 +1,12 @@
 """Tests for metering error visibility (BACK-778).
 
 Covers the metering status/callback surface (`_core.metering_status`), its
-wiring into `submit_ai_event` and `MeteringThread`, and the ERROR-level log
+wiring into `submit_ai_event` and the metering worker tasks, and the ERROR-level log
 for a missing API key.
 """
 
 import asyncio
+import datetime
 import logging
 import time
 
@@ -209,6 +210,7 @@ def test_tool_event_success_records_success():
                 error_message=None,
                 usage_metadata=None,
                 context=ReveniumContext(),
+                occurred_at=datetime.datetime.now(datetime.timezone.utc),
             )
         )
 

@@ -4,6 +4,8 @@ Covers the buffer unit contract (FIFO, bounds, TTL, stop-on-retryable,
 discard-on-permanent), the retryability classification, and the integration
 points: submit_ai_event, tool-event dispatch, and shutdown drain.
 """
+import datetime
+import socket
 import threading
 import time
 from types import SimpleNamespace
@@ -12,7 +14,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from revenium_middleware._core import metering_buffer
+from revenium_middleware._core import metering, metering_buffer
 from revenium_middleware._core.metering_buffer import (
     BufferedEvent,
     MeteringBuffer,
@@ -227,7 +229,20 @@ class TestBufferContract:
 
         buf.flush()
 
-        assert replayer.timeouts == [metering_buffer.REPLAY_TIMEOUT_SECONDS]
+        assert replayer.timeouts == [metering.DEFAULT_TIMEOUT_SECONDS]
+
+    def test_a_replay_waits_as_long_as_the_metering_timeout_setting(self, monkeypatch):
+        monkeypatch.setenv(metering.TIMEOUT_ENV, "3")
+        replayer = RecordingReplayer()
+        buf = make_buffer(replay_fn=replayer)
+        buf.push("ai", {"seq": 0})
+        buf.push("ai", {"seq": 1})
+
+        buf.flush()
+        buf.push("ai", {"seq": 2})
+        buf.flush(deadline_seconds=30.0)
+
+        assert replayer.timeouts == [3.0, 3.0, 3.0]
 
     def test_stats_shape(self):
         buf = make_buffer(replay_fn=RecordingReplayer())
@@ -268,6 +283,50 @@ class TestModuleSingleton:
 
         assert buf.stats()["max_size"] == 7
         assert buf._flush_interval == 1.5
+
+    @pytest.mark.parametrize("raw, expected", [("500", 500), ("500.0", 500), ("1e3", 1000)])
+    def test_max_size_accepts_any_whole_number_spelling(self, monkeypatch, raw, expected):
+        monkeypatch.setenv("REVENIUM_BUFFER_MAX_SIZE", raw)
+        monkeypatch.setattr(metering_buffer, "_buffer", None)
+
+        assert metering_buffer.get_buffer().stats()["max_size"] == expected
+
+    @pytest.mark.parametrize("raw", ["0", "-5", "inf", "nan"])
+    def test_max_size_below_one_or_not_finite_uses_the_default(self, monkeypatch, caplog, raw):
+        monkeypatch.setenv("REVENIUM_BUFFER_MAX_SIZE", raw)
+        monkeypatch.setattr(metering_buffer, "_buffer", None)
+
+        with caplog.at_level("WARNING"):
+            buf = metering_buffer.get_buffer()
+
+        assert buf.stats()["max_size"] == metering_buffer.DEFAULT_MAX_SIZE
+        assert "REVENIUM_BUFFER_MAX_SIZE" in caplog.text
+
+    @pytest.mark.parametrize("raw", ["0", "-1", "nan", "inf", "1e300"])
+    def test_flush_interval_that_would_spin_or_stop_the_flush_thread_uses_the_default(self, monkeypatch, caplog, raw):
+        """0, negative and nan made the flush loop spin and replay without pause; inf and
+        values past threading.TIMEOUT_MAX made Event.wait raise, ending the flush thread."""
+        monkeypatch.setenv("REVENIUM_BUFFER_FLUSH_INTERVAL", raw)
+        monkeypatch.setattr(metering_buffer, "_buffer", None)
+
+        with caplog.at_level("WARNING"):
+            buf = metering_buffer.get_buffer()
+
+        assert buf._flush_interval == metering_buffer.DEFAULT_FLUSH_INTERVAL
+        assert f"Invalid REVENIUM_BUFFER_FLUSH_INTERVAL={raw!r}" in caplog.text
+
+    @pytest.mark.parametrize("raw", ["", "lots"])
+    def test_empty_or_malformed_env_uses_defaults(self, monkeypatch, caplog, raw):
+        monkeypatch.setenv("REVENIUM_BUFFER_MAX_SIZE", raw)
+        monkeypatch.setenv("REVENIUM_BUFFER_FLUSH_INTERVAL", raw)
+        monkeypatch.setattr(metering_buffer, "_buffer", None)
+
+        with caplog.at_level("WARNING"):
+            buf = metering_buffer.get_buffer()
+
+        assert buf.stats()["max_size"] == metering_buffer.DEFAULT_MAX_SIZE
+        assert buf._flush_interval == metering_buffer.DEFAULT_FLUSH_INTERVAL
+        assert ("REVENIUM_BUFFER_MAX_SIZE" in caplog.text) == bool(raw)
 
 
 @pytest.fixture()
@@ -341,7 +400,8 @@ class TestSubmitAiEventIntegration:
         buf.flush()
 
         assert buf.stats()["size"] == 0
-        call = healthy.ai.create_completion.call_args
+        healthy.with_options.assert_called_once_with(max_retries=0)
+        call = healthy.with_options.return_value.ai.create_completion.call_args
         assert call.kwargs["extra_headers"]["Idempotency-Key"] == "replay-me"
         assert call.kwargs["model"] == "gpt-test"
 
@@ -359,7 +419,7 @@ class TestToolEventIntegration:
             "https://api.test/meter/v2/tool/events", "hak_k",
             tool_id="buffered-tool", operation="run", duration_ms=5,
             success=True, error_message=None, usage_metadata=None,
-            context=get_context()))
+            context=get_context(), occurred_at=datetime.datetime.now(datetime.timezone.utc)))
 
         assert fresh_buffer.stats()["size"] == 1
         event = fresh_buffer._events[0]
@@ -378,7 +438,7 @@ class TestToolEventIntegration:
             "https://api.test/meter/v2/tool/events", "hak_k",
             tool_id="poison-tool", operation="run", duration_ms=5,
             success=True, error_message=None, usage_metadata=None,
-            context=get_context()))
+            context=get_context(), occurred_at=datetime.datetime.now(datetime.timezone.utc)))
 
         assert fresh_buffer.stats()["size"] == 0
 
@@ -555,6 +615,60 @@ class TestMeteringStatusIntegration:
         assert status.error_count == 0
 
 
+def test_deadline_bounds_the_wait_for_a_flush_already_in_progress():
+    replayer = RecordingReplayer()
+    buf = MeteringBuffer(max_size=10, flush_interval=9999.0, replay_fn=replayer)
+    buf.push("ai", {"seq": 0})
+    buf._flush_lock.acquire()
+
+    try:
+        started = time.monotonic()
+        result = buf.flush(deadline_seconds=0.2)
+        elapsed = time.monotonic() - started
+    finally:
+        buf._flush_lock.release()
+
+    assert 0.15 <= elapsed < 0.7
+    assert result == {"sent": 0, "expired": 0, "discarded": 0, "remaining": 1}
+    assert replayer.calls == []
+
+
+class _SlowOverflowTask:
+    def __init__(self, seconds):
+        self._seconds = seconds
+
+    def materialize(self, enqueued_at, timeout=None):
+        time.sleep(self._seconds)
+
+    def discard(self):
+        pass
+
+
+@pytest.mark.parametrize("build_seconds, deadline, low, high", [
+    # The build spends 0.3s, so the lock wait gets the remaining 0.1s, not another 0.4s.
+    (0.3, 0.4, 0.35, 0.6),
+    # The build outlasts the whole deadline, so the held lock is not waited on at all.
+    (1.0, 0.2, 0.15, 0.45),
+])
+def test_lock_wait_after_a_slow_overflow_build_uses_only_the_remaining_budget(build_seconds, deadline, low, high):
+    replayer = RecordingReplayer()
+    buf = MeteringBuffer(max_size=10, flush_interval=9999.0, replay_fn=replayer)
+    buf.push_overflow(_SlowOverflowTask(build_seconds))
+    buf.push("ai", {"seq": 0})
+    buf._flush_lock.acquire()
+
+    try:
+        started = time.monotonic()
+        result = buf.flush(deadline_seconds=deadline)
+        elapsed = time.monotonic() - started
+    finally:
+        buf._flush_lock.release()
+
+    assert low <= elapsed < high
+    assert result["sent"] == 0
+    assert replayer.calls == []
+
+
 def test_tiny_deadline_strictly_bounds_per_call_timeout():
     received = []
 
@@ -567,3 +681,415 @@ def test_tiny_deadline_strictly_bounds_per_call_timeout():
     buf.flush(deadline_seconds=0.2)
 
     assert received and received[0] <= 0.2
+
+
+class TestEvictionVisibility:
+    """Evicted events are lost usage: counted in the status and logged with a count (BACK-3919)."""
+
+    def test_evictions_are_counted_in_the_metering_status(self, clean_metering_status):
+        buf = make_buffer(max_size=2, replay_fn=RecordingReplayer())
+
+        for i in range(5):
+            buf.push("ai", {"seq": i})
+
+        assert get_metering_status().evicted_count == 3
+        assert buf.stats()["total_evicted"] == 3
+
+    def test_an_eviction_does_not_hold_the_buffer_lock_while_it_waits_for_the_status_lock(
+        self, clean_metering_status
+    ):
+        from revenium_middleware._core import metering_status
+
+        buf = make_buffer(max_size=1, replay_fn=RecordingReplayer())
+        buf.push("ai", {"seq": 0})
+        with metering_status._lock:
+            evicting = threading.Thread(target=buf.push, args=("ai", {"seq": 1}), daemon=True)
+            evicting.start()
+            evicting.join(0.2)
+            reader = threading.Thread(target=buf.undelivered, daemon=True)
+            reader.start()
+            reader.join(2.0)
+            assert not reader.is_alive(), "the buffer lock was held while waiting for the status lock"
+        evicting.join(2.0)
+        assert get_metering_status().evicted_count == 1
+
+    def test_reset_clears_the_eviction_count(self, clean_metering_status):
+        buf = make_buffer(max_size=1, replay_fn=RecordingReplayer())
+        buf.push("ai", {"seq": 0})
+        buf.push("ai", {"seq": 1})
+
+        reset_metering_status()
+
+        assert get_metering_status().evicted_count == 0
+
+    def test_each_report_logs_the_evictions_since_the_previous_one(self, caplog):
+        buf = make_buffer(max_size=2, replay_fn=RecordingReplayer())
+        for i in range(5):
+            buf.push("ai", {"seq": i})
+
+        with caplog.at_level("WARNING", logger="revenium_middleware"):
+            buf.report_evictions()
+            buf.report_evictions()
+            buf.push("ai", {"seq": 5})
+            buf.report_evictions()
+
+        reports = [r.getMessage() for r in caplog.records if "evicted" in r.getMessage()]
+        assert len(reports) == 2
+        assert "evicted 3 undelivered event(s)" in reports[0]
+        assert "evicted 1 undelivered event(s)" in reports[1] and "(4 in total)" in reports[1]
+
+    def test_the_flush_thread_reports_evictions_every_cycle(self, caplog, monkeypatch):
+        from revenium_middleware._core import metering
+        monkeypatch.setattr(metering, "shutdown_event", threading.Event())
+        buf = make_buffer(max_size=2, flush_interval=0.05,
+                          replay_fn=RecordingReplayer(failures={n: make_status_error(503) for n in range(1000)}))
+
+        with caplog.at_level("WARNING", logger="revenium_middleware"):
+            for i in range(4):
+                buf.push("ai", {"seq": i})
+            deadline = time.monotonic() + 5
+            while "evicted 2 undelivered" not in caplog.text and time.monotonic() < deadline:
+                time.sleep(0.01)
+            buf._flush_interval = 3600
+
+        assert "evicted 2 undelivered event(s)" in caplog.text
+
+
+class ConcurrencyRecorder:
+    def __init__(self, seconds, failures=None):
+        self._seconds = seconds
+        self._lock = threading.Lock()
+        self._in_flight = 0
+        self.peak = 0
+        self.calls = []
+        self.failures = dict(failures or {})  # seq -> exception
+
+    def __call__(self, event, timeout_seconds):
+        with self._lock:
+            self._in_flight += 1
+            self.peak = max(self.peak, self._in_flight)
+            self.calls.append(event)
+        try:
+            time.sleep(self._seconds)
+            if event.payload["seq"] in self.failures:
+                raise self.failures[event.payload["seq"]]
+        finally:
+            with self._lock:
+                self._in_flight -= 1
+
+
+class TestConcurrentReplay:
+    """A backlog drains several events at a time instead of one round trip each (BACK-3919)."""
+
+    def test_the_default_replay_sends_several_events_at_once(self):
+        assert MeteringBuffer()._replay_concurrency == metering_buffer.REPLAY_CONCURRENCY > 1
+
+    def test_a_backlog_replays_a_batch_at_a_time(self):
+        replayer = ConcurrencyRecorder(0.1)
+        buf = make_buffer(max_size=100, replay_fn=replayer, replay_concurrency=16)
+        for i in range(48):
+            buf.push("ai", {"seq": i})
+
+        started = time.monotonic()
+        result = buf.flush()
+
+        assert time.monotonic() - started < 1.5
+        assert replayer.peak == 16
+        assert result["sent"] == 48
+        assert buf.stats()["total_replayed"] == 48
+
+    def test_retryable_failures_in_a_batch_go_back_to_the_front_in_order(self):
+        unreachable = make_status_error(503)
+        replayer = ConcurrencyRecorder(0.01, failures={1: unreachable, 3: unreachable})
+        buf = make_buffer(max_size=100, replay_fn=replayer, replay_concurrency=4)
+        for i in range(6):
+            buf.push("ai", {"seq": i})
+
+        buf.flush()
+
+        assert [event.payload["seq"] for event in buf._events] == [1, 3, 4, 5]
+        assert buf.stats()["total_replayed"] == 2
+
+    def test_a_flush_with_a_deadline_replays_one_at_a_time(self):
+        replayer = ConcurrencyRecorder(0.01)
+        buf = make_buffer(max_size=100, replay_fn=replayer, replay_concurrency=16)
+        for i in range(8):
+            buf.push("ai", {"seq": i})
+
+        buf.flush(deadline_seconds=5)
+
+        assert replayer.peak == 1
+        assert buf.stats()["total_replayed"] == 8
+
+    def test_with_the_circuit_open_a_flush_sends_one_event_to_probe(self):
+        from revenium_middleware._core import delivery_circuit
+        for _ in range(delivery_circuit.FAILURES_TO_OPEN):
+            delivery_circuit.get_circuit().record_failure()
+        replayer = ConcurrencyRecorder(0, failures={n: make_status_error(503) for n in range(10)})
+        buf = make_buffer(max_size=100, replay_fn=replayer, replay_concurrency=16)
+        for i in range(10):
+            buf.push("ai", {"seq": i})
+
+        buf.flush()
+
+        assert len(replayer.calls) == 1
+        assert buf.stats()["size"] == 10
+
+    def test_replay_outcomes_open_and_close_the_circuit(self):
+        from revenium_middleware._core import delivery_circuit
+        circuit = delivery_circuit.get_circuit()
+        failing = RecordingReplayer(failures={n: make_status_error(503) for n in range(10)})
+        buf = make_buffer(replay_fn=failing)
+        buf.push("ai", {"seq": 0})
+
+        for _ in range(delivery_circuit.FAILURES_TO_OPEN):
+            buf.flush()
+        assert circuit.is_open()
+
+        buf._replay_fn = RecordingReplayer()
+        buf.flush()
+        assert not circuit.is_open()
+
+    def test_a_batch_with_deliveries_counts_as_the_endpoint_answering(self):
+        from revenium_middleware._core import delivery_circuit
+        circuit = delivery_circuit.get_circuit()
+        for _ in range(delivery_circuit.FAILURES_TO_OPEN + 1):
+            mixed = RecordingReplayer(failures={15: make_status_error(503)})
+            buf = make_buffer(max_size=100, replay_fn=mixed, replay_concurrency=16)
+            for i in range(16):
+                buf.push("ai", {"seq": i})
+            buf.flush()
+            assert not circuit.is_open()
+
+    def test_the_size_stat_counts_events_still_being_replayed(self):
+        release = threading.Event()
+        started = threading.Event()
+
+        def slow_replay(event, timeout_seconds):
+            started.set()
+            release.wait(5)
+
+        buf = make_buffer(max_size=100, replay_fn=slow_replay, replay_concurrency=16)
+        for i in range(3):
+            buf.push("ai", {"seq": i})
+        flushing = threading.Thread(target=buf.flush, daemon=True)
+        flushing.start()
+        try:
+            assert started.wait(5)
+            assert buf.stats()["size"] == 3
+        finally:
+            release.set()
+            flushing.join(5)
+        assert buf.stats()["size"] == 0
+
+
+class KindReplayer:
+    """Replays events whose kind's endpoint answers; ``unreachable`` kinds, and ``failing`` seqs, fail with a 503."""
+
+    def __init__(self, unreachable=(), failing=()):
+        self.unreachable = set(unreachable)
+        self.failing = set(failing)
+        self.calls = []
+
+    def __call__(self, event, timeout_seconds):
+        self.calls.append(event)
+        if event.kind in self.unreachable or event.payload["seq"] in self.failing:
+            raise make_status_error(503)
+
+    def delivered(self):
+        return [
+            e.payload["seq"] for e in self.calls
+            if e.kind not in self.unreachable and e.payload["seq"] not in self.failing
+        ]
+
+
+def open_delivery_circuit():
+    from revenium_middleware._core import delivery_circuit
+    for _ in range(delivery_circuit.FAILURES_TO_OPEN):
+        delivery_circuit.get_circuit().record_failure()
+    return delivery_circuit.get_circuit()
+
+
+class TestReplayPerKind:
+    """An unreachable AI endpoint never holds back the tool events behind its records (BACK-3919)."""
+
+    @pytest.mark.parametrize("circuit_open", [False, True], ids=["circuit closed", "circuit open"])
+    @pytest.mark.parametrize("concurrency", [1, 16])
+    def test_tool_records_behind_a_failing_ai_record_are_replayed(self, circuit_open, concurrency):
+        if circuit_open:
+            open_delivery_circuit()
+        replayer = KindReplayer(unreachable={"ai"})
+        buf = make_buffer(max_size=100, replay_fn=replayer, replay_concurrency=concurrency)
+        buf.push("ai", {"seq": "ai-0"})
+        for i in range(3):
+            buf.push("tool", {"seq": f"tool-{i}"})
+
+        result = buf.flush()
+
+        assert replayer.delivered() == ["tool-0", "tool-1", "tool-2"]
+        assert [(e.kind, e.payload["seq"]) for e in buf._events] == [("ai", "ai-0")]
+        assert result["sent"] == 3
+
+    def test_a_flush_with_a_deadline_also_replays_past_a_failing_ai_record(self):
+        replayer = KindReplayer(unreachable={"ai"})
+        buf = make_buffer(max_size=100, replay_fn=replayer)
+        buf.push("ai", {"seq": "ai-0"})
+        buf.push("tool", {"seq": "tool-0"})
+
+        buf.flush(deadline_seconds=5)
+
+        assert replayer.delivered() == ["tool-0"]
+        assert [e.payload["seq"] for e in buf._events] == ["ai-0"]
+
+    def test_an_unreachable_kind_is_tried_once_per_flush(self):
+        replayer = KindReplayer(unreachable={"ai"})
+        buf = make_buffer(max_size=100, replay_fn=replayer)
+        for i in range(3):
+            buf.push("ai", {"seq": f"ai-{i}"})
+            buf.push("tool", {"seq": f"tool-{i}"})
+
+        buf.flush()
+
+        assert [e.payload["seq"] for e in replayer.calls if e.kind == "ai"] == ["ai-0"]
+        assert [e.payload["seq"] for e in buf._events] == ["ai-0", "ai-1", "ai-2"]
+
+    def test_records_keep_their_order_within_each_kind_when_both_endpoints_fail(self):
+        replayer = KindReplayer(unreachable={"ai"}, failing={"tool-1"})
+        buf = make_buffer(max_size=100, replay_fn=replayer)
+        buf.push("ai", {"seq": "ai-0"})
+        for i in range(3):
+            buf.push("tool", {"seq": f"tool-{i}"})
+        buf.push("ai", {"seq": "ai-1"})
+
+        buf.flush()
+
+        assert replayer.delivered() == ["tool-0"]
+        remaining = [(e.kind, e.payload["seq"]) for e in buf._events]
+        assert [seq for kind, seq in remaining if kind == "ai"] == ["ai-0", "ai-1"]
+        assert [seq for kind, seq in remaining if kind == "tool"] == ["tool-1", "tool-2"]
+
+    def test_a_flush_examines_each_blocked_record_once(self):
+        examined = []
+
+        def counting_clock():
+            examined.append(None)
+            return time.time()
+
+        buf = make_buffer(max_size=5000, replay_fn=KindReplayer(unreachable={"ai"}), replay_concurrency=16,
+                          now_fn=counting_clock)
+        for i in range(2000):
+            buf.push("ai", {"seq": f"ai-{i}"})
+        for i in range(2000):
+            buf.push("tool", {"seq": f"tool-{i}"})
+        examined.clear()
+
+        result = buf.flush()
+
+        assert result["sent"] == 2000
+        assert len(examined) <= 4000
+        assert [e.payload["seq"] for e in buf._events] == [f"ai-{i}" for i in range(2000)]
+
+    def test_parked_records_count_toward_capacity_and_are_evicted_first(self):
+        seen = {}
+
+        def replay(event, timeout_seconds):
+            if event.kind == "ai":
+                raise make_status_error(503)
+            for i in range(4):
+                buf.push("ai", {"seq": f"new-{i}"})
+                if i == 1:
+                    seen["undelivered"] = buf.undelivered()
+
+        buf = make_buffer(max_size=5, replay_fn=replay)
+        buf.push("ai", {"seq": "ai-0"})
+        buf.push("ai", {"seq": "ai-1"})
+        buf.push("tool", {"seq": "tool-0"})
+
+        buf.flush()
+
+        assert seen["undelivered"] == 5
+        assert [e.payload["seq"] for e in buf._events] == ["ai-1", "new-0", "new-1", "new-2", "new-3"]
+        assert buf.stats()["total_evicted"] == 1
+
+    def test_parked_records_return_in_order_when_the_deadline_ends_the_flush(self):
+        def replay(event, timeout_seconds):
+            if event.kind == "ai":
+                raise make_status_error(503)
+            time.sleep(0.3)
+
+        buf = make_buffer(max_size=100, replay_fn=replay)
+        buf.push("ai", {"seq": "ai-0"})
+        buf.push("ai", {"seq": "ai-1"})
+        buf.push("tool", {"seq": "tool-0"})
+        buf.push("tool", {"seq": "tool-1"})
+
+        buf.flush(deadline_seconds=0.2)
+
+        assert [e.payload["seq"] for e in buf._events] == ["ai-0", "ai-1", "tool-1"]
+        assert buf.undelivered() == 3
+
+    def test_parked_records_return_in_order_when_the_flush_raises(self):
+        class Interrupted(BaseException):
+            pass
+
+        def replay(event, timeout_seconds):
+            if event.kind == "ai":
+                raise make_status_error(503)
+            raise Interrupted()
+
+        buf = make_buffer(max_size=100, replay_fn=replay)
+        buf.push("ai", {"seq": "ai-0"})
+        buf.push("ai", {"seq": "ai-1"})
+        buf.push("tool", {"seq": "tool-0"})
+        buf.push("ai", {"seq": "ai-2"})
+
+        with pytest.raises(Interrupted):
+            buf.flush()
+
+        assert [e.payload["seq"] for e in buf._events] == ["ai-0", "ai-1", "ai-2"]
+
+    def test_while_the_circuit_is_open_a_batch_still_probes_with_one_ai_record(self):
+        open_delivery_circuit()
+        replayer = KindReplayer(unreachable={"ai"})
+        buf = make_buffer(max_size=100, replay_fn=replayer, replay_concurrency=16)
+        for i in range(10):
+            buf.push("ai", {"seq": f"ai-{i}"})
+
+        buf.flush()
+
+        assert len(replayer.calls) == 1
+        assert buf.stats()["size"] == 10
+
+    def test_tool_replays_neither_close_nor_open_the_circuit(self):
+        circuit = open_delivery_circuit()
+        buf = make_buffer(max_size=100, replay_fn=KindReplayer())
+        buf.push("tool", {"seq": "tool-0"})
+        buf.flush()
+        assert circuit.is_open()
+
+        from revenium_middleware._core import delivery_circuit
+        delivery_circuit.reset()
+        failing = make_buffer(max_size=100, replay_fn=KindReplayer(unreachable={"tool"}))
+        failing.push("tool", {"seq": "tool-1"})
+        for _ in range(delivery_circuit.FAILURES_TO_OPEN):
+            failing.flush()
+        assert not delivery_circuit.get_circuit().is_open()
+
+
+class TestReplayTimeout:
+    """A replay near or past its flush deadline still gets a timeout httpx accepts."""
+
+    def test_a_spent_budget_still_yields_a_positive_timeout(self):
+        timeout = make_buffer()._replay_timeout(0.1, started=time.monotonic() - 5.0)
+
+        assert timeout > 0
+
+    def test_a_spent_budget_yields_a_timeout_the_socket_layer_accepts(self):
+        timeout = make_buffer()._replay_timeout(0.1, started=time.monotonic() - 5.0)
+        left, right = socket.socketpair()
+        try:
+            left.settimeout(timeout)
+        finally:
+            left.close()
+            right.close()
+

@@ -213,12 +213,12 @@ def extract_audio_fields(result: Any, arguments: Dict[str, Any]) -> Dict[str, An
 def _build_common_args(
     application: str,
     request_time_dt: datetime.datetime,
+    response_time_dt: datetime.datetime,
     usage_metadata: Dict[str, Any],
     transaction_id: str,
     is_streamed: bool,
 ) -> Dict[str, Any]:
     """Build the common metering arguments shared by all media types."""
-    response_time_dt = datetime.datetime.now(datetime.timezone.utc)
     response_time = response_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     request_time = request_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     request_duration = (response_time_dt - request_time_dt).total_seconds() * 1000
@@ -276,6 +276,7 @@ def handle_metering(
     """
     if get_client() is None:
         return  # metering disabled (no API key configured)
+    response_time_dt = datetime.datetime.now(datetime.timezone.utc)
 
     async def metering_call():
         try:
@@ -285,7 +286,7 @@ def handle_metering(
 
             media_type = detect_media_type(application)
             common = _build_common_args(
-                application, request_time_dt, usage_metadata, transaction_id, is_streamed
+                application, request_time_dt, response_time_dt, usage_metadata, transaction_id, is_streamed
             )
 
             agentic_fields = extract_agentic_job_fields(usage_metadata)

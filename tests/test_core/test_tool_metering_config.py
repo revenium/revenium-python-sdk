@@ -7,6 +7,7 @@ path also lacked the /meter prefix the real API uses.
 """
 import time
 
+import httpx
 import pytest
 
 from revenium_middleware._metering import decorator as tool_metering
@@ -28,11 +29,12 @@ class FakeResponse:
 class HttpxStub:
     def __init__(self):
         self.calls = []
+        self.timeouts = []
         stub = self
 
         class AsyncClient:
             def __init__(self, timeout=None):
-                pass
+                stub.timeouts.append(timeout)
 
             async def __aenter__(self):
                 return self
@@ -78,6 +80,18 @@ def test_env_vars_used_when_configure_never_called(tool_env):
     call = stub.calls[0]
     assert call.url == "https://api.dev.example/meter/v2/tool/events"
     assert call.headers["x-api-key"] == "hak_env_key"
+
+
+def test_tool_events_wait_as_long_as_the_metering_timeout_settings(tool_env):
+    stub, monkeypatch = tool_env
+    monkeypatch.setenv("REVENIUM_METERING_API_KEY", "hak_env_key")
+    monkeypatch.setenv("REVENIUM_METERING_TIMEOUT_SECONDS", "2.5")
+    monkeypatch.setenv("REVENIUM_METERING_CONNECT_TIMEOUT_SECONDS", "0.5")
+
+    report_tool_call(tool_id="timed-tool", duration_ms=5, success=True)
+
+    assert wait_for_calls(stub)
+    assert stub.timeouts == [httpx.Timeout(2.5, connect=0.5)]
 
 
 def test_no_key_anywhere_skips_post_instead_of_demo_localhost(tool_env):

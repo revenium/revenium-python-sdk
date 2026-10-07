@@ -9,7 +9,7 @@ this via class inheritance and re-export symbols for backward compatibility.
 import logging
 import os
 import warnings
-from typing import Set, Optional
+from typing import Callable, Optional, Set, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +98,10 @@ class Config:
     # revenium_middleware.litellm.proxy.guardrail. On by default.
     ENV_REVENIUM_LITELLM_SHARED_CALL_ID: str = "REVENIUM_LITELLM_SHARED_CALL_ID"
 
+    # Process shutdown -- see _core/metering.py and _core/shutdown_signals.py.
+    ENV_REVENIUM_SHUTDOWN_TIMEOUT_SECONDS: str = "REVENIUM_SHUTDOWN_TIMEOUT_SECONDS"
+    ENV_REVENIUM_INSTALL_SIGNAL_HANDLERS: str = "REVENIUM_INSTALL_SIGNAL_HANDLERS"
+
 
 class SecurityConfig:
     """Security-related configuration shared across all providers."""
@@ -113,6 +117,11 @@ class SecurityConfig:
     SENSITIVE_PATTERNS: Set[str] = {
         'sk-', 'pk-', 'Bearer ', 'Basic ', 'Token '
     }
+
+
+def env_flag_enabled(name: str) -> bool:
+    """Whether an opt-in environment flag is set to "1", "true", "yes" or "on"."""
+    return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
 
 
 def is_capture_prompts_enabled() -> bool:
@@ -153,6 +162,32 @@ def is_selective_metering_enabled() -> bool:
     """
     env_value = os.environ.get("REVENIUM_SELECTIVE_METERING", "false").lower()
     return env_value in ("true", "1", "yes", "on")
+
+
+Number = TypeVar("Number", int, float)
+
+
+def read_env_number(
+    name: str,
+    default: Number,
+    parse: Callable[[str], Number],
+    is_valid: Optional[Callable[[Number], bool]] = None,
+) -> Number:
+    """Parse a numeric env var; unset uses ``default``, malformed or invalid warns and uses it.
+
+    ``is_valid`` is optional; without it any value ``parse`` accepts is used.
+    """
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = parse(raw)
+    except (ValueError, OverflowError):
+        value = None
+    if value is None or (is_valid is not None and not is_valid(value)):
+        logger.warning("Invalid %s=%r; using default %s", name, raw, default)
+        return default
+    return value
 
 
 def get_config_value(key: str, default: any = None) -> any:

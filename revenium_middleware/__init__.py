@@ -124,14 +124,22 @@ except AttributeError:
     logger.setLevel(logging.INFO)
     logger.warning(f"Invalid log level: {log_level}, defaulting to INFO")
 
-# Configure a handler with the readable formatter if none exists
+
+def _application_logs_nothing(record: logging.LogRecord) -> bool:
+    """Whether ``record`` would reach no handler of the application's, the only time the SDK prints it."""
+    return not (logger.propagate and logging.root.handlers)
+
+
+# Python's guidance is that a library leaves output to the application. A
+# script that never configures logging has always seen the SDK's lines from
+# this handler, so it stays, standing down once the application adds a root
+# handler, which would otherwise print every line a second time.
 if not logger.handlers and not logging.root.handlers:
     handler = logging.StreamHandler()
-    formatter = ReadableFormatter()
-    handler.setFormatter(formatter)
+    handler.setFormatter(ReadableFormatter())
+    handler.addFilter(_application_logs_nothing)
     logger.addHandler(handler)
 
-# Allow propagation to root logger for testing
 logger.propagate = True
 
 # Re-export everything from _core for backward compatibility.

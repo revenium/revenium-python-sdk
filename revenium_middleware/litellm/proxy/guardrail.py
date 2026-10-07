@@ -7,8 +7,11 @@ before the proxied call and meters usage after it:
   (``revenium_middleware._core.enforcement.check_enforcement``) against the
   request's subscriber/organization attribution and turns a
   ``BudgetExceededError`` into the HTTP 429 LiteLLM expects. Every other
-  failure fails **open**: an unreachable or misbehaving enforcement path never
-  blocks a call.
+  failure fails **open**. The check is safe to await on the proxy's event loop
+  because it never waits on Revenium: it judges the request against the rules
+  already cached and leaves refreshing them to the SDK's poller thread, so an
+  unreachable, slow or misconfigured enforcement endpoint neither refuses a
+  call nor delays it.
 * **post_call** -- meters the completion (success and failure alike) through
   the SDK's metering client, exactly as the deprecated ``MiddlewareHandler``
   callback does: ``submit_ai_event`` dispatched via ``run_async_in_thread``,
@@ -91,10 +94,12 @@ import logging
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 
 from fastapi import HTTPException
 from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.integrations.custom_logger import CustomLogger
+from litellm.types.guardrails import GuardrailEventHooks
 
 from revenium_middleware._core import get_client, run_async_in_thread, submit_ai_event
 from revenium_middleware._core.cache_tokens import (
@@ -104,7 +109,7 @@ from revenium_middleware._core.cache_tokens import (
     total_priced_tokens,
 )
 from revenium_middleware._core.config import is_shared_call_id_enabled
-from revenium_middleware._core.enforcement import check_enforcement
+from revenium_middleware._core.enforcement import check_enforcement, normalize_email
 from revenium_middleware._core.exceptions import BudgetExceededError
 from revenium_middleware._core.fields import merge_extra_body
 
@@ -115,8 +120,11 @@ from .middleware import (
     _extract_agentic_job_from_headers,
     _extract_organization_name,
     _extract_product_name,
+    SUBSCRIBER_EMAIL_HEADER,
+    SUBSCRIBER_ID_HEADER,
     extract_request_headers,
     format_utc_timestamp,
+    header_then_metadata,
     read_shared_call_id,
     record_shared_call_id,
     resolve_transaction_id,
@@ -208,6 +216,15 @@ def _note_missing_shared_call_id():
 # than a missed row. ``test_proxy_guardrail_streaming`` asserts the two still
 # agree, so a rename fails a test instead of quietly stopping the metering.
 _ANTHROPIC_MESSAGES_CALL_TYPE = "anthropic_messages"
+
+# The call types whose streams end in one of this guardrail's metering hooks:
+# a chat stream through the post-call hook LiteLLM runs on the assembled
+# response, an Anthropic-shaped one through ``async_log_success_event``. A
+# streamed /v1/completions or /v1/responses call reaches neither (verified on
+# litellm 1.104.0), so for those the client wrapper is the only meter there is.
+_STREAMED_CALL_TYPES_METERED_HERE = frozenset(
+    {"acompletion", _ANTHROPIC_MESSAGES_CALL_TYPE}
+)
 
 # How many recently metered calls the duplicate guard remembers. Each entry is
 # one short id, so this costs a few hundred kilobytes and covers far more calls
@@ -366,6 +383,17 @@ class _MeteredCalls:
             return True
 
 
+def _call_type(request_kwargs):
+    """The LiteLLM call type of the route serving ``request_kwargs``.
+
+    Read off the proxy's logging object rather than inferred from the entry
+    point, because the Anthropic-shaped route reaches ``litellm.acompletion``
+    through a bridge that relabels the logging object as ``anthropic_messages``.
+    """
+    call_type = getattr(request_kwargs.get("litellm_logging_obj"), "call_type", None)
+    return getattr(call_type, "value", call_type)
+
+
 def _litellm_call_id(*sources):
     """LiteLLM's own correlation id, from the first source that carries one."""
     for source in sources:
@@ -508,26 +536,55 @@ def _key_metadata(metadata, user_api_key_dict):
     return key_metadata
 
 
+def _key_owner_id(key_metadata):
+    return str(key_metadata.get("revenium_user_id", "") or "")
+
+
+def _key_owner_email(metadata, user_api_key_dict, key_metadata):
+    return (
+        metadata.get("user_api_key_user_email", "")
+        or getattr(user_api_key_dict, "user_email", "")
+        or key_metadata.get("email", "")
+        or ""
+    )
+
+
+def _same_email(first, second):
+    return (
+        isinstance(first, str)
+        and isinstance(second, str)
+        and normalize_email(first) == normalize_email(second)
+    )
+
+
 def _build_subscriber(headers, metadata, user_api_key_dict, key_metadata):
     """Build the metering subscriber block.
 
     Fallback chain, most explicit first: ``x-revenium-*`` headers, then LiteLLM
     request metadata, then the ``UserAPIKeyAuth`` fields, then the virtual key's
     own ``revenium_*`` custom metadata.
+
+    ``x-revenium-subscriber-id`` and ``x-revenium-subscriber-email`` are taken
+    as the caller states them, with no check against the key: a virtual key
+    shared by several people trusts each of them to name themselves, and
+    budget enforcement keys per-person and department caps on that email.
+    Without either, the call is attributed to the key's owner.
+
+    The key owner's ``revenium_user_id`` is used only while the subscriber is
+    still the key owner: no per-call email, or one that normalizes to the
+    owner's own. A per-call email naming someone else gets no id, because
+    grouped enforcement matches ``subscriber.id`` before the email, so the
+    owner's id would check the owner's balance instead of the caller's.
     """
     subscriber = {}
-    subscriber_id = (
-        metadata.get("x-revenium-subscriber-id", "")
-        or headers.get("x-revenium-subscriber-id")
-        or str(key_metadata.get("revenium_user_id", "") or "")
-        or ""
+    per_call_id = header_then_metadata(headers, metadata, SUBSCRIBER_ID_HEADER)
+    per_call_email = header_then_metadata(headers, metadata, SUBSCRIBER_EMAIL_HEADER)
+    owner_email = _key_owner_email(metadata, user_api_key_dict, key_metadata)
+    names_someone_else = per_call_email and not _same_email(per_call_email, owner_email)
+    subscriber_id = per_call_id or (
+        "" if names_someone_else else _key_owner_id(key_metadata)
     )
-    subscriber_email = (
-        metadata.get("user_api_key_user_email", "")
-        or getattr(user_api_key_dict, "user_email", "")
-        or key_metadata.get("email", "")
-        or ""
-    )
+    subscriber_email = per_call_email or owner_email
     credential_name = (
         metadata.get("user_api_key_alias", "")
         or getattr(user_api_key_dict, "key_alias", "")
@@ -819,6 +876,11 @@ class ReveniumGuardrail(CustomGuardrail):
         3. Failed open -- anything else went wrong in the check: logged,
            request allowed. Enforcement never takes the proxy down with it.
 
+        Calls the synchronous ``check_enforcement`` directly on the event loop,
+        with no ``to_thread``, because that check does no network I/O and no
+        sleeping (BACK-3917); a thread hop would add latency and an executor
+        dependency to every request for nothing.
+
         Args:
             user_api_key_dict: LiteLLM ``UserAPIKeyAuth`` for the calling key.
             cache: LiteLLM's ``DualCache`` (unused; enforcement keeps its own).
@@ -946,6 +1008,55 @@ class ReveniumGuardrail(CustomGuardrail):
                 error,
             )
             return None
+
+    def meters_request(self, request_kwargs):
+        """Whether this guardrail meters the LiteLLM call ``request_kwargs`` makes.
+
+        The client wrapper asks this on every patched LiteLLM call and stands
+        aside when it is true, so a wrong True loses a row while a wrong False
+        only sends a second one. Every case this cannot settle answers False.
+
+        It is true only when all three hold:
+
+        * The proxy is serving the call. LiteLLM attaches
+          ``proxy_server_request`` to every request it receives and strips one a
+          caller sends, so a direct call from the same process, such as a
+          background job or another callback, never carries it.
+        * A streamed call is of a type whose end reaches a metering hook here
+          (``_STREAMED_CALL_TYPES_METERED_HERE``).
+        * LiteLLM runs this guardrail's post-call hooks for the request, which
+          it does not for a key or team that opted out of it.
+
+        Args:
+            request_kwargs: The keyword arguments the patched LiteLLM entry
+                point was called with, which on the proxy is the request body
+                the router forwarded.
+        """
+        try:
+            if not isinstance(request_kwargs.get("proxy_server_request"), Mapping):
+                return False
+            if (
+                request_kwargs.get("stream")
+                and _call_type(request_kwargs) not in _STREAMED_CALL_TYPES_METERED_HERE
+            ):
+                return False
+            return (
+                self.should_run_guardrail(
+                    data=request_kwargs, event_type=GuardrailEventHooks.post_call
+                )
+                is True
+            )
+        except Exception as error:
+            # Broad on purpose: this runs inside the caller's LiteLLM call, where
+            # anything raised would fail it, and the vendor method it consults
+            # changes between releases. Answering False keeps the call metered.
+            logger.debug(
+                "ReveniumGuardrail: could not tell whether this call is metered "
+                "here (%s: %s) -- leaving it to the client wrapper",
+                type(error).__name__,
+                error,
+            )
+            return False
 
     async def async_post_call_success_hook(self, data, user_api_key_dict, response):
         """Meter a successful proxied call.

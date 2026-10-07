@@ -6,6 +6,19 @@ them in memory. ``check_enforcement(...)`` is a pre-call hook that raises
 ``BudgetExceededError`` when a tripped rule matches the current
 request, blocking the outbound provider call before any spend occurs.
 
+The pre-call hook never talks to the network (BACK-3917). It judges the
+request against whatever rules are cached and, when they are stale, asks the
+poller thread to refresh them; it never refreshes them itself. The hook runs
+on the caller's thread, and for a LiteLLM proxy or an ``AsyncOpenAI`` caller
+that thread is the event loop serving every request, so an inline refresh --
+five attempts and their backoff sleeps, about 58 s against a hung endpoint --
+froze all traffic, not just the one request. A refresh that fails is not
+retried for one poll interval (``_refresh_failure_backoff_seconds``), so an
+outage costs the control plane what the healthy poller costs and request
+traffic adds nothing. Before the first fetch has landed nothing is cached:
+the default fail-open mode lets the call through and
+``REVENIUM_CB_FAIL_MODE=closed`` refuses it, both without waiting.
+
 Department budgets are decided by the server: the rules response carries a
 top-level ``departmentBudgetBlocks`` map of subscriber email -> blocking rule
 id, pre-computed from department membership, a
@@ -57,7 +70,7 @@ from urllib.parse import quote, urlparse
 
 import httpx
 
-from .config import Config
+from .config import Config, env_flag_enabled
 from .exceptions import BudgetExceededError
 from .subscriber import extract_subscriber_from_metadata
 
@@ -74,11 +87,11 @@ _FETCH_BACKOFF_INITIAL = 0.5      # seconds; doubles per attempt
 _FETCH_BACKOFF_CAP = 8.0          # seconds; caps the backoff we choose ourselves
 _FETCH_RETRYABLE_STATUS = frozenset({408, 429})  # plus any 5xx
 
-# Give-up threshold for *server-supplied* ``Retry-After`` waits, deliberately
-# NOT _FETCH_BACKOFF_CAP. It is a budget for one whole ``_fetch_rules`` call,
-# not a per-response limit: a response is honoured only if its interval fits
+# Give-up thresholds for *server-supplied* ``Retry-After`` waits, deliberately
+# NOT _FETCH_BACKOFF_CAP. Each is a budget for one whole read, not a
+# per-response limit: a response is honoured only if its interval fits
 # entirely in what is left, so a server repeating ``Retry-After: 20`` across
-# five attempts can park a caller for 20 s in total rather than 100 s.
+# five attempts can park a reader for 20 s in total rather than 100 s.
 #
 # Inside the budget the fetch waits the whole interval that was asked for;
 # outside it the fetch neither waits nor retries, records a cooldown (see
@@ -87,16 +100,19 @@ _FETCH_RETRYABLE_STATUS = frozenset({408, 429})  # plus any 5xx
 # wait -- truncating it would retry sooner than the 429 permitted, which is
 # the one thing the status code asks a client not to do (RFC 9110 §10.2.3).
 #
-# 20 s rather than the 60 s the metering client honours (see
-# ``_parse_retry_after_header`` in ``_metering/_base_client.py``) because this
-# fetch is synchronous: ``_get_rules`` calls ``_refresh_cache`` on the caller's
-# thread once the cache is past ``_CACHE_TTL``, so the wait parks a customer
-# request that is already blocked on its own provider call. If this path ever
-# becomes background-only the bound becomes 60 s. Cross-SDK numbers:
+# The number follows the path shape. The rules refresh runs only on the
+# poller thread, where a wait parks nobody, so it gets the 60 s the metering
+# client honours (``_parse_retry_after_header`` in
+# ``_metering/_base_client.py``). The two inspection reads,
+# ``fetch_enforcement_rule`` and ``fetch_enforcement_rule_roster``, still run
+# on their caller's thread and keep 20 s. Cross-SDK numbers:
 # ``docs/conventions/retry-after.md``.
-_RETRY_AFTER_GIVE_UP_SECONDS = 20.0
+_REFRESH_RETRY_AFTER_GIVE_UP_SECONDS = 60.0
+_INSPECTION_RETRY_AFTER_GIVE_UP_SECONDS = 20.0
 
-# Longest a single Retry-After may suppress rule refreshes. This is NOT the
+# Longest a single Retry-After may suppress rule refreshes. It applies to the
+# server-supplied interval only; the backoff after a failed refresh is the SDK's
+# own poll interval and is never clamped by it. This is NOT the
 # ``min()`` on a wait that rule 1 forbids: nothing is parked and no retry is
 # issued early inside the cooldown window -- the fetch has already given up,
 # every caller is served from cache, and no request goes out until the window
@@ -170,8 +186,29 @@ _poll_thread: Optional[threading.Thread] = None
 _poll_lock = threading.Lock()
 _stop_event = threading.Event()
 
-# Serializes synchronous stale-cache refreshes to prevent thundering herd
+# Held for the whole of a refresh, so at most one is in flight per process
+# however many threads ask for one; a refresh that finds it held is dropped,
+# not queued.
 _refresh_lock = threading.Lock()
+
+# Set to wake the poller early: by a pre-call check that found the cache stale,
+# and by ``stop_polling`` so the poller does not sleep out its interval.
+_poll_wakeup = threading.Event()
+
+
+def _forget_parent_refresh() -> None:
+    """Give a forked child a free ``_refresh_lock``.
+
+    A refresh in flight in the parent at fork time leaves the child a copy of
+    the lock that is held by a poller thread the child does not have, so every
+    refresh in the child would be skipped and its rules would never load.
+    """
+    global _refresh_lock
+    _refresh_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forget_parent_refresh)
 
 # Which cache generation the department maps in memory belong to. Bumped, under
 # _cache_lock, wherever those maps are replaced -- a fetch or a disk load -- and
@@ -194,8 +231,9 @@ _warn_dedupe_lock = threading.Lock()
 _warned_org_unit_callers: Set[Tuple[int, str, int]] = set()
 
 # Monotonic deadline before which no refresh may issue a request, set when the
-# fetch declines to wait out a Retry-After. 0.0 means no cooldown in force.
-# Read and written under _cache_lock.
+# fetch declines to wait out a Retry-After (``_begin_refresh_cooldown``) and
+# when a refresh fails for any other reason (``_begin_failure_backoff``). 0.0
+# means no cooldown in force. Read and written under _cache_lock.
 _refresh_cooldown_until = 0.0
 
 # Single-shot warnings so misconfigured environments don't spam logs
@@ -203,18 +241,14 @@ _team_id_warned = False
 _disk_load_attempted = False
 
 
-def _env_truthy(name: str) -> bool:
-    return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
-
-
 def is_circuit_breaker_enabled() -> bool:
     """Return True when the operator has opted in to enforcement."""
-    return _env_truthy(Config.ENV_CIRCUIT_BREAKER_ENABLED)
+    return env_flag_enabled(Config.ENV_CIRCUIT_BREAKER_ENABLED)
 
 
 def is_bypass_enabled() -> bool:
     """``REVENIUM_BYPASS=true`` short-circuits enforcement at every callsite."""
-    return _env_truthy(Config.ENV_REVENIUM_BYPASS)
+    return env_flag_enabled(Config.ENV_REVENIUM_BYPASS)
 
 
 def _poll_interval_seconds() -> int:
@@ -227,6 +261,19 @@ def _poll_interval_seconds() -> int:
     except ValueError:
         logger.debug("Invalid %s=%r, using default", Config.ENV_REVENIUM_CB_POLL_INTERVAL_SECONDS, raw)
         return _DEFAULT_POLL_INTERVAL
+
+
+def _refresh_failure_backoff_seconds() -> float:
+    """How long a failed refresh suppresses the next one.
+
+    One poll interval: during an outage the SDK then asks the control plane
+    exactly as often as it does when healthy, request traffic adds no
+    attempts, and a recovered endpoint is noticed within the same interval a
+    healthy cache is refreshed in. A 403 from a wrong key or team id is a
+    misconfiguration that only an operator can fix, and one attempt a minute
+    picks up the fix without flooding the log.
+    """
+    return float(_poll_interval_seconds())
 
 
 def _fail_mode_is_closed() -> bool:
@@ -536,7 +583,7 @@ def _retry_after_seconds(response: "httpx.Response") -> Optional[float]:
 
     Returns the full interval the server asked for, unclamped -- deciding
     whether it is short enough to honour belongs to the caller, which weighs
-    it against ``_RETRY_AFTER_GIVE_UP_SECONDS``. ``None`` means the header was
+    it against its Retry-After budget. ``None`` means the header was
     absent or unparseable, so the caller falls back to its own backoff.
     """
     raw = response.headers.get("Retry-After")
@@ -556,33 +603,52 @@ def _retry_after_seconds(response: "httpx.Response") -> Optional[float]:
 
 
 def _begin_refresh_cooldown(seconds: float) -> float:
-    """Stop issuing refresh requests for ``seconds``, as the server asked.
+    """Stop issuing refresh requests for the ``Retry-After`` the fetch declined to wait.
 
-    Giving up on a ``Retry-After`` is only half of honouring it. Without a
-    cooldown the next customer request finds the same stale cache, triggers the
-    same synchronous refresh and issues another control-plane request -- one
-    per customer request for as long as the throttling lasts, which is worse
-    than the truncated retry this replaced. Recording the deadline honours the
-    server's interval in full while making nobody wait for it: refreshes are
-    skipped and callers are served from the cached rules until it passes.
+    Giving up on the header is only half of honouring it. Without a cooldown
+    the next customer request finds the same stale cache and asks for the same
+    refresh: one control-plane request per customer request for as long as the
+    throttling lasts. Recording the deadline makes nobody wait for it:
+    refreshes are skipped and callers are served from the cached rules until
+    it passes.
 
     Clamped to ``_REFRESH_COOLDOWN_CEILING_SECONDS`` -- a sanity bound on how
     long one header may suppress refreshes, not a truncated wait; see that
-    constant. Never shortens a cooldown already in force. Returns the seconds
-    remaining until the deadline now in effect.
+    constant. Returns the seconds remaining until the deadline now in effect.
     """
+    return _extend_refresh_cooldown(min(max(0.0, seconds), _REFRESH_COOLDOWN_CEILING_SECONDS))
+
+
+def _begin_failure_backoff() -> float:
+    """Stop issuing refresh requests for ``_refresh_failure_backoff_seconds``.
+
+    Not clamped by ``_REFRESH_COOLDOWN_CEILING_SECONDS``: that bounds what one
+    server header can impose, while this is the operator's own poll interval,
+    so a one-hour interval means one attempt an hour during an outage too.
+    Returns the seconds remaining until the deadline now in effect.
+    """
+    return _extend_refresh_cooldown(_refresh_failure_backoff_seconds())
+
+
+def _extend_refresh_cooldown(seconds: float) -> float:
+    """Move the cooldown deadline ``seconds`` out, never shortening one in force."""
     global _refresh_cooldown_until
     now = time.monotonic()
-    deadline = now + min(max(0.0, seconds), _REFRESH_COOLDOWN_CEILING_SECONDS)
+    deadline = now + max(0.0, seconds)
     with _cache_lock:
         _refresh_cooldown_until = max(_refresh_cooldown_until, deadline)
         return _refresh_cooldown_until - now
 
 
-def _refresh_is_on_cooldown() -> bool:
-    """True while a Retry-After interval the fetch declined to wait is running."""
+def _refresh_cooldown_remaining() -> float:
+    """Seconds until a refresh may issue a request again; 0.0 when it may now."""
     with _cache_lock:
-        return time.monotonic() < _refresh_cooldown_until
+        return max(0.0, _refresh_cooldown_until - time.monotonic())
+
+
+def _refresh_is_on_cooldown() -> bool:
+    """True while a declined Retry-After or a failed refresh's backoff is running."""
+    return _refresh_cooldown_remaining() > 0.0
 
 
 class _RetryPlan(NamedTuple):
@@ -596,20 +662,21 @@ class _RetryPlan(NamedTuple):
     budget_remaining: float
 
 
-def _plan_retry(response: "httpx.Response", backoff: float, budget_remaining: float) -> _RetryPlan:
+def _plan_retry(response: "httpx.Response", backoff: float, budget_remaining: float,
+                budget_total: float) -> _RetryPlan:
     """Decide how to handle a retryable response, spending the Retry-After budget.
 
     Three outcomes, and the ``None`` is the one that matters:
 
     * no usable ``Retry-After`` -- our own ``backoff``, which we are free to
       cap and which does not spend the budget: the budget exists to bound how
-      long the *server* can park a caller, not how long we park ourselves;
+      long the *server* can park a reader, not how long we park ourselves;
     * a ``Retry-After`` that fits in ``budget_remaining`` -- that interval in
       full, never truncated, and the budget shrinks by it;
     * a ``Retry-After`` that does not fit -- ``None``. Waiting it out would
-      park a customer request past the bound; retrying sooner would ignore the
-      429. So the fetch does neither: it records the cooldown so the interval
-      is still respected, and the caller keeps the rules it already has.
+      park the reader past the bound; retrying sooner would ignore the 429.
+      So the fetch does neither: it records the cooldown so the interval is
+      still respected, and the reader keeps what it already has.
     """
     retry_after = _retry_after_seconds(response)
     if retry_after is None:
@@ -621,7 +688,7 @@ def _plan_retry(response: "httpx.Response", backoff: float, budget_remaining: fl
             "Retry-After budget left; failing open on the previous cache and not "
             "refreshing again for %.0fs",
             response.status_code, retry_after, budget_remaining,
-            _RETRY_AFTER_GIVE_UP_SECONDS, cooldown,
+            budget_total, cooldown,
         )
         return _RetryPlan(None, budget_remaining)
     return _RetryPlan(retry_after, budget_remaining - retry_after)
@@ -716,7 +783,8 @@ def _fetch_target() -> Optional[_FetchTarget]:
 
 
 def _get_enforcement(url: str, api_key: str, resource: str,
-                     params: Optional[dict] = None) -> Optional["httpx.Response"]:
+                     params: Optional[dict], retry_after_budget: float,
+                     ) -> Optional["httpx.Response"]:
     """GET one enforcement resource under the shared retry and Retry-After budget.
 
     Returns the first response the retry policy does not retry -- the caller
@@ -725,17 +793,17 @@ def _get_enforcement(url: str, api_key: str, resource: str,
     the read in the log lines.
 
     Every enforcement read goes through here rather than calling ``httpx.get``
-    itself: the Retry-After budget and the refresh cooldown (FRONT-1682) exist
-    because these reads run on a caller's own request thread, and a second
-    unguarded GET against the same throttled origin reintroduces the request
-    amplification that ticket fixed.
+    itself: a second unguarded GET against an origin that has already asked
+    for a Retry-After interval reintroduces the request amplification
+    FRONT-1682 fixed.
 
     ``params`` of ``None`` sends the request httpx builds from the URL alone,
     which is what the unfiltered team-wide read has always sent.
+    ``retry_after_budget`` is the server-requested wait this read may spend in
+    total across every attempt; it depends on whose thread the read runs on
+    (see ``_REFRESH_RETRY_AFTER_GIVE_UP_SECONDS``).
     """
-    # Server-requested wait time this call may still spend, in total across
-    # every attempt. See _RETRY_AFTER_GIVE_UP_SECONDS.
-    retry_after_budget = _RETRY_AFTER_GIVE_UP_SECONDS
+    budget_total = retry_after_budget
     for attempt in range(_FETCH_MAX_ATTEMPTS):
         backoff = min(_FETCH_BACKOFF_INITIAL * (2 ** attempt), _FETCH_BACKOFF_CAP)
         try:
@@ -754,7 +822,7 @@ def _get_enforcement(url: str, api_key: str, resource: str,
         if not _is_retryable_status(response.status_code):
             return response
 
-        plan = _plan_retry(response, backoff, retry_after_budget)
+        plan = _plan_retry(response, backoff, retry_after_budget, budget_total)
         retry_after_budget = plan.budget_remaining
         if plan.wait_seconds is None:
             # Give up without waiting and without retrying: the cooldown
@@ -776,7 +844,9 @@ def _get_enforcement(url: str, api_key: str, resource: str,
     return None
 
 
-def _fetch_rules(rule_id: Optional[str] = None) -> Optional[_FetchedRules]:
+def _fetch_rules(rule_id: Optional[str] = None,
+                 retry_after_budget: float = _REFRESH_RETRY_AFTER_GIVE_UP_SECONDS,
+                 ) -> Optional[_FetchedRules]:
     """Fetch the current enforcement payload from the Revenium API.
 
     Returns the rules and the three department-budget maps on success — any of
@@ -796,7 +866,8 @@ def _fetch_rules(rule_id: Optional[str] = None) -> Optional[_FetchedRules]:
         return None
 
     params = {"ruleId": rule_id} if rule_id else None
-    response = _get_enforcement(target.team_url, target.api_key, "rule", params)
+    response = _get_enforcement(target.team_url, target.api_key, "rule", params,
+                                retry_after_budget)
     if response is None:
         return None
 
@@ -825,8 +896,9 @@ def _fetch_roster(rule_id: str, page: int = 0, size: int = 25,
     the pre-call path reads it, and a cached copy would carry a second
     lifetime that could outlive the rule it describes.
 
-    It spends the same Retry-After budget as the rule fetch and records the
-    same cooldown when it gives up, but unlike ``_refresh_cache`` a cooldown
+    It runs on its caller's thread, so it spends the shorter inspection
+    Retry-After budget, and records the same cooldown as the rule refresh when
+    it gives up, but unlike ``_refresh_cache`` a cooldown
     already in force does not suppress it: this is one read a person asked
     for, not one per customer request, and answering it with ``None`` because
     the poller was throttled would hide the reading rather than protect the
@@ -846,7 +918,7 @@ def _fetch_roster(rule_id: str, page: int = 0, size: int = 25,
         params["band"] = band
 
     response = _get_enforcement(f"{target.team_url}/roster", target.api_key,
-                                "roster", params)
+                                "roster", params, _INSPECTION_RETRY_AFTER_GIVE_UP_SECONDS)
     if response is None:
         return None
 
@@ -890,7 +962,7 @@ def fetch_enforcement_rule(rule_id: str) -> Optional[dict]:
     if not rule_id:
         raise ValueError("rule_id is required to read a single enforcement rule")
 
-    fetched = _fetch_rules(rule_id)
+    fetched = _fetch_rules(rule_id, _INSPECTION_RETRY_AFTER_GIVE_UP_SECONDS)
     if fetched is None or not fetched.rules:
         return None
     return fetched.rules[0]
@@ -929,27 +1001,48 @@ def fetch_enforcement_rule_roster(rule_id: str, page: int = 0, size: int = 25,
 
 
 def _refresh_cache() -> None:
-    """Refresh the in-memory rule cache.
+    """Refresh the in-memory rule cache, unless a refresh is already running.
 
-    Only advances ``_cache_timestamp`` on a successful fetch — a transient
-    network error must not poison the stale-cache trigger and silently
-    suppress retries for the next ``_CACHE_TTL`` window. Disk persistence
-    happens outside ``_cache_lock`` so a slow filesystem write can't block
-    concurrent ``check_enforcement`` callers on the pre-call path.
+    Called by the poller thread, never by the pre-call path. Holding
+    ``_refresh_lock`` throughout keeps one refresh in flight per process.
+    """
+    if not _refresh_lock.acquire(blocking=False):
+        return
+    try:
+        _refresh_cache_holding_lock()
+    finally:
+        _refresh_lock.release()
 
-    Issues nothing at all while a Retry-After cooldown is in force, so a
-    throttled tenant sends one control-plane request rather than one per
-    customer request. Skipping is free here: the cached rules stay in force
-    and no caller waits for the interval to elapse.
+
+def _refresh_cache_holding_lock() -> None:
+    """Fetch the rules and install them, or back off when the fetch fails.
+
+    Issues nothing while a cooldown is in force. A failed fetch -- timeout,
+    refusal, 5xx, any 4xx -- keeps the cached rules and starts a backoff of
+    ``_refresh_failure_backoff_seconds`` before the next attempt, and
+    ``_cache_timestamp`` stays where it was, so the cache keeps reading as
+    stale and is refreshed as soon as the backoff allows. The backoff is
+    recorded before ``_refresh_lock`` is released, so no pre-call check can
+    see a stale cache with neither a refresh nor a backoff in force and wake
+    the poller straight back into the outage.
+
+    Disk persistence happens outside ``_cache_lock`` so a slow filesystem write
+    can't block concurrent ``check_enforcement`` callers on the pre-call path.
     """
     global _cached_rules, _cached_org_unit_blocks, _cached_org_unit_block_balances
     global _cached_org_unit_warnings
     global _cache_timestamp, _cache_initialized
     if _refresh_is_on_cooldown():
-        logger.debug("Enforcement refresh skipped: Retry-After cooldown still in force")
+        logger.debug("Enforcement refresh skipped: a cooldown is still in force")
         return
     fetched = _fetch_rules()
     if fetched is None:
+        backoff = _begin_failure_backoff()
+        logger.warning(
+            "Enforcement rules could not be refreshed; enforcing the rules already "
+            "cached (none, if no fetch has succeeded yet) and trying again in %.0fs",
+            backoff,
+        )
         return
     with _cache_lock:
         _cached_rules = fetched.rules
@@ -968,7 +1061,24 @@ def _poll_loop() -> None:
     interval = _poll_interval_seconds()
     while not _stop_event.is_set():
         _refresh_cache()
-        _stop_event.wait(interval)
+        # A wake-up asked for while that refresh ran was answered by it, so it
+        # is dropped. Stop is checked after the clear because stop_polling sets
+        # _stop_event before _poll_wakeup, so a stop can never be cleared away.
+        _poll_wakeup.clear()
+        if _stop_event.is_set():
+            break
+        _poll_wakeup.wait(_next_poll_wait_seconds(interval))
+
+
+def _next_poll_wait_seconds(interval: float) -> float:
+    """Sleep until the cooldown ends when one is running, else one interval.
+
+    Waiting a whole interval after a refresh the cooldown skipped would
+    double the gap between attempts whenever the wait ends a moment before the
+    cooldown does.
+    """
+    remaining = _refresh_cooldown_remaining()
+    return remaining if remaining > 0.0 else interval
 
 
 def _ensure_poller_running() -> None:
@@ -999,6 +1109,10 @@ def _snapshot_department_budgets() -> _DepartmentBudgets:
 def _get_rules() -> Tuple[list, _DepartmentBudgets, bool]:
     """Return cached rules, the department maps, and the initialized flag.
 
+    Never fetches. A stale cache is served as it is and the poller is woken to
+    refresh it, unless a refresh is already running or a cooldown is in force,
+    either of which will bring the cache up to date without being asked.
+
     Reading every field under one ``_cache_lock`` acquisition prevents the
     fail-closed path from torn-reading ``_cache_initialized`` against a
     half-written ``_cached_rules`` from the background poller, and keeps the
@@ -1007,20 +1121,13 @@ def _get_rules() -> Tuple[list, _DepartmentBudgets, bool]:
     """
     now = time.monotonic()
     with _cache_lock:
-        age = now - _cache_timestamp
+        stale = not _cache_initialized or now - _cache_timestamp > _CACHE_TTL
+        cooling_down = now < _refresh_cooldown_until
         rules = list(_cached_rules)
         departments = _snapshot_department_budgets()
         initialized = _cache_initialized
-    if age > _CACHE_TTL:
-        if _refresh_lock.acquire(blocking=False):
-            try:
-                _refresh_cache()
-                with _cache_lock:
-                    rules = list(_cached_rules)
-                    departments = _snapshot_department_budgets()
-                    initialized = _cache_initialized
-            finally:
-                _refresh_lock.release()
+    if stale and not cooling_down and not _refresh_lock.locked():
+        _poll_wakeup.set()
     return rules, departments, initialized
 
 
@@ -1132,7 +1239,7 @@ def _is_org_unit_rule(rule: dict) -> bool:
     return isinstance(group_by, str) and group_by.strip().upper() in _ORG_UNIT_GROUP_BY_VALUES
 
 
-def _normalize_email(email: str) -> str:
+def normalize_email(email: str) -> str:
     """The one canonical form of an address, as the server writes its map keys.
 
     ``EmailNormalizer.normalize`` on the platform side is ``trim().lowercase()``
@@ -1148,6 +1255,9 @@ def _normalize_email(email: str) -> str:
     (ß -> ss) would build a key the server never wrote.
     """
     return email.strip().lower()
+
+
+_normalize_email = normalize_email
 
 
 def _caller_emails(usage_metadata: Optional[dict]) -> List[str]:
@@ -1440,6 +1550,13 @@ def check_enforcement(usage_metadata: Optional[dict] = None) -> None:
     Invoke before the upstream provider call. No-op when the circuit breaker
     is disabled or no rules are tripped.
 
+    Never waits on the network, so it is safe to call on an event loop: the
+    request is judged against the rules already cached, and refreshing them is
+    the poller thread's job. Until the first fetch lands there are none, and
+    the call goes through -- or, with ``REVENIUM_CB_FAIL_MODE=closed``, is
+    refused -- at once. The only I/O is the first call's read of the
+    ``REVENIUM_CACHE_DIR`` snapshot, a local file read once per process.
+
     Subscriber-grouped rules are evaluated against the caller's own balance
     from ``groupBreakdown`` rather than the rule-level aggregate; see
     ``_rule_blocks``.
@@ -1535,8 +1652,12 @@ def stop_polling() -> None:
     ``_ensure_poller_running`` spinning the thread up on a concurrent first
     request — without the lock, shutdown could observe ``None`` and skip the
     ``join`` even though a poller is alive.
+
+    ``_poll_wakeup`` is set after ``_stop_event`` so a poller sleeping out its
+    interval wakes now instead of up to one poll interval later.
     """
     _stop_event.set()
+    _poll_wakeup.set()
     with _poll_lock:
         thread = _poll_thread
     if thread is not None:

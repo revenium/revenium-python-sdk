@@ -8,19 +8,19 @@ parts:
 
 * a ``Retry-After`` that fits the remaining budget is waited out in full, then
   retried;
-* ``_RETRY_AFTER_GIVE_UP_SECONDS`` is a budget for the whole ``_fetch_rules``
-  call, so a server repeating an in-bound interval cannot park a caller for a
-  multiple of the bound;
+* the bound is a budget for the whole ``_fetch_rules`` call, so a server
+  repeating an in-bound interval cannot park a reader for a multiple of it;
 * a ``Retry-After`` that does not fit is neither waited out nor retried. The
   fetch records a cooldown for the interval instead -- capped by a sanity
   ceiling so one absurd header cannot suppress refreshes for hours -- so the
   server's request is still honoured, and fails open on the cached rules: one
   control-plane request while throttled, not one per customer request.
 
-The bound is 20 s rather than the metering clients' 60 s because this fetch is
-synchronous: ``_get_rules`` refreshes on the caller's thread once the cache is
-past ``_CACHE_TTL``, so the wait parks a customer request. See
-``docs/conventions/retry-after.md`` for the numbers in every SDK.
+The bound follows the path shape. The rules refresh runs only on the poller
+thread (BACK-3917), where a wait parks nobody, so it gets the metering
+clients' 60 s; the two inspection reads still run on their caller's thread and
+keep 20 s. See ``docs/conventions/retry-after.md`` for the numbers in every
+SDK.
 """
 import datetime
 import threading
@@ -66,7 +66,7 @@ class TestHonoursTheFullIntervalWithinTheBound:
 
     def test_the_bound_itself_is_honoured_not_given_up_on(self, fetch_env):
         monkeypatch, sleeps = fetch_env
-        bound = enforcement._RETRY_AFTER_GIVE_UP_SECONDS
+        bound = enforcement._REFRESH_RETRY_AFTER_GIVE_UP_SECONDS
         stub_get(monkeypatch, [throttled(int(bound)), make_response(200)])
 
         enforcement._fetch_rules()
@@ -77,10 +77,10 @@ class TestHonoursTheFullIntervalWithinTheBound:
 class TestTheBoundIsABudgetForTheWholeCall:
     """The bound limits the total wait per fetch, not each response separately."""
 
-    def test_four_in_bound_intervals_do_not_park_the_caller_for_four_bounds(self, fetch_env):
+    def test_four_in_bound_intervals_do_not_park_the_reader_for_four_bounds(self, fetch_env):
         """A per-response threshold let ``Retry-After: 20`` x4 sleep 80 s."""
         monkeypatch, sleeps = fetch_env
-        bound = enforcement._RETRY_AFTER_GIVE_UP_SECONDS
+        bound = enforcement._REFRESH_RETRY_AFTER_GIVE_UP_SECONDS
         stub = stub_get(monkeypatch, [throttled(int(bound))] * 10)
 
         assert enforcement._fetch_rules() is None
@@ -90,13 +90,13 @@ class TestTheBoundIsABudgetForTheWholeCall:
 
     def test_the_budget_is_spent_across_attempts_then_gives_up(self, fetch_env):
         monkeypatch, sleeps = fetch_env
-        stub = stub_get(monkeypatch, [throttled(8)] * 10)
+        stub = stub_get(monkeypatch, [throttled(25)] * 10)
 
         assert enforcement._fetch_rules() is None
-        # 8 + 8 fits in 20; the third 8 does not fit the remaining 4, and is
-        # not truncated to 4 either -- the fetch gives up instead.
-        assert sleeps == [8.0, 8.0]
-        assert sum(sleeps) <= enforcement._RETRY_AFTER_GIVE_UP_SECONDS
+        # 25 + 25 fits in 60; the third 25 does not fit the remaining 10, and
+        # is not truncated to 10 either -- the fetch gives up instead.
+        assert sleeps == [25.0, 25.0]
+        assert sum(sleeps) <= enforcement._REFRESH_RETRY_AFTER_GIVE_UP_SECONDS
         assert stub.calls == 3
 
     def test_our_own_backoff_does_not_spend_the_servers_budget(self, fetch_env):
@@ -153,7 +153,7 @@ class TestGivingUpStartsACooldown:
     """Declining to wait is only half of honouring the header.
 
     Without a cooldown the cache is still stale on the next customer request,
-    which triggers another synchronous refresh and another control-plane
+    which wakes the poller into another refresh and another control-plane
     request -- one per customer request for as long as the throttling lasts.
     """
 
@@ -171,14 +171,18 @@ class TestGivingUpStartsACooldown:
     def test_fifty_customer_requests_inside_the_window_make_one_control_plane_request(self, clocked):
         monkeypatch, sleeps, clock = clocked
         stub = stub_get(monkeypatch, [throttled(120), make_response(200, json_body={"rules": []})])
+        enforcement._refresh_cache()
+        enforcement._poll_wakeup.clear()
 
         for _ in range(50):
             rules, _blocks, initialized = enforcement._get_rules()
             assert rules == [{"ruleId": 1, "breached": False}]  # cached rules serve every one
             assert initialized is True
+            assert not enforcement._poll_wakeup.is_set(), "a request asked for a refresh inside the window"
+            enforcement._refresh_cache()
 
-        assert stub.calls == 1, "the cooldown did not suppress the request-driven refresh"
-        assert sleeps == [], "a customer request was parked waiting on the 429"
+        assert stub.calls == 1, "the cooldown did not suppress the refresh"
+        assert sleeps == [], "the fetch waited on a 429 it could not honour"
 
     def test_the_next_request_after_the_deadline_refreshes(self, clocked):
         monkeypatch, sleeps, clock = clocked
@@ -187,14 +191,15 @@ class TestGivingUpStartsACooldown:
             make_response(200, json_body={"rules": [{"ruleId": 2}]}),
         ])
 
-        enforcement._get_rules()
+        enforcement._refresh_cache()
         assert stub.calls == 1
 
         clock.advance(119)
-        enforcement._get_rules()
+        enforcement._refresh_cache()
         assert stub.calls == 1, "refreshed before the interval the server asked for"
 
         clock.advance(2)  # now past now+120
+        enforcement._refresh_cache()
         rules, _blocks, _initialized = enforcement._get_rules()
 
         assert stub.calls == 2
@@ -230,15 +235,16 @@ class TestGivingUpStartsACooldown:
             make_response(200, json_body={"rules": [{"ruleId": 3}]}),
         ])
 
-        enforcement._get_rules()
+        enforcement._refresh_cache()
         assert stub.calls == 1
         assert sleeps == []
 
         clock.advance(ceiling - 1)
-        enforcement._get_rules()
+        enforcement._refresh_cache()
         assert stub.calls == 1, "refreshed before the ceiling elapsed"
 
         clock.advance(2)
+        enforcement._refresh_cache()
         rules, _blocks, _initialized = enforcement._get_rules()
 
         assert stub.calls == 2, "the ceiling did not release the cooldown"
@@ -257,36 +263,45 @@ class TestGivingUpStartsACooldown:
 
 
 class TestPathShapeAndBound:
-    """One assertion pinning both halves of the decision.
+    """One test pinning both halves of the decision, for each path.
 
-    Shape: SYNCHRONOUS. ``_get_rules`` calls ``_refresh_cache`` on the
-    caller's thread once the cache is older than ``_CACHE_TTL``, so a
-    Retry-After wait here parks a customer request that is already blocked on
-    its own provider call. Bound: 20 s, deliberately shorter than the 60 s the
-    metering clients use.
+    Shape: BACKGROUND for the rules refresh. ``_get_rules`` never refreshes on
+    the caller's thread; it wakes the poller, which refreshes on its own
+    (BACK-3917). A Retry-After wait there parks nobody, so the refresh gets the
+    60 s the metering clients use. The inspection reads still run on their
+    caller's thread and keep 20 s.
 
-    If this path ever becomes background-only (the shape the Go SDK's ``poll``
-    goroutine has), this is the test that has to change: a wait that costs a
-    customer nothing gets the 60 s bound instead.
+    If the refresh ever moves back onto a caller's thread, this is the test
+    that has to change, and ``docs/conventions/retry-after.md`` with it.
     """
 
-    def test_bound_is_20s_because_the_refresh_is_synchronous_on_the_callers_thread(self, fetch_env):
+    def test_refresh_bound_is_60s_because_the_refresh_runs_on_the_poller(self, fetch_env):
         monkeypatch, _ = fetch_env
 
-        assert enforcement._RETRY_AFTER_GIVE_UP_SECONDS == 20.0
+        assert enforcement._REFRESH_RETRY_AFTER_GIVE_UP_SECONDS == 60.0
+        assert enforcement._INSPECTION_RETRY_AFTER_GIVE_UP_SECONDS == 20.0
         # A server-supplied give-up threshold and a cap on the backoff we chose
         # ourselves are two different decisions, so they stay two constants.
-        assert enforcement._RETRY_AFTER_GIVE_UP_SECONDS != enforcement._FETCH_BACKOFF_CAP
+        assert enforcement._REFRESH_RETRY_AFTER_GIVE_UP_SECONDS != enforcement._FETCH_BACKOFF_CAP
 
         caller = threading.current_thread()
         refreshed_on = []
-        monkeypatch.setattr(enforcement, "_refresh_cache",
-                            lambda: refreshed_on.append(threading.current_thread()))
+        refreshed = threading.Event()
+
+        def record_refresh():
+            refreshed_on.append(threading.current_thread())
+            refreshed.set()
+
+        monkeypatch.setattr(enforcement, "_refresh_cache", record_refresh)
         monkeypatch.setattr(enforcement, "_cache_timestamp", stale_cache_timestamp())
 
         enforcement._get_rules()
+        assert refreshed_on == [], "the refresh ran on the caller's thread"
 
-        assert refreshed_on == [caller], "the refresh no longer runs on the caller's thread"
+        enforcement._ensure_poller_running()
+        assert refreshed.wait(2)
+        assert caller not in refreshed_on
+        assert refreshed_on[0].name == "revenium-enforcement-poll"
 
 
 class TestNoCustomerRequestIsHarmedWhenTheFetchGivesUp:
@@ -312,6 +327,7 @@ class TestNoCustomerRequestIsHarmedWhenTheFetchGivesUp:
         stub = stub_get(monkeypatch, [throttled(120)] * 10)
         monkeypatch.setattr(enforcement, "_cached_rules", [{"ruleId": 1, "breached": False}])
 
+        enforcement._refresh_cache()
         enforcement.check_enforcement({"organizationName": "AcmeCorp"})  # must not raise
 
         assert sleeps == [], "a customer request was parked waiting on a 429"
@@ -325,6 +341,7 @@ class TestNoCustomerRequestIsHarmedWhenTheFetchGivesUp:
             "ruleId": 1, "name": "Monthly cap", "breached": True, "currentValue": 120.0,
         }])
 
+        enforcement._refresh_cache()
         with pytest.raises(enforcement.BudgetExceededError):
             enforcement.check_enforcement({"organizationName": "AcmeCorp"})
 
@@ -338,19 +355,21 @@ class TestNoCustomerRequestIsHarmedWhenTheFetchGivesUp:
 
         for _ in range(50):
             enforcement.check_enforcement({"organizationName": "AcmeCorp"})  # must not raise
+            enforcement._refresh_cache()
 
         assert stub.calls == 1
         assert sleeps == []
 
 
-class TestTheRosterReadRidesTheSameBudget:
+class TestTheRosterReadRidesTheSameRules:
     """BACK-3360: the roster is a second GET on the same origin, under the same rules.
 
     A bare ``httpx.get`` here would reintroduce exactly what FRONT-1682 fixed:
     an unguarded request against an origin that has already said how long to
     wait. The roster read therefore shares ``_get_enforcement`` with the rule
-    fetch, so the give-up budget, the cooldown and the fail-open are one
-    implementation rather than two that can drift.
+    fetch, so the give-up logic, the cooldown and the fail-open are one
+    implementation rather than two that can drift. Its budget is the
+    inspection one, because it runs on its caller's thread.
     """
 
     def test_a_retry_after_inside_the_bound_is_waited_out_in_full(self, fetch_env):
@@ -392,7 +411,7 @@ class TestTheRosterReadRidesTheSameBudget:
 
         enforcement.fetch_enforcement_rule_roster("mN3xpQz")
 
-        assert sum(sleeps) <= enforcement._RETRY_AFTER_GIVE_UP_SECONDS
+        assert sum(sleeps) <= enforcement._INSPECTION_RETRY_AFTER_GIVE_UP_SECONDS
 
     def test_transient_failures_are_retried_then_fail_open_on_none(self, fetch_env):
         monkeypatch, _ = fetch_env

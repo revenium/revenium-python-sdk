@@ -991,6 +991,7 @@ class TestBedrockTransportLoad:
         from revenium_middleware.anthropic import bedrock_transport as bt
 
         monkeypatch.setenv("REVENIUM_BEDROCK_TRANSPORT", "1")
+        threads_before = threading.active_count()
 
         emitted = []
         lock = threading.Lock()
@@ -1033,4 +1034,6 @@ class TestBedrockTransportLoad:
         total = len(sync_jobs) + len(async_jobs)
         assert len(emitted) == total  # zero missing, zero duplicated
         assert len(set(emitted)) == total  # unique request-derived IDs
-        assert threading.active_count() < 20  # workers returned to idle
+        # The burst's own executor threads are gone; long-lived SDK daemons
+        # (metering workers, buffer flush) that other tests started do not count.
+        assert threading.active_count() <= threads_before

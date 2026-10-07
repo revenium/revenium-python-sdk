@@ -7,6 +7,7 @@ dispatch fire-and-forget like AI-completion metering does.
 """
 import asyncio
 import contextlib
+import datetime
 import inspect
 import json
 import logging
@@ -207,7 +208,7 @@ def test_dispatch_failure_does_not_leak_unawaited_coroutine(slow_endpoint, monke
     # so capture the coroutine and assert on its state directly.
     captured = []
 
-    def raiser(coro):
+    def raiser(coro, gated_by_circuit=True):
         captured.append(coro)
         raise RuntimeError("thread pool exploded")
 
@@ -227,6 +228,31 @@ def test_dispatch_failure_does_not_leak_unawaited_coroutine(slow_endpoint, monke
     finally:
         # Idempotent; keeps a failing run from also spewing the leak warning.
         coro.close()
+
+
+class FrozenClock:
+    current = datetime.datetime(2026, 10, 6, 12, 0, 0, tzinfo=datetime.timezone.utc)
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls.current
+
+
+def test_queued_tool_event_is_stamped_when_the_tool_ran_not_when_delivered(endpoint, monkeypatch):
+    queued = []
+
+    def hold_in_queue(coro, gated_by_circuit=True):
+        queued.append(coro)
+        return object()
+
+    monkeypatch.setattr("revenium_middleware.run_async_in_thread", hold_in_queue)
+    monkeypatch.setattr(tool_metering, "datetime", FrozenClock)
+
+    report_tool_call(tool_id="queued-tool", duration_ms=5, success=True)
+    FrozenClock.current += datetime.timedelta(seconds=45)
+    asyncio.run(queued.pop())
+
+    assert endpoint.calls[0].json["timestamp"] == "2026-10-06T12:00:00Z"
 
 
 # ---------------------------------------------------------------------------

@@ -30,6 +30,7 @@ class TestTicketIdCapture:
             args = _build_common_args(
                 application="fal-ai/flux/dev",
                 request_time_dt=datetime.datetime.now(datetime.timezone.utc),
+                response_time_dt=datetime.datetime.now(datetime.timezone.utc),
                 usage_metadata={'ticketId': 'META-1'},
                 transaction_id="fal-test123",
                 is_streamed=False,
