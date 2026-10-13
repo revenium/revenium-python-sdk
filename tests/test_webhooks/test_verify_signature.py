@@ -94,6 +94,30 @@ def test_rotation_overlap_order_independent():
     assert verify_signature(payload, header, ts, [secret_b, secret_a]) is True
 
 
+@pytest.mark.parametrize("signing_position", ["first", "second"])
+def test_rotation_accepts_a_header_signed_only_with_one_listed_secret(signing_position):
+    payload = b'{"event":"test"}'
+    ts = str(NOW)
+    secrets = ["secret_old", "secret_new"]
+    signing_secret = secrets[0] if signing_position == "first" else secrets[1]
+    header = f"sha256={_sign(payload, ts, signing_secret)}"
+    assert verify_signature(payload, header, ts, secrets) is True
+
+
+def test_a_matching_signature_after_a_non_matching_one_is_accepted():
+    payload = b'{"event":"test"}'
+    ts = str(NOW)
+    header = f"sha256={'0' * 64}, sha256={_sign(payload, ts, SECRET)}"
+    assert verify_signature(payload, header, ts, [SECRET]) is True
+
+
+def test_a_header_signed_with_neither_listed_secret_is_rejected():
+    payload = b'{"event":"test"}'
+    ts = str(NOW)
+    header = f"sha256={_sign(payload, ts, 'secret_other')}"
+    assert verify_signature(payload, header, ts, ["secret_old", "secret_new"]) is False
+
+
 def test_timestamp_in_past_outside_tolerance():
     payload = b"body"
     past_ts = str(NOW - 301)
@@ -173,3 +197,54 @@ def test_uppercase_hex_signature_verifies():
     ts = str(NOW)
     sig_lower = _sign(payload, ts, SECRET)
     assert verify_signature(payload, f"sha256={sig_lower.upper()}", ts, [SECRET]) is True
+
+
+_DISTINCT_SECRET_CHARACTERS = sorted(set(SECRET))
+
+
+@pytest.mark.parametrize("character", _DISTINCT_SECRET_CHARACTERS)
+def test_signature_made_with_one_character_of_a_plain_string_secret_is_rejected(character):
+    """BACK-4404: a plain-string secret must not be split into one secret per character."""
+    payload = b'{"event":"forged"}'
+    ts = str(NOW)
+    header = f"sha256={_sign(payload, ts, character)}"
+    assert verify_signature(payload, header, ts, SECRET) is False
+
+
+def test_a_header_carrying_one_signature_per_character_is_rejected():
+    payload = b'{"event":"forged"}'
+    ts = str(NOW)
+    characters = _DISTINCT_SECRET_CHARACTERS[:10]
+    header = ", ".join(f"sha256={_sign(payload, ts, c)}" for c in characters)
+    assert verify_signature(payload, header, ts, SECRET) is False
+
+
+def test_plain_string_secrets_returns_false_without_raising():
+    """A genuine signature with the secret passed bare still returns False.
+
+    Guards against the wrong fix of wrapping a plain string in a list, which
+    would return True here; the docstring promises False for wrong types.
+    """
+    payload = b'{"event":"test"}'
+    ts = str(NOW)
+    header = f"sha256={_sign(payload, ts, SECRET)}"
+    assert verify_signature(payload, header, ts, SECRET) is False
+
+
+@pytest.mark.parametrize(
+    "secrets",
+    ["secret", "", None, b"x", 5, 3.0, {"k": "v"}, ["a", 1]],
+    ids=["str", "empty-str", "none", "bytes", "int", "float", "dict", "mixed-list"],
+)
+def test_wrong_secrets_types_return_false_without_raising(secrets):
+    payload = b'{"event":"test"}'
+    ts = str(NOW)
+    header = f"sha256={_sign(payload, ts, SECRET)}, sha256={_sign(payload, ts, 'k')}"
+    assert verify_signature(payload, header, ts, secrets) is False
+
+
+def test_a_tuple_of_secrets_still_verifies():
+    payload = b'{"event":"test"}'
+    ts = str(NOW)
+    header = f"sha256={_sign(payload, ts, SECRET)}"
+    assert verify_signature(payload, header, ts, (SECRET,)) is True

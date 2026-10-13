@@ -1,7 +1,8 @@
 """Structural metering coverage, read from the running program rather than source text.
 
-The patch registry records a target before the wrap is attempted, so a registry
-entry proves nothing on its own. These tests resolve every registered target to
+The patch registry unrecords a target whose wrap raised (``wrap_once`` and the
+fal default-client aliases), but a registry entry still says nothing about what the live program reads (a later rebinding or
+another library can replace the attribute). These tests resolve every registered target to
 its live attribute and require a wrapt wrapper owned by our middleware, require
 the async twin of every wrapped sync entry point, and require the class-level
 method behind every wrapped default-client bound method.
@@ -37,6 +38,7 @@ OWNER_BY_ROOT = {
     "litellm": "revenium_middleware.litellm",
     "fal_client": "revenium_middleware.fal",
     "perplexity": "revenium_middleware.perplexity",
+    "langchain_core": "revenium_middleware.openai.langchain",
 }
 
 SDKS_IN_THIS_ENVIRONMENT = frozenset(selected_environment().provider_sdks)
@@ -169,6 +171,19 @@ def _ollama_twin(path):
     return f"ollama.AsyncClient.{path.rpartition('.')[2]}"
 
 
+_LANGCHAIN_CORE_TWIN_SUFFIXES = (
+    ("._generate_with_cache", "._agenerate_with_cache"),
+    (".BaseChatModel.generate", ".BaseChatModel.agenerate"),
+)
+
+
+def _langchain_core_twin(path):
+    for sync_suffix, async_suffix in _LANGCHAIN_CORE_TWIN_SUFFIXES:
+        if path.endswith(sync_suffix):
+            return path[:-len(sync_suffix)] + async_suffix
+    return None
+
+
 TWIN_RULES = {
     "openai": _async_class_twin,
     "anthropic": _async_class_twin,
@@ -179,6 +194,7 @@ TWIN_RULES = {
     "ollama": _ollama_twin,
     "vertexai": _vertex_twin,
     "botocore": lambda path: None,
+    "langchain_core": _langchain_core_twin,
 }
 
 

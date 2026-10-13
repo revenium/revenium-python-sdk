@@ -5,16 +5,25 @@ This module provides functions to detect media types from fal.ai application nam
 normalize model names to LiteLLM format, and capture trace visualization fields.
 """
 
-import os
 import re
 import logging
-from typing import Optional, Dict, Any
+from typing import Any
 
 from revenium_middleware._core.trace_fields import (  # noqa: F401 — re-exported
     TICKET_ID_MAX_LENGTH,
     AGENT_VERSION_MAX_LENGTH,
+    get_environment,
+    get_region,
+    get_credential_alias,
+    get_trace_type,
+    get_trace_name,
+    get_parent_transaction_id,
+    get_transaction_name,
+    get_retry_number,
     get_ticket_id,
     get_agent_version,
+    validate_trace_type,
+    validate_trace_name,
     validate_ticket_id,
     validate_agent_version,
 )
@@ -109,134 +118,54 @@ AUDIO_KEYWORDS = [
     "tortoise",
 ]
 
+LANGUAGE_MODEL_ENDPOINT_PATTERN = re.compile(r"openrouter|llm|text-generation", re.IGNORECASE)
+RESULT_MEDIA_KEYS = ("images", "image", "video", "audio", "audio_url")
+
+INPUT_TOKEN_KEYS = ("prompt_tokens", "input_tokens")
+OUTPUT_TOKEN_KEYS = ("completion_tokens", "output_tokens")
+TOTAL_TOKEN_KEY = "total_tokens"
+TOKEN_USAGE_KEYS = INPUT_TOKEN_KEYS + OUTPUT_TOKEN_KEYS + (TOTAL_TOKEN_KEY,)
+
 # LiteLLM naming constants
 LITELLM_PREFIX = "fal_ai/"
 FAL_ENDPOINT_PREFIX = "fal-ai/"
 
 
-def get_environment() -> Optional[str]:
-    """Get deployment environment from environment variables."""
-    return (
-        os.getenv(ENV_REVENIUM_ENVIRONMENT)
-        or os.getenv(ENV_ENVIRONMENT)
-        or os.getenv(ENV_DEPLOYMENT_ENV)
-    )
+def _result_has_media(result: Any) -> bool:
+    return isinstance(result, dict) and any(result.get(key) for key in RESULT_MEDIA_KEYS)
 
 
-def get_region() -> Optional[str]:
-    """Get cloud region from environment variables."""
-    region = os.getenv(ENV_REVENIUM_REGION)
-    if region:
-        return region
-    region = os.getenv(ENV_AWS_REGION) or os.getenv(ENV_AWS_DEFAULT_REGION)
-    if region:
-        return region
-    region = os.getenv(ENV_AZURE_REGION)
-    if region:
-        return region
-    region = os.getenv(ENV_GCP_REGION) or os.getenv(ENV_GOOGLE_CLOUD_REGION)
-    if region:
-        return region
-    return None
+def _is_positive_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
 
 
-def get_credential_alias() -> Optional[str]:
-    """Get credential alias from environment variables."""
-    return os.getenv(ENV_REVENIUM_CREDENTIAL_ALIAS)
+def _result_reports_token_usage(result: Any) -> bool:
+    usage = result.get("usage") if isinstance(result, dict) else None
+    if not isinstance(usage, dict):
+        return False
+    return any(_is_positive_number(usage.get(key)) for key in TOKEN_USAGE_KEYS)
 
 
-def get_trace_type() -> Optional[str]:
-    """Get and validate trace type from environment variables."""
-    trace_type = os.getenv(ENV_REVENIUM_TRACE_TYPE)
-    if trace_type:
-        return validate_trace_type(trace_type)
-    return None
-
-
-def get_trace_name() -> Optional[str]:
-    """Get and validate trace name from environment variables."""
-    trace_name = os.getenv(ENV_REVENIUM_TRACE_NAME)
-    if trace_name:
-        return validate_trace_name(trace_name)
-    return None
-
-
-def get_parent_transaction_id() -> Optional[str]:
-    """Get parent transaction ID from environment variables."""
-    return os.getenv(ENV_REVENIUM_PARENT_TRANSACTION_ID)
-
-
-def get_transaction_name(usage_metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    """Get transaction name with fallback to task_type."""
-    transaction_name = os.getenv(ENV_REVENIUM_TRANSACTION_NAME)
-    if transaction_name:
-        return transaction_name
-    if usage_metadata:
-        transaction_name = usage_metadata.get("transactionName") or usage_metadata.get(
-            "transaction_name"
-        )
-        if transaction_name:
-            return transaction_name
-        task_type = usage_metadata.get("task_type") or usage_metadata.get("taskType")
-        if task_type:
-            return task_type
-    return None
-
-
-def get_retry_number() -> int:
-    """Get retry number from environment variables."""
-    try:
-        return int(os.getenv(ENV_REVENIUM_RETRY_NUMBER, "0"))
-    except ValueError:
-        logger.warning("Invalid REVENIUM_RETRY_NUMBER value, defaulting to 0")
-        return 0
-
-
-def validate_trace_type(trace_type: str) -> Optional[str]:
-    """Validate trace type format and length."""
-    if not trace_type:
-        return None
-    if len(trace_type) > TRACE_TYPE_MAX_LENGTH:
-        logger.warning(
-            "traceType exceeds maximum length of %d characters. Field will be omitted.",
-            TRACE_TYPE_MAX_LENGTH,
-        )
-        return None
-    if not TRACE_TYPE_PATTERN.match(trace_type):
-        logger.warning(
-            "traceType contains invalid characters. Field will be omitted."
-        )
-        return None
-    return trace_type
-
-
-def validate_trace_name(trace_name: str) -> Optional[str]:
-    """Validate trace name length and truncate if needed."""
-    if not trace_name:
-        return None
-    if len(trace_name) > TRACE_NAME_MAX_LENGTH:
-        logger.warning(
-            "traceName exceeds maximum length of %d characters. Truncating.",
-            TRACE_NAME_MAX_LENGTH,
-        )
-        return trace_name[:TRACE_NAME_MAX_LENGTH]
-    return trace_name
-
-
-def detect_media_type(application: str) -> str:
+def detect_media_type(application: str, result: Any = None) -> str:
     """
-    Detect the media type (image, video, audio) from the fal.ai application name.
+    Detect the record type (chat, image, video, audio) of a fal.ai call.
 
     Args:
         application: The fal.ai application/model ID (e.g., "fal-ai/flux/dev")
+        result: The call's result, when there is one. Only a dict is inspected.
 
     Returns:
-        Media type string: 'image', 'video', 'audio', or 'generation' (default)
+        Media type string: 'chat', 'image', 'video', 'audio', or 'generation'
+        (no application name)
     """
     if not application:
         return "generation"
 
     app_lower = application.lower()
+    has_media = _result_has_media(result)
+
+    if LANGUAGE_MODEL_ENDPOINT_PATTERN.search(application) and not has_media:
+        return "chat"
 
     # Check for video keywords first (more specific)
     for keyword in VIDEO_KEYWORDS:
@@ -252,6 +181,11 @@ def detect_media_type(application: str) -> str:
     for keyword in IMAGE_KEYWORDS:
         if keyword in app_lower:
             return "image"
+
+    # Token usage is trusted only here, for an endpoint no keyword list claims:
+    # image and audio endpoints can report usage too and keep their own record.
+    if not has_media and _result_reports_token_usage(result):
+        return "chat"
 
     # Default to image since most fal.ai models are image generators
     return "image"

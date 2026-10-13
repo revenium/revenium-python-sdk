@@ -83,6 +83,7 @@ from ._exceptions import (
     APIConnectionError,
     APIResponseValidationError,
 )
+from revenium_middleware._core.log_sanitize import sanitize_for_logging
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -477,7 +478,7 @@ class BaseClient(Generic[_HttpxClientT, _DefaultStreamT]):
         retries_taken: int = 0,
     ) -> httpx.Request:
         if log.isEnabledFor(logging.DEBUG):
-            log.debug("Request options: %s", model_dump(options, exclude_unset=True))
+            log.debug("Request options: %s", sanitize_for_logging(model_dump(options, exclude_unset=True)))
 
         kwargs: dict[str, Any] = {}
 
@@ -736,6 +737,10 @@ class BaseClient(Generic[_HttpxClientT, _DefaultStreamT]):
         return timeout if timeout >= 0 else 0
 
     def _should_retry(self, response: httpx.Response) -> bool:
+        if 300 <= response.status_code < 400:
+            log.debug("Not retrying a redirect, status code %i", response.status_code)
+            return False
+
         # Note: this is not a standard header
         should_retry_header = response.headers.get("x-should-retry")
 
@@ -778,7 +783,7 @@ class _DefaultHttpxClient(httpx.Client):
     def __init__(self, **kwargs: Any) -> None:
         kwargs.setdefault("timeout", DEFAULT_TIMEOUT)
         kwargs.setdefault("limits", DEFAULT_CONNECTION_LIMITS)
-        kwargs.setdefault("follow_redirects", True)
+        kwargs.setdefault("follow_redirects", False)
         super().__init__(**kwargs)
 
 
@@ -1285,7 +1290,7 @@ class _DefaultAsyncHttpxClient(httpx.AsyncClient):
     def __init__(self, **kwargs: Any) -> None:
         kwargs.setdefault("timeout", DEFAULT_TIMEOUT)
         kwargs.setdefault("limits", DEFAULT_CONNECTION_LIMITS)
-        kwargs.setdefault("follow_redirects", True)
+        kwargs.setdefault("follow_redirects", False)
         super().__init__(**kwargs)
 
 

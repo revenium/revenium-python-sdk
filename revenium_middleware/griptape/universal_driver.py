@@ -9,14 +9,48 @@ Supported Providers:
 - Tier 2 (via LiteLLM): Google/Gemini, Cohere, Azure OpenAI, Bedrock, and 100+ others
 """
 import logging
-import os
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 
+import attrs
 from griptape.drivers.prompt.base_prompt_driver import BasePromptDriver
 from griptape.drivers.embedding.base_embedding_driver import BaseEmbeddingDriver
 from griptape.common.prompt_stack.prompt_stack import PromptStack
 
 logger = logging.getLogger(__name__)
+
+# Derived from the driver class itself; copying them would make the Revenium
+# driver serialize as the unmetered class it wraps.
+_SERIALIZATION_FIELDS = ("type", "module_name")
+
+
+def _openai_driver_class_for(base_driver: BasePromptDriver) -> type:
+    from griptape.drivers.prompt.azure_openai_chat_prompt_driver import AzureOpenAiChatPromptDriver
+    from .openai_driver import ReveniumAzureOpenAiDriver, ReveniumOpenAiDriver
+
+    if isinstance(base_driver, AzureOpenAiChatPromptDriver):
+        return ReveniumAzureOpenAiDriver
+    return ReveniumOpenAiDriver
+
+
+def _driver_settings(base_driver: BasePromptDriver, target: type) -> Dict[str, Any]:
+    """Every constructor setting of base_driver that target accepts, keyed by its init alias."""
+    return {
+        field.alias: getattr(base_driver, field.name)
+        for field in attrs.fields(target)
+        if field.init and field.alias not in _SERIALIZATION_FIELDS and hasattr(base_driver, field.name)
+    }
+
+
+def _unsupported_settings(base_driver: BasePromptDriver, target: type) -> List[str]:
+    """Init aliases of base_driver's own fields that target cannot accept."""
+    if not attrs.has(type(base_driver)):
+        return []
+    accepted = {field.alias for field in attrs.fields(target) if field.init}
+    return [
+        field.alias
+        for field in attrs.fields(type(base_driver))
+        if field.init and field.alias not in _SERIALIZATION_FIELDS and field.alias not in accepted
+    ]
 
 
 class ReveniumDriver:
@@ -38,12 +72,13 @@ class ReveniumDriver:
         agent = Agent(prompt_driver=driver)
 
     Note:
-        Wrapping an existing driver preserves the common configuration fields
-        per provider (OpenAI: api_key, base_url, organization, temperature,
-        max_tokens; Anthropic: api_key, temperature, max_tokens, top_p, top_k;
-        Ollama: host, temperature, max_tokens, options). For any other advanced
-        configuration, construct the provider-specific Revenium driver
-        (e.g. ReveniumAnthropicDriver) directly.
+        Wrapping an OpenAI, Azure OpenAI, Anthropic or Ollama driver keeps
+        every setting of the original driver, including a client you passed
+        in; an Azure driver keeps calling your Azure resource. A setting the
+        Revenium driver cannot accept, such as an extra field on your own
+        subclass, is dropped with a warning that names it (never its value),
+        and methods you overrode on your own subclass are not kept because the
+        wrap returns a Revenium class.
     """
     
     def __init__(self, 
@@ -61,23 +96,24 @@ class ReveniumDriver:
             force_provider: Force specific provider ("openai", "anthropic", "ollama", "litellm")
             usage_metadata: Optional metadata for Revenium tracking
             **kwargs: Additional arguments passed to the underlying driver
-                     - proxy_url/proxy_api_key automatically forces LiteLLM provider
+                     - proxy_url/proxy_api_key on the driver forces LiteLLM provider;
+                       the LITELLM_PROXY_URL environment variable alone does not
+                       (and both are ignored when base_driver is given)
         """
         self._wrapped_driver = None
         self._provider = None
         self.usage_metadata = usage_metadata or {}
         
-        # Check if proxy parameters are provided - if so, force LiteLLM
-        proxy_url = kwargs.get('proxy_url') or os.getenv('LITELLM_PROXY_URL')
-        if proxy_url and not force_provider:
-            logger.info("Proxy configuration detected, forcing LiteLLM provider")
-            force_provider = "litellm"
-        
         # Determine the provider and create the appropriate driver
         if base_driver:
+            if kwargs.get('proxy_url') or kwargs.get('proxy_api_key'):
+                logger.warning("proxy_url and proxy_api_key are ignored when wrapping an existing driver")
             self._provider = self._detect_provider_from_driver(base_driver)
             self._wrapped_driver = self._wrap_existing_driver(base_driver)
         elif model:
+            if (kwargs.get('proxy_url') or kwargs.get('proxy_api_key')) and not force_provider:
+                logger.info("Proxy configuration detected, forcing LiteLLM provider")
+                force_provider = "litellm"
             self._provider = force_provider or self._detect_provider_from_model(model)
             self._wrapped_driver = self._create_driver_for_provider(self._provider, model, **kwargs)
         else:
@@ -208,44 +244,16 @@ class ReveniumDriver:
         
         try:
             if provider == "openai":
-                from .openai_driver import ReveniumOpenAiDriver
-                # Extract parameters from base driver
-                wrapped = ReveniumOpenAiDriver(
-                    model=base_driver.model,
-                    api_key=getattr(base_driver, 'api_key', None),
-                    base_url=getattr(base_driver, 'base_url', None),
-                    organization=getattr(base_driver, 'organization', None),
-                    temperature=getattr(base_driver, 'temperature', 0.1),
-                    max_tokens=getattr(base_driver, 'max_tokens', None),
-                    usage_metadata=self.usage_metadata
-                )
-                return wrapped
+                return self._rebuild_keeping_settings(base_driver, _openai_driver_class_for(base_driver))
 
             elif provider == "anthropic":
                 from .anthropic_driver import ReveniumAnthropicDriver
-                wrapped = ReveniumAnthropicDriver(
-                    model=base_driver.model,
-                    api_key=getattr(base_driver, 'api_key', None),
-                    temperature=getattr(base_driver, 'temperature', 0.1),
-                    max_tokens=getattr(base_driver, 'max_tokens', None),
-                    top_p=getattr(base_driver, 'top_p', None),
-                    top_k=getattr(base_driver, 'top_k', None),
-                    usage_metadata=self.usage_metadata
-                )
-                return wrapped
+                return self._rebuild_keeping_settings(base_driver, ReveniumAnthropicDriver)
 
             elif provider == "ollama":
                 from .ollama_driver import ReveniumOllamaDriver
-                wrapped = ReveniumOllamaDriver(
-                    model=base_driver.model,
-                    host=getattr(base_driver, 'host', None),
-                    temperature=getattr(base_driver, 'temperature', 0.1),
-                    max_tokens=getattr(base_driver, 'max_tokens', None),
-                    options=getattr(base_driver, 'options', None),
-                    usage_metadata=self.usage_metadata
-                )
-                return wrapped
-                
+                return self._rebuild_keeping_settings(base_driver, ReveniumOllamaDriver)
+
             else:
                 # For unknown drivers, we can't wrap them yet — fail loudly rather
                 # than silently returning an unmetered driver.
@@ -261,6 +269,14 @@ class ReveniumDriver:
                 f"the {provider} driver could not be imported ({e}). "
                 f"Construct the driver via ReveniumDriver(model=..., force_provider=...) instead."
             )
+
+    def _rebuild_keeping_settings(self, base_driver: BasePromptDriver, target: type) -> BasePromptDriver:
+        dropped = _unsupported_settings(base_driver, target)
+        if dropped:
+            logger.warning(
+                "Wrapping %s: the Revenium driver does not support these settings, so they were not kept: %s",
+                type(base_driver).__name__, ", ".join(dropped))
+        return target(usage_metadata=self.usage_metadata, **_driver_settings(base_driver, target))
 
     # Delegate all method calls to the wrapped driver
     def __getattr__(self, name):

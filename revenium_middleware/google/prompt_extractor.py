@@ -10,7 +10,6 @@ Google Gemini API Format:
 - parts: Array of text/data objects within each content
 """
 
-import json
 import logging
 from typing import Dict, Any, Optional, Tuple
 
@@ -18,6 +17,7 @@ from .config import Config
 from revenium_middleware._core.config import is_capture_prompts_enabled
 from revenium_middleware._core.prompt_extraction import (
     extract_streaming_response_content as _core_extract_streaming_response_content,
+    serialize_messages_within_limit,
 )
 
 logger = logging.getLogger("revenium_middleware.extension")
@@ -184,75 +184,11 @@ def extract_prompts_from_request(
                         content_dict['parts'].append({'inline_data': '[BINARY_DATA]'})
                 normalized_contents.append(content_dict)
             
-            # Truncate if needed
             if normalized_contents:
-                # Serialize to JSON first to check size
-                input_messages = json.dumps(normalized_contents, ensure_ascii=False)
-
-                # Apply truncation if too long
-                if len(input_messages) > Config.MAX_PROMPT_LENGTH:
-                    # Truncate at the content level to maintain valid JSON
-                    # Strategy: Truncate text within parts, then re-serialize
-                    truncated_contents = []
-                    remaining_length = Config.MAX_PROMPT_LENGTH - marker_len - 100  # Reserve space for JSON structure and marker
-                    current_length = 0
-
-                    for content in normalized_contents:
-                        if current_length >= remaining_length:
-                            break
-
-                        truncated_content = {'role': content.get('role', 'user'), 'parts': []}
-                        for part in content.get('parts', []):
-                            if current_length >= remaining_length:
-                                break
-
-                            if 'text' in part:
-                                text = part['text']
-                                available = remaining_length - current_length
-                                if len(text) > available:
-                                    # Truncate this text part
-                                    truncated_content['parts'].append({'text': text[:available] + '...'})
-                                    current_length += available
-                                    break
-                                else:
-                                    truncated_content['parts'].append(part)
-                                    current_length += len(text)
-                            else:
-                                # Non-text part (e.g., binary data marker)
-                                truncated_content['parts'].append(part)
-                                current_length += 20  # Estimate for non-text parts
-
-                        if truncated_content['parts']:
-                            truncated_contents.append(truncated_content)
-
-                    # Re-serialize the truncated content and add marker as a note in the last message
-                    # This keeps the JSON valid while indicating truncation
-                    if truncated_contents:
-                        # Add truncation marker as a special part in the last message
-                        truncated_contents[-1]['parts'].append({'text': marker})
-
-                    input_messages = json.dumps(truncated_contents, ensure_ascii=False)
-
-                    # Verify the serialized length and trim further if needed
-                    # (JSON escaping/structure can cause the serialized output to exceed the budget)
-                    if len(input_messages) > Config.MAX_PROMPT_LENGTH:
-                        # Instead of hard truncating (which can produce invalid JSON),
-                        # return a minimal valid JSON structure with truncation notice
-                        truncation_notice = {
-                            "role": "user",
-                            "parts": [{"text": f"[Content truncated - exceeded {Config.MAX_PROMPT_LENGTH} character limit]"}]
-                        }
-                        input_messages = json.dumps([truncation_notice], ensure_ascii=False)
-                        logger.warning(
-                            f"Serialized JSON exceeded limit after content truncation "
-                            f"({len(input_messages)} > {Config.MAX_PROMPT_LENGTH}). "
-                            f"Returning minimal valid JSON structure with truncation notice."
-                        )
-
-                    prompts_truncated = True
-                    logger.debug(
-                        f"Input contents truncated to {len(input_messages)} characters (valid JSON maintained)"
-                    )
+                input_messages, input_truncated = serialize_messages_within_limit(
+                    normalized_contents, Config.MAX_PROMPT_LENGTH
+                )
+                prompts_truncated = prompts_truncated or input_truncated
         except (TypeError, ValueError) as e:
             logger.warning(f"Failed to serialize input contents to JSON: {e}")
             input_messages = None

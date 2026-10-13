@@ -10,9 +10,14 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 # Add project root to path
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
+
+pytestmark = pytest.mark.e2e
+MISSING_KEYS = "ANTHROPIC_API_KEY and REVENIUM_METERING_API_KEY are needed for this live test"
 
 def load_env():
     """Load environment variables from .env file."""
@@ -43,8 +48,7 @@ def test_flat_metadata_backward_compatibility():
 
     # Verify API keys
     if not os.getenv("ANTHROPIC_API_KEY") or not os.getenv("REVENIUM_METERING_API_KEY"):
-        print("❌ API keys not set")
-        return False
+        pytest.skip(MISSING_KEYS)
 
     print("✅ API keys found")
     print()
@@ -62,60 +66,50 @@ def test_flat_metadata_backward_compatibility():
     print("   Middleware should convert these to nested structure")
     print()
 
-    try:
-        # Use OLD flat structure (what current examples show)
-        message = client.messages.create(
-            model="claude-3-haiku-20240307",
-            max_tokens=50,
-            messages=[{"role": "user", "content": "Test"}],
-            usage_metadata={
-                "subscriber_id": "test-user-456",
-                "subscriber_email": "oldstyle@example.com",
-                "subscriber_credential_name": "legacy-api-key",
-                "organization_id": "e2e-test-flat-keys",
-                "trace_id": "test-flat-keys-001"
-            }
-        )
+    # Use OLD flat structure (what current examples show)
+    message = client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=50,
+        messages=[{"role": "user", "content": "Test"}],
+        usage_metadata={
+            "subscriber_id": "test-user-456",
+            "subscriber_email": "oldstyle@example.com",
+            "subscriber_credential_name": "legacy-api-key",
+            "organization_id": "e2e-test-flat-keys",
+            "trace_id": "test-flat-keys-001"
+        }
+    )
 
-        assert message.content[0].text
+    assert message.content[0].text
 
-        print("✅ API call successful!")
-        print(f"   Response: {message.content[0].text[:100]}...")
-        print(f"   Tokens: {message.usage.input_tokens} + {message.usage.output_tokens}")
-        print()
+    print("✅ API call successful!")
+    print(f"   Response: {message.content[0].text[:100]}...")
+    print(f"   Tokens: {message.usage.input_tokens} + {message.usage.output_tokens}")
+    print()
 
-        print("=" * 80)
-        print("MANUAL VERIFICATION REQUIRED")
-        print("=" * 80)
-        print()
-        print("1. Go to Revenium dashboard")
-        print("2. Filter by organization_id: 'e2e-test-flat-keys'")
-        print("3. Find event with trace_id: 'test-flat-keys-001'")
-        print("4. Check if subscriber fields ARE populated (middleware conversion):")
-        print()
-        print("   CRITICAL - Did Middleware Convert Flat→Nested?")
-        print("   ✓ subscriber.id: 'test-user-456' (from flat subscriber_id)")
-        print("   ✓ subscriber.email: 'oldstyle@example.com' (from flat subscriber_email)")
-        print("   ✓ subscriber.credential.name: 'legacy-api-key' (from flat)")
-        print()
-        print("   IF THESE ARE EMPTY:")
-        print("   ❌ Middleware conversion NOT working - users lose data!")
-        print()
-        print("   IF THESE ARE POPULATED:")
-        print("   ✅ Backward compatibility working")
-        print("   ⚠️  But examples still teach wrong pattern!")
-        print()
-        print("=" * 80)
-
-        return True
-
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+    print("=" * 80)
+    print("MANUAL VERIFICATION REQUIRED")
+    print("=" * 80)
+    print()
+    print("1. Go to Revenium dashboard")
+    print("2. Filter by organization_id: 'e2e-test-flat-keys'")
+    print("3. Find event with trace_id: 'test-flat-keys-001'")
+    print("4. Check if subscriber fields ARE populated (middleware conversion):")
+    print()
+    print("   CRITICAL - Did Middleware Convert Flat→Nested?")
+    print("   ✓ subscriber.id: 'test-user-456' (from flat subscriber_id)")
+    print("   ✓ subscriber.email: 'oldstyle@example.com' (from flat subscriber_email)")
+    print("   ✓ subscriber.credential.name: 'legacy-api-key' (from flat)")
+    print()
+    print("   IF THESE ARE EMPTY:")
+    print("   ❌ Middleware conversion NOT working - users lose data!")
+    print()
+    print("   IF THESE ARE POPULATED:")
+    print("   ✅ Backward compatibility working")
+    print("   ⚠️  But examples still teach wrong pattern!")
+    print()
+    print("=" * 80)
 
 
 if __name__ == "__main__":
-    success = test_flat_metadata_backward_compatibility()
-    sys.exit(0 if success else 1)
+    test_flat_metadata_backward_compatibility()

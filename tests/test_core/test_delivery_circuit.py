@@ -6,7 +6,7 @@ import time
 import httpx
 import pytest
 
-from revenium_middleware._core import delivery_circuit, metering_buffer
+from revenium_middleware._core import delivery_circuit, metering_buffer, tool_event_transport
 from revenium_middleware._core.delivery_circuit import DeliveryCircuit
 from revenium_middleware._core.metering_buffer import MeteringBuffer
 from revenium_middleware._core.metering_pool import MeteringTask, MeteringWorkerPool
@@ -117,27 +117,16 @@ class TestCircuit:
 
 
 class ToolEndpoint:
-    """Stands in for the httpx module the tool-event sender posts through; records each URL it is sent to."""
+    """Stands in for the shared tool-event client; records each URL it is sent to and the timeout it was sent with."""
 
     def __init__(self):
         self.urls = []
-        endpoint = self
+        self.timeouts = []
 
-        class AsyncClient:
-            def __init__(self, timeout=None):
-                pass
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *exc):
-                return False
-
-            async def post(self, url, headers=None, json=None):
-                endpoint.urls.append(url)
-                return httpx.Response(202, request=httpx.Request("POST", url))
-
-        self.AsyncClient = AsyncClient
+    def post(self, url, headers=None, json=None, timeout=None):
+        self.urls.append(url)
+        self.timeouts.append(timeout)
+        return httpx.Response(202, request=httpx.Request("POST", url))
 
     def wait_for_post(self, timeout=5.0):
         deadline = time.monotonic() + timeout
@@ -148,7 +137,7 @@ class ToolEndpoint:
 @pytest.fixture
 def tool_endpoint(monkeypatch):
     endpoint = ToolEndpoint()
-    monkeypatch.setattr(tool_metering, "httpx", endpoint)
+    monkeypatch.setattr(tool_event_transport, "_client", endpoint)
     tool_metering.configure(metering_url="http://tools.test", api_key="rev_mk_test")
     yield endpoint
     tool_metering.configure()

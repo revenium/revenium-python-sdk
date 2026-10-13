@@ -14,10 +14,13 @@ are always sent.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import collections
 import contextvars
 import itertools
 import logging
+import os
+import platform
 import queue
 import threading
 import time
@@ -29,6 +32,12 @@ from revenium_middleware._core.metering_buffer import BuildDeadlineExceeded, del
 from revenium_middleware._core.metering_status import record_metering_error
 
 logger = logging.getLogger("revenium_middleware")
+
+# socket.getaddrinfo imports the idna codec on a process's first hostname lookup, which is
+# otherwise a worker's first send. A fork during that import leaves the child a half-built
+# encodings.idna that CPython caches as "unknown encoding: idna", so no lookup in the child
+# ever succeeds again; loading it here, before any worker exists, closes that window.
+codecs.lookup("idna")
 
 WORKERS_ENV = "REVENIUM_METERING_WORKERS"
 QUEUE_SIZE_ENV = "REVENIUM_METERING_QUEUE_SIZE"
@@ -43,6 +52,25 @@ DEFAULT_QUEUE_SIZE = 1000
 STOP_CHECK_SECONDS = 0.25
 
 _task_ids = itertools.count(1)
+_platform_probed = False
+
+
+def _probe_platform_once() -> None:
+    """Run ``platform.platform()`` once per process, on the thread starting the first workers.
+
+    It imports plistlib on macOS the first time a request builds its headers; a fork during that
+    import leaves the child waiting forever on the import lock, so it runs before any worker
+    exists. Not at import: it starts ``uname -p`` (and ``file -b`` on macOS) subprocesses, which
+    a process that never meters should not pay for.
+    """
+    global _platform_probed
+    if _platform_probed:
+        return
+    _platform_probed = True
+    try:
+        platform.platform()
+    except Exception:  # a platform probe must never stop metering
+        pass
 
 
 def _never() -> bool:
@@ -338,6 +366,7 @@ class MeteringWorkerPool:
                 self._ensuring_workers = False
 
     def _start_missing_workers(self) -> None:
+        _probe_platform_once()
         self._workers = [(worker, stop) for worker, stop in self._workers if worker.is_alive()]
         while len(self._workers) < self._worker_count:
             stop_requested = threading.Event()
@@ -378,6 +407,22 @@ def _may_send(task: MeteringTask) -> bool:
 _pool: Optional[MeteringWorkerPool] = None
 # Reentrant for the same reason as the pool's own locks.
 _pool_lock = threading.RLock()
+# A forked child keeps its parents' pools so their queued coroutines, which
+# the parent sends, are never collected unawaited in the child.
+_pools_left_by_parent: List[MeteringWorkerPool] = []
+
+
+def _forget_parent_pool() -> None:
+    """Give a forked child an empty pool of its own; the parent's queued events are the parent's to send."""
+    global _pool, _pool_lock
+    if _pool is not None:
+        _pools_left_by_parent.append(_pool)
+    _pool = None
+    _pool_lock = threading.RLock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forget_parent_pool)
 
 
 def _is_positive(value: int) -> bool:

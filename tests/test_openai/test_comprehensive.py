@@ -280,6 +280,98 @@ class TestAzureOpenAISupport:
         assert mock_config.is_valid.called
 
 
+def _chat_response_reporting(model):
+    from types import SimpleNamespace
+    usage = SimpleNamespace(
+        prompt_tokens=11,
+        completion_tokens=5,
+        total_tokens=16,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+    )
+    return SimpleNamespace(
+        id="chatcmpl-model-name-test",
+        model=model,
+        usage=usage,
+        choices=[SimpleNamespace(finish_reason="stop")],
+        system_fingerprint=None,
+    )
+
+
+def _usage_data_for(client, model):
+    from revenium_middleware.openai.middleware import OperationType, extract_usage_data
+    usage_data, _ = extract_usage_data(
+        _chat_response_reporting(model),
+        OperationType.CHAT,
+        "2026-10-08T12:00:00Z",
+        "2026-10-08T12:00:01Z",
+        1000,
+        client_instance=client,
+    )
+    return usage_data
+
+
+class AzureOpenAI:
+    base_url = "https://example.openai.azure.com/"
+
+
+class OpenAI:
+    def __init__(self, base_url="https://api.openai.com/v1"):
+        self.base_url = base_url
+
+
+class TestAzureModelNameResolution:
+    """BACK-3987: Azure records keep the model id Azure reports."""
+
+    @pytest.fixture(autouse=True)
+    def clear_azure_model_cache(self):
+        from revenium_middleware.openai.azure_model_resolver import clear_model_cache
+        clear_model_cache()
+        yield
+        clear_model_cache()
+
+    @pytest.mark.parametrize("model", [
+        "gpt-4.1",
+        "gpt-4.1-mini",
+        "gpt-4.1-nano",
+        "gpt-4.1-nano-2025-04-14",
+        "o4-mini",
+        "o4-mini-2025-04-16",
+        "gpt-4o-2024-08-06",
+    ])
+    def test_azure_records_the_model_azure_reports(self, model):
+        usage_data = _usage_data_for(AzureOpenAI(), model)
+
+        assert usage_data["model"] == model
+        assert usage_data["provider"] == "Azure"
+
+    @pytest.mark.parametrize("deployment_name, expected", [
+        ("my-gpt4-dev", "gpt-4"),
+        ("gpt41-prod", "gpt-4.1"),
+        ("prod-gpt-4.1-mini", "gpt-4.1-mini"),
+        ("gpt-4.1-mini-v2", "gpt-4.1-mini"),
+        ("GPT-4.1-Mini", "gpt-4.1-mini"),
+        ("my-o4-mini", "o4-mini"),
+        ("o4mini-prod", "o4-mini"),
+        ("sql-proto4", "sql-proto4"),
+        ("gpt-4-1106-preview", "gpt-4-1106-preview"),
+        ("gpt-4-vision", "gpt-4-vision-preview"),
+        ("gpt-4-mini", "gpt-4"),
+        ("gpt-4-32k-0613", "gpt-4-32k-0613"),
+        ("gpt-4o-mini-realtime-preview-2024-12-17", "gpt-4o-mini-realtime-preview-2024-12-17"),
+        ("gpt-35-turbo", "gpt-3.5-turbo"),
+    ])
+    def test_azure_custom_deployment_names_map_to_their_family(self, deployment_name, expected):
+        from revenium_middleware.openai.azure_model_resolver import resolve_azure_model_name
+
+        assert resolve_azure_model_name(deployment_name, None, {}, use_api_fallback=False) == expected
+
+    def test_direct_openai_model_name_is_untouched(self):
+        usage_data = _usage_data_for(OpenAI(), "gpt-4.1-nano-2025-04-14")
+
+        assert usage_data["model"] == "gpt-4.1-nano-2025-04-14"
+        assert usage_data["provider"] == "OPENAI"
+
+
 class TestLangChainIntegration:
     """Tests for LangChain integration."""
 
@@ -355,6 +447,40 @@ class TestProviderMetadata:
         metadata = get_provider_metadata(Provider.AZURE_OPENAI)
         assert metadata['provider'] == 'Azure'
         assert metadata['model_source'] == 'OPENAI'
+
+    def test_xai_base_url_is_recorded_as_xai(self):
+        usage_data = _usage_data_for(OpenAI("https://api.x.ai/v1"), "grok-4.20-0309-non-reasoning")
+
+        assert usage_data["provider"] == "XAI"
+        assert usage_data["model_source"] == "XAI"
+
+    def test_real_openai_client_pointed_at_xai_is_detected_as_xai(self):
+        import openai
+        from revenium_middleware.openai.provider import detect_provider
+
+        client = openai.OpenAI(base_url="https://api.x.ai/v1", api_key="test")
+
+        assert detect_provider(client=client).name == "XAI"
+
+    @pytest.mark.parametrize("base_url", [
+        "https://max.aiproxy.example/v1",
+        "https://evil-x.ai/v1",
+        "https://x.ai.evil.com/v1",
+        "https://api.openai.com/v1",
+    ])
+    def test_lookalike_host_stays_openai(self, base_url):
+        from revenium_middleware.openai.provider import detect_provider, Provider
+
+        assert detect_provider(base_url=base_url) == Provider.OPENAI
+        assert detect_provider(client=OpenAI(base_url)) == Provider.OPENAI
+
+    def test_azure_client_is_never_relabelled(self):
+        from revenium_middleware.openai.provider import detect_provider, Provider
+
+        class AzureOpenAI:
+            base_url = "https://api.x.ai/v1"
+
+        assert detect_provider(client=AzureOpenAI()) == Provider.AZURE_OPENAI
 
 
 class TestMetadataStructure:

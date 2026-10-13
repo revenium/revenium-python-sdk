@@ -124,6 +124,13 @@ class AICreateCompletionParams(TypedDict, total=False):
     counts the tokens actually spent rather than the level requested.
     """
 
+    client_surface: Annotated[str, PropertyInfo(alias="clientSurface")]
+    """The first-party app that sent this coding-assistant call (max 64 chars).
+
+    For example claude-code for the terminal CLI or claude-code-desktop for the
+    desktop app; the backend owns the vocabulary.
+    """
+
     prompt_id: Annotated[str, PropertyInfo(alias="promptId")]
     """Identifier of the user prompt that produced this completion (max 64 chars)"""
 
@@ -294,9 +301,7 @@ class AICreateCompletionParams(TypedDict, total=False):
     trace_id: Annotated[str, PropertyInfo(alias="traceId")]
     """Trace multiple LLM calls belonging to same overall request"""
 
-    # Sent on every metered call although it is not in the published spec:
-    # _core/trace_fields.py::get_credential_alias() supplies the value on
-    # live traffic; removal pending confirmation from the metering API owners.
+    # SDK-side input only: resources/ai.py sends it as subscriber.credential.name, never under this name.
     credential_alias: Annotated[str, PropertyInfo(alias="credentialAlias")]
     """Human-readable name for the API key being used"""
 

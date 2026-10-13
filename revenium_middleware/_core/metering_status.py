@@ -15,6 +15,7 @@ Both are re-exported from the top-level ``revenium_middleware`` package.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -54,6 +55,16 @@ _evicted_count = 0
 _last_error: Optional[BaseException] = None
 _last_error_at: Optional[datetime] = None
 _error_callbacks: List[Callable[[MeteringErrorEvent], None]] = []
+
+
+def _forget_parent_lock() -> None:
+    """Keep the counters in a forked child, but not a lock a parent thread held at the fork."""
+    global _lock
+    _lock = threading.RLock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forget_parent_lock)
 
 
 def get_metering_status() -> MeteringStatus:

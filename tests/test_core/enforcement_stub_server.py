@@ -10,6 +10,7 @@ Not a test module (no ``test_`` prefix), so pytest imports it rather than
 collecting it.
 """
 import asyncio
+import gc
 import json
 import socket
 import threading
@@ -24,6 +25,8 @@ REFUSE = "refuse"
 UNAVAILABLE = "503"
 FORBIDDEN = "403"
 HEALTHY = "healthy"
+# Answers like HEALTHY, but only once ``release`` is set: a fetch still in flight.
+SLOW = "slow"
 FAILURE_MODES = (HANG, REFUSE, UNAVAILABLE, FORBIDDEN)
 
 # Longest a hung request is held before the stub drops it. Teardown releases
@@ -44,16 +47,18 @@ def _free_port() -> int:
 class EnforcementStub:
     """A rules endpoint that hangs, refuses, fails or answers, as asked.
 
-    ``hits`` counts the requests that reached it. A ``refuse`` stub has no
-    listener at all, so nothing can reach it and its count stays zero.
+    ``hits`` counts the requests that reached it and ``api_keys`` lists the
+    ``x-api-key`` each one carried. A ``refuse`` stub has no listener at all,
+    so nothing can reach it and its count stays zero.
     """
 
-    def __init__(self, mode: str, rules: Optional[list] = None):
+    def __init__(self, mode: str, rules: Optional[list] = None, departments: Optional[dict] = None):
         self.mode = mode
         self.rules = rules or []
+        self.departments = departments or {}
         self.release = threading.Event()
         self._lock = threading.Lock()
-        self._hits = 0
+        self._api_keys: List[Optional[str]] = []
         self._server: Optional[ThreadingHTTPServer] = None
         self.port = _free_port()
         if mode != REFUSE:
@@ -69,11 +74,16 @@ class EnforcementStub:
     @property
     def hits(self) -> int:
         with self._lock:
-            return self._hits
+            return len(self._api_keys)
 
-    def _record_hit(self) -> None:
+    @property
+    def api_keys(self) -> List[Optional[str]]:
         with self._lock:
-            self._hits += 1
+            return list(self._api_keys)
+
+    def _record_hit(self, api_key: Optional[str]) -> None:
+        with self._lock:
+            self._api_keys.append(api_key)
 
     def _handler(self):
         stub = self
@@ -83,13 +93,15 @@ class EnforcementStub:
                 pass
 
             def do_GET(self):
-                stub._record_hit()
+                stub._record_hit(self.headers.get("x-api-key"))
                 if stub.mode == HANG:
                     stub.release.wait(_HANG_CAP_SECONDS)
                     self.close_connection = True
                     return
-                if stub.mode == HEALTHY:
-                    self._send(200, {"rules": stub.rules})
+                if stub.mode == SLOW:
+                    stub.release.wait(_HANG_CAP_SECONDS)
+                if stub.mode in (HEALTHY, SLOW):
+                    self._send(200, {"rules": stub.rules, **stub.departments})
                     return
                 stub.release.wait(_ROUND_TRIP_SECONDS)
                 self._send(int(stub.mode), {"error": stub.mode})
@@ -193,6 +205,9 @@ async def drive_on_loop(call, requests: int, rate: float, tick: float = 0.005,
         finally:
             latencies.append(time.perf_counter() - started)
 
+    # A full collection of the suite's heap pauses the loop for up to 0.6 s on
+    # Python 3.10, which reads as a held loop; collect before measuring instead.
+    gc.collect()
     ticker = asyncio.create_task(monitor())
     tasks = []
     for _ in range(requests):

@@ -86,6 +86,32 @@ class TestAudioDetection:
         assert detect_media_type("fal-ai/music-gen") == "audio"
 
 
+class TestChatDetection:
+    """Tests for language model endpoint detection."""
+
+    def test_language_model_endpoints(self):
+        assert detect_media_type("fal-ai/any-llm") == "chat"
+        assert detect_media_type("fal-ai/any-llm/enterprise") == "chat"
+        assert detect_media_type("openrouter/router") == "chat"
+        assert detect_media_type("openrouter/router/video") == "chat"
+        assert detect_media_type("openrouter/router/audio") == "chat"
+        assert detect_media_type("fal-ai/TEXT-GENERATION/v1") == "chat"
+
+    def test_usage_in_the_result_marks_an_unlisted_endpoint_as_chat(self):
+        result = {"output": "hi", "usage": {"prompt_tokens": 7, "completion_tokens": 5}}
+        assert detect_media_type("fal-ai/some-new-model", result) == "chat"
+        assert detect_media_type("fal-ai/some-new-model", {"usage": {"credits": 3}}) == "image"
+        assert detect_media_type("fal-ai/some-new-model", {"usage": {"prompt_tokens": 0}}) == "image"
+        assert detect_media_type("fal-ai/whisper", {"text": "hi", "usage": {"prompt_tokens": 7}}) == "audio"
+
+    def test_media_in_the_result_overrides_a_language_model_name(self):
+        images = {"images": [{"url": "https://fal.media/files/test/image1.png"}]}
+        assert detect_media_type("fal-ai/skillmix-xl", images) == "image"
+        assert detect_media_type("fal-ai/skillmix-xl", {"images": []}) == "chat"
+        assert detect_media_type("fal-ai/skillmix-xl", None) == "chat"
+        assert detect_media_type("fal-ai/skillmix-xl", "an image of a cat") == "chat"
+
+
 class TestEdgeCases:
     """Edge case tests."""
 

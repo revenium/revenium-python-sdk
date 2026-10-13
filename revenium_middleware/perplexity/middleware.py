@@ -5,9 +5,12 @@ This module provides automatic metering and tracking for Perplexity AI API
 calls. It uses wrapt to patch the OpenAI client methods and send usage data
 to Revenium.
 """
+import contextlib
 import datetime
+import importlib
 import logging
 import uuid
+from contextvars import ContextVar
 from typing import Dict, Any, Optional
 from enum import Enum
 
@@ -19,19 +22,28 @@ from revenium_middleware import (
     merge_metadata,
 )
 from revenium_middleware._core import submit_ai_event
+from revenium_middleware._core.log_sanitize import sanitize_for_logging
+from revenium_middleware._core.call_ownership import OPENAI, call_owned_by_outer_wrapper, with_callback_metadata
+from revenium_middleware._core.enforcement import check_enforcement, check_unmetered_call
+from revenium_middleware._core.metering import current_client
+from revenium_middleware._core.parse_failures import metering_failed_parse
+from revenium_middleware._core.patch_registry import is_patched
+from revenium_middleware._core.responses_status import responses_stop_reason
 from revenium_middleware._core.fields import (
     extract_org_and_product,
     extract_common_metadata,
     extract_effort_field,
     extract_prompt_context_fields,
     extract_agentic_job_fields,
+    extract_skill_fields,
     merge_extra_body,
 )
+from revenium_middleware._core.perplexity_cost import extract_reported_cost
 
-from ._metering_scope import metering_skipped
+from ._metering_scope import metering_skipped, take_usage_metadata
 from .patching import wrap_registered
 from .provider import Provider, detect_provider, get_provider_metadata
-from .streaming import AsyncMeteredStream, MeteredStream, StreamMeter
+from .streaming import AsyncMeteredStream, meter_call
 from .trace_fields import (
     get_environment,
     get_region,
@@ -122,16 +134,21 @@ def extract_token_usage(response: Any) -> Dict[str, int]:
     }
 
     if hasattr(response, 'usage') and response.usage:
-        usage["prompt_tokens"] = getattr(response.usage, 'prompt_tokens', 0)
-        usage["completion_tokens"] = getattr(response.usage, 'completion_tokens', 0)
+        usage["prompt_tokens"] = _token_count(response.usage, 'prompt_tokens', 'input_tokens')
+        usage["completion_tokens"] = _token_count(response.usage, 'completion_tokens', 'output_tokens')
         usage["total_tokens"] = getattr(response.usage, 'total_tokens', 0)
 
     return usage
 
 
-def build_trace_fields() -> Dict[str, Any]:
+def _token_count(usage: Any, chat_name: str, responses_name: str) -> int:
+    count = getattr(usage, chat_name, None)
+    return getattr(usage, responses_name, 0) if count is None else count
+
+
+def build_trace_fields(usage_metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    Build trace visualization fields from environment variables.
+    Build trace visualization fields from the call's metadata, then environment variables.
 
     Returns:
         Dictionary with trace fields
@@ -139,23 +156,23 @@ def build_trace_fields() -> Dict[str, Any]:
     fields = {}
 
     # Add optional trace fields if available
-    if env := get_environment():
+    if env := get_environment(usage_metadata):
         fields["environment"] = env
-    if region := get_region():
+    if region := get_region(usage_metadata):
         fields["region"] = region
-    if alias := get_credential_alias():
+    if alias := get_credential_alias(usage_metadata):
         fields["credential_alias"] = alias
-    if trace_type := get_trace_type():
+    if trace_type := get_trace_type(usage_metadata):
         fields["trace_type"] = trace_type
-    if trace_name := get_trace_name():
+    if trace_name := get_trace_name(usage_metadata):
         fields["trace_name"] = trace_name
-    if parent_id := get_parent_transaction_id():
+    if parent_id := get_parent_transaction_id(usage_metadata):
         fields["parent_transaction_id"] = parent_id
-    if txn_name := get_transaction_name():
+    if txn_name := get_transaction_name(usage_metadata):
         fields["transaction_name"] = txn_name
 
     # Always include retry number (defaults to 0)
-    fields["retry_number"] = get_retry_number()
+    fields["retry_number"] = get_retry_number(usage_metadata)
 
     return fields
 
@@ -181,7 +198,7 @@ def send_metering_data(
         is_streaming: Whether this is a streaming response
         transaction_id: Transaction ID for tracking
     """
-    if get_client() is None:
+    if current_client() is None:
         return  # metering disabled (no API key configured)
     response_time_dt = datetime.datetime.now(datetime.timezone.utc)
     request_duration = (response_time_dt - request_time_dt).total_seconds() * 1000
@@ -194,7 +211,8 @@ def send_metering_data(
             else:
                 txn_id = transaction_id
 
-            # Extract token usage
+            if not getattr(response, 'usage', None):
+                logger.warning("No usage data found in response")
             token_usage = extract_token_usage(response)
 
             # Detect operation type
@@ -205,12 +223,14 @@ def send_metering_data(
             if hasattr(response, 'choices') and response.choices:
                 finish_reason = getattr(response.choices[0], 'finish_reason', None)
                 stop_reason = get_stop_reason(finish_reason)
+            else:
+                stop_reason = responses_stop_reason(response)
 
             # Get provider metadata
             provider_metadata = get_provider_metadata(provider)
 
             # Build trace fields
-            trace_fields = build_trace_fields()
+            trace_fields = build_trace_fields(usage_metadata)
             if ticket_id := get_ticket_id(usage_metadata):
                 trace_fields["ticket_id"] = ticket_id
             if agent_version := get_agent_version(usage_metadata):
@@ -237,6 +257,7 @@ def send_metering_data(
                 "cache_read_token_count": 0,
                 "reasoning_token_count": 0,
             }
+            completion_args.update(extract_reported_cost(response))
 
             organization_name, product_name = extract_org_and_product(usage_metadata)
             if organization_name:
@@ -245,9 +266,12 @@ def send_metering_data(
                 completion_args["product_name"] = product_name
 
             meta = extract_common_metadata(usage_metadata)
+            quality_score = meta.pop("response_quality_score")
             for key, value in meta.items():
                 if value:
                     completion_args[key] = value
+            if quality_score is not None:
+                completion_args["response_quality_score"] = quality_score
 
             if usage_metadata.get("subscriber"):
                 completion_args["subscriber"] = usage_metadata.get("subscriber")
@@ -264,6 +288,7 @@ def send_metering_data(
             # Reasoning effort level (caller-supplied, forwarded verbatim)
             completion_args.update(extract_effort_field(usage_metadata))
             completion_args.update(extract_prompt_context_fields(usage_metadata))
+            completion_args.update(extract_skill_fields(usage_metadata))
 
             agentic_fields = extract_agentic_job_fields(usage_metadata)
             extra_body = merge_extra_body(None, agentic_fields)
@@ -271,7 +296,7 @@ def send_metering_data(
             if extra_body:
                 completion_args["extra_body"] = extra_body
 
-            logger.debug(f"Sending metering data: {completion_args}")
+            logger.debug("Sending metering data: %s", sanitize_for_logging(completion_args))
             result = submit_ai_event("completion", completion_args)
             logger.debug(f"Metering call result: {result}")
 
@@ -297,19 +322,25 @@ class _CompatibleCall:
     """The request-side facts of one Perplexity call made through the OpenAI client."""
 
     def __init__(self, client_instance, kwargs):
-        api_metadata = kwargs.pop("usage_metadata", {})
-
-        extra_body = kwargs.get('extra_body', {})
-        if isinstance(extra_body, dict) and 'usage_metadata' in extra_body:
-            extra_metadata = extra_body.pop('usage_metadata', {})
-            api_metadata = {**extra_metadata, **api_metadata}
-
+        api_metadata = take_usage_metadata(kwargs)
+        self._api_metadata = api_metadata
         self.usage_metadata = merge_metadata(api_metadata)
         self.provider = detect_provider(client=client_instance, base_url=client_instance.base_url)
         self.model = kwargs.get('model', 'unknown')
         self.is_streaming = kwargs.get('stream', False)
         self.request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-        self.transaction_id = f"perplexity-{self.request_time_dt.timestamp()}"
+        self.metering_client = current_client()
+        self.transaction_id = f"perplexity-{uuid.uuid4().hex}"
+
+    def adopt_callback_metadata(self) -> None:
+        """Lay the call's metadata over an attached LangChain callback's, in
+        the context the call is made in. The call sits in the OpenAI client's
+        slot, so a LangChain model reaches it as an OpenAI transport call."""
+        self.usage_metadata = merge_metadata(with_callback_metadata(OPENAI, self._api_metadata))
+
+    def check_caps(self) -> None:
+        check_enforcement(self.usage_metadata, model=self.model,
+                          provider=get_provider_metadata(self.provider)["provider"])
 
     def meter(self, response) -> None:
         send_metering_data(
@@ -319,56 +350,206 @@ class _CompatibleCall:
             self.model,
             self.provider,
             is_streaming=bool(self.is_streaming),
-            transaction_id=self.transaction_id,
+            transaction_id=getattr(response, "id", None) or self.transaction_id,
         )
 
 
-def create_wrapper(wrapped, instance, args, kwargs):
-    if metering_skipped():
-        return wrapped(*args, **kwargs)
+def _check_unmetered_caps(client_instance, kwargs, api_metadata) -> None:
+    """A Perplexity call this wrapper does not meter is still refused by a breached cap."""
+    provider = detect_provider(client=client_instance, base_url=client_instance.base_url)
+    check_unmetered_call(api_metadata, model=kwargs.get('model'), provider=get_provider_metadata(provider)["provider"],
+                         callback_transport=OPENAI)
 
+
+def _unmetered_metadata(kwargs) -> Dict[str, Any]:
+    """The metadata of a call this wrapper leaves to another: an outer wrapper that meters it
+    gets the request with its metadata, and a selectively unmetered one without."""
+    if call_owned_by_outer_wrapper():
+        api_metadata = kwargs.get("usage_metadata")
+        return dict(api_metadata) if isinstance(api_metadata, dict) else {}
+    return take_usage_metadata(kwargs)
+
+
+def _pass_on_unmetered(client_instance, kwargs) -> None:
+    _check_unmetered_caps(client_instance, kwargs, _unmetered_metadata(kwargs))
+
+
+def _left_unmetered() -> bool:
+    return call_owned_by_outer_wrapper() or metering_skipped()
+
+
+_parse_call_in_progress: ContextVar[bool] = ContextVar("revenium_perplexity_parse_call_in_progress", default=False)
+
+
+@contextlib.contextmanager
+def _metered_by_parse():
+    """Mark the enclosed provider call as metered by a ``parse()`` wrap, so a
+    ``create()`` that an OpenAI release routes ``parse()`` through stays
+    unmetered instead of sending a second record."""
+    token = _parse_call_in_progress.set(True)
+    try:
+        yield
+    finally:
+        _parse_call_in_progress.reset(token)
+
+
+def create_wrapper(wrapped, instance, args, kwargs):
     # The Perplexity API is OpenAI-compatible, so this wrapper patches the same
     # openai.resources.chat.completions.Completions.create slot as the OpenAI
     # middleware. Without this guard, calls made by a plain OpenAI client would
-    # be metered and tagged as PERPLEXITY. Defer non-Perplexity calls to the
-    # next wrapper (or original).
+    # be metered and tagged as PERPLEXITY. Defer non-Perplexity calls, metadata
+    # and all, to the next wrapper (or original).
     client_instance = _perplexity_client(instance)
-    if client_instance is None:
+    if client_instance is None or _parse_call_in_progress.get():
+        return wrapped(*args, **kwargs)
+
+    if _left_unmetered():
+        _pass_on_unmetered(client_instance, kwargs)
         return wrapped(*args, **kwargs)
 
     call = _CompatibleCall(client_instance, kwargs)
-    response = wrapped(*args, **kwargs)
-    if call.is_streaming:
-        return MeteredStream(response, StreamMeter(call.meter))
-    call.meter(response)
-    return response
+    call.adopt_callback_metadata()
+    call.check_caps()
+    return meter_call(call, wrapped(*args, **kwargs), OPENAI)
 
 
 def async_create_wrapper(wrapped, instance, args, kwargs):
-    if metering_skipped():
-        return wrapped(*args, **kwargs)
-
     # Same guard as create_wrapper: the OpenAI middleware wraps this
     # AsyncCompletions.create slot too and defers Perplexity-bound calls here.
     client_instance = _perplexity_client(instance)
-    if client_instance is None:
+    if client_instance is None or _parse_call_in_progress.get():
         return wrapped(*args, **kwargs)
+
+    if _left_unmetered():
+        api_metadata = _unmetered_metadata(kwargs)
+
+        async def invoke_unmetered():
+            _check_unmetered_caps(client_instance, kwargs, api_metadata)
+            return await wrapped(*args, **kwargs)
+
+        return invoke_unmetered()
 
     call = _CompatibleCall(client_instance, kwargs)
 
     async def invoke():
-        response = await wrapped(*args, **kwargs)
-        if call.is_streaming:
-            return AsyncMeteredStream(response, StreamMeter(call.meter))
-        call.meter(response)
-        return response
+        call.adopt_callback_metadata()
+        call.check_caps()
+        return meter_call(call, await wrapped(*args, **kwargs), OPENAI, AsyncMeteredStream)
+
+    return invoke()
+
+
+def _meter_parsed_response(response, call) -> None:
+    meter_call(call, response, OPENAI)
+
+
+def parse_wrapper(wrapped, instance, args, kwargs):
+    """``parse()`` posts its request itself rather than calling ``create()``,
+    so a Perplexity-bound structured-output call is checked and metered here."""
+    client_instance = _perplexity_client(instance)
+    if client_instance is None or _parse_call_in_progress.get():
+        return wrapped(*args, **kwargs)
+
+    if _left_unmetered():
+        _pass_on_unmetered(client_instance, kwargs)
+        with _metered_by_parse():
+            return wrapped(*args, **kwargs)
+
+    call = _CompatibleCall(client_instance, kwargs)
+    call.adopt_callback_metadata()
+    call.check_caps()
+    with _metered_by_parse(), metering_failed_parse(
+        call, _meter_parsed_response, provider="Perplexity", log=logger
+    ):
+        response = wrapped(*args, **kwargs)
+    return meter_call(call, response, OPENAI)
+
+
+def async_parse_wrapper(wrapped, instance, args, kwargs):
+    client_instance = _perplexity_client(instance)
+    if client_instance is None or _parse_call_in_progress.get():
+        return wrapped(*args, **kwargs)
+
+    if _left_unmetered():
+        api_metadata = _unmetered_metadata(kwargs)
+
+        async def invoke_unmetered():
+            _check_unmetered_caps(client_instance, kwargs, api_metadata)
+            with _metered_by_parse():
+                return await wrapped(*args, **kwargs)
+
+        return invoke_unmetered()
+
+    call = _CompatibleCall(client_instance, kwargs)
+
+    async def invoke():
+        call.adopt_callback_metadata()
+        call.check_caps()
+        with _metered_by_parse(), metering_failed_parse(
+            call, _meter_parsed_response, provider="Perplexity", log=logger
+        ):
+            response = await wrapped(*args, **kwargs)
+        return meter_call(call, response, OPENAI, AsyncMeteredStream)
 
     return invoke()
 
 
 OPENAI_COMPLETIONS_MODULE = "openai.resources.chat.completions"
+OPENAI_RESPONSES_MODULE = "openai.resources.responses"
+OPENAI_RESPONSES_CREATE = f"{OPENAI_RESPONSES_MODULE}.Responses.create"
+OPENAI_ASYNC_RESPONSES_CREATE = f"{OPENAI_RESPONSES_MODULE}.AsyncResponses.create"
+OPENAI_RESPONSES_PARSE = f"{OPENAI_RESPONSES_MODULE}.Responses.parse"
+OPENAI_ASYNC_RESPONSES_PARSE = f"{OPENAI_RESPONSES_MODULE}.AsyncResponses.parse"
+OPENAI_EMBEDDINGS_MODULE = "openai.resources.embeddings"
+OPENAI_EMBEDDINGS_CREATE = f"{OPENAI_EMBEDDINGS_MODULE}.Embeddings.create"
+OPENAI_ASYNC_EMBEDDINGS_CREATE = f"{OPENAI_EMBEDDINGS_MODULE}.AsyncEmbeddings.create"
+
+
+def embeddings_strip_wrapper(wrapped, instance, args, kwargs):
+    """An embeddings call to Perplexity is not metered here, but its Revenium metadata
+    must still not reach Perplexity."""
+    if _perplexity_client(instance) is not None:
+        take_usage_metadata(kwargs)
+    return wrapped(*args, **kwargs)
+
+
+def _unless_openai_integration_wraps(openai_wrap: str, perplexity_wrapper):
+    # The OpenAI integration takes a Perplexity-bound Responses or embeddings call's metadata itself
+    # (a Responses call is metered labelled PERPLEXITY), so this wrap only acts when that one is not installed.
+    def wrapper(wrapped, instance, args, kwargs):
+        if is_patched(openai_wrap):
+            return wrapped(*args, **kwargs)
+        return perplexity_wrapper(wrapped, instance, args, kwargs)
+    return wrapper
+
+
+def _openai_defines(module: str, attribute_path: str) -> bool:
+    try:
+        target = importlib.import_module(module)
+        for name in attribute_path.split('.'):
+            target = getattr(target, name)
+    except (ImportError, AttributeError):
+        return False
+    return True
+
 
 wrap_registered(f"perplexity:{OPENAI_COMPLETIONS_MODULE}.Completions.create",
                 OPENAI_COMPLETIONS_MODULE, "Completions.create", create_wrapper)
 wrap_registered(f"perplexity:{OPENAI_COMPLETIONS_MODULE}.AsyncCompletions.create",
                 OPENAI_COMPLETIONS_MODULE, "AsyncCompletions.create", async_create_wrapper)
+for _attribute, _wrapper in (("Completions.parse", parse_wrapper), ("AsyncCompletions.parse", async_parse_wrapper)):
+    if _openai_defines(OPENAI_COMPLETIONS_MODULE, _attribute):
+        wrap_registered(f"perplexity:{OPENAI_COMPLETIONS_MODULE}.{_attribute}",
+                        OPENAI_COMPLETIONS_MODULE, _attribute, _wrapper)
+for _openai_wrap, _wrapper in ((OPENAI_RESPONSES_CREATE, create_wrapper),
+                               (OPENAI_ASYNC_RESPONSES_CREATE, async_create_wrapper),
+                               (OPENAI_RESPONSES_PARSE, parse_wrapper),
+                               (OPENAI_ASYNC_RESPONSES_PARSE, async_parse_wrapper)):
+    _attribute = _openai_wrap[len(OPENAI_RESPONSES_MODULE) + 1:]
+    if _openai_defines(OPENAI_RESPONSES_MODULE, _attribute):
+        wrap_registered(f"perplexity:{_openai_wrap}", OPENAI_RESPONSES_MODULE, _attribute,
+                        _unless_openai_integration_wraps(_openai_wrap, _wrapper))
+for _openai_wrap in (OPENAI_EMBEDDINGS_CREATE, OPENAI_ASYNC_EMBEDDINGS_CREATE):
+    _attribute = _openai_wrap[len(OPENAI_EMBEDDINGS_MODULE) + 1:]
+    wrap_registered(f"perplexity:{_openai_wrap}", OPENAI_EMBEDDINGS_MODULE, _attribute,
+                    _unless_openai_integration_wraps(_openai_wrap, embeddings_strip_wrapper))

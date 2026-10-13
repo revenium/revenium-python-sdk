@@ -209,6 +209,7 @@ def test_defaults_deliver_every_record_promptly_from_a_slow_endpoint(
 def test_an_outage_is_buffered_without_holding_workers_and_replayed_after_recovery(monkeypatch, default_delivery):
     with SlowMeteringStub(0.25) as stub:
         connect(monkeypatch, stub)
+        baseline_threads = delivery_threads()
         stub.hanging.set()
         outage = Driver()
         outage.run(OUTAGE_SECONDS)
@@ -228,5 +229,6 @@ def test_an_outage_is_buffered_without_holding_workers_and_replayed_after_recove
     # and only the probes still hold a worker; without it the queue is full.
     assert pending_as_the_outage_ends <= metering_pool.DEFAULT_WORKERS
     peak_threads = max(outage.peak_threads, recovery.peak_threads)
-    assert peak_threads <= metering_pool.DEFAULT_WORKERS + BUFFER_THREADS + metering_buffer.REPLAY_CONCURRENCY - 1
+    started_threads = peak_threads - baseline_threads
+    assert started_threads <= metering_pool.DEFAULT_WORKERS + BUFFER_THREADS + metering_buffer.REPLAY_CONCURRENCY - 1
     assert max(outage.slowest_call, recovery.slowest_call) < 0.05

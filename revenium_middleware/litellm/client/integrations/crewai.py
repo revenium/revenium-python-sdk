@@ -16,9 +16,9 @@ Example:
     >>> crew = ReveniumCrewWrapper(
     ...     agents=[agent],
     ...     tasks=[task],
-    ...     organization_id="AcmeCorp",
+    ...     organization_name="AcmeCorp",
     ...     subscription_id="82764738",
-    ...     product_id="Platinum"
+    ...     product_name="Platinum"
     ... )
     >>> 
     >>> # Execute - all metadata automatically tracked
@@ -27,11 +27,54 @@ Example:
 
 import uuid
 import logging
+from contextlib import contextmanager
 from typing import List, Optional, Dict, Any
+from ...._core.context import injected_metadata_scope
+from ...._core.patch_registry import is_patched
 from ....job_context import JobContext
 from ..context import metadata_context
 
 logger = logging.getLogger("revenium_middleware.crewai")
+
+# CrewAI 1.x native LLM classes, keyed by class name so no CrewAI provider
+# module (each needs its own optional vendor SDK) is imported to match them.
+_NATIVE_LLM_MIDDLEWARE = {
+    "OpenAICompletion": ("openai.resources.chat.completions.Completions.create", "revenium_middleware.openai"),
+    "AnthropicCompletion": ("anthropic.resources.messages.messages.Messages.create", "revenium_middleware.anthropic"),
+    "GeminiCompletion": ("google.genai.models.Models.generate_content", "revenium_middleware.google.google_ai"),
+}
+_UNMETERED_NATIVE_LLMS = frozenset({"AzureCompletion", "BedrockCompletion", "SnowflakeCompletion"})
+_warned_llm_classes = set()
+
+
+def _native_llm_class_name(llm: Any) -> Optional[str]:
+    for klass in type(llm).__mro__:
+        if klass.__name__ in _NATIVE_LLM_MIDDLEWARE or klass.__name__ in _UNMETERED_NATIVE_LLMS:
+            return klass.__name__
+    return None
+
+
+def _warn_if_unmetered(llm: Any) -> None:
+    class_name = _native_llm_class_name(llm)
+    if class_name is None or class_name in _warned_llm_classes:
+        return
+    if class_name in _UNMETERED_NATIVE_LLMS:
+        _warned_llm_classes.add(class_name)
+        logger.warning(
+            "CrewAI %s calls are not metered by Revenium; build that LLM with is_litellm=True "
+            "and import revenium_middleware.litellm.client.middleware",
+            type(llm).__name__,
+        )
+        return
+    patch_key, middleware_module = _NATIVE_LLM_MIDDLEWARE[class_name]
+    if not is_patched(patch_key):
+        _warned_llm_classes.add(class_name)
+        logger.warning("CrewAI %s calls are not metered: import %s before kickoff", type(llm).__name__, middleware_module)
+
+
+def _is_crew_streaming_output(result: Any) -> bool:
+    return any(klass.__name__ == "CrewStreamingOutput" for klass in type(result).__mro__)
+
 
 try:
     from crewai import Crew, Agent, Task
@@ -100,22 +143,24 @@ class ReveniumCrewWrapper:
     This class wraps a CrewAI Crew and automatically tracks:
     - Organization, subscription, and product IDs
     - Unique trace_id for each crew execution
-    - Agent role for each agent interaction
-    - Task type for each task execution
+    - Agent role and task type for each task execution (CrewAI before 0.203 only)
     - Optional agentic job fields (agentic_job_id/name/type/version) for
       Revenium's agentic outcomes API
 
-    All metadata is automatically injected into LiteLLM calls via the
-    context API, eliminating the need for manual monkey-patching.
+    All metadata is automatically injected into every model call the crew
+    makes through a provider whose Revenium middleware is imported (LiteLLM,
+    OpenAI, Anthropic), eliminating the need for manual monkey-patching.
 
     When constructed with an ``agentic_job_id``, the wrapper can also report
     or amend the job's business outcome via ``report_job_outcome`` and
     ``amend_job_outcome`` (requires a write-scope ``rev_sk_`` API key).
 
     Attributes:
-        organization_id: Customer or department ID
+        organization_name: Customer or department name
         subscription_id: Billing plan reference
-        product_id: Product or feature identifier
+        product_name: Product or feature name
+        organization_id: Deprecated, use organization_name
+        product_id: Deprecated, use product_name
         trace_id: Unique identifier for this crew execution (auto-generated)
         agentic_job_id: Optional agentic job identifier for outcome reporting
         agentic_job_name: Optional human-readable agentic job name
@@ -128,9 +173,9 @@ class ReveniumCrewWrapper:
         self,
         agents: List[Any],
         tasks: List[Any],
-        organization_id: str,
-        subscription_id: str,
-        product_id: str,
+        organization_id: Optional[str] = None,
+        subscription_id: Optional[str] = None,
+        product_id: Optional[str] = None,
         trace_id: Optional[str] = None,
         agentic_job_id: Optional[str] = None,
         agentic_job_name: Optional[str] = None,
@@ -139,6 +184,8 @@ class ReveniumCrewWrapper:
         team_id: Optional[str] = None,
         process: Optional[Any] = None,
         verbose: bool = False,
+        organization_name: Optional[str] = None,
+        product_name: Optional[str] = None,
         **crew_kwargs
     ):
         """
@@ -147,9 +194,9 @@ class ReveniumCrewWrapper:
         Args:
             agents: List of CrewAI Agent objects
             tasks: List of CrewAI Task objects
-            organization_id: Customer or department ID from non-Revenium systems
+            organization_id: Deprecated, use organization_name.
             subscription_id: Reference to a billing plan in non-Revenium systems
-            product_id: Your product or feature making the AI call
+            product_id: Deprecated, use product_name.
             trace_id: Optional unique identifier for this execution. If not provided,
                      a UUID will be generated automatically.
             agentic_job_id: Optional agentic job identifier. When set, it is
@@ -163,15 +210,17 @@ class ReveniumCrewWrapper:
                      the job outcome (falls back to REVENIUM_TEAM_ID).
             process: Optional CrewAI process type (sequential, hierarchical, etc.)
             verbose: Whether to enable verbose logging
+            organization_name: Customer or department name from non-Revenium systems
+            product_name: Your product or feature making the AI call
             **crew_kwargs: Additional arguments to pass to Crew constructor
 
         Example:
             >>> crew = ReveniumCrewWrapper(
             ...     agents=[agent1, agent2],
             ...     tasks=[task1, task2],
-            ...     organization_id="AcmeCorp",
+            ...     organization_name="AcmeCorp",
             ...     subscription_id="82764738",
-            ...     product_id="Platinum",
+            ...     product_name="Platinum",
             ...     agentic_job_id="support-456",
             ...     agentic_job_type="customer_support",
             ...     agentic_job_version="2.0",
@@ -186,13 +235,13 @@ class ReveniumCrewWrapper:
         """
         if not CREWAI_AVAILABLE:
             raise ImportError(
-                "CrewAI is not installed. Install it with: "
-                "pip install 'revenium-python-sdk[litellm]'"
+                "CrewAI is not installed. Install it with the extra for your agents' models, e.g.: "
+                "pip install 'revenium-python-sdk[openai]' crewai"
             )
         
-        self.organization_id = organization_id
         self.subscription_id = subscription_id
-        self.product_id = product_id
+        self.organization_name = organization_name if organization_name is not None else organization_id
+        self.product_name = product_name if product_name is not None else product_id
         self.trace_id = trace_id or str(uuid.uuid4())
         self.agentic_job_id = agentic_job_id
         self.agentic_job_name = agentic_job_name
@@ -221,22 +270,35 @@ class ReveniumCrewWrapper:
             f"Initialized Revenium Crew wrapper with trace_id: {self.trace_id}"
         )
 
+    @property
+    def organization_id(self) -> Optional[str]:
+        return self.organization_name
+
+    @organization_id.setter
+    def organization_id(self, value: Optional[str]) -> None:
+        self.organization_name = value
+
+    @property
+    def product_id(self) -> Optional[str]:
+        return self.product_name
+
+    @product_id.setter
+    def product_id(self, value: Optional[str]) -> None:
+        self.product_name = value
+
     def _execution_metadata(self) -> Dict[str, Any]:
         """Build the metadata dict injected for every crew execution."""
-        metadata: Dict[str, Any] = {
-            "organization_id": self.organization_id,
+        optional = {
+            "organization_name": self.organization_name,
             "subscription_id": self.subscription_id,
-            "product_id": self.product_id,
-            "trace_id": self.trace_id,
+            "product_name": self.product_name,
+            "agentic_job_id": self.agentic_job_id,
+            "agentic_job_name": self.agentic_job_name,
+            "agentic_job_type": self.agentic_job_type,
+            "agentic_job_version": self.agentic_job_version,
         }
-        if self.agentic_job_id is not None:
-            metadata["agentic_job_id"] = self.agentic_job_id
-        if self.agentic_job_name is not None:
-            metadata["agentic_job_name"] = self.agentic_job_name
-        if self.agentic_job_type is not None:
-            metadata["agentic_job_type"] = self.agentic_job_type
-        if self.agentic_job_version is not None:
-            metadata["agentic_job_version"] = self.agentic_job_version
+        metadata: Dict[str, Any] = {"trace_id": self.trace_id}
+        metadata.update((field, value) for field, value in optional.items() if value is not None)
         return metadata
 
     def kickoff(self, inputs: Optional[Dict[str, Any]] = None):
@@ -249,16 +311,15 @@ class ReveniumCrewWrapper:
         Returns:
             The result from the crew execution
         """
-        # Set base metadata for the entire crew execution
-        # This will be picked up by the middleware for all LiteLLM calls
-        with metadata_context.set(**self._execution_metadata()):
+        self._warn_unmetered_llms()
+        with self._attribution_scope():
             logger.debug(f"Starting crew execution with trace_id: {self.trace_id}")
 
             # Setup task-level metadata (version-aware: monkey-patching or callbacks)
             self._setup_task_callbacks()
 
             try:
-                return self._crew.kickoff(inputs=inputs)
+                return self._attribute_stream(self._crew.kickoff(inputs=inputs))
             finally:
                 # Clean up any monkey-patches
                 self._unpatch_task_execution()
@@ -273,8 +334,8 @@ class ReveniumCrewWrapper:
         Returns:
             The result from the crew execution
         """
-        # Set base metadata for the entire crew execution
-        with metadata_context.set(**self._execution_metadata()):
+        self._warn_unmetered_llms()
+        with self._attribution_scope():
             logger.debug(f"Starting async crew execution with trace_id: {self.trace_id}")
 
             # Setup task-level metadata (version-aware: monkey-patching or callbacks)
@@ -282,10 +343,10 @@ class ReveniumCrewWrapper:
 
             try:
                 if hasattr(self._crew, 'kickoff_async'):
-                    return await self._crew.kickoff_async(inputs=inputs)
+                    return self._attribute_stream(await self._crew.kickoff_async(inputs=inputs))
                 else:
                     # Fallback to sync if async not available
-                    return self._crew.kickoff(inputs=inputs)
+                    return self._attribute_stream(self._crew.kickoff(inputs=inputs))
             finally:
                 # Clean up any monkey-patches
                 self._unpatch_task_execution()
@@ -301,8 +362,8 @@ class ReveniumCrewWrapper:
         Returns:
             The result from the training
         """
-        # Set base metadata for the entire training session
-        with metadata_context.set(**self._execution_metadata()):
+        self._warn_unmetered_llms()
+        with self._attribution_scope():
             logger.debug(f"Starting crew training with trace_id: {self.trace_id}")
 
             # Setup task-level metadata (version-aware: monkey-patching or callbacks)
@@ -316,6 +377,71 @@ class ReveniumCrewWrapper:
             finally:
                 # Clean up any monkey-patches
                 self._unpatch_task_execution()
+
+    @contextmanager
+    def _attribution_scope(self):
+        """Attribute every model call in the enclosed code to this crew.
+
+        The LiteLLM client wrapper reads ``metadata_context``; the OpenAI and
+        Anthropic middlewares read the core injected metadata. Both get the
+        same fields and both are restored on exit.
+        """
+        metadata = self._execution_metadata()
+        with metadata_context.set(**metadata), injected_metadata_scope(metadata):
+            yield
+
+    def _warn_unmetered_llms(self) -> None:
+        """Warn once per CrewAI LLM class whose calls no imported middleware meters."""
+        try:
+            llms = [getattr(self._crew, "manager_llm", None), getattr(self._crew, "planning_llm", None)]
+            for agent in self._agents:
+                llms.append(getattr(agent, "llm", None))
+                llms.append(getattr(agent, "function_calling_llm", None))
+            for llm in llms:
+                if llm is not None:
+                    _warn_if_unmetered(llm)
+        except Exception as e:
+            logger.debug("Could not check the crew's LLMs for missing middleware: %s", e)
+
+    def _attribute_stream(self, result: Any) -> Any:
+        """Attribute a streaming crew's model calls, which run while it is iterated."""
+        if not _is_crew_streaming_output(result):
+            return result
+        if getattr(result, "_sync_iterator", None) is not None:
+            result._sync_iterator = self._scoped_steps(result._sync_iterator)
+        if getattr(result, "_async_iterator", None) is not None:
+            result._async_iterator = self._scoped_async_steps(result._async_iterator)
+        return result
+
+    def _scoped_steps(self, iterator):
+        # Each step gets its own scope: a scope held across a yield would be
+        # reset from whatever context resumes the generator.
+        try:
+            while True:
+                with self._attribution_scope():
+                    try:
+                        chunk = next(iterator)
+                    except StopIteration:
+                        return
+                yield chunk
+        finally:
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                close()
+
+    async def _scoped_async_steps(self, iterator):
+        try:
+            while True:
+                with self._attribution_scope():
+                    try:
+                        chunk = await iterator.__anext__()
+                    except StopAsyncIteration:
+                        return
+                yield chunk
+        finally:
+            aclose = getattr(iterator, "aclose", None)
+            if aclose is not None:
+                await aclose()
 
     def report_job_outcome(
         self,
@@ -493,45 +619,18 @@ class ReveniumCrewWrapper:
 
     def _setup_task_callbacks_only(self):
         """
-        Setup callbacks for tasks (callback-only approach for CrewAI 0.203.0+).
+        Log each task's agent and type (CrewAI 0.203.0+).
 
-        Note: Callbacks execute AFTER task completion, so they cannot inject
-        metadata into LiteLLM calls. This approach only provides logging.
+        Task callbacks run after the task, so they cannot inject metadata into
+        model calls; the crew-level attribution scope does that. The task's own
+        ``callback`` is left untouched, so a wrapper reused across runs never
+        stacks a layer on it.
         """
-        try:
-            from crewai.tasks.task_output import TaskOutput
-        except ImportError:
-            logger.warning("Could not import TaskOutput - callbacks not available")
-            return
-
         for task in self._tasks:
-            # Extract agent role and task type for this task
             agent_role = self._get_agent_role(task)
             task_type = self._get_task_type(task)
+            logger.debug(f"Tracking task with agent={agent_role}, task_type={task_type}")
 
-            # Create a callback for logging only
-            def task_callback(output: TaskOutput, agent=agent_role, task_t=task_type):
-                """Callback executed after task completion (logging only)."""
-                logger.debug(
-                    f"Task completed: agent={agent}, task_type={task_t}"
-                )
-
-            # Store original callback if it exists
-            original_callback = getattr(task, 'callback', None)
-
-            # Create a combined callback that calls both
-            if original_callback:
-                def combined_callback(output: TaskOutput, orig=original_callback, new=task_callback):
-                    new(output)
-                    orig(output)
-                task.callback = combined_callback
-            else:
-                task.callback = task_callback
-
-            logger.debug(
-                f"Setup callback for task with agent={agent_role}, task_type={task_type}"
-            )
-    
     def _get_agent_role(self, task: Any) -> str:
         """
         Extract agent role from a task.

@@ -2,12 +2,15 @@
 Tests for per-media-type field extraction from fal.ai responses.
 """
 
+import logging
+
 import pytest
 from revenium_middleware.fal._metering import (
     extract_image_fields,
     extract_video_fields,
     extract_audio_fields,
     generate_transaction_id,
+    requested_duration_seconds,
 )
 
 
@@ -98,6 +101,76 @@ class TestExtractVideoFields:
     def test_non_dict_result(self):
         fields = extract_video_fields("not a dict", {})
         assert fields == {}
+
+
+class TestRequestedDurationSeconds:
+    """fal documents clip lengths as "8s", "5", 5 or "auto"; only a positive finite number of seconds is read."""
+
+    @pytest.mark.parametrize(
+        "value, expected",
+        [
+            ("8s", 8.0),
+            ("8S", 8.0),
+            (" 8s ", 8.0),
+            ("5.5s", 5.5),
+            ("8 s", 8.0),
+            ("5", 5.0),
+            (5, 5.0),
+            (7.5, 7.5),
+        ],
+    )
+    def test_a_number_of_seconds_is_read(self, value, expected):
+        assert requested_duration_seconds(value) == expected
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "0s",
+            "9" * 400,
+            10**400,
+            float("inf"),
+            float("nan"),
+            True,
+            -5,
+            "-5s",
+            "8sec",
+            "1080p",
+            "16:9",
+            "auto",
+            "long",
+            [8],
+        ],
+    )
+    def test_anything_else_is_unreadable(self, value):
+        assert requested_duration_seconds(value) is None
+
+    @pytest.mark.parametrize("value, expected", [("8s", 8.0), ("auto", None), ("long", None), ("9" * 400, None)])
+    def test_extracting_video_fields_reads_the_duration_without_raising(self, value, expected):
+        fields = extract_video_fields({"video": {"url": "v.mp4"}}, {"duration": value})
+        assert fields.get("requested_duration_seconds") == expected
+
+    @pytest.mark.parametrize("value", ["long", "8sec", True, -5])
+    def test_an_unreadable_duration_warns_once(self, caplog, value):
+        caplog.set_level(logging.DEBUG, logger="revenium_middleware.fal")
+        fields = extract_video_fields({"video": {"url": "v.mp4"}}, {"duration": value})
+        assert "requested_duration_seconds" not in fields
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "duration" in warnings[0].getMessage()
+
+    @pytest.mark.parametrize("value", ["auto", "AUTO", " Auto "])
+    def test_auto_leaves_no_requested_duration_and_does_not_warn(self, caplog, value):
+        caplog.set_level(logging.DEBUG, logger="revenium_middleware.fal")
+        fields = extract_video_fields({"video": {"url": "v.mp4"}}, {"duration": value})
+        assert "requested_duration_seconds" not in fields
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    @pytest.mark.parametrize("value", ["", None, 0])
+    def test_an_absent_duration_leaves_no_field_and_does_not_warn(self, caplog, value):
+        caplog.set_level(logging.DEBUG, logger="revenium_middleware.fal")
+        fields = extract_video_fields({"video": {"url": "v.mp4"}}, {"duration": value})
+        assert "requested_duration_seconds" not in fields
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
 class TestExtractAudioFields:

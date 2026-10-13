@@ -5,6 +5,7 @@ at import time: env vars populated later (vault bootstraps, Django settings,
 import-order accidents) were silently ignored forever, and there was no
 programmatic configuration API at all.
 """
+import logging
 from unittest.mock import MagicMock
 
 import pytest
@@ -77,3 +78,18 @@ def test_get_client_does_not_rebuild_when_env_still_missing(unconfigured_client)
 def test_initialize_metering_is_exported_publicly():
     assert "initialize_metering" in revenium_middleware.__all__
     assert callable(revenium_middleware.initialize_metering)
+
+
+def test_missing_key_error_names_the_in_code_route(unconfigured_client, caplog):
+    """BACK-4246: the startup error names the in-code alternative that meters AI calls, and not configure()."""
+    caplog.set_level(logging.ERROR, logger="revenium_middleware")
+
+    metering._build_metering_client(None, None)
+
+    errors = [record.getMessage() for record in caplog.records if record.levelno == logging.ERROR]
+    assert errors == [
+        "REVENIUM_METERING_API_KEY environment variable is not set or is blank. "
+        "Metering is disabled and no usage data will be sent to Revenium. "
+        "Set it, or call revenium_middleware.initialize_metering(api_key=...) in code; "
+        "configure() sets the key for tool events only."
+    ]

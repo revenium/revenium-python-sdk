@@ -11,6 +11,9 @@ EXPECTED_NAMES = [
     "ReveniumAnthropicDriver",
     "ReveniumOllamaDriver",
     "ReveniumLiteLLMDriver",
+    "enable_budget_errors",
+    "disable_budget_errors",
+    "raise_if_budget_exceeded",
 ]
 
 

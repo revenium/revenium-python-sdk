@@ -22,18 +22,20 @@ having no payload to inspect.
 """
 
 import datetime
+import uuid
 
 import pytest
 
 pytest.importorskip("litellm")
 pytest.importorskip("fastapi")
 
-from unittest.mock import patch  # noqa: E402
+from unittest.mock import MagicMock, patch  # noqa: E402
 
 from revenium_middleware.litellm.proxy.guardrail import ReveniumGuardrail  # noqa: E402
 
 from .proxy_hook_harness import (  # noqa: E402
     GuardrailResponse,
+    after_pre_call,
     drive_metering,
     guardrail_data,
     make_key_dict,
@@ -167,6 +169,31 @@ class TestSuccessPayload:
         assert submitted_args(submit)["effort"] == "high"
 
     @pytest.mark.asyncio
+    async def test_a_malformed_quality_score_header_still_sends_the_record(self, guardrail):
+        """BACK-4339: Revenium refuses a record carrying a malformed optional field,
+        so the send funnel drops the field and keeps the tokens."""
+        client = MagicMock()
+        headers = {
+            "x-revenium-response-quality-score": "high",
+            "x-revenium-effort": "very high",
+        }
+        with patch("revenium_middleware._core.metering_submission.current_client", lambda: client), \
+                patch("revenium_middleware.litellm.proxy.guardrail.run_async_in_thread",
+                      side_effect=drive_metering):
+            await _success(
+                guardrail,
+                data=guardrail_data(headers=headers),
+                response=_response(Usage(5, 10, 15)),
+            )
+
+        client.ai.create_completion.assert_called_once()
+        sent = client.ai.create_completion.call_args.kwargs
+        assert sent["input_token_count"] == 5
+        assert sent["output_token_count"] == 10
+        assert "response_quality_score" not in sent
+        assert "effort" not in sent
+
+    @pytest.mark.asyncio
     async def test_virtual_key_metadata_fills_attribution_headers_omit(
         self, guardrail, submit
     ):
@@ -198,6 +225,42 @@ class TestSuccessPayload:
         assert submitted_args(submit)["organization_name"] == "AcmeCorp"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("blank", ["", "   "], ids=["empty", "whitespace"])
+    async def test_a_blank_organization_header_falls_back_to_the_key_team(
+        self, guardrail, submit, blank
+    ):
+        """BACK-4030: a blank header is absent, so the key's team still applies."""
+        await _success(
+            guardrail,
+            data=guardrail_data(headers={"x-revenium-organization-name": blank}),
+            key_dict=make_key_dict(team_alias="FinanceTeam"),
+        )
+        assert submitted_args(submit)["organization_name"] == "FinanceTeam"
+
+    @pytest.mark.asyncio
+    async def test_a_blank_key_team_alias_falls_back_to_key_metadata(self, guardrail, submit):
+        await _success(
+            guardrail,
+            key_dict=make_key_dict(
+                team_alias="", metadata={"revenium_organization_name": "KeyOrg"}
+            ),
+        )
+        assert submitted_args(submit)["organization_name"] == "KeyOrg"
+
+    @pytest.mark.asyncio
+    async def test_a_blank_product_header_falls_back_to_the_deprecated_product_id(
+        self, guardrail, submit
+    ):
+        await _success(
+            guardrail,
+            data=guardrail_data(headers={
+                "x-revenium-product-name": "",
+                "x-revenium-product-id": "p1",
+            }),
+        )
+        assert submitted_args(submit)["product_name"] == "p1"
+
+    @pytest.mark.asyncio
     async def test_timing_comes_from_hidden_params(self, guardrail, submit):
         await _success(guardrail)
         args = submitted_args(submit)
@@ -205,6 +268,23 @@ class TestSuccessPayload:
         assert args["mediation_latency"] == 10
         datetime.datetime.strptime(args["request_time"], "%Y-%m-%dT%H:%M:%SZ")
         datetime.datetime.strptime(args["response_time"], "%Y-%m-%dT%H:%M:%SZ")
+
+
+class TestTheRowNamesTheDeploymentModel:
+    """A proxy alias is not a model Revenium can price, so the row names the deployment's model."""
+
+    @pytest.mark.asyncio
+    async def test_an_aliased_model_is_metered_under_its_deployment_model(self, guardrail, submit):
+        await _success(guardrail, data=guardrail_data(model="team-gpt", upstream_model="gpt-4o-mini"))
+
+        assert submitted_args(submit)["model"] == "gpt-4o-mini"
+
+    @pytest.mark.asyncio
+    async def test_a_caller_supplied_metadata_deployment_never_names_the_model(self, guardrail, submit):
+        """On /v1/messages ``metadata`` is the caller's own request body, so it can claim any deployment."""
+        await _success(guardrail, data=guardrail_data(model="team-gpt", metadata={"deployment": "forged-cheap"}))
+
+        assert submitted_args(submit)["model"] != "forged-cheap"
 
 
 class TestAgenticJobTagging:
@@ -271,7 +351,7 @@ class TestFailurePath:
     @pytest.mark.asyncio
     async def test_failure_is_metered_with_error_stop_reason(self, guardrail, submit):
         await guardrail.async_post_call_failure_hook(
-            request_data=guardrail_data(),
+            request_data=after_pre_call(guardrail_data()),
             original_exception=Exception("provider exploded"),
             user_api_key_dict=make_key_dict(),
         )
@@ -288,7 +368,7 @@ class TestFailurePath:
             "x-revenium-agentic-job-id": "job-42",
         }
         await guardrail.async_post_call_failure_hook(
-            request_data=guardrail_data(headers=headers),
+            request_data=after_pre_call(guardrail_data(headers=headers)),
             original_exception=Exception("provider exploded"),
             user_api_key_dict=make_key_dict(),
         )
@@ -302,7 +382,7 @@ class TestFailurePath:
         error = Exception("truncated")
         error.usage = Usage(12, 0, 12)
         await guardrail.async_post_call_failure_hook(
-            request_data=guardrail_data(),
+            request_data=after_pre_call(guardrail_data()),
             original_exception=error,
             user_api_key_dict=make_key_dict(),
         )
@@ -312,7 +392,7 @@ class TestFailurePath:
     async def test_failure_metering_error_does_not_propagate(self, guardrail, submit):
         submit.side_effect = Exception("metering API down")
         await guardrail.async_post_call_failure_hook(
-            request_data=guardrail_data(),
+            request_data=after_pre_call(guardrail_data()),
             original_exception=Exception("provider exploded"),
             user_api_key_dict=make_key_dict(),
         )
@@ -395,13 +475,16 @@ class TestNeverFailsTheProxiedCall:
         assert isinstance(args["transaction_id"], str) and args["transaction_id"]
 
     @pytest.mark.asyncio
-    async def test_transaction_id_falls_back_to_the_litellm_call_id(
+    async def test_an_idless_response_is_never_filed_under_litellms_call_id(
         self, guardrail, submit
     ):
-        """With no .id, the row is still correlatable to LiteLLM's own call."""
+        """LiteLLM's call id is the caller's header, so repeats of it would merge into one record."""
         response = _response(response_id=None, hidden_params={"litellm_call_id": "call-abc"})
         await _success(guardrail, response=response)
-        assert submitted_args(submit)["transaction_id"] == "call-abc"
+        transaction_id = submitted_args(submit)["transaction_id"]
+        assert transaction_id != "call-abc"
+        assert transaction_id
+        uuid.UUID(transaction_id)
 
     @pytest.mark.asyncio
     async def test_a_chat_response_is_labelled_chat(self, guardrail, submit):
@@ -436,7 +519,7 @@ class TestTransactionIdIsNeverAConstant:
     async def test_two_idless_failures_get_different_ids(self, guardrail, submit):
         for _ in range(2):
             await guardrail.async_post_call_failure_hook(
-                request_data=guardrail_data(),
+                request_data=after_pre_call(guardrail_data()),
                 original_exception=Exception("provider exploded"),
                 user_api_key_dict=make_key_dict(),
             )
@@ -457,18 +540,21 @@ class TestTransactionIdIsNeverAConstant:
         data = guardrail_data()
         data["litellm_call_id"] = "call-failed-1"
         await guardrail.async_post_call_failure_hook(
-            request_data=data,
+            request_data=after_pre_call(data),
             original_exception=Exception("provider exploded"),
             user_api_key_dict=make_key_dict(),
         )
         assert submitted_args(submit)["transaction_id"].startswith("call-failed-1:err:")
 
     @pytest.mark.asyncio
-    async def test_a_success_prefers_the_request_litellm_call_id(self, guardrail, submit):
+    async def test_an_idless_success_ignores_the_request_litellm_call_id(self, guardrail, submit):
         data = guardrail_data()
         data["litellm_call_id"] = "call-ok-1"
         await _success(guardrail, data=data, response=_response(response_id=None))
-        assert submitted_args(submit)["transaction_id"] == "call-ok-1"
+        transaction_id = submitted_args(submit)["transaction_id"]
+        assert transaction_id != "call-ok-1"
+        assert transaction_id
+        uuid.UUID(transaction_id)
 
     @pytest.mark.asyncio
     async def test_the_response_id_still_wins_when_present(self, guardrail, submit):
@@ -482,7 +568,7 @@ class TestTransactionIdIsNeverAConstant:
         error = Exception("provider exploded")
         error.id = "err-abc"
         await guardrail.async_post_call_failure_hook(
-            request_data=guardrail_data(),
+            request_data=after_pre_call(guardrail_data()),
             original_exception=error,
             user_api_key_dict=make_key_dict(),
         )
@@ -500,7 +586,7 @@ class TestFailureOperationType:
 
     async def _meter_failure(self, guardrail, request_data=None, key_dict=None):
         await guardrail.async_post_call_failure_hook(
-            request_data=request_data if request_data is not None else guardrail_data(),
+            request_data=after_pre_call(request_data if request_data is not None else guardrail_data()),
             original_exception=Exception("provider exploded"),
             user_api_key_dict=key_dict or make_key_dict(),
         )
@@ -596,3 +682,93 @@ class TestStreamFlagUsesTheResolvedHiddenParams:
         response = _response(hidden_params={"optional_params": {"stream": True}})
         await _success(guardrail, data=guardrail_data(stream=False), response=response)
         assert submitted_args(submit)["is_streamed"] is False
+
+
+PIN_SETTING = "REVENIUM_LITELLM_PIN_ORGANIZATION_TO_KEY_TEAM"
+ORGANIZATION_HEADERS = pytest.mark.parametrize("header", [
+    "x-revenium-organization-name",
+    "x-revenium-organization-id",
+])
+
+
+class TestOrganizationPinnedToTheKeyTeam:
+    """With the operator's pin on, the record names the key's team, not a caller's header (BACK-4363)."""
+
+    @pytest.mark.asyncio
+    @ORGANIZATION_HEADERS
+    async def test_the_record_names_the_pinned_key_team(
+        self, guardrail, submit, monkeypatch, header
+    ):
+        monkeypatch.setenv(PIN_SETTING, "true")
+
+        await _success(
+            guardrail,
+            data=guardrail_data(headers={header: "SomeoneElse"}),
+            key_dict=make_key_dict(team_alias="AcmeTeam"),
+        )
+
+        assert submitted_args(submit)["organization_name"] == "AcmeTeam"
+
+    @pytest.mark.asyncio
+    async def test_the_failure_record_names_the_pinned_key_team(
+        self, guardrail, submit, monkeypatch
+    ):
+        monkeypatch.setenv(PIN_SETTING, "true")
+
+        await guardrail.async_post_call_failure_hook(
+            request_data=after_pre_call(
+                guardrail_data(headers={"x-revenium-organization-name": "SomeoneElse"})
+            ),
+            original_exception=Exception("provider exploded"),
+            user_api_key_dict=make_key_dict(team_alias="AcmeTeam"),
+        )
+
+        assert submitted_args(submit)["organization_name"] == "AcmeTeam"
+
+    @pytest.mark.asyncio
+    async def test_without_the_setting_the_header_names_the_record(
+        self, guardrail, submit, monkeypatch
+    ):
+        monkeypatch.delenv(PIN_SETTING, raising=False)
+
+        await _success(
+            guardrail,
+            data=guardrail_data(headers={"x-revenium-organization-name": "SomeoneElse"}),
+            key_dict=make_key_dict(team_alias="AcmeTeam"),
+        )
+
+        assert submitted_args(submit)["organization_name"] == "SomeoneElse"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("team_alias", [None, "", "   "], ids=["none", "empty", "whitespace"])
+    async def test_a_pinned_key_with_no_team_alias_keeps_the_header_organization(
+        self, guardrail, submit, monkeypatch, team_alias
+    ):
+        monkeypatch.setenv(PIN_SETTING, "true")
+
+        await _success(
+            guardrail,
+            data=guardrail_data(headers={"x-revenium-organization-name": "SomeoneElse"}),
+            key_dict=make_key_dict(team_alias=team_alias),
+        )
+
+        assert submitted_args(submit)["organization_name"] == "SomeoneElse"
+
+    @pytest.mark.asyncio
+    async def test_a_non_streamed_messages_record_names_the_pinned_key_team(
+        self, guardrail, submit, monkeypatch
+    ):
+        """The /v1/messages shape: headers in litellm_metadata, the caller's body in metadata."""
+        monkeypatch.setenv(PIN_SETTING, "true")
+
+        await _success(
+            guardrail,
+            data=guardrail_data(
+                headers={"x-revenium-organization-name": "SomeoneElse"},
+                metadata={"user_id": "claude-code-user"},
+                metadata_key="litellm_metadata",
+            ),
+            key_dict=make_key_dict(team_alias="AcmeTeam"),
+        )
+
+        assert submitted_args(submit)["organization_name"] == "AcmeTeam"

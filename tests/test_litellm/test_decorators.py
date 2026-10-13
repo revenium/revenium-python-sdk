@@ -12,7 +12,16 @@ Tests cover:
 
 import pytest
 import asyncio
-from revenium_middleware.litellm.client.decorators import track_agent, track_task, track_job
+import contextvars
+import inspect
+import json
+import threading
+from unittest.mock import patch
+
+from revenium_middleware.litellm.client.decorators import (
+    track_agent, track_job, track_organization, track_product, track_quality, track_subscriber,
+    track_subscription, track_task, track_trace,
+)
 from revenium_middleware.litellm.client.context import metadata_context
 
 
@@ -408,3 +417,591 @@ class TestDecoratorWithContextManager:
             "task_type": "research"
         }
 
+
+MESSAGES = [{"role": "user", "content": "hi there"}]
+
+
+def _completion_kwargs(**extra):
+    return {"model": "gpt-4o-mini", "messages": MESSAGES, "mock_response": "hello world", **extra}
+
+
+def _run_in_own_thread(coro):
+    thread = threading.Thread(target=asyncio.run, args=(coro,))
+    thread.start()
+    thread.join()
+    return thread
+
+
+@pytest.fixture
+def litellm():
+    return pytest.importorskip("litellm")
+
+
+@pytest.fixture
+def payloads(litellm):
+    from revenium_middleware.litellm.client import middleware as mw
+
+    recorded = []
+    with patch.object(mw, "run_async_in_thread", side_effect=_run_in_own_thread), \
+            patch.object(mw, "submit_ai_event", side_effect=lambda op, args, **kwargs: recorded.append(args)):
+        yield recorded
+
+
+TRACKERS = [
+    pytest.param(lambda: track_agent("GenAgent"), lambda p: p["agent"], "GenAgent", id="track_agent"),
+    pytest.param(lambda: track_task("gen-task"), lambda p: p["task_type"], "gen-task", id="track_task"),
+    pytest.param(
+        lambda: track_job(job_id="job-gen-1"), lambda p: (p["extra_body"] or {}).get("agenticJobId"), "job-gen-1",
+        id="track_job",
+    ),
+    pytest.param(lambda: track_trace("gen-trace"), lambda p: p["trace_id"], "gen-trace", id="track_trace"),
+    pytest.param(
+        lambda: track_organization("GenOrg"), lambda p: p["organization_name"], "GenOrg", id="track_organization",
+    ),
+    pytest.param(
+        lambda: track_subscription("sub-gen"), lambda p: p["subscription_id"], "sub-gen", id="track_subscription",
+    ),
+    pytest.param(lambda: track_product("gen-product"), lambda p: p["product_name"], "gen-product", id="track_product"),
+    pytest.param(
+        lambda: track_subscriber(subscriber_id="sub-1"), lambda p: (p["subscriber"] or {}).get("id"), "sub-1",
+        id="track_subscriber",
+    ),
+    pytest.param(lambda: track_quality(0.75), lambda p: p["response_quality_score"], 0.75, id="track_quality"),
+]
+
+
+def _agent():
+    return metadata_context.get().get("agent")
+
+
+class TestTrackSubscriberWithoutValues:
+    """A subscriber decorator with nothing to set leaves the body's own metadata changes alone."""
+
+    def setup_method(self):
+        metadata_context.clear()
+
+    def teardown_method(self):
+        metadata_context.clear()
+
+    def test_sync_body_metadata_updates_survive_an_empty_track_subscriber(self):
+        @track_subscriber()
+        def work():
+            metadata_context.update(some_key="v")
+
+        work()
+
+        assert metadata_context.get().get("some_key") == "v"
+
+    def test_async_body_metadata_updates_survive_an_empty_track_subscriber(self):
+        @track_subscriber()
+        async def work():
+            metadata_context.update(some_key="v")
+
+        async def drive():
+            await work()
+            return metadata_context.get()
+
+        assert asyncio.run(drive()).get("some_key") == "v"
+
+
+class TestTrackingDecoratorsOnGenerators:
+    """The tags stay on every LiteLLM call a decorated generator body makes, one step at a time."""
+
+    def setup_method(self):
+        metadata_context.clear()
+
+    def teardown_method(self):
+        metadata_context.clear()
+
+    @pytest.mark.parametrize("make_decorator,field,expected", TRACKERS)
+    def test_calls_inside_a_decorated_sync_generator_carry_the_decorators_field(
+        self, litellm, payloads, make_decorator, field, expected
+    ):
+        @make_decorator()
+        def stream():
+            for index in range(2):
+                litellm.completion(**_completion_kwargs())
+                yield index
+
+        assert list(stream()) == [0, 1]
+
+        assert len(payloads) == 2
+        assert [field(p) for p in payloads] == [expected, expected]
+
+    @pytest.mark.parametrize("make_decorator,field,expected", TRACKERS)
+    def test_calls_inside_a_decorated_async_generator_carry_the_decorators_field(
+        self, litellm, payloads, make_decorator, field, expected
+    ):
+        @make_decorator()
+        async def stream():
+            for index in range(2):
+                await litellm.acompletion(**_completion_kwargs())
+                yield index
+
+        async def drain():
+            return [item async for item in stream()]
+
+        assert asyncio.run(drain()) == [0, 1]
+
+        assert len(payloads) == 2
+        assert [field(p) for p in payloads] == [expected, expected]
+
+    @pytest.mark.parametrize("kind", ["sync", "async"])
+    def test_caller_context_has_no_decorator_field_between_items_or_after_the_stream(self, kind):
+        seen, caller = [], []
+
+        if kind == "sync":
+            @track_agent("A")
+            def steps(fail=False):
+                for index in range(3):
+                    seen.append(_agent())
+                    if fail and index == 1:
+                        raise RuntimeError("mid-stream")
+                    yield index
+
+            for _ in steps():
+                caller.append(metadata_context.get())
+            caller.append(metadata_context.get())
+
+            with pytest.raises(RuntimeError):
+                for _ in steps(fail=True):
+                    caller.append(metadata_context.get())
+            caller.append(metadata_context.get())
+
+            closed = steps()
+            next(closed)
+            closed.close()
+            caller.append(metadata_context.get())
+        else:
+            @track_agent("A")
+            async def steps(fail=False):
+                for index in range(3):
+                    seen.append(_agent())
+                    if fail and index == 1:
+                        raise RuntimeError("mid-stream")
+                    yield index
+
+            async def drive():
+                async for _ in steps():
+                    caller.append(metadata_context.get())
+                caller.append(metadata_context.get())
+
+                with pytest.raises(RuntimeError):
+                    async for _ in steps(fail=True):
+                        caller.append(metadata_context.get())
+                caller.append(metadata_context.get())
+
+                closed = steps()
+                await closed.__anext__()
+                await closed.aclose()
+                caller.append(metadata_context.get())
+
+            asyncio.run(drive())
+
+        assert seen == ["A"] * 6
+        assert caller == [{}] * len(caller)
+        assert metadata_context.get() == {}
+
+    @pytest.mark.parametrize("kind", ["sync", "async"])
+    def test_send_throw_and_close_reach_the_decorated_generator_body(self, kind):
+        seen = []
+
+        if kind == "sync":
+            @track_agent("GenAgent")
+            def conversation():
+                try:
+                    received = yield "first"
+                    seen.append(("sent", received, _agent()))
+                    try:
+                        yield "second"
+                    except KeyError:
+                        seen.append(("thrown", _agent()))
+                    yield "third"
+                    yield "unreached"
+                finally:
+                    seen.append(("finally", _agent()))
+
+            generator = conversation()
+            assert next(generator) == "first"
+            assert generator.send("hello") == "second"
+            assert generator.throw(KeyError("boom")) == "third"
+            generator.close()
+        else:
+            @track_agent("GenAgent")
+            async def conversation():
+                try:
+                    received = yield "first"
+                    seen.append(("sent", received, _agent()))
+                    try:
+                        yield "second"
+                    except KeyError:
+                        seen.append(("thrown", _agent()))
+                    yield "third"
+                    yield "unreached"
+                finally:
+                    seen.append(("finally", _agent()))
+
+            async def drive():
+                generator = conversation()
+                assert await generator.__anext__() == "first"
+                assert await generator.asend("hello") == "second"
+                assert await generator.athrow(KeyError("boom")) == "third"
+                await generator.aclose()
+
+            asyncio.run(drive())
+
+        assert seen == [("sent", "hello", "GenAgent"), ("thrown", "GenAgent"), ("finally", "GenAgent")]
+        assert metadata_context.get() == {}
+
+    def test_stacked_tracking_decorators_on_a_generator_carry_both_fields(self, litellm, payloads):
+        @track_agent("StackAgent")
+        @track_trace("stack-trace")
+        def stream():
+            litellm.completion(**_completion_kwargs())
+            yield
+
+        list(stream())
+
+        assert len(payloads) == 1
+        assert (payloads[0]["agent"], payloads[0]["trace_id"]) == ("StackAgent", "stack-trace")
+
+    def test_dynamic_value_is_resolved_once_per_generator(self, litellm, payloads):
+        class Agent:
+            name = "first"
+
+            @track_agent(name_from_attr="name")
+            def stream(self):
+                for _ in range(2):
+                    litellm.completion(**_completion_kwargs())
+                    yield
+
+        agent = Agent()
+        generator = agent.stream()
+        next(generator)
+        agent.name = "second"
+        list(generator)
+
+        assert [p["agent"] for p in payloads] == ["first", "first"]
+
+    @pytest.mark.parametrize("make_decorator,field,expected", TRACKERS)
+    def test_a_tracked_generator_behind_a_third_party_decorator_carries_the_field(
+        self, litellm, payloads, make_decorator, field, expected
+    ):
+        """BACK-4325: a retry, tracing or caching decorator under ours keeps the stream's calls tagged."""
+        def third_party(func):
+            def wrapper(*args, **kwargs):
+                return func(*args, **kwargs)
+            return wrapper
+
+        @make_decorator()
+        @third_party
+        def stream():
+            for index in range(2):
+                litellm.completion(**_completion_kwargs())
+                yield index
+
+        assert list(stream()) == [0, 1]
+
+        assert len(payloads) == 2
+        assert [field(p) for p in payloads] == [expected, expected]
+
+    @pytest.mark.parametrize("make_decorator,field,expected", TRACKERS)
+    def test_tracked_generators_stay_generator_functions(self, make_decorator, field, expected):
+        @make_decorator()
+        def stream():
+            yield
+
+        @make_decorator()
+        async def async_stream():
+            yield
+
+        assert inspect.isgeneratorfunction(stream)
+        assert inspect.isasyncgenfunction(async_stream)
+
+    def test_each_step_in_a_fresh_context_keeps_the_tag(self, litellm, payloads):
+        @track_agent("CopiedAgent")
+        def stream():
+            for index in range(2):
+                litellm.completion(**_completion_kwargs())
+                yield index
+
+        generator = stream()
+        for _ in range(2):
+            contextvars.copy_context().run(next, generator)
+            assert metadata_context.get() == {}
+        contextvars.copy_context().run(generator.close)
+
+        assert [p["agent"] for p in payloads] == ["CopiedAgent", "CopiedAgent"]
+
+    def test_a_stream_yielded_by_the_body_and_drained_by_the_caller_keeps_the_tag(self, litellm, payloads):
+        @track_agent("StreamAgent")
+        def stream():
+            yield litellm.completion(**_completion_kwargs(stream=True))
+
+        for litellm_stream in stream():
+            list(litellm_stream)
+
+        assert len(payloads) == 1
+        assert payloads[0]["agent"] == "StreamAgent"
+        assert payloads[0]["is_streamed"] is True
+
+    def test_the_return_value_of_a_decorated_generator_reaches_a_yield_from_caller(self):
+        @track_agent("ReturnAgent")
+        def inner():
+            yield _agent()
+            return "done"
+
+        def outer():
+            result = yield from inner()
+            yield result
+
+        assert list(outer()) == ["ReturnAgent", "done"]
+
+
+class TestEmptyPerCallMetadata:
+    """BACK-4322: an empty per-call field leaves a tracking decorator's value on the record."""
+
+    def setup_method(self):
+        metadata_context.clear()
+
+    def teardown_method(self):
+        metadata_context.clear()
+
+    @pytest.mark.parametrize("blank", [None, ""], ids=["none", "empty"])
+    def test_an_empty_usage_metadata_field_keeps_the_tracking_decorators_value(self, litellm, payloads, blank):
+        @track_organization("acme")
+        def handle():
+            litellm.completion(**_completion_kwargs(usage_metadata={"trace_id": "t-1", "organization_name": blank}))
+
+        handle()
+
+        assert len(payloads) == 1
+        assert payloads[0]["organization_name"] == "acme"
+        assert payloads[0]["trace_id"] == "t-1"
+
+    def test_a_real_usage_metadata_value_still_overrides_the_tracking_decorator(self, litellm, payloads):
+        @track_organization("acme")
+        def handle():
+            litellm.completion(**_completion_kwargs(usage_metadata={"organization_name": "per-call"}))
+
+        handle()
+
+        assert len(payloads) == 1
+        assert payloads[0]["organization_name"] == "per-call"
+
+
+ARGUMENT_TRACKERS = [
+    pytest.param(lambda: track_agent(name_from_arg="value"), "agent", id="track_agent"),
+    pytest.param(lambda: track_task(type_from_arg="value"), "task_type", id="track_task"),
+    pytest.param(lambda: track_trace(id_from_arg="value"), "trace_id", id="track_trace"),
+    pytest.param(lambda: track_organization(name_from_arg="value"), "organization_name", id="track_organization"),
+    pytest.param(lambda: track_subscription(id_from_arg="value"), "subscription_id", id="track_subscription"),
+    pytest.param(lambda: track_product(name_from_arg="value"), "product_name", id="track_product"),
+]
+PASSING = pytest.mark.parametrize("passing", ["keyword", "positional"])
+EMPTY = pytest.mark.parametrize("empty", [None, ""], ids=["none", "empty"])
+
+
+def _call(function, value, passing):
+    return function("q", value=value) if passing == "keyword" else function("q", value)
+
+
+def _sends_no_field(payloads, field):
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert field not in payload or payload[field] is None
+    assert '"None"' not in json.dumps(payload, default=str)
+
+
+class TestTrackingDecoratorsWithEmptyArguments:
+    """BACK-4317: an argument passed as None or "" sets no tag, never the text "None"."""
+
+    def setup_method(self):
+        metadata_context.clear()
+
+    def teardown_method(self):
+        metadata_context.clear()
+
+    @PASSING
+    @EMPTY
+    @pytest.mark.parametrize("make_decorator,field", ARGUMENT_TRACKERS)
+    def test_an_empty_argument_sets_no_tag(self, litellm, payloads, make_decorator, field, empty, passing):
+        @make_decorator()
+        def answer(question, value):
+            return litellm.completion(**_completion_kwargs())
+
+        _call(answer, empty, passing)
+
+        _sends_no_field(payloads, field)
+
+    @PASSING
+    def test_subscriber_arguments_passed_as_none_send_no_subscriber(self, litellm, payloads, passing):
+        @track_subscriber(id_from_arg="user_id", email_from_arg="user_email", credential_from_arg="credential")
+        def answer(question, user_id, user_email, credential):
+            return litellm.completion(**_completion_kwargs())
+
+        if passing == "keyword":
+            answer("q", user_id=None, user_email=None, credential=None)
+        else:
+            answer("q", None, None, None)
+
+        assert len(payloads) == 1
+        assert not payloads[0].get("subscriber")
+        assert '"None"' not in json.dumps(payloads[0], default=str)
+
+    def test_an_empty_argument_keeps_the_outer_decorators_value(self, litellm, payloads):
+        @track_organization("acme")
+        @track_organization(name_from_arg="org")
+        def answer(question, org):
+            return litellm.completion(**_completion_kwargs())
+
+        answer("q", org=None)
+
+        assert len(payloads) == 1
+        assert payloads[0]["organization_name"] == "acme"
+
+    @EMPTY
+    def test_an_attribute_set_to_an_empty_value_sets_no_tag(self, litellm, payloads, empty):
+        class Agent:
+            name = empty
+
+            @track_agent(name_from_attr="name")
+            def answer(self):
+                return litellm.completion(**_completion_kwargs())
+
+        Agent().answer()
+
+        _sends_no_field(payloads, "agent")
+
+    @PASSING
+    @pytest.mark.parametrize("make_decorator,field", ARGUMENT_TRACKERS)
+    def test_a_real_argument_is_still_recorded(self, litellm, payloads, make_decorator, field, passing):
+        @make_decorator()
+        def answer(question, value):
+            return litellm.completion(**_completion_kwargs())
+
+        _call(answer, "acme", passing)
+
+        assert len(payloads) == 1
+        assert payloads[0][field] == "acme"
+
+
+class TestTrackingDecoratorsWithDefaultArguments:
+    """BACK-4319: how the tagged argument is passed never makes the customer's function fail."""
+
+    def setup_method(self):
+        metadata_context.clear()
+
+    def teardown_method(self):
+        metadata_context.clear()
+
+    @pytest.mark.parametrize("make_decorator,field", ARGUMENT_TRACKERS)
+    def test_a_defaulted_argument_is_recorded(self, litellm, payloads, make_decorator, field):
+        @make_decorator()
+        def run(question, value="support-agent"):
+            litellm.completion(**_completion_kwargs())
+            return "answer"
+
+        assert run("q") == "answer"
+
+        assert len(payloads) == 1
+        assert payloads[0][field] == "support-agent"
+
+    @pytest.mark.parametrize("make_decorator,field", ARGUMENT_TRACKERS)
+    def test_a_defaulted_none_argument_sets_no_tag(self, litellm, payloads, make_decorator, field):
+        @make_decorator()
+        def run(question, value=None):
+            litellm.completion(**_completion_kwargs())
+            return "answer"
+
+        assert run("q") == "answer"
+
+        _sends_no_field(payloads, field)
+
+    @pytest.mark.parametrize("call", [lambda graded: graded("q"), lambda graded: graded("q", score=None)],
+                             ids=["no_score", "score_none"])
+    def test_a_quality_scored_function_without_a_score_returns_and_sends_no_score(self, litellm, payloads, call):
+        @track_quality(score_from_arg="score")
+        def graded(question, score=None):
+            litellm.completion(**_completion_kwargs())
+            return "answer"
+
+        assert call(graded) == "answer"
+
+        _sends_no_field(payloads, "response_quality_score")
+
+    def test_a_non_numeric_quality_score_returns_and_sends_no_score(self, litellm, payloads, caplog):
+        @track_quality(score_from_arg="score")
+        def graded(question, score=None):
+            litellm.completion(**_completion_kwargs())
+            return "answer"
+
+        with caplog.at_level("WARNING", logger="revenium_middleware"):
+            assert graded("q", score="high") == "answer"
+
+        _sends_no_field(payloads, "response_quality_score")
+        warnings = [record.getMessage() for record in caplog.records if "quality_score" in record.getMessage()]
+        assert len(warnings) == 1
+        assert "high" not in warnings[0]
+
+    def test_a_quality_score_of_zero_is_recorded_as_zero(self, litellm, payloads):
+        @track_quality(score_from_arg="score")
+        def graded(question, score=None):
+            return litellm.completion(**_completion_kwargs())
+
+        graded("q", score=0)
+
+        assert len(payloads) == 1
+        assert payloads[0]["response_quality_score"] == 0.0
+
+    def test_an_argument_through_kwargs_catch_all_that_is_not_passed_sets_no_tag(self, litellm, payloads):
+        @track_agent(name_from_arg="agent_name")
+        def run(question, **extra):
+            litellm.completion(**_completion_kwargs())
+            return "answer"
+
+        assert run("q") == "answer"
+
+        _sends_no_field(payloads, "agent")
+
+    def test_an_argument_through_kwargs_catch_all_that_is_passed_is_recorded(self, litellm, payloads):
+        @track_agent(name_from_arg="agent_name")
+        def run(question, **extra):
+            return litellm.completion(**_completion_kwargs())
+
+        run("q", agent_name="catch-all-agent")
+
+        assert len(payloads) == 1
+        assert payloads[0]["agent"] == "catch-all-agent"
+
+    def test_a_call_missing_a_required_argument_raises_the_functions_own_error(self):
+        def run(question, value):
+            return "answer"
+
+        decorated = track_agent(name_from_arg="value")(run)
+
+        with pytest.raises(TypeError) as undecorated_error:
+            run()
+        with pytest.raises(TypeError) as decorated_error:
+            decorated()
+        assert str(decorated_error.value) == str(undecorated_error.value)
+
+    def test_a_misnamed_argument_still_raises(self):
+        @track_agent(name_from_arg="agent_nmae")
+        def run(question, agent_name="a"):
+            return "answer"
+
+        with pytest.raises(ValueError, match="not found"):
+            run("q")
+
+    @pytest.mark.parametrize("decorator", [
+        lambda: track_job(job_id_from_arg="job_id"),
+        lambda: track_job(job_id="j-1", type_from_arg="job_type"),
+    ], ids=["job_id", "job_type"])
+    def test_track_job_argument_not_passed_through_kwargs_catch_all_still_raises(self, decorator):
+        @decorator()
+        def process(**kw):
+            return metadata_context.get()
+
+        with pytest.raises(ValueError, match="not found"):
+            process()

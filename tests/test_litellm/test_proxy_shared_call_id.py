@@ -73,8 +73,10 @@ from revenium_middleware.litellm.proxy import middleware as mw  # noqa: E402
 from revenium_middleware.litellm.proxy.guardrail import ReveniumGuardrail  # noqa: E402
 
 from .proxy_hook_harness import (  # noqa: E402
+    HOST_TRACE_VARIABLES,
     GuardrailResponse,
     SubscriptableResponse,
+    after_pre_call,
     base_kwargs,
     drive_metering,
     guardrail_data,
@@ -208,7 +210,7 @@ async def drive_guardrail_failure(guardrail, data, error=None):
     with patch.object(gmod, "submit_ai_event") as submit, \
             patch.object(gmod, "run_async_in_thread", side_effect=drive_metering):
         await guardrail.async_post_call_failure_hook(
-            request_data=data,
+            request_data=after_pre_call(data),
             original_exception=error if error is not None
             else Exception("provider exploded"),
             user_api_key_dict=make_key_dict(),
@@ -353,7 +355,7 @@ class TestTheMint:
 
     @pytest.mark.asyncio
     async def test_pre_call_hook_mints_nothing_when_the_flag_is_off(self):
-        """Opted out: the request body is handed back untouched."""
+        """Opted out: nothing is added but the pre-call stamp."""
         data = guardrail_data()
         before = {"model": data["model"], "metadata": dict(data["metadata"])}
 
@@ -361,6 +363,7 @@ class TestTheMint:
 
         assert "litellm_metadata" not in data
         assert mw.REVENIUM_CALL_ID_KEY not in data["metadata"]
+        data["metadata"].pop(gmod._METER_KEY_FIELD)
         assert data["metadata"] == before["metadata"]
 
     @pytest.mark.asyncio
@@ -457,7 +460,7 @@ class TestTheMint:
         request before ``check_enforcement`` can raise, or the ordering makes
         the mint conditional on the budget decision.
         """
-        def _blocked(_metadata):
+        def _blocked(*_args, **_kwargs):
             raise gmod.BudgetExceededError("Team Budget breached")
 
         monkeypatch.setattr(gmod, "check_enforcement", _blocked)
@@ -477,14 +480,14 @@ class TestTheMint:
         data = guardrail_data()
         assert await run_pre_call(new_guardrail(), data) is data
 
-        def _blocked(_metadata):
+        def _blocked(*_args, **_kwargs):
             raise gmod.BudgetExceededError("Team Budget breached")
 
         monkeypatch.setattr(gmod, "check_enforcement", _blocked)
         with pytest.raises(gmod.HTTPException):
             await run_pre_call(new_guardrail(), guardrail_data())
 
-        def _exploded(_metadata):
+        def _exploded(*_args, **_kwargs):
             raise RuntimeError("enforcement service unreachable")
 
         monkeypatch.setattr(gmod, "check_enforcement", _exploded)
@@ -922,6 +925,9 @@ class TestTheDefault:
         pytest.param("false", False, id="false"),
         pytest.param("FALSE", False, id="false-uppercase"),
         pytest.param("0", False, id="zero"),
+        pytest.param("", True, id="blank"),
+        pytest.param("  ", True, id="whitespace"),
+        pytest.param(" true", True, id="padded-true"),
     ])
     def test_the_flag_is_on_unless_opted_out(self, monkeypatch, value, enabled):
         from revenium_middleware._core.config import is_shared_call_id_enabled
@@ -934,15 +940,27 @@ class TestTheDefault:
         assert is_shared_call_id_enabled() is enabled
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", [
+        pytest.param(None, id="unset"),
+        pytest.param("", id="blank"),
+        pytest.param("  ", id="whitespace"),
+    ])
     async def test_an_unset_flag_hands_the_client_the_id_the_row_carries(
-        self, monkeypatch
+        self, monkeypatch, value
     ):
-        """Acceptance criterion 1: the header and the metered row agree."""
-        monkeypatch.delenv(FLAG, raising=False)
+        """Acceptance criterion 1: the header and the metered row agree.
+
+        A blank value is what a deployment template passes through for an
+        unset host variable, so it must mint exactly as unset does (BACK-4019).
+        """
+        if value is None:
+            monkeypatch.delenv(FLAG, raising=False)
+        else:
+            monkeypatch.setenv(FLAG, value)
         guardrail = new_guardrail(event_hook=["pre_call", "post_call"])
         data = guardrail_data()
         await run_pre_call(guardrail, data)
-        minted, _, _ = mint_keys(data["litellm_metadata"])
+        minted, _, _ = mint_keys(data.get("litellm_metadata", {}))
 
         headers = await guardrail.async_post_call_response_headers_hook(
             data=data,
@@ -954,7 +972,7 @@ class TestTheDefault:
             response=GuardrailResponse(response_id="chatcmpl-paid", usage=Usage()),
         )
 
-        assert UUID4.fullmatch(minted), minted
+        assert UUID4.fullmatch(minted or ""), minted
         assert headers["request-id"] == minted
         assert submitted_args(submit)["transaction_id"] == minted
 
@@ -1001,7 +1019,7 @@ class TestFlagOffParity:
     """With the flag off, nothing this PR adds is observable."""
 
     @pytest.mark.asyncio
-    async def test_flag_off_output_is_byte_identical_to_today_on_the_guardrail(self):
+    async def test_flag_off_output_is_byte_identical_to_today_on_the_guardrail(self, monkeypatch):
         """Both guardrail hooks, whole payload, against a frozen dict.
 
         Two kinds of value cannot be frozen and are pinned by shape instead,
@@ -1010,6 +1028,8 @@ class TestFlagOffParity:
         digits per event. Every other key, and the key set itself, is compared
         literally, so a value this PR changed or a key it added fails here.
         """
+        for name in HOST_TRACE_VARIABLES:
+            monkeypatch.delenv(name, raising=False)
         guardrail = new_guardrail()
 
         data = guardrail_data()
@@ -1234,6 +1254,45 @@ class TestStartupWarning:
         ]
         naming_pre_call = [m for m in messages if "pre_call" in m and FLAG in m]
         assert len(naming_pre_call) == 1, messages
+
+    def test_an_opted_out_guardrail_says_so_at_startup(self, caplog):
+        """BACK-4019: an operator who turned it off, or typed a value that
+        reads as off, sees that at startup instead of nothing at all."""
+        caplog.set_level("INFO", logger="revenium_middleware.extension")
+        new_guardrail(event_hook=["pre_call", "post_call"])
+
+        saying_off = [
+            record.getMessage() for record in caplog.records
+            if FLAG in record.getMessage() and "is off" in record.getMessage()
+        ]
+        assert len(saying_off) == 1, [r.getMessage() for r in caplog.records]
+        assert "'false'" in saying_off[0], saying_off[0]
+
+    def test_a_padded_opt_out_is_logged_without_its_padding(self, monkeypatch, caplog):
+        """BACK-4019: a padded typo such as " ture " reads as off, and the
+        startup line shows the typo instead of hiding it as whitespace."""
+        monkeypatch.setenv(FLAG, " ture ")
+        caplog.set_level("INFO", logger="revenium_middleware.extension")
+        new_guardrail(event_hook=["pre_call", "post_call"])
+
+        saying_off = [
+            record.getMessage() for record in caplog.records
+            if FLAG in record.getMessage() and "is off" in record.getMessage()
+        ]
+        assert len(saying_off) == 1, [r.getMessage() for r in caplog.records]
+        assert "'ture'" in saying_off[0], saying_off[0]
+
+    def test_a_blank_flag_guardrail_mints_and_says_it_is_on(self, monkeypatch, caplog):
+        """BACK-4019: a blank value is unset, so the default holds and is logged."""
+        monkeypatch.setenv(FLAG, "")
+        caplog.set_level("INFO", logger="revenium_middleware.extension")
+
+        guardrail = new_guardrail(event_hook=["pre_call", "post_call"])
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert guardrail._shared_id_active
+        assert len([m for m in messages if FLAG in m and "is on" in m]) == 1, messages
+        assert not [m for m in messages if FLAG in m and "is off" in m], messages
 
 
 # --- Retries and the mixed configuration ---------------------------------

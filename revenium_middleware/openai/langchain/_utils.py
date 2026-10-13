@@ -53,7 +53,8 @@ def _check_langchain_cached() -> Tuple[bool, Optional[Exception]]:
         _langchain_check_cache = (True, None)
         logger.debug("LangChain is available")
     except ImportError as e:
-        _langchain_check_cache = (False, e)
+        # A cached traceback would keep the first caller's frames alive for good.
+        _langchain_check_cache = (False, e.with_traceback(None))
         logger.debug(f"LangChain is not available: {e}")
 
     return _langchain_check_cache

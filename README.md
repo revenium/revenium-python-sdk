@@ -16,11 +16,10 @@ The official Revenium Python SDK — unified AI metering middleware for deeply a
 - **Decorator Support**: `@revenium_metadata` for automatic metadata injection and `@revenium_meter` for selective metering
 - **Tool Metering**: `@meter_tool` to meter arbitrary tool/function calls alongside LLM API metering
 - **Prompt Capture**: Optional capture of prompts and responses for analytics and debugging
-- **Terminal Summary**: Real-time cost and usage summaries in your terminal (human-readable or JSON)
 - **Distributed Tracing**: Built-in trace visualization fields for cross-service observability
 - **Asynchronous Processing**: Usage records are sent from a fixed pool of background threads, never on your request path
-- **Graceful Shutdown**: Flushes pending metering data when the process exits, within a bounded time, without taking over your application's signal handling
-- **Thread-Safe**: Production-ready with `contextvars`-based context management for concurrent applications
+- **Graceful Shutdown**: Flushes pending metering data when the process exits, and when a `multiprocessing` worker process finishes its job, within a bounded time, without taking over your application's signal handling; `flush_metering()` flushes on demand
+- **Thread-Safe**: Production-ready with `contextvars`-based context management for concurrent applications; wrap worker thread targets with `carry_context` (see [Decorator Support](#decorator-support))
 
 ## Supported Providers
 
@@ -28,6 +27,7 @@ The official Revenium Python SDK — unified AI metering middleware for deeply a
 |----------|-------|----------------|
 | OpenAI | `openai` | `pip install revenium-python-sdk[openai]` |
 | Azure OpenAI | `openai` | `pip install revenium-python-sdk[openai]` |
+| xAI (Grok, via OpenAI SDK) | `openai` | `pip install revenium-python-sdk[openai]` |
 | Anthropic | `anthropic` | `pip install revenium-python-sdk[anthropic]` |
 | AWS Bedrock (Anthropic) | `anthropic` | `pip install revenium-python-sdk[anthropic]` |
 | Google Gemini | `google-genai` | `pip install revenium-python-sdk[google-genai]` |
@@ -41,23 +41,56 @@ The official Revenium Python SDK — unified AI metering middleware for deeply a
 | LangChain | `langchain` | `pip install revenium-python-sdk[langchain]` |
 | Griptape | `griptape` | `pip install revenium-python-sdk[griptape]` |
 
+Not supported: Runway video generation is not metered automatically; to record those calls, wrap them with `@meter_tool` (see [Tool Metering](#tool-metering)).
+
 ## Feature Matrix
 
 | Feature | OpenAI | Anthropic | Google | Ollama | LiteLLM | Perplexity | fal.ai |
 |---------|--------|-----------|--------|--------|---------|------------|--------|
-| Chat Completions | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Chat Completions | Yes\* | Yes | Yes | Yes | Yes | Yes | Yes |
 | Streaming | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | Embeddings | Yes | - | Yes | Yes | Yes | - | - |
 | Vision/Multimodal | Yes | Yes | Yes | - | Yes | - | Yes |
+| Audio (speech, transcription, translation) | Yes | - | - | - | Proxy mode | - | Yes |
 | Image Generation | - | - | Yes | - | - | - | Yes |
-| Video Generation | - | - | Yes | - | - | - | Yes |
-| Prompt Capture | Yes | Yes | Yes | - | Yes | - | - |
-| Terminal Summary | Yes | Yes | Yes | Yes | Yes | - | - |
+| Video Generation | - | - | Yes[^veo] | - | - | - | Yes |
+| Prompt Capture | Yes | Yes | Yes | - | Client mode[^litellm-capture] | - | - |
 | Azure / Bedrock | Azure | Bedrock | Vertex AI | - | All | - | - |
 | LangChain Integration | Yes | - | - | - | - | - | - |
 | Griptape Integration | Yes | Yes | - | Yes | Yes | - | - |
-| CrewAI Integration | - | - | - | - | Yes | - | - |
+| CrewAI Integration | Yes | Yes | Yes | - | Yes | - | - |
 | Proxy Mode | - | - | - | - | Yes | - | - |
+
+[^litellm-capture]: LiteLLM prompt capture covers chat calls your own code makes (`completion`, `acompletion` and their streams). The LiteLLM gateway plugin (`ReveniumGuardrail`) does not capture prompts or replies.
+
+\* OpenAI's `chat.completions` and `responses` calls are metered[^openai-background]; the legacy `completions.create` endpoint is not.
+
+[^openai-background]: An OpenAI background response (`responses.create(background=True)`) is recorded when your code's `responses.retrieve(...)`, a resumed stream (`responses.retrieve(..., stream=True)` or `responses.stream(response_id=...)`) or `responses.cancel(...)` first sees the job finish, with the `usage_metadata` you gave at create. A background job you never retrieve, or retrieve only from a different process than the one that created it or after a restart, is not recorded. A cancelled background job is recorded when OpenAI reports usage for it on the first call that sees it cancelled, usually `responses.cancel(...)`; a cancelled job with no usage on that call is not recorded. A background stream cut off part-way and never resumed or retrieved is not recorded. Background jobs created through `beta.responses` are not metered. A background job created through `responses.with_streaming_response.create(..., background=True)` is not recorded, even when you retrieve it later. Reading a finished job only through `responses.with_streaming_response.retrieve(...)` does not record it; the job stays pending, and the next `responses.retrieve(...)` or `responses.with_raw_response.retrieve(...)` in the same process records it once.
+
+[^veo]: A Veo video through `google.genai` (the Gemini API, or Vertex AI with `vertexai=True`) is recorded when your code's `client.operations.get(...)` (or `client.aio.operations.get(...)`) first sees the operation finish, billed at the requested clip length times the videos returned (Google's response carries no duration). A failed operation is recorded as a failed, zero-second video. When the request sets `webhook_config` or `pubsub_topic`, the video is recorded when you submit it. A video you never poll, or poll from a different process than the one that submitted it, is not recorded.
+
+Some billable provider calls are not metered at all: see [Calls the SDK does not meter](#calls-the-sdk-does-not-meter).
+
+## Calls the SDK does not meter
+
+The calls below are billed by the provider (some, such as batch and fine-tuning jobs, when the job runs rather than when you call them), but the SDK records no usage for them: nothing reaches Revenium and nothing is logged. On every build a test compares this list with the SDK's inventory of the public calls of the OpenAI, Anthropic, Perplexity, Gemini, Ollama, LiteLLM and fal clients, boto3's Bedrock Runtime client, and the Vertex AI model, session, batch prediction, tuning and context-cache classes, on the provider versions the SDK is tested on. Calls reached another way, for example LangChain classes that call their own vendor SDK, are outside that check, except LangChain embeddings, listed by hand below; wrapping one with `wrap()` logs a warning. Sync and async forms are folded into one name, and the `with_raw_response` and `with_streaming_response` forms of a listed call are not metered either. To record any of these calls, wrap it with `@meter_tool` (see [Tool Metering](#tool-metering)).
+
+<!-- not-metered:start -->
+- **OpenAI** (`OpenAI` and `AsyncOpenAI` clients): `batches.create`, `beta.agents.sessions.create`, `beta.agents.sessions.events.create`, `beta.agents.sessions.events.stream`, `beta.agents.sessions.stream`, `beta.agents.sessions.update`, `beta.chatkit.sessions.create`, `beta.realtime.connect`, `beta.responses.compact`, `beta.responses.connect`, `beta.responses.create`, `beta.threads.create_and_run`, `beta.threads.create_and_run_poll`, `beta.threads.create_and_run_stream`, `beta.threads.runs.create`, `beta.threads.runs.create_and_poll`, `beta.threads.runs.create_and_stream`, `beta.threads.runs.stream`, `beta.threads.runs.submit_tool_outputs`, `beta.threads.runs.submit_tool_outputs_and_poll`, `beta.threads.runs.submit_tool_outputs_stream`, `completions.create`, `decisions.create`, `evals.runs.create`, `fine_tuning.alpha.graders.run`, `fine_tuning.jobs.create`, `images.create_variation`, `images.edit`, `images.generate`, `live.connect`, `live.create`, `live.forks.connect`, `live.sessions.accept`, `live.sessions.fork`, `live.sideband.connect`, `realtime.calls.accept`, `realtime.calls.create`, `realtime.connect`, `responses.compact`, `responses.connect`, `videos.create`, `videos.create_and_poll`, `videos.create_character`, `videos.edit`, `videos.extend`, `videos.remix`
+- **Anthropic** (`Anthropic` and `AsyncAnthropic` clients): `beta.deployments.run`, `beta.dreams.create`, `beta.environments.work.poller`, `beta.environments.work.worker`, `beta.messages.batches.create`, `beta.sessions.create`, `beta.sessions.events.send`, `beta.sessions.events.stream`, `beta.sessions.events.tool_runner`, `beta.sessions.threads.events.stream`, `messages.batches.create`
+- **Google Gemini** (`google.genai` `Client` and `Client.aio`): `batches.create`, `batches.create_embeddings`, `caches.create`, `caches.update`, `file_search_stores.import_file`, `file_search_stores.upload_to_file_search_store`, `interactions.create`, `live.connect`, `live.music.connect`, `models.edit_image`, `models.recontext_image`, `models.segment_image`, `models.upscale_image`, `triggers.run`, `tunings.tune`
+- **Google Vertex AI** (`vertexai` classes): `batch_prediction.BatchPredictionJob.submit`, `caching.CachedContent.create`, `caching.CachedContent.update`, `language_models.ChatModel.tune_model`, `language_models.ChatModel.tune_model_rlhf`, `language_models.ChatSession.send_message`, `language_models.ChatSession.send_message_async`, `language_models.ChatSession.send_message_streaming`, `language_models.ChatSession.send_message_streaming_async`, `language_models.CodeChatModel.tune_model`, `language_models.CodeChatSession.send_message`, `language_models.CodeChatSession.send_message_async`, `language_models.CodeChatSession.send_message_streaming`, `language_models.CodeChatSession.send_message_streaming_async`, `language_models.CodeGenerationModel.batch_predict`, `language_models.CodeGenerationModel.predict`, `language_models.CodeGenerationModel.predict_async`, `language_models.CodeGenerationModel.predict_streaming`, `language_models.CodeGenerationModel.predict_streaming_async`, `language_models.CodeGenerationModel.tune_model`, `language_models.TextEmbeddingModel.batch_predict`, `language_models.TextEmbeddingModel.deploy_tuned_model`, `language_models.TextEmbeddingModel.tune_model`, `language_models.TextGenerationModel.batch_predict`, `language_models.TextGenerationModel.predict`, `language_models.TextGenerationModel.predict_async`, `language_models.TextGenerationModel.predict_streaming`, `language_models.TextGenerationModel.predict_streaming_async`, `language_models.TextGenerationModel.tune_model`, `language_models.TextGenerationModel.tune_model_rlhf`, `preview.caching.CachedContent.create`, `preview.caching.CachedContent.update`, `preview.vision_models.ImageCaptioningModel.get_captions`, `preview.vision_models.ImageGenerationModel.upscale_image`, `preview.vision_models.ImageQnAModel.ask_question`, `preview.vision_models.ImageSegmentationModel.segment_image`, `preview.vision_models.ImageTextModel.ask_question`, `preview.vision_models.ImageTextModel.get_captions`, `preview.vision_models.MultiModalEmbeddingModel.get_embeddings`, `preview.vision_models.WatermarkVerificationModel.verify_image`, `tuning.sft.train`, `vision_models.ImageCaptioningModel.get_captions`, `vision_models.ImageGenerationModel.upscale_image`, `vision_models.ImageQnAModel.ask_question`, `vision_models.ImageTextModel.ask_question`, `vision_models.ImageTextModel.get_captions`, `vision_models.MultiModalEmbeddingModel.get_embeddings`
+- **AWS Bedrock** (boto3 bedrock-runtime client; Claude models are metered when REVENIUM_BEDROCK_TRANSPORT is on): `apply_guardrail`, `converse`, `converse_stream`, `invoke_guardrail_checks`, `invoke_model`, `invoke_model_with_response_stream`, `start_async_invoke`
+- **Perplexity** (`Perplexity` and `AsyncPerplexity` clients): `async_.chat.completions.create`, `browser.sessions.create`, `contextualized_embeddings.create`, `embeddings.create`, `responses.create`, `search.create`
+- **LiteLLM** (the `litellm` module): `aadapter_completion`, `aadapter_generate_content`, `acode_interpreter_tool`, `acompact_responses`, `acreate_batch`, `acreate_fine_tuning_job`, `acreate_run`, `acreate_sandbox`, `adapter_completion`, `adecisions`, `agenerate_content`, `aimage_edit`, `aimage_generation`, `aimage_variation`, `aingest`, `anthropic_interface.messages.acreate`, `anthropic_interface.messages.create`, `anthropic_messages`, `anthropic_messages_handler`, `aocr`, `aquery`, `arealtime_calls`, `arerank`, `aresponses`, `aresponses_api_with_mcp`, `aresponses_with_retries`, `arun_code`, `arun_thread`, `arun_thread_stream`, `asearch`, `aspeech`, `asystemone`, `atranscription`, `avideo_create_character`, `avideo_edit`, `avideo_extension`, `avideo_generation`, `avideo_remix`, `compact_responses`, `config_completion`, `create_batch`, `create_fine_tuning_job`, `create_run`, `decisions`, `image_edit`, `image_generation`, `image_variation`, `ingest`, `nlp_cloud_chat_completion`, `ocr`, `query`, `replicate_chat_completion`, `rerank`, `responses`, `responses_with_retries`, `run_thread`, `run_thread_stream`, `search`, `speech`, `systemone`, `transcription`, `video_create_character`, `video_edit`, `video_extension`, `video_generation`, `video_remix`
+- **Ollama** (`Client`, `AsyncClient` and the `ollama` module): `systemone`, `web_fetch`, `web_search`
+- **fal.ai** (`SyncClient`, `AsyncClient` and the `fal_client` module): `realtime`, `realtime_async`, `ws_connect`, `ws_connect_async`
+- **LangChain** (embeddings models from vendors other than OpenAI, Azure OpenAI and Ollama, such as `MistralAIEmbeddings`): `Embeddings.aembed_documents`, `Embeddings.aembed_query`, `Embeddings.embed_documents`, `Embeddings.embed_query`
+<!-- not-metered:end -->
+
+Raw boto3 calls to AWS Bedrock send no usage record for any model unless `REVENIUM_BEDROCK_TRANSPORT` is set to `1` or `true`; with it set, Claude models on `invoke_model`, `invoke_model_with_response_stream`, `converse` and `converse_stream` are metered, and other models still are not. Claude through `AnthropicBedrock` is metered either way. `boto3.client("bedrock-agent-runtime")` (`invoke_agent`, `retrieve_and_generate`), Bedrock batch inference through `boto3.client("bedrock").create_model_invocation_job`, and Vertex AI `evaluation`, `agent_engines` and `rag` are also not metered and are outside the check.
+
+LiteLLM's `transcription` and `atranscription` calls to OpenAI models are recorded when `revenium_middleware.openai` is also imported, because LiteLLM sends them through the OpenAI SDK, which that integration meters; that record carries none of the `usage_metadata` passed to LiteLLM. Without that import they are not recorded.
 
 ## Installation
 
@@ -170,6 +203,8 @@ Emit per-agent terminal outcomes (`CONVERTED`, `DEFLECTED`, `ESCALATED`) alongsi
 
 > **You need a write-scope key (`rev_sk_`) to use the agentic outcomes API.** Metering keys (`rev_mk_`) can only meter completions and tool events — they cannot report, amend, or read job outcomes, and the SDK rejects them client-side before any HTTP request is made. Key resolution: explicit `api_key=` > `REVENIUM_WRITE_API_KEY` > `REVENIUM_OUTCOME_API_KEY` (deprecated fallback) > `REVENIUM_METERING_API_KEY`.
 
+Outcome, job and job-type economics calls go to the same Revenium address as usage records: `REVENIUM_METERING_BASE_URL`, or `https://api.revenium.ai` when it is unset. Set `REVENIUM_PROFITSTREAM_BASE_URL`, or pass `profitstream_base_url=`, only when outcomes live at a different address.
+
 ### Job-Type Economics and Outcome Facts
 
 Keep a metering key for AI telemetry and a separate write key for outcomes and
@@ -251,8 +286,10 @@ with JobContext("loan-app-12345", type="loan_processing", version="2.1") as job:
 ```
 
 - **Async:** `async with JobContext(...) as job:` works identically.
-- **Auto-FAILED:** if an unhandled exception escapes the block before an outcome was reported, the context automatically reports `execution_status="FAILED"` (error message and class in metadata) and always re-raises the original exception.
-- **Blocking:** outcome calls are synchronous HTTP requests with retries; tune how long they may block with the `retry_attempts`, `retry_initial_seconds`, and `retry_max_seconds` arguments, accepted by the `JobContext` constructor, `JobContext.attach()`, `get_outcome_history()`, and the CrewAI wrapper's `report_job_outcome`/`amend_job_outcome`.
+- **Auto-FAILED:** if an unhandled exception escapes the block, the context automatically reports `execution_status="FAILED"` (the exception's class in `metadata.error`, `metadata.errorType` and the outcome reason; its message too when `REVENIUM_CAPTURE_ERROR_MESSAGES=true`, redacted as for failed tool events and capped at 2048 characters; an exception from a provider's HTTP error, which can quote the request, sends its class only unless `REVENIUM_CAPTURE_PROMPTS=true` as well) and always re-raises the original exception. It skips the FAILED when a `report_outcome` or `amend_outcome` call succeeded, the platform answered that the job already has an outcome, the exception escaping the block is the one your own `report_outcome`/`amend_outcome` raised, or that call found no such job (404). So a report you caught that failed, followed by a crash, still gets FAILED. If the caught report was in fact stored (a timeout after the platform saved it), the automatic FAILED is refused as already reported and only logged; the stored outcome stands.
+- **Job id format:** Revenium refuses any other job id on AI calls, so a job id must start with an ASCII letter or digit, contain only ASCII letters, digits, `.`, `_` and `-`, be at most 255 characters, and not be `types` or `conversion-funnel`. Entering `JobContext` with any other id raises `ValueError` before any call is made. `JobContext.attach()` still accepts such an id, for reporting on a job created with `create_job`. An id from `usage_metadata`, `@track_job`, `REVENIUM_AGENTIC_JOB_ID` or proxy headers that breaks the rule is left off the call: the call is still metered, a warning is logged once per id, and the call does not fall back to the surrounding job's id. AI calls never create a job under such an id, so `report_outcome` on it fails with a 404 after its retries unless the job was created with `create_job`.
+- **Blocking:** outcome calls are synchronous HTTP requests with retries; tune how long they may block with the `retry_attempts`, `retry_initial_seconds`, and `retry_max_seconds` arguments, accepted by the `JobContext` constructor, `JobContext.attach()`, `get_outcome_history()`, the job reads in [Reading Jobs Back](#reading-jobs-back), and the CrewAI wrapper's `report_job_outcome`/`amend_job_outcome`.
+- **Retry after a gateway error:** when a gateway answers 502, 503 or 504 and the retry is then refused as already reported, the SDK reads the job once and treats the report as delivered if the stored outcome is the one it sent, unamended. An identical outcome stored by another writer in that gap is reported as success too; the reporter label (`reported_by`) and `metrics` facts are not checked. A timeout or connection error on the report itself is not retried.
 - **Team resolution:** explicit `team_id=` > `REVENIUM_TEAM_ID` > automatic resolution from the API key; `OutcomeReportingError` is raised if none of these yields a team.
 - **Nesting:** a nested `JobContext` is a different job (replace, not merge); exiting the inner context restores the outer job's fields.
 
@@ -299,7 +336,7 @@ except OutcomeAmendConflictError as conflict:
                           expected_entity_version=conflict.current_entity_version)
 ```
 
-The handle also records that version, so the retry above works with or without passing `expected_entity_version=` explicitly. `current_entity_version` is `None` when the conflict body carries no version; the version then has to come from a job read (`GET /v2/api/jobs/{agenticJobId}`), which this SDK does not wrap yet, and a retry without it is unlocked (last-write-wins). `get_outcome_history()` rows carry an `amendment_sequence`, not an entity version — history tells you *what* changed, never which version to retry with.
+The handle also records that version, so the retry above works with or without passing `expected_entity_version=` explicitly. `current_entity_version` is `None` when the conflict body carries no version; read it with `get_job(job_id)["entityVersion"]`; a retry without it is unlocked (last-write-wins). `get_outcome_history()` rows carry an `amendment_sequence`, not an entity version. History tells you *what* changed, never which version to retry with.
 
 Every outcome call replaces the recorded version with the one its response reports, including clearing it when a response carries none, so a completed call never leaves a token behind that the platform has already moved past.
 
@@ -337,11 +374,39 @@ handle.close()
 
 - **Declare the metric first:** a fact only lands if the job type's economics contract declares that key as a `PER_JOB` metric; an undeclared key is rejected with a 400. `quality_rate` is a rate and the platform range-checks it to 0..1.
 - **Entry shape:** `key` and `value` are required; `provenance` (`MEASURED` | `SELF_REPORTED` | `DERIVED` | `ATTESTED`), `recordedBy`, `source`, `reason` and `recordedAt` are optional. Entries are sent exactly as you write them, so the fields you omit take the platform's defaults (`SELF_REPORTED`, the calling principal, `api`) instead of being guessed by the SDK. A missing `key` or `value` — or no entries at all on `append_outcome_metrics()` — raises `ValueError` before any HTTP request, on `JobContext` and `AgenticOutcomeClient` alike.
-- **Append-only:** facts accumulate; the SDK never dedupes or replaces one, because the platform owns fact identity. `metrics=` on `amend_outcome()` appends as part of the amendment.
+- **One active fact per key:** a job keeps one active fact for each metric key. Appending a key the job already has supersedes the earlier fact (the earlier fact is deactivated, not deleted), and the platform refuses that append with a 400 unless the entry carries a `reason`. The same key twice in one request is refused. The SDK sends entries as written and never dedupes them. `metrics=` on `amend_outcome()` records facts as part of the amendment; a repeated key there also supersedes the earlier fact, and the amendment's own reason (or the platform's automated reason for an API-key caller) is used when an entry has none.
 - **Not part of outcome history:** `get_outcome_history()` returns the outcome revisions only — appended facts do not appear in those rows.
-- **Retries:** an append is retried only on `429`, which proves the platform rejected the request before recording anything. A `502`/`503`/`504` is raised instead of retried: the facts may already be recorded, and a second append is a second fact, so the decision to resend is yours (check the recorded facts first).
+- **Retries:** an append is retried only on `429`, which proves the platform rejected the request before recording anything. A `502`/`503`/`504` is raised instead of retried: the facts may already be recorded, and resending a key that is already recorded is a correction, refused without a `reason` and, with one, superseding the fact, so the decision to resend is yours (check the recorded facts first).
 - **Locking is unaffected:** appending facts does not change the job's `entityVersion`, so the handle keeps the version it recorded and a following `amend_outcome()` still locks against it. (`report_outcome()` and `amend_outcome()` clear the recorded version when their response carries none, because those calls advance it; an append does not.)
 - **Why it matters:** AI Alerts evaluate `QUALITY_RATE` from these facts, so a job whose integration emits none is invisible to those rules.
+
+### Reading Jobs Back
+
+These calls need a write-scope key (`rev_sk_`), like every other outcome call. A metering key (`rev_mk_`) is rejected before any request.
+
+```python
+from revenium_middleware import (
+    get_conversion_funnel, get_job, get_job_roi, get_job_transactions,
+    get_job_types, list_jobs,
+)
+
+page = list_jobs(job_type="loan_processing", execution_status="SUCCESS", size=50)
+for job in page["content"]:
+    print(job["agenticJobId"], job["outcomeType"])
+
+version = get_job("loan-app-12345")["entityVersion"]
+types = get_job_types()
+roi = get_job_roi("loan-app-12345")["roi"]
+calls = get_job_transactions("loan-app-12345")["transactions"]
+rate = get_conversion_funnel(
+    start_date="2026-09-01T00:00:00Z", end_date="2026-09-30T23:59:59Z",
+)["conversionRate"]
+```
+
+- **Results are the API's JSON:** each call returns dicts with the field names the API sends (camelCase), so a field the platform adds later reaches you without an SDK upgrade.
+- **Paging:** `list_jobs` returns `{"content": [...], "page": {...}}`; `page` is 0-based and only the filters you pass are sent.
+- **Missing job:** a job that does not exist raises `httpx.HTTPStatusError` (404).
+- **Team and retries:** team resolution and the retry knobs work as for `get_outcome_history()`.
 
 ### Outcome Exceptions
 
@@ -370,6 +435,16 @@ client.report_outcome(job_id, {...})       # close the job with a terminal outco
 client.append_outcome_metrics(job_id, [...])  # append declared per-job facts later
 client.close()
 ```
+
+In an `emit_completion` payload the agent is named by `agent`. `agentName` and `currency` are not sent (Revenium does not store them); `emit_completion` names them in its one-time warning about unsent keys.
+
+`emit_completion` and `emit_tool_event` queue the record and return at once, like every automatic record: the SDK's background threads send it with the same timeouts and retries (see [Metering Delivery and Timeouts](#metering-delivery-and-timeouts)), and a record that fails with a timeout, a refused connection or a 5xx goes to the store-and-forward buffer and is sent when Revenium is reachable again. Delivery errors are logged, not raised; `emit_completion` still raises `ValueError` before anything is queued when the payload is missing a required key. Both calls return the payload you passed.
+
+Records go to the address set in code with `initialize_metering(base_url=...)` or a `metering_key(..., base_url=...)` block when one is set, else `REVENIUM_METERING_BASE_URL`; pass `meter_base_url=` to `AgenticOutcomeSettings` to pin another address. They are always sent under the settings' `api_key`, never a `metering_key()` key. `http_client=` serves jobs and outcomes only.
+
+A script that emits many records and exits right away has `REVENIUM_SHUTDOWN_TIMEOUT_SECONDS` (default 5) to send the records still queued; raise it if records are reported unsent at exit.
+
+`emit_tool_event` sends one `Idempotency-Key` per call and reuses it when the buffer replays the event, so a tool event replayed after a gateway error is stored once.
 
 The job is created implicitly by the first metric ingested for `agenticJobId`. Call `client.create_job(job_id)` explicitly if you need to record an agent run before emitting any metrics; it returns the created job resource merged over the fields you supplied, including the `entityVersion` an outcome amendment sends back as `expectedEntityVersion`.
 
@@ -400,6 +475,16 @@ with idempotency_key(f"order-{order_id}"):
 
 The context manager is backed by `contextvars`, so it scopes correctly across threads and asyncio tasks.
 
+### Several calls in one block
+
+- Each model call in a block gets its own key: `order-42`, then `order-42:2`, `order-42:3` and so on, in the order its usage record is delivered. That can differ from the order the calls were made, because records are delivered in the background. Every call in the block is recorded.
+- A retry the SDK makes itself (an HTTP retry, or a replay from the delivery buffer) reuses the same key and is stored once.
+- Rerunning the same block is refused call by call, up to the number of calls the original block made: each refusal is logged and counted as a metering error, and the rerun's provider spend is not recorded. Calls beyond the original count are recorded.
+- A block key that ends in `:<number>`, such as `order-42:2`, can collide with another block's derived keys. Avoid that shape.
+- Tool events are not keyed by the block; each tool event carries its own key (see [Tool Metering](#tool-metering)).
+- fal queue jobs are not keyed by the block either; each job's record uses its own key, `fal-<request id>` (see [fal.ai](#falai)).
+- If a derived key would be longer than 255 characters, the SDK uses the SHA-256 hex digest of the block key in its place, so the key stays valid and the same on every rerun.
+
 ### Backend behavior
 
 | Scenario | Backend response |
@@ -414,7 +499,7 @@ See [docs.revenium.io/integrations/idempotency](https://docs.revenium.io/integra
 
 ### Key format
 
-`Idempotency-Key` must be 1–255 printable ASCII characters. UUID v4 is the recommended format and what the SDK generates by default.
+`Idempotency-Key` must be 1–255 printable ASCII characters, with no leading or trailing spaces. `idempotency_key()` and `set_idempotency_key()` raise `ValueError` for an empty key and for any other key that breaks this rule (an accented or non-Latin letter, a line break, a tab, a leading or trailing space, or more than 255 characters), before anything in the block runs. UUID v4 is the recommended format and what the SDK generates by default.
 
 ---
 
@@ -475,7 +560,7 @@ Webhook deliveries without a configured signing secret arrive without HMAC heade
 
 ### OpenAI
 
-Supports chat completions, streaming, embeddings, function calling, and vision/multimodal.
+Supports chat completions, streaming, embeddings, function calling, vision/multimodal, and audio (speech, transcription and translation).
 
 ```python
 from dotenv import load_dotenv
@@ -515,9 +600,28 @@ embedding = client.embeddings.create(
 )
 ```
 
+A chat or Responses call the provider refuses (a 400, 429 or 500, for example), streamed or not, sends one record with stop reason `ERROR`, zero tokens and the error's class and HTTP status as its error reason (plus the provider's redacted error message when both `REVENIUM_CAPTURE_ERROR_MESSAGES` and `REVENIUM_CAPTURE_PROMPTS` are `true`; a provider's error can quote the request, so it is never sent with prompt capture off), cut to 255 characters with its "(HTTP <status>)" ending kept; a stream that breaks off part-way is recorded with stop reason `ERROR` too. The HTTP status is also sent as the record's error code; a call that got no HTTP error answer (a connection error, a timeout, or a stream that broke off) has none. Your code still gets the original exception. Embeddings, `parse()` and calls a spending cap refuses send no error record.
+
+#### Audio
+
+`audio.transcriptions.create`, `audio.translations.create` and `audio.speech.create` (sync, async, `with_raw_response` and `with_streaming_response`, on `OpenAI` and `AzureOpenAI`) each send one audio record, with `usage_metadata` attribution like a chat call. Spending caps apply to them as they do to chat.
+
+```python
+transcript = client.audio.transcriptions.create(model="whisper-1", file=open("call.mp3", "rb"))
+speech = client.audio.speech.create(model="tts-1", voice="alloy", input="Your order has shipped.")
+```
+
+What each record carries:
+- **Transcription and translation:** the audio seconds OpenAI bills (`usage.seconds`, else the `duration` of a `verbose_json` response), or, for models OpenAI bills by token (`gpt-4o-transcribe`, `gpt-4o-mini-transcribe`), the input, output and audio input tokens. A streamed transcription is recorded once, when the stream ends or is closed.
+- **Speech:** the number of characters in `input`, plus `voice`, `speed` and `response_format`. The audio itself is never read.
+
+Some calls report no duration, so their record is stored with a duration of zero and no cost: transcriptions with `response_format` `text`, `srt` or `vtt`, translations in the default `json` format (use `verbose_json` to get the duration), anything called through `with_streaming_response`, and a `with_raw_response` call with `stream=True`. Revenium may also show $0 for models it prices by token, such as `gpt-4o-mini-tts`, as it does for the Go and Node SDKs.
+
+If a LiteLLM gateway with `ReveniumGuardrail` also imports `revenium_middleware.openai`, an OpenAI audio call proxied through it is recorded twice; import only the LiteLLM integration in the gateway process.
+
 #### Azure OpenAI
 
-The middleware automatically detects Azure OpenAI when using `AzureOpenAI()` and resolves deployment names to standard model names for accurate pricing.
+The middleware automatically detects Azure OpenAI when using `AzureOpenAI()` and resolves deployment names to standard model names for accurate pricing. The model Azure reports (for example `gpt-4.1-nano-2025-04-14`) is recorded as is; a custom deployment name is mapped to its model family.
 
 ```python
 from openai import AzureOpenAI
@@ -542,6 +646,30 @@ response = client.chat.completions.create(
 - `AZURE_OPENAI_DEPLOYMENT` - Default deployment name
 
 **Examples:** `examples/openai/` - `openai_basic.py`, `openai_streaming.py`, `azure_basic.py`, `azure_streaming.py`
+
+#### xAI (Grok)
+
+Point the OpenAI client at xAI and calls are recorded with provider `XAI`, so xAI spend is priced and reported as xAI rather than OpenAI.
+
+A spending cap on a Grok model also stops calls that use the short names xAI publishes for it, such as `grok-4.20`; see [Cost Controls / Enforcement](#cost-controls--enforcement) for how model filters treat vendor aliases.
+
+On a Grok reasoning model the reasoning tokens xAI bills are counted as output, and each record carries xAI's own charge for the call (`cost_in_usd_ticks`) as its total cost. This applies when the client's base URL is on `x.ai`; Grok reached through a proxy or gateway is recorded as the OpenAI-compatible call it appears to be.
+
+```python
+import os
+from openai import OpenAI
+import revenium_middleware.openai
+
+client = OpenAI(
+    api_key=os.getenv("XAI_API_KEY"),
+    base_url="https://api.x.ai/v1"
+)
+
+response = client.chat.completions.create(
+    model="grok-4.20-0309-non-reasoning",
+    messages=[{"role": "user", "content": "Hello!"}]
+)
+```
 
 ---
 
@@ -605,11 +733,13 @@ async def main():
 asyncio.run(main())
 ```
 
-**Note:** The middleware wraps the `messages.create` and `messages.stream` endpoints, sync and async alike (including `create(stream=True)`). Other Anthropic SDK features work normally but aren't metered.
+**Note:** The middleware meters `messages.create` (including `create(stream=True)`), `messages.stream` and `messages.parse`, and the same calls on `client.beta.messages` (`create`, `stream`, `parse` and each step of `tool_runner`), sync and async, including their `with_raw_response` and `with_streaming_response` forms, on the Anthropic, Bedrock and Vertex AI clients. Calls listed under [Calls the SDK does not meter](#calls-the-sdk-does-not-meter), message batches among them, are not metered.
+
+A call the provider refuses sends one record with stop reason `ERROR`, zero tokens and the error's class and HTTP status as its error reason (plus the provider's redacted error message when both `REVENIUM_CAPTURE_ERROR_MESSAGES` and `REVENIUM_CAPTURE_PROMPTS` are `true`; a provider's error can quote the request, so it is never sent with prompt capture off; at most 255 characters, keeping its "(HTTP <status>)" ending), as does a `create(stream=True)` stream that breaks off part-way. The HTTP status is also sent as the record's error code; a call that got no HTTP error answer (a connection error, a timeout, or a stream that broke off) has none. Your code still gets the original exception. Calls served through the Bedrock fast path, and calls a spending cap refuses, send no error record.
 
 #### AWS Bedrock
 
-The middleware provides complete AWS Bedrock integration with automatic detection.
+The middleware meters Claude on AWS Bedrock through `AnthropicBedrock`, with automatic detection.
 
 ```python
 import anthropic
@@ -638,9 +768,12 @@ message = client.messages.create(
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `AWS_REGION` | AWS region for Bedrock | `us-east-1` |
-| `REVENIUM_BEDROCK_DISABLE` | Set to `1` to disable Bedrock support (Bedrock detection only - Foundry detection is unaffected) | Not set |
+| `REVENIUM_BEDROCK_DISABLE` | Set to `1` to disable Bedrock support for Anthropic clients (Bedrock detection only - Foundry detection is unaffected). Raw boto3 calls metered with `REVENIUM_BEDROCK_TRANSPORT`, and LangChain's `ChatBedrock` and `ChatBedrockConverse`, are still recorded as AWS | Not set |
+| `REVENIUM_BEDROCK_TRANSPORT` | Set to `1` or `true` to meter Claude models called through a raw `boto3.client("bedrock-runtime")` (`invoke_model`, `invoke_model_with_response_stream`, `converse`, `converse_stream`); other Bedrock models are never metered this way | Not set |
 
-**AWS authentication** uses the standard credential chain: environment variables, `~/.aws/credentials`, IAM roles, AWS SSO. Required permissions: `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream`.
+**AWS authentication**: an `AnthropicBedrock` client uses its own `aws_access_key` / `aws_secret_key` / `aws_session_token`, `aws_profile` or Bedrock `api_key`, exactly as without the middleware. A plain `anthropic.Anthropic` client with a Bedrock `base_url` uses the standard credential chain: environment variables, `~/.aws/credentials`, IAM roles, AWS SSO. Required permissions: `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream`.
+
+**Raw boto3 calls, application inference profiles and Provisioned Throughput**: with `REVENIUM_BEDROCK_TRANSPORT=1`, raw `boto3.client("bedrock-runtime")` calls to Claude (`invoke_model`, `invoke_model_with_response_stream`, `converse`, `converse_stream`) are metered and capped. A call written as a cross-Region inference profile ARN or a foundation model ARN is recorded and priced under the model id the ARN names (`us.anthropic.claude-haiku-4-5-20251001-v1:0`, `anthropic.claude-haiku-4-5-20251001-v1:0`), as the same call by that plain id is. A Claude call through an application inference profile ARN (`arn:aws:bedrock:<region>:<account>:application-inference-profile/<id>`) also needs `bedrock:GetInferenceProfile`, and one through a Provisioned Throughput ARN (`arn:aws:bedrock:<region>:<account>:provisioned-model/<id>`) needs `bedrock:GetProvisionedModelThroughput`, because neither ARN names the model: the SDK looks each ARN up once per process, in the background, starting at its first call, and from then on records and caps the call under the Claude model it runs. The lookup never delays your call: calls made before it answers, usually only the first in a process, are neither metered nor capped. The lookup uses the proxy, client certificate and CA bundle set on your boto3 client. A Provisioned Throughput call is recorded under its foundation model (for example `anthropic.claude-haiku-4-5-20251001-v1:0`), so the cost Revenium shows is the on-demand equivalent of its tokens, not the hourly price AWS bills, and a cost cap fills at that rate: a breached cost BLOCK cap can stop calls on capacity you have already paid for. Without the permission the call still goes through, unmetered and uncapped, and the SDK logs one warning per ARN. A lookup that fails for a temporary reason (an outage, a dropped connection, an expired session token) is retried every 5 minutes in the background. Profiles and Provisioned Throughputs that run a non-Claude model are not metered. A profile copied from a US or EU cross-Region profile is recorded and priced as that profile (for example `us.anthropic.claude-haiku-4-5-20251001-v1:0`), so its cost matches the regional rate AWS bills. A profile copied from an Australia, Japan, APAC, India or global cross-Region profile, or on a single Region, is recorded under the model id (`anthropic.claude-haiku-4-5-20251001-v1:0`). A cap on either id or on the Claude model name (`claude-haiku-4-5-20251001`) applies to the call. With cost controls on, a sync `AnthropicBedrock` call by an application inference profile ARN is also capped under the Claude model the profile routes to, using the same once-per-process lookup and the same `bedrock:GetInferenceProfile` permission; without the permission it is still metered but cannot be capped by model. A failed lookup is remembered only for the credentials that made it, so a client with the permission still looks the profile up and is metered and capped. An `AsyncAnthropicBedrock` call by a profile is capped that way once the profile has been looked up by a sync or raw boto3 call in the same process.
 
 **Supported Bedrock models:**
 
@@ -692,13 +825,13 @@ that Foundry bills at. `AsyncAnthropicFoundry` is metered the same way, as is
 
 ### Google AI (Gemini / Vertex AI)
 
-Supports chat completions, streaming, embeddings, image generation (Imagen), and vision/multimodal. Choose between Google AI SDK (simple API key setup) or Vertex AI SDK (production-grade with full token counting).
+Supports chat completions, streaming, embeddings, image generation (Imagen), and vision/multimodal. The Google AI SDK (`google-genai`) is the recommended path for both the Gemini Developer API (API key) and Vertex AI (`genai.Client(vertexai=True, ...)`): it counts chat tokens on both, and embedding tokens on Vertex AI. The SDK still meters calls made through the Vertex AI SDK (`vertexai`), but Google deprecated that SDK's generative AI modules (`generative_models`, `language_models`, `vision_models`) and its releases after June 24, 2026 do not include them; see [Google's notice](https://cloud.google.com/vertex-ai/generative-ai/docs/deprecations/genai-vertexai-sdk). Use google-genai with `vertexai=True` for new work.
 
 ```bash
-# Google AI SDK only (Gemini Developer API)
+# Google AI SDK (Gemini Developer API, or Vertex AI with vertexai=True)
 pip install "revenium-python-sdk[google-genai]"
 
-# Vertex AI SDK only (recommended for production)
+# Vertex AI SDK (vertexai package)
 pip install "revenium-python-sdk[google-vertex]"
 ```
 
@@ -723,7 +856,21 @@ response = client.models.generate_content(
 print(response.text)
 ```
 
-#### Vertex AI SDK
+The same call on Vertex AI, with the same metering:
+
+```python
+client = genai.Client(vertexai=True, project="your-gcp-project", location="us-central1")
+response = client.models.generate_content(
+    model="gemini-2.0-flash-001",
+    contents="Hello! Introduce yourself in one sentence.",
+    usage_metadata={"organizationName": "AcmeCorp", "task_type": "chat"}
+)
+print(response.text)
+```
+
+#### Vertex AI SDK (deprecated by Google)
+
+Google deprecated the generative AI modules of this SDK; see the notice above. Use the google-genai example above for new code.
 
 ```python
 from dotenv import load_dotenv
@@ -744,11 +891,15 @@ print(response.text)
 | Use Case | Recommended SDK | Why |
 |----------|----------------|-----|
 | Quick prototyping | Google AI SDK | Simple API key setup |
-| Production applications | Vertex AI SDK | Full token counting, enterprise features |
-| Embeddings-heavy workloads | Vertex AI SDK | Complete token tracking for embeddings |
-| Enterprise/GCP environments | Vertex AI SDK | Advanced Google Cloud integration |
+| Production applications | Google AI SDK with `vertexai=True` | Full token counting, including embeddings, on Vertex AI |
+| Embeddings-heavy workloads | Google AI SDK with `vertexai=True` | Vertex AI returns a token count for every embedded text |
+| Existing Vertex AI SDK code | Vertex AI SDK (deprecated by Google) | Still metered; migrate to google-genai with `vertexai=True` |
 
-**Note:** Google AI SDK embeddings don't return token counts due to API limitations, but requests are still tracked.
+**Note:** On Vertex AI (`genai.Client(vertexai=True, ...)`) google-genai embeddings are recorded with the input tokens Google returns for every text. The Gemini API (API key) returns no token count for embeddings, so those calls are recorded with 0 tokens, and still tracked.
+
+A `generate_content` or `generate_content_stream` call through the Google AI SDK (the Gemini API, or Vertex AI with `genai.Client(vertexai=True)`) that Google refuses (a 429 or 500, for example), sync, async or streamed, sends one record with stop reason `ERROR`, zero tokens and the error's class and HTTP status as its error reason; a stream that breaks off part-way is recorded with stop reason `ERROR` too. The HTTP status is also sent as the record's error code; a call that got no HTTP error answer (a connection error, a timeout, or a stream that broke off) has none. Your code still gets Google's own exception. Embeddings, Imagen, Veo, calls made with the `vertexai` library and calls a spending cap refuses send no error record.
+
+**Images from Gemini image models:** an image made with `generate_content` or `generate_content_stream` on a Gemini image model (for example `gemini-3.1-flash-lite-image`), through google-genai (the Gemini API, or `genai.Client(vertexai=True)`) or the `vertexai` library, sync, async or streamed, sends two records that share the call's trace, job and customer. An image record (operation type `IMAGE`, transaction id the chat record's plus `-image`) carries the number of images and is priced at the model's per-image price in Revenium; the chat record carries only the answer's text tokens, with the image tokens Google reports removed. Known limits: the per-image price is one fixed price per model, so 2K and 4K images are under-billed; interim "thought" images are not counted, only the final images are; when Google does not report the image's token share, the image tokens also stay on the chat record; a call that fails or a stream that breaks off is recorded as chat only. Gemini images made through LiteLLM (`gemini/...`), the LangChain unified handler fallback or griptape are still recorded as chat.
 
 **Google AI environment variables:**
 - `GOOGLE_API_KEY` - For Google AI SDK
@@ -801,6 +952,8 @@ response = ollama.embed(model='nomic-embed-text', input=['Text 1', 'Text 2', 'Te
 
 **Supported endpoints:** `chat()`, `generate()`, `embed()` and the legacy `embeddings()`, whether called at module level (`ollama.chat()`) or on an explicit client such as `ollama.Client(host="http://my-ollama:11434")` or `ollama.AsyncClient(...)`, streamed or not.
 
+A `chat()` or `generate()` call the Ollama server refuses (a 500, for example), streamed or not, sends one record with stop reason `ERROR`, zero tokens and the error's class and HTTP status as its error reason; a stream that breaks off part-way is recorded with stop reason `ERROR` too. The HTTP status is also sent as the record's error code; a call that got no HTTP error answer (a connection error, a timeout, or a stream that broke off) has none. Your code still gets Ollama's own exception. Embeddings and calls a spending cap refuses send no error record.
+
 **OpenAI compatibility mode:** You can also use Ollama with the OpenAI SDK:
 
 ```python
@@ -850,15 +1003,16 @@ response = litellm.completion(
 )
 ```
 
-Client mode meters `completion`, `acompletion`, `text_completion`, `atext_completion`, `completion_with_retries` and `acompletion_with_retries`, streamed or not, and `embedding` / `aembedding` as embedding calls. When you stream without `stream_options={"include_usage": True}`, the middleware asks LiteLLM for the usage chunk itself and keeps it out of your stream. LiteLLM adds that chunk for every provider, including ones it does not send `stream_options` to. `litellm.responses` and `litellm.aresponses` are not metered, except on providers LiteLLM serves through `completion`.
+Client mode meters `completion`, `acompletion`, `text_completion`, `atext_completion`, `completion_with_retries` and `acompletion_with_retries`, streamed or not, and `embedding` / `aembedding` as embedding calls. When you stream without `stream_options={"include_usage": True}`, the middleware asks LiteLLM for the usage chunk itself and keeps it out of your stream. LiteLLM adds that chunk for every provider, including ones it does not send `stream_options` to. `litellm.responses` and `litellm.aresponses` are not metered, except on providers LiteLLM serves through `completion`. A completion that fails, or a stream that breaks off, sends one record with stop reason `ERROR`, zero tokens for a call that never started, and the error's class and HTTP status as its error reason (plus the provider's redacted error message when both `REVENIUM_CAPTURE_ERROR_MESSAGES` and `REVENIUM_CAPTURE_PROMPTS` are `true`; a provider's error can quote the request, so it is never sent with prompt capture off); your code still gets the original exception. The HTTP status is also sent as the record's error code; a call that got no HTTP error answer (a connection error, a timeout, or a stream that broke off) has none. LiteLLM gives a connection error a 500 and a timeout a 408 that no server answered, so those get no error code and no HTTP status in their error reason, including the `InternalServerError` LiteLLM raises for a refused connection on its `openai/` and `anthropic/` providers. LiteLLM also raises a few real provider answers, such as a Vertex AI 502, as connection errors, and those get no error code either. Failure records sent by the LiteLLM gateway (proxy) do not carry the error code yet.
 
-Inside a LiteLLM proxy running `ReveniumGuardrail` with `default_on: true` and `post_call` among its modes, client mode leaves each proxied request to the guardrail, so the request is recorded once, with the guardrail's subscriber and model naming. Client mode still records the proxied calls the guardrail does not meter, which today are streamed `/v1/completions` and `/v1/responses` calls, and every call your own code in the proxy's process makes to LiteLLM directly.
+Inside a LiteLLM proxy running `ReveniumGuardrail` with `default_on: true` and `post_call` among its modes, client mode leaves each proxied request to the guardrail, so the request is recorded once, with the guardrail's subscriber. The row names the deployment's model (the `litellm_params.model` behind the `model_name` your callers use, without its provider prefix), so a call to an alias is priced as the model it reached. The guardrail also meters streamed `/v1/responses` calls (Codex CLI, the OpenAI Agents SDK) for every provider. Client mode still records the proxied calls the guardrail does not meter, which today are streamed `/v1/completions` calls, and every call your own code in the proxy's process makes to LiteLLM directly.
 
 #### Proxy Mode
 
 `ReveniumGuardrail` is the LiteLLM proxy integration. It is a LiteLLM
 `CustomGuardrail` that **enforces the caller's budget before** the proxied call and
-**meters usage after** it — successes, failures and streamed responses alike.
+**meters usage after** it: successes, failures and streamed responses alike,
+except calls a spending cap refuses.
 
 ```bash
 pip install "revenium-python-sdk[litellm-proxy]"   # requires Python 3.10+
@@ -881,14 +1035,21 @@ expects a different shape and exits the proxy at startup with
 `GuardrailItem() argument after ** must be a mapping, not str`.
 
 `mode` must be a **list** to enable both hooks; a single string restricts the
-guardrail to that one event type. `pre_call` alone enforces without metering;
-`post_call` alone meters without enforcing.
+guardrail to that one event type. `pre_call` alone enforces without metering.
+`post_call` alone meters successful calls without enforcing, but records no failed
+calls: a failed call is recorded only for a request the Revenium guardrail's
+`pre_call` hook ran on, so a request LiteLLM refuses for a wrong or missing key
+sends no record. Adding `pre_call` enforces no budget unless
+`REVENIUM_CIRCUIT_BREAKER_ENABLED=true`.
 
 **Budget enforcement** reuses the SDK's own circuit breaker, so a proxy enforces
 exactly what every other Revenium integration enforces — including department
-budgets. It is opt-in via `REVENIUM_CIRCUIT_BREAKER_ENABLED=true`; see
-[Cost Controls](#cost-controls). A blocked call never reaches the provider and the
-caller receives HTTP 429:
+budgets. An organization cap is checked against the organization the call names,
+which a caller can choose by header unless you pin it to the key's team (see
+"Organization caps and the organization header" below). It is opt-in via `REVENIUM_CIRCUIT_BREAKER_ENABLED=true`; see
+[Cost Controls](#cost-controls). A blocked call never reaches the provider, the
+caller receives HTTP 429, and no failed-call record is sent, as with the OpenAI and
+Anthropic integrations:
 
 ```json
 {"error": {"message": "Request blocked by Revenium enforcement rule: Team Budget",
@@ -896,6 +1057,8 @@ caller receives HTTP 429:
            "budgets": [{"name": "Team Budget", "ruleId": 7, "threshold": 10.0,
                         "currentValue": 11.5, "resetsAt": "2026-10-01T00:00:00Z"}]}}
 ```
+
+When the rule carries a deny message, the body's `message` ends with it, as `BudgetExceededError.message` does (see [Exception Contract](#exception-contract)).
 
 Enforcement **fails open**: if the enforcement path is unreachable or misbehaves,
 the call proceeds, and it proceeds without waiting. The pre-call check reads the
@@ -914,7 +1077,51 @@ for reasoning effort), with the calling virtual key's metadata as the fallback �
 `revenium_user_id`, `revenium_organization_name`, `revenium_key_name`, and
 `revenium_agentic_job_*`. Agentic job tags (`x-revenium-agentic-job-id`, `-name`,
 `-type`, `-version`) ride along for cost/ROI correlation; the job id is required for
-the others to be recorded.
+the others to be recorded. A malformed header value, such as a quality score of
+`high` or an effort of `very high`, is left off the record with a WARNING in the
+gateway log; the call is still recorded.
+
+**Organization caps and the organization header.** By default the
+`x-revenium-organization-name` header (and the retired `x-revenium-organization-id`)
+wins over the calling virtual key's team alias, for the budget check and the record
+alike. That means anyone holding a team's key can send another organization's name
+and move their spend off their own organization's cap: the call is checked against,
+and recorded under, the name they sent. To make the key's team decide instead, set
+
+```bash
+export REVENIUM_LITELLM_PIN_ORGANIZATION_TO_KEY_TEAM=true
+```
+
+With it on, a call made with a key that belongs to a LiteLLM team is checked and
+recorded under that team's alias whatever organization header it sends, so the team
+alias is the organization: renaming the team in LiteLLM renames where its spend is
+booked. A key with no team alias (none set, or blank) still takes the organization
+from the header; on the guardrail, a key with neither falls back to its
+`revenium_organization_name` metadata. `1`, `yes` and `on` also turn the setting on.
+Unset, `false`, `0`, `no` and `off` leave it off; any other value leaves it off too,
+and the proxy logs a warning at startup naming the setting. The deprecated callback
+honours the same setting for its record.
+
+**Trace fields** come from the gateway host's own settings, and a matching header wins
+per call: `REVENIUM_ENVIRONMENT` (or `ENVIRONMENT`, or `DEPLOYMENT_ENV`) and
+`x-revenium-environment`; `REVENIUM_REGION` (or `AWS_REGION`, `AWS_DEFAULT_REGION`,
+`AZURE_REGION`, `GCP_REGION`, `GOOGLE_CLOUD_REGION`) and `x-revenium-region`;
+`REVENIUM_CREDENTIAL_ALIAS` and `x-revenium-credential-alias`;
+`REVENIUM_TICKET_ID` and `x-revenium-ticket-id`; `REVENIUM_TRANSACTION_NAME`, `REVENIUM_TRACE_TYPE`, `REVENIUM_TRACE_NAME`,
+`REVENIUM_PARENT_TRANSACTION_ID`, `REVENIUM_RETRY_NUMBER` and `REVENIUM_SKILL_*`, with
+the headers `x-revenium-transaction-name`, `-trace-type`, `-trace-name`,
+`-parent-transaction-id`, `-retry-number`, `-skill-name`, `-skill-source`,
+`-skill-kind`, `-skill-plugin-name`, `-skill-marketplace-name` and
+`-skill-invocation-trigger`. The gateway does not fall back to the task type for the
+transaction name, and sends a retry number only when the header or
+`REVENIUM_RETRY_NUMBER` sets one. The credential alias names the credential only on
+calls with no subscriber id or email and no virtual key alias; most virtual keys carry
+their owner's email, so those calls keep the owner's own credential. A spending cap on
+a credential alias therefore covers only calls with no subscriber identity, and on
+those calls a caller's `x-revenium-credential-alias` wins over the host's alias, for
+the cap check and the record alike. The agent's own version rides in
+`x-revenium-agent-version`, per call only with no host setting, and is cut to 64
+characters.
 
 **Who made the call.** By default a proxied call is metered and budget-checked as the
 owner of the virtual key it used, which is right when every person has their own key.
@@ -950,12 +1157,15 @@ reports the same value as the call's transaction id. Claude Code copies `request
 onto its own record, Revenium's duplicate check sees two records with one identifier,
 and one call becomes one record.
 
-**It is on by default.** To opt out and keep LiteLLM's own response id as the
-transaction id, with no `request-id` header added:
+**It is on by default.** To opt out, with no `request-id` header added (each
+`/v1/messages` record then carries a per-request id the proxy assigns, never
+Anthropic's `msg_` id):
 
 ```bash
 export REVENIUM_LITELLM_SHARED_CALL_ID=false
 ```
+
+Blank or unset means on; `true`, `1`, `yes`, `on` mean on; any other value turns it off and the guardrail logs that at startup.
 
 New calls go straight back to two records when you do; records already merged stay
 merged. Four things have to be true for it to work:
@@ -1018,6 +1228,11 @@ stays quiet.
 meters but never enforces a budget. It keeps working in this release and emits a
 `DeprecationWarning` (and a log line) when the proxy builds it.
 
+While the callback is listed, client mode leaves each proxied completion to it, so the
+call is recorded once, with the subscriber, organization and product from the
+`x-revenium-*` headers. Proxied embeddings are recorded by client mode, without those
+headers, as the callback has never metered them.
+
 To migrate, delete the callbacks entry and add the `guardrails` block above:
 
 ```diff
@@ -1058,10 +1273,12 @@ proxy running would be a logger with no pre-call hook and no ability to block a
 call — the enforcement half would silently not exist.
 
 So the client integration keeps its own path, unchanged: use
-`revenium_middleware.litellm.client` as documented above. Note that the LiteLLM
-client wrapper meters but does not currently run the pre-call circuit breaker —
-enforcement in client mode is available today through the OpenAI middleware, and
-through this guardrail in proxy mode. Both the guardrail and the client wrapper
+`revenium_middleware.litellm.client` as documented above. The LiteLLM client
+wrapper runs the same pre-call circuit breaker with the caller's `usage_metadata`
+(and any `@revenium_metadata` identity) and raises `BudgetExceededError` before
+LiteLLM is called, so LiteLLM's retries never send a blocked call. That check runs
+only outside the proxy: requests the proxy serves are enforced by this guardrail.
+Both the guardrail and the client wrapper
 already share their metering plumbing (`revenium_middleware._core`: field
 extraction, cache-token extraction and `submit_ai_event`), so the guardrail adds no
 second copy of it.
@@ -1087,10 +1304,25 @@ The tracking decorators above support static values, extraction from function ar
 #### CrewAI Integration
 
 ```bash
-pip install "revenium-python-sdk[litellm]" crewai
+pip install "revenium-python-sdk[openai]" crewai
 ```
 
-Pre-built wrapper for tracking CrewAI agent executions. **Note:** CrewAI requires Python 3.12 or earlier.
+Pre-built wrapper for tracking CrewAI agent executions. Use the extra for your agents' models: `[openai]`, `[anthropic]`, `[google-genai]`, or `[litellm]` for models CrewAI sends through LiteLLM. CrewAI 1.x supports Python 3.10 to 3.13.
+
+**Import the middleware for your agents' models before you build the crew.** CrewAI 1.x calls OpenAI, Anthropic and Gemini through their own SDKs, not through LiteLLM, so those calls are recorded by the matching Revenium middleware:
+
+```python
+import revenium_middleware.openai            # OpenAI models, e.g. LLM(model="gpt-4o-mini")
+import revenium_middleware.anthropic         # Anthropic models, e.g. LLM(model="anthropic/claude-3-5-haiku-latest")
+import revenium_middleware.google.google_ai  # Gemini models, e.g. LLM(model="gemini/gemini-2.5-flash")
+import revenium_middleware.litellm.client.middleware  # LLM(..., is_litellm=True) and models CrewAI routes to LiteLLM
+```
+
+Each model call the crew makes during `kickoff()` or `kickoff_async()`, including a crew built with `stream=True` as you iterate it, is recorded once and carries the wrapper's organization, subscription, product, trace and agentic job fields. Importing more than one of these is safe: a call is still recorded once. When an agent's model has no matching middleware imported, the wrapper logs one warning naming the import to add.
+
+What the wrapper does not cover:
+- CrewAI's native Azure (`azure-ai-inference`), Bedrock (boto3 Converse) and Snowflake providers are not metered. Build those LLMs with `LLM(model=..., is_litellm=True)` and import the LiteLLM middleware.
+- Only `kickoff()` and `kickoff_async()` are attributed. Calls started through the underlying crew's `akickoff()` or `kickoff_for_each*()` are not.
 
 **Job outcome tracking:** pass the `agentic_job_*` kwargs to tie every LLM call in the crew to one agentic job, then report (or later amend) the job's business outcome. Requires a write-scope key (`rev_sk_`) — see [Agentic Outcomes](#agentic-outcomes-outcome-based-metering).
 
@@ -1100,9 +1332,9 @@ from revenium_middleware.litellm.client.integrations.crewai import ReveniumCrewW
 crew = ReveniumCrewWrapper(
     agents=[support_agent],
     tasks=[triage_task],
-    organization_id="AcmeCorp",
+    organization_name="AcmeCorp",
     subscription_id="82764738",
-    product_id="Platinum",
+    product_name="Platinum",
     agentic_job_id="support-ticket-456",
     agentic_job_name="Support Ticket Triage",
     agentic_job_type="customer_support",
@@ -1164,11 +1396,14 @@ client = Perplexity(api_key=os.getenv("PERPLEXITY_API_KEY"))
 
 response = client.chat.completions.create(
     model="sonar",
-    messages=[{"role": "user", "content": "Hello!"}]
+    messages=[{"role": "user", "content": "Hello!"}],
+    usage_metadata={"organizationName": "AcmeCorp"}
 )
 ```
 
-Both approaches work identically - the middleware automatically detects which SDK you're using.
+Both approaches work identically - the middleware automatically detects which SDK you're using. Both clients accept Revenium metadata as `usage_metadata=` or as `extra_body={"usage_metadata": ...}`, and the middleware removes it before the request reaches Perplexity. The one exception is the OpenAI client's `responses.stream()` helper, sync or async: it takes `usage_metadata=` only when `revenium_middleware.openai` is imported, and otherwise raises `TypeError` before any request is sent. With only `revenium_middleware.perplexity` imported, pass `extra_body={"usage_metadata": ...}` to that helper instead. Search, embeddings, contextualized embeddings, async chat and browser session calls on the native client are not metered or capped (see [Calls the SDK does not meter](#calls-the-sdk-does-not-meter)); metadata passed to them is removed and not used. An OpenAI-client embeddings call to Perplexity is recorded only when `revenium_middleware.openai` is imported.
+
+A native Perplexity SDK `chat.completions.create` call that Perplexity refuses (a 400, 429 or 500, for example), streamed or not, sends one record with stop reason `ERROR`, zero tokens and the error's class and HTTP status as its error reason. The HTTP status is also sent as the record's error code; a call that got no HTTP error answer has none. Your code still gets Perplexity's own exception. A native stream that breaks off after it started, and calls a spending cap refuses, send no error record.
 
 **Streaming:**
 
@@ -1184,13 +1419,15 @@ for chunk in stream:
         print(chunk.choices[0].delta.content, end="", flush=True)
 ```
 
+**Through LangChain:** `ChatPerplexity` keeps only token counts from Perplexity's answer, so the charge Perplexity reports (`usage.cost`, which includes its flat per-request fee) would never reach a LangChain record. When `perplexityai` is installed, importing `revenium_middleware.openai.langchain` therefore adds a read-only hook to the Perplexity SDK's `chat.completions.create` and `responses.create` (sync, async and streamed). Inside a LangChain run it hands the reported cost to the Revenium callback's record; it sends no record of its own, checks no spending cap, and leaves calls made outside a LangChain run untouched. Importing `revenium_middleware.perplexity` as well still works as above: its own record carries the cost for chat calls, and calls with a built-in tool (which go to the Responses API) are recorded by the callback.
+
 **Examples:** `examples/perplexity/` - `getting_started.py`, `basic.py`, `streaming.py`, `example_decorator.py`
 
 ---
 
 ### fal.ai
 
-Supports image, video, and audio generation through fal.ai with automatic media type detection.
+Supports image, video, and audio generation through fal.ai with automatic media type detection. Language model endpoints (`fal-ai/any-llm`, the OpenRouter router `openrouter/router`) are recorded as chat completions with the tokens fal reports.
 
 ```python
 import revenium_middleware.fal  # Auto-activates
@@ -1212,9 +1449,13 @@ for image in result.get("images", []):
     print(f"Image URL: {image['url']}")
 ```
 
-**Supported methods:** `run`, `subscribe`, `stream` and the queue flow (`submit`, then `status` and `result` or the handle's `get()`), on the module-level functions (`fal_client.run`, `fal_client.run_async`, and so on) and on clients you construct yourself (`fal_client.SyncClient(key=...)`, `fal_client.AsyncClient(key=...)`). Pass `usage_metadata` to `run`, `subscribe`, `stream` or `submit`.
+**Supported methods:** `run`, `subscribe`, `stream` and the queue flow (`submit`, then `status` and `result` or the handle's `get()`), on the module-level functions (`fal_client.run`, `fal_client.run_async`, and so on) and on clients you construct yourself (`fal_client.SyncClient(key=...)`, `fal_client.AsyncClient(key=...)`). Pass `usage_metadata` to `run`, `subscribe`, `stream`, `submit`, `result` or the handle's `get()`.
 
 **Queued jobs** are metered once, when the result is fetched: `submit` and `status` send nothing, fetching the same result again sends nothing more, and a job whose result is never fetched is not metered. A stream is metered from its last event once you have read it to the end.
+
+**Jobs fetched in another process:** the tags given to `submit` stay in the process that submitted the job, because fal has no field that carries them with it. When another process fetches the result (another worker, a webhook handler, the same service after a restart), pass the tags there: `fal_client.result(application, request_id, usage_metadata={...})` or `handle.get(usage_metadata={...})`. Without them the job is recorded with no organization, product, subscriber, trace or agent, and the SDK logs a warning naming the request id. In the process that submitted the job, the tags given at submit win, and tags given at fetch fill only the fields the submit left unset.
+
+Every record of a queued job is sent under `fal-<request id>`, as both its transaction id and its Idempotency-Key, so fetching the same job again in another process does not bill it twice: Revenium refuses the repeat, and the SDK logs the refusal and counts it as one metering error. Revenium keeps the first record it receives for a transaction id, so this holds however long after the first fetch the repeat comes, and a later fetch without tags never replaces a tagged record.
 
 **Media type detection:** The middleware automatically detects the type of media being generated (image, video, audio) based on the application name for accurate cost tracking.
 
@@ -1231,7 +1472,7 @@ Callback handler that automatically tracks LLM calls, chains, tools, and agent a
 pip install "revenium-python-sdk[langchain]"
 ```
 
-Wrap any LangChain LLM (or embeddings model) with `wrap()` — the Revenium callback handler is attached for you:
+Wrap any LangChain chat model or LLM with `wrap()`; the Revenium callback handler is attached for you:
 
 ```python
 from langchain_openai import ChatOpenAI
@@ -1281,7 +1522,13 @@ llm = wrap(ChatOpenAI(model="gpt-4o-mini"))
 response = await llm.ainvoke("Hello!")
 ```
 
-**Supported providers:** OpenAI, Anthropic, Google, AWS Bedrock, Azure OpenAI, Cohere, HuggingFace, Ollama. Provider is auto-detected from LangChain class name or model name prefix.
+**Supported providers:** OpenAI, Anthropic, Google, AWS Bedrock, Azure OpenAI, Cohere, HuggingFace, Mistral, Ollama. Provider is auto-detected from LangChain class name or model name prefix.
+
+**Perplexity cost:** a `ChatPerplexity` record carries the cost Perplexity reported, per-request fee included, for chat calls and for calls with a built-in tool such as web search. Importing this module installs a read-only hook on the Perplexity SDK for this (see [Perplexity](#perplexity)); the hook sends nothing itself.
+
+**Text-completion models:** streamed calls from `langchain_openai.OpenAI` and `AzureOpenAI` (`stream`, `astream`, `invoke` with `streaming=True`) are recorded with the provider's token counts. Importing this module installs a read-only hook on the OpenAI SDK's legacy `completions.create` that asks the endpoint for its usage chunk during a LangChain stream and keeps that chunk out of your stream, except that a server whose usage chunk also carries an empty choice, such as the LiteLLM proxy, passes it through as one extra empty text chunk. The hook sends nothing itself, and a direct `completions.create` call outside LangChain is untouched and still not metered. A server that ignores the request gets a record with zero tokens and a warning. These streamed calls still send no record: `ainvoke` on a `streaming=True` model, a stream you stop reading early, and Azure OpenAI api-versions before `2024-09-01-preview`, which reject the usage request, so it is not sent there.
+
+**Claude advisor and compaction passes:** a `ChatAnthropic` call metered by the callback alone sends one record per advisor or compaction pass when LangChain does not stream the call. Whenever LangChain streams it, only the main call is recorded, because LangChain keeps no per-pass usage on a streamed result: `stream`, `astream`, `streaming=True`, a `stream=True` call keyword, `astream_events`, or a LangGraph run streamed in `messages` mode, even when your code calls `invoke`. To record the passes for those calls too, also `import revenium_middleware.anthropic`, which covers every form.
 
 **Attaching to an existing LLM:** use `attach_to()` to add tracking in-place, with any of the standard metadata fields (see [Metadata Fields](#metadata-fields)):
 
@@ -1291,11 +1538,52 @@ from revenium_middleware.openai.langchain import attach_to
 attach_to(llm, usage_metadata={
     "organizationName": "my_org",
     "productName": "my_product",
-    "subscriber": {"id": "user_123", "email": "user@example.com"},
 })
 ```
 
-Credentials come from the standard environment variables (`REVENIUM_METERING_API_KEY`, `REVENIUM_METERING_BASE_URL`) or `revenium_middleware.configure()`.
+Calling `attach_to()` again on the same model replaces its Revenium handler rather than adding a second one. Attach once at startup with the fields every call shares. Do not call `attach_to()` per request on a model your requests share: overlapping requests would all be recorded under whichever person was attached last. To name the person per request, use one of these:
+
+```python
+from revenium_middleware import revenium_metadata
+from revenium_middleware.openai.langchain import UnifiedReveniumCallbackHandler
+
+# (a) Model attached once at startup; name the person inside the request handler.
+def handle_request(user, question):
+    @revenium_metadata(subscriber={"id": user.id, "email": user.email})
+    def answer():
+        return llm.invoke(question)
+    return answer()
+
+# (b) A model with no attach_to(); pass a handler with the call.
+def handle_request(user, question):
+    handler = UnifiedReveniumCallbackHandler(usage_metadata={"subscriber": {"id": user.id}})
+    return bare_llm.invoke(question, config={"callbacks": [handler]})
+```
+
+With pattern (a), consume a stream inside the decorated function, or open the decorator around the iteration: a stream returned unconsumed (for example in a FastAPI `StreamingResponse`) is recorded without the decorator's fields.
+
+Where the handler attached with `attach_to()` and `@revenium_metadata` both name a field (for example `subscriber`), the attached handler's value is used, on every model.
+
+Combining a startup `attach_to()` with a per-call handler on the same model records each call once, with the attached handler's fields; the per-call handler's fields are used only when the attached handler has none.
+
+**Embeddings models:** LangChain embeddings models run no callbacks, so `wrap()` and `attach_to()` return the model unchanged, attach nothing and log one warning per model class. Wrapping a chain or other runnable that has no callbacks field also attaches nothing and logs a warning; wrap the model inside it instead. `OpenAIEmbeddings` and `AzureOpenAIEmbeddings` calls are still recorded by the OpenAI middleware, without the `usage_metadata` given to `wrap()`; tag them with `@revenium_metadata` on the function that makes the call:
+
+```python
+from revenium_middleware import revenium_metadata
+from langchain_openai import OpenAIEmbeddings
+
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+
+@revenium_metadata(organization_name="AcmeCorp", agent="support_agent", trace_id="session-123")
+def embed(texts):
+    return embeddings.embed_documents(texts)
+```
+
+Embeddings from vendors other than OpenAI, Azure OpenAI and Ollama through LangChain, such as `MistralAIEmbeddings`, are not metered (see [Calls the SDK does not meter](#calls-the-sdk-does-not-meter)).
+
+**OpenAI Decisions, model router and auto mode:** a request made through langchain-openai's `OpenAIDecisions`, including the one `OpenAIModelRouterMiddleware` and `OpenAIAutoModeMiddleware` make on every agent run, is recorded with its input and output tokens when the handler reaches that run: pass it in the run's `config={"callbacks": [handler]}` (for example `agent.invoke(inputs, config={"callbacks": [handler]})`), or give the middleware a configured `OpenAIDecisions(...).with_config(callbacks=[handler])`. A handler attached to the chat model with `attach_to()` or `wrap()` does not see these requests. Decisions requests are not checked against spending caps, and a direct `client.decisions.create` call on the OpenAI client is not metered.
+
+Credentials come from the standard environment variables (`REVENIUM_METERING_API_KEY`, `REVENIUM_METERING_BASE_URL`) or `revenium_middleware.initialize_metering(api_key=..., base_url=...)`. `revenium_middleware.configure()` sets the key for tool events only, so it does not meter LangChain calls.
 
 ---
 
@@ -1315,18 +1603,31 @@ pip install "revenium-python-sdk[griptape,litellm,litellm-proxy]"  # 100+ provid
 ```python
 import os
 from griptape.structures import Agent
-from revenium_middleware.griptape import ReveniumDriver
+from revenium_middleware import BudgetExceededError
+from revenium_middleware.griptape import ReveniumDriver, enable_budget_errors
 
 os.environ["REVENIUM_METERING_API_KEY"] = "your_revenium_key"
+enable_budget_errors()  # once at startup, so a spending-cap refusal reaches your except block
 
 agent = Agent(prompt_driver=ReveniumDriver(
     model="gpt-4o-mini",
     usage_metadata={"task_type": "demo"},
 ))
-agent.run("Hello!")
+try:
+    agent.run("Hello!")
+except BudgetExceededError as e:
+    print(f"Spending cap reached: {e.message}")
 ```
 
 Force a provider with `force_provider="litellm"`, or wrap an existing driver with `ReveniumDriver(base_driver=...)`.
+
+A wrapped OpenAI, Azure OpenAI, Claude or Ollama driver keeps every setting you gave it, including your own client, address, key, streaming and retry settings. A setting the Revenium driver cannot carry, such as an extra field on your own driver subclass, is named in a warning instead of being dropped silently.
+
+To route Griptape through a LiteLLM gateway, pass `proxy_url=` (and `proxy_api_key=`) to `ReveniumDriver`, either as a base address or ending in `/chat/completions`. On that route Griptape tools are not sent and the gateway, not the SDK, records usage. The `LITELLM_PROXY_URL` environment variable alone does not change which provider a Griptape model uses, so `ReveniumDriver(model="gpt-4o-mini")` still calls OpenAI and records usage. Models that already route through LiteLLM (`force_provider="litellm"`, `gemini-*` and provider-qualified ids) still follow `LITELLM_PROXY_URL` through the LiteLLM driver's own setting. The proxy arguments are ignored, with a warning, when you wrap an existing driver.
+
+**Spending caps:** Griptape turns any error inside a task into an error result, so without `enable_budget_errors()` an agent stopped by a cap returns the refusal text as its answer. With it, `agent.run(...)`, `Pipeline.run()` and `Workflow.run()` raise `BudgetExceededError`, in any thread. `run_stream` never raises: call `raise_if_budget_exceeded(agent)` after the stream ends, or after any run when you do not use the setup line. A refused call is never sent to the provider and is not retried. Nothing is installed on import: `enable_budget_errors()` sets Griptape's global observability driver, wrapping one you already set with `Observability.set_global_driver(...)` so it still sees every call, and `disable_budget_errors()` turns it off. If you use a `with Observability(...)` or `with GriptapeCloudStructure(observe=True)` block, call `enable_budget_errors()` inside each block, after it opens: leaving the block turns it off, and calling it before the block makes Griptape refuse the block. Pass your driver as `delegate=` only if you have already entered it or it has no enter or exit work.
+
+Not covered: on the LiteLLM gateway route (`proxy_url=`) the gateway answers a cap with HTTP 429, which reaches you as `requests.HTTPError`, not `BudgetExceededError`. A refusal inside a tool (for example a vector-store embedding) reaches the model as the tool's output, not your `except`. The refusal is saved as the run's output in conversation memory, and Griptape still logs it at ERROR.
 
 **Embeddings:**
 
@@ -1344,7 +1645,11 @@ driver = ReveniumEmbeddingDriver(model="text-embedding-3-large")
 
 ## Metadata Fields
 
-Add business context to any API call by passing a `usage_metadata` dictionary. All fields are optional.
+Add business context to a call the SDK records by passing a `usage_metadata` dictionary. All fields are optional. The calls listed in [Calls the SDK does not meter](#calls-the-sdk-does-not-meter) record nothing from it; on LiteLLM's image generation, image edit, transcription, video generation and search calls, after `revenium_middleware.litellm` is imported, the SDK removes it before the request is sent, so it never reaches the provider.
+These fields are shortened with a WARNING when longer than Revenium stores, so the call is still
+recorded: `trace_id`, `task_type`, `agent`, `subscription_id`, `parent_transaction_id`, `environment`,
+`region`, `transaction_name`, `operation_subtype`, `subscriber.id` and `subscriber.email` at 255
+characters, and `product_name` at 224. Other text fields are sent as given.
 
 | Field | Description | Use Case |
 |-------|-------------|----------|
@@ -1393,10 +1698,9 @@ high-effort reasoning spend can be separated from the rest. It is a free-form
 string, not an enum -- vendor vocabularies differ and drift, so `low`, `medium`,
 `high`, `xhigh` and `ultra` are all real values, and a level this SDK release has
 never heard of is passed through untouched rather than rejected or rewritten. The
-Revenium backend owns validation (at most 16 characters, matching
-`^[A-Za-z0-9_-]+$`); a value it rejects fails the metering call visibly instead
-of being silently dropped, so it surfaces in the log and in
-`get_metering_status()`. It is distinct from the reported reasoning token count,
+Revenium backend rule is at most 16 characters, matching `^[A-Za-z0-9_-]+$`; a
+value outside it is left off the record with a WARNING, and the call is still
+recorded with its tokens and cost. It is distinct from the reported reasoning token count,
 which measures the tokens actually spent rather than the level requested.
 
 Set it per call in `usage_metadata` on any provider integration. In LiteLLM proxy
@@ -1419,7 +1723,7 @@ Enhanced observability fields for tracking AI operations across environments, re
 |-------|----------------------------------|-------------|----------|
 | `environment` | `REVENIUM_ENVIRONMENT` (auto-detects: `ENVIRONMENT`, `DEPLOYMENT_ENV`) | Deployment environment | Track usage across `production`, `staging`, `dev` |
 | `region` | `REVENIUM_REGION` (auto-detects: `AWS_REGION`, `AZURE_REGION`, `GCP_REGION`) | Cloud region identifier | Multi-region deployment tracking and latency analysis |
-| `credential_alias` | `REVENIUM_CREDENTIAL_ALIAS` | Human-readable API key name | Track which credential was used for rotation and auditing |
+| `credential_alias` | `REVENIUM_CREDENTIAL_ALIAS` | Name of the provider API key used for the call, recorded as the subscriber's credential name | See usage and spend per provider key on calls with no subscriber id or email; a credential name or value you set on the subscriber wins |
 | `trace_type` | `REVENIUM_TRACE_TYPE` | Workflow category (max 128 chars, alphanumeric/hyphens/underscores) | Group similar workflows (e.g., `"customer-support"`, `"data-analysis"`) |
 | `trace_name` | `REVENIUM_TRACE_NAME` | Human-readable trace label (max 256 chars) | Label trace instances (e.g., `"Customer Support Chat"`) |
 | `parent_transaction_id` | `REVENIUM_PARENT_TRANSACTION_ID` | Parent transaction ID | Link child operations to parents across microservices |
@@ -1434,7 +1738,7 @@ Enhanced observability fields for tracking AI operations across environments, re
 | `skill_marketplace_name` | `REVENIUM_SKILL_MARKETPLACE_NAME` | Marketplace the skill or plugin was installed from (max 256 chars) | Track marketplace-sourced skill usage |
 | `skill_invocation_trigger` | `REVENIUM_SKILL_INVOCATION_TRIGGER` | What triggered the skill (max 32 chars; common values: `user-slash`, `claude-proactive`, `nested-skill`) | Separate user-invoked from proactive skill usage |
 
-**Note:** `operation_type` (e.g., `CHAT`, `EMBED`, `TOOL_CALL`) and `operation_subtype` (e.g., `function_call`, `streaming`) are automatically detected by the middleware and cannot be overridden.
+**Note:** `operation_type` (e.g., `CHAT`, `EMBED`, `TOOL_CALL`) and `operation_subtype` (e.g., `function_call`, `streaming`) are automatically detected by the middleware and cannot be overridden. To label a function's calls, use `metadata={"task_type": "..."}` on `@revenium_meter` or a `transaction_name`.
 
 ### Usage
 
@@ -1468,6 +1772,8 @@ response = client.chat.completions.create(
 ```
 
 **Best practice:** Use environment variables for static deployment configuration (`environment`, `region`, `credential_alias`) and pass dynamic values (`trace_name`, `transaction_name`, `organizationName`) directly in `usage_metadata` or via decorators.
+
+The credential alias is stored as the subscriber's credential name (`subscriber.credential.name`). A call with no subscriber id or email is recorded under a credential named after the alias. A call that names a subscriber, by id or email, keeps that subscriber's own credential, and the SDK does not send the alias on it, so different subscribers are never linked to one shared credential. A credential name or value you set on the subscriber yourself (`subscriber.credential`, or `subscriber_credential_name` / `subscriber_credential`) wins over the alias in what the SDK sends. If your team uses strict ingestion, register the alias as a credential first, or calls that carry it can be refused.
 
 ### Distributed Tracing Example
 
@@ -1531,8 +1837,8 @@ answer = handle_customer_query("How do I reset my password?")
 **Features:**
 - **DRY Principle**: Define metadata once, apply to all API calls in the function
 - **Composable**: Decorators can be nested - inner decorators inherit and override outer ones
-- **API-level override**: `usage_metadata` passed directly to API calls always takes precedence over decorator metadata
-- **Async support**: Works with both sync and async functions
+- **API-level override**: `usage_metadata` passed directly to API calls always takes precedence over decorator metadata; a `None` or empty per-call value leaves the decorator's value in place
+- **Async and streaming support**: Works with sync and async functions, and with generator and async generator functions such as streaming endpoints. In a generator, the metadata applies to the calls the generator body makes, not to code that handles each yielded item. The same holds for a streaming function behind a retry, tracing or caching decorator, and for a plain or async function that returns a generator
 - **Thread-safe**: Uses `contextvars` for proper isolation
 
 **Nested decorators (metadata merging):**
@@ -1581,6 +1887,8 @@ Control which functions are metered when selective metering mode is enabled. Thi
 
 **Note:** This decorator only has an effect when `REVENIUM_SELECTIVE_METERING=true` is set. By default, all API calls are metered automatically.
 
+Calls outside a `@revenium_meter` function are not metered, but they still accept `usage_metadata`: the middleware removes it before the request reaches the AI provider. This covers LangChain models carrying the Revenium callback and raw boto3 Bedrock calls with `REVENIUM_BEDROCK_TRANSPORT=1`. A stream, through LangChain or raw boto3, is judged when it starts, so a stream started inside a metered function is recorded even if it is read to the end outside it. Spending caps (`REVENIUM_CIRCUIT_BREAKER_ENABLED=true`) still apply to calls outside a metered function, through every provider middleware. Nested `@revenium_meter` functions keep the outer function metered after the inner one returns. A decorated generator or async generator function, such as a streaming endpoint, has the calls its body makes metered and tagged. So does one that also carries another decorator listed below the Revenium ones, such as a retry, tracing or caching decorator, and a plain or async function that returns a generator. A generator handed back inside another object, such as `StreamingResponse(gen())`, is not seen: decorate the generator function itself.
+
 ```bash
 # Enable selective metering
 export REVENIUM_SELECTIVE_METERING=true
@@ -1612,6 +1920,36 @@ def free_feature(prompt: str) -> str:
 - `"true"`, `"1"`, `"yes"`, `"on"` (case-insensitive) - Selective metering enabled
 - `"false"`, `"0"`, `"no"`, `"off"`, or unset - All calls metered (default)
 
+**Worker threads:** The metering mark of `@revenium_meter` and the tags of
+`@revenium_metadata` follow `await`, asyncio tasks and `asyncio.to_thread`, but
+not `ThreadPoolExecutor`, `threading.Thread` or `loop.run_in_executor`: those
+start the thread in an empty context. AI calls made on such a thread are not metered when selective metering
+is on, and are recorded without the decorator's tags when it is off.
+
+To carry them, wrap the thread's target with `carry_context` inside the decorated
+function, each time you hand work to a thread:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+from revenium_middleware import carry_context, revenium_meter, revenium_metadata
+
+@revenium_meter()
+@revenium_metadata(task_type="premium-feature", organizationName="PremiumTier")
+def summarize_all(docs: list[str]) -> list[str]:
+    with ThreadPoolExecutor() as pool:
+        return list(pool.map(carry_context(summarize), docs))
+```
+
+`carry_context` is not a decorator: a wrap made outside the decorated function
+carries nothing. With selective metering on, a thread started outside any
+decorated function is never metered through it; with it off, such calls are
+still metered, without the decorator's tags. Wrapping an `async def` carries
+nothing either, because its coroutine runs later on the event loop, outside the
+copied context: wrap the sync function the thread runs instead, or copy the
+context around the awaited call. It also carries a `metering_key()` or `idempotency_key()`
+block in force where it is called. The first time selective metering skips a
+call, the SDK logs one INFO line saying so.
+
 **Decorator order matters:** Place `@revenium_meter` before `@revenium_metadata` (outer to inner).
 
 ---
@@ -1640,6 +1978,8 @@ def lookup_customer(customer_id: str) -> dict:
 result = lookup_customer("CUST-42")
 ```
 
+When a decorated tool raises, the event is sent with `success: false` and the exception's class (for example `HTTPStatusError`) as `errorMessage`, and the exception is re-raised. The message itself often holds request URLs, keys or personal data, so it is sent only when `REVENIUM_CAPTURE_ERROR_MESSAGES=true`, as `<Class>: <message>` capped at 2048 characters, with `[REDACTED]` in place of card numbers, every key shape prompt capture masks (plus `pk-` and `Token` values), JSON Web Tokens, query-string values, `Bearer` and `Basic` tokens, URL user names and passwords, values under labels ending in a sensitive name (`password`, `secret`, `token`, `api_key`, `authorization` and the like) and emails. An exception raised from a provider's HTTP error (an OpenAI, Anthropic, LiteLLM, google-genai, Perplexity or Ollama error, or an exception raised while handling one) can quote the request, prompt included, so its message is sent only when `REVENIUM_CAPTURE_PROMPTS=true` as well; otherwise the class alone is sent.
+
 **Manual reporting:**
 
 ```python
@@ -1653,6 +1993,8 @@ report_tool_call(
     usage_metadata={"records": 42},
 )
 ```
+
+**Transaction ids:** each tool event gets its own transaction id, so every tool call is recorded. A `transaction_id` you set through `context()`, `set_context()` or `report_tool_call()` groups tool calls: it is sent as the event's `traceId`, or as `usageMetadata.callerTransactionId` when you also set a `trace_id`. A retry the SDK makes itself (an HTTP retry, or a replay from the delivery buffer) reuses the event's id and is stored once. Calling `report_tool_call` twice records two events, even with identical arguments.
 
 ---
 
@@ -1670,12 +2012,30 @@ export REVENIUM_CAPTURE_PROMPTS=true
 
 | Field | Description | Source |
 |-------|-------------|--------|
-| `system_prompt` | System prompt content | From `system` parameter / system message |
-| `input_messages` | User/assistant messages as JSON | From `messages` parameter |
-| `output_response` | Assistant's response content | From response content blocks |
-| `prompts_truncated` | Truncation flag | Set to `true` if any field exceeded 50,000 characters |
+| `system_prompt` | System prompt content | From `system` parameter / system message; for the OpenAI Responses API, `instructions` (else the first `system` or `developer` input item) |
+| `input_messages` | User/assistant messages as JSON | From `messages` parameter, or the Responses API `input` |
+| `output_response` | Assistant's response content | From response content blocks, or the text of a Responses API reply's messages |
+| `prompts_truncated` | Truncation flag | Set to `true` if any field exceeded its maximum length |
 
-Each field has a maximum length of **50,000 characters**. If exceeded, it's truncated with a `...[TRUNCATED]` marker.
+Each field has a maximum length of **50,000 characters**. If exceeded, it's truncated with a `...[TRUNCATED]` marker. `input_messages` is always stored as valid JSON: when the messages do not fit, the longest texts are shortened first, each ending in the marker, and if that is not enough the oldest messages are left out.
+
+Credentials in these three fields are masked before they leave your process, both in the records the provider integrations send with prompt capture on and in the text values of `systemPrompt`, `inputMessages` and `outputResponse` sent with `AgenticOutcomeClient.emit_completion`: keys starting `sk-`, `sk-proj-`, `sk-ant-`, `pplx-`, `xai-`, `gsk_`, `AIza`, `AKIA`, `ghp_`, `ghs_`, `gho_`, `ghu_`, `ghr_`, `github_pat_`, `hf_`, `rev_sk_`, `rev_mk_` and `hak_`, Slack tokens (`xoxb-`, `xoxp-` and the other `xox?-` forms), the secret half of a fal key (`<key id>:<secret>`), PEM private key blocks (`-----BEGIN PRIVATE KEY-----` and the RSA, EC and OpenSSH forms), card numbers, JSON Web Tokens, `Bearer` tokens, `Basic` credentials, the password in an address such as `postgres://user:password@host`, the signature of a presigned S3, Google Cloud Storage or Azure link, and the value after any label ending in `password`, `passwd`, `pwd`, `secret`, `secrets`, `token`, `api_key`, `credential` or `credentials`, or ending in `key` and naming a secret, private, access, API, auth, signing, client, session, master, encryption, account or storage key (so `AWS_SECRET_ACCESS_KEY=` and `private_key:` are masked, `password_hint:` and `max_tokens:` are not). The key's prefix, a fal key's id, a link's path and other parameters, and an address's user and host are kept; the secret is replaced with `***REDACTED***` (`***REDACTED_JWT***` for a JSON Web Token). A key glued to the letters or digits before it is not recognized.
+
+Only signed JSON Web Tokens are masked to `***REDACTED_JWT***`, wherever the SDK masks them: three parts joined by dots, the first containing `eyJ` and the second starting with it. An encrypted five-part token and an unsigned token whose last part is empty are sent as written.
+
+For LiteLLM, capture covers client mode chat calls (`completion`, `acompletion` and their streams), with the same fields and truncation as the OpenAI integration. Embeddings are not captured, and the LiteLLM gateway plugin does not capture the prompts or replies of the calls it proxies.
+
+### Maximum Length
+
+```bash
+export REVENIUM_MAX_PROMPT_SIZE=20000
+```
+
+`REVENIUM_MAX_PROMPT_SIZE` sets the maximum length for every integration, as in the Go and Node SDKs. It must be a positive whole number; any other value is ignored with a warning. A value below 200 is raised to 200, the smallest length that still holds the `...[TRUNCATED]` marker, with a warning. Gemini and Vertex AI also read `REVENIUM_MAX_PROMPT_LENGTH`, and `REVENIUM_MAX_PROMPT_SIZE` wins when both are set. For Gemini and Vertex AI the length is capped at 1,000,000 characters; this cap is Python only.
+
+The SDK reads these settings once, when it is imported, so call `load_dotenv()` before importing it.
+
+The Go and Node SDKs also read `REVENIUM_ORGANIZATION_ID`, `REVENIUM_ORGANIZATION_NAME` and `REVENIUM_PRINT_SUMMARY`; the Python SDK does not.
 
 ### Example
 
@@ -1700,6 +2060,10 @@ response = client.chat.completions.create(
 
 Prompt capture works with both streaming and non-streaming requests, and with multimodal content (text, images, etc.).
 
+On the OpenAI Responses API, capture covers `responses.create` and `responses.stream`, sync or async, streamed or not, through `with_raw_response`, and background calls. A Responses call captures only its own `instructions` and `input`: earlier turns OpenAI holds for you through `previous_response_id` or `conversation`, and a stored prompt template passed as `prompt=`, are not captured. `output_response` holds the text of the assistant's messages only; tool calls, reasoning and refusals are not captured, as for chat calls. Async `with_streaming_response` calls that are not streamed (`AsyncOpenAI` `chat.completions.with_streaming_response.create(...)` and `responses.with_streaming_response.create(...)`, read with `await response.parse()`) are not recorded today, so nothing is captured for them. Calls the SDK does not meter at all are not captured either; see [Calls the SDK does not meter](#calls-the-sdk-does-not-meter).
+
+LangChain calls the SDK records through its callback (chat models no Revenium client integration meters, for example ChatMistralAI, ChatCohere, Fireworks, Hugging Face and langchain-google-vertexai models, and text-completion models) capture the system prompt, input messages and reply too, sync or async, streamed or not. A text-completion prompt is stored as one `user` message. Tool calls inside the history are not captured, though the OpenAI chat integration keeps them; a tool message keeps its `tool_call_id`.
+
 ### Security Considerations
 
 - Prompts may contain sensitive user data
@@ -1716,7 +2080,7 @@ Block outbound provider requests client-side when a Revenium cost control trips.
 
 > **Terminology note:** The customer-facing entity is called a **cost control**, served by the backend at `/v2/api/ai/cost-controls`. This SDK polls a separate compiled-rules feed at `/v2/api/ai/enforcement-rules/{teamId}` and is unaffected by changes to the CRUD path — no SDK upgrade is required.
 
-Currently wired for the OpenAI provider (other providers land via per-provider follow-on tickets).
+Every provider middleware checks the cap: OpenAI, Azure OpenAI, Anthropic (including Claude on Bedrock and Foundry), Google Gemini and Vertex AI, Ollama, Perplexity, fal, the LiteLLM client and proxy, and the LangChain callback.
 
 ### Enable
 
@@ -1741,11 +2105,13 @@ REVENIUM_ENFORCEMENT_BASE_URL=https://api.revenium.ai/profitstream  # optional
 | `REVENIUM_ENFORCEMENT_BASE_URL` | origin of `REVENIUM_METERING_BASE_URL` | Base URL for the enforcement API. Set when the enforcement API lives behind a context-path. |
 | `REVENIUM_CB_POLL_INTERVAL_SECONDS` | `60` | Background poll interval for rule refreshes. |
 | `REVENIUM_CB_FAIL_MODE` | `open` | `open` (default) lets calls through when no cache exists; `closed` raises `BudgetExceededError` until rules are loaded. |
-| `REVENIUM_CACHE_DIR` | — | When set, the rule cache is mirrored to `<dir>/revenium_enforcement_rules.json` so a restarted process doesn't fail-closed on the very first call. |
+| `REVENIUM_CACHE_DIR` | unset | When set, the rule cache is mirrored to `<dir>/revenium_enforcement_rules.<scope>.json` so a restarted process doesn't fail-closed on the very first call. `<scope>` is a short hash of the enforcement base URL and `REVENIUM_TEAM_ID`, so services for different teams can share one folder and each loads only its own rules. Nothing is saved without `REVENIUM_TEAM_ID`. |
+
+On/off and mode settings ignore case and surrounding spaces or line endings; a value the SDK does not recognise keeps the default and logs one warning naming the setting.
 
 ### Public API
 
-Enforcement auto-initializes when the OpenAI middleware loads:
+Enforcement starts with the first call any provider middleware checks, for example:
 
 ```python
 import revenium_middleware.openai  # auto-instruments openai
@@ -1754,7 +2120,20 @@ import openai
 client = openai.OpenAI()
 ```
 
-The pre-call check fires before every chat / embeddings / responses call. When the circuit breaker is disabled, it is a no-op. When enabled:
+The pre-call check fires before every call these middlewares meter, including streamed, raw-response, beta and async variants and calls selective metering leaves unmetered:
+
+- OpenAI and Azure OpenAI: chat completions, responses, embeddings and audio.
+- Anthropic, including Claude on Bedrock (`AnthropicBedrock`, and raw boto3 calls with `REVENIUM_BEDROCK_TRANSPORT=1`), Claude on Vertex AI (`AnthropicVertex`) and Foundry: `messages.create`, `stream` and `parse`, and their beta twins.
+- Google: google-genai content, embeddings, Imagen and Veo, and Vertex AI generation, chat, embeddings and Imagen.
+- Ollama: chat, generate, embed and embeddings.
+- Perplexity: the native client and the OpenAI-compatible client.
+- fal: run, stream, submit and subscribe.
+- LiteLLM: client completions and embeddings, and the proxy guardrail.
+- LangChain: the callback checks every model unless its calls go through a Revenium middleware that is imported and checks them itself (OpenAI and Azure OpenAI, including DeepSeek, xAI, Together, Cerebras, Upstage and `ChatOpenAIMantle`; Anthropic, including `ChatAnthropicBedrock`, `ChatAnthropicMantle` and `ChatAnthropicVertex`; Gemini through `langchain-google-genai`; Ollama; LiteLLM; Perplexity; Claude on Bedrock with the Bedrock transport). So Groq, Fireworks, Mistral, Cohere, Hugging Face, `langchain-google-vertexai` Gemini and any vendor not listed here are checked by the callback. So are LangChain's text-completion models (`OpenAI`, `AzureOpenAI` and other `BaseOpenAI` subclasses): they call the legacy completions endpoint, which no middleware checks. `AnthropicLLM` and `OllamaLLM` are checked by their middleware. A refusal there is logged by LangChain at WARNING before it reaches your code.
+
+LangChain embeddings models run no callbacks: `OpenAIEmbeddings` and `AzureOpenAIEmbeddings` are checked by the OpenAI middleware, Ollama embeddings are checked by the Ollama middleware, embeddings from other vendors are not checked.
+
+When the circuit breaker is disabled, it is a no-op. When enabled:
 
 1. A daemon thread (`revenium-enforcement-poll`) starts on first use.
 2. It polls `GET {REVENIUM_ENFORCEMENT_BASE_URL}/v2/api/ai/enforcement-rules/{REVENIUM_TEAM_ID}` every `REVENIUM_CB_POLL_INTERVAL_SECONDS` with the `x-api-key` header.
@@ -1762,13 +2141,17 @@ The pre-call check fires before every chat / embeddings / responses call. When t
 4. A refresh that fails (timeout, refused connection, 5xx, or any 4xx such as a 403 for a wrong key or team id) keeps the cached rules, logs a warning, and is not retried for one `REVENIUM_CB_POLL_INTERVAL_SECONDS`, however much traffic arrives meanwhile.
 5. `204 No Content` is treated as "no rules configured" — the cache is cleared.
 
+A rule with filters (a cap scoped to an agent, model, provider, subscriber, credential, task type, product or organization) blocks or warns only the calls that match all of them; a filter the SDK cannot evaluate, such as the model of a LiteLLM proxy request, keeps the rule applying.
+
+A model filter also holds a vendor's own aliases for the model it names, because Revenium records those calls under the model the vendor serves; an alias is honoured only on a call that can reach that vendor (its own client, a LiteLLM route to it, or a bare LiteLLM model name), so an Ollama model that shares the name is not held. A Gemini `-latest` alias (`gemini-flash-latest`, `gemini-flash-lite-latest`, `gemini-pro-latest`) is held by a `MODEL IS` or `MODEL IN` cap on any version of the same tier, such as `gemini-3.8-flash`, since Google moves the alias to each new model of that tier; a cap on another tier, or on a TTS, audio or image variant, does not hold it. A substring model filter (`CONTAINS`, `STARTS_WITH`, `ENDS_WITH`) whose value is a full model name of the same tier, such as `CONTAINS gemini-3.8-flash`, holds the alias the same way. A substring filter whose value is only part of a name, such as `STARTS_WITH gemini-3.8`, holds it only when the alias text itself matches, because which model Google will serve is not known before the call. Google's other `-latest` names that do not follow `gemini-<tier>-latest` (`antigravity-preview-latest`, `gemini-2.5-flash-native-audio-latest`) are held only by a cap on that name. On Vertex AI, which records the alias itself, a cap on the alias name holds it as well. An xAI short name such as `grok-4.20` or `grok-code-fast-1` is held by a cap on the full model xAI answers with (`grok-4.20-0309-reasoning`, `grok-build-0.1`), for every name xAI listed when this SDK version shipped; a name xAI adds or repoints later is held only after an SDK update.
+
 ### Exception Contract
 
 ```python
-from revenium_middleware.openai import BudgetExceededError
+from revenium_middleware import BudgetExceededError
 ```
 
-When a tripped rule matches the current request, the middleware raises before the OpenAI call is made. All structured fields are populated when the server provides them:
+When a tripped rule matches the current request, the middleware raises before the provider call is made. `revenium_middleware.openai` still exports the same class. All structured fields are populated when the server provides them:
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
@@ -1778,11 +2161,29 @@ When a tripped rule matches the current request, the middleware raises before th
 | `threshold` | `float \| None` | Configured limit |
 | `resets_at` | `str \| None` | ISO-8601 timestamp the rule next resets |
 | `rule_id` | `str \| int \| None` | Server-side rule identifier |
+| `deny_message` | `str \| None` | The message written for the rule, when it has one; also appended to `message` |
 
-`BudgetExceededError` does **not** inherit from `ReveniumMiddlewareError`, so the OpenAI middleware's `handle_exception_safely` decorator never swallows it — it always reaches your `except` block.
+When the breached rule carries a deny message, `message` is the usual text followed by that message, for example `"Request blocked by Revenium enforcement rule: monthly-gpt4-cap. Ask the user before retrying."`, and `deny_message` holds the message alone, so your code can show it as written. Placeholders in it, such as `{spent}` or `{model}`, are shown exactly as written and not filled in by this SDK; read `current_value`, `threshold`, `rule_name` and `resets_at` from the exception for those values. A rule without a deny message keeps the usual text and leaves `deny_message` as `None`.
+
+`BudgetExceededError` does **not** inherit from `ReveniumMiddlewareError`, and no provider middleware swallows it, so it reaches your `except` block, with two exceptions.
+
+Griptape turns errors inside a task into an error result, so call `enable_budget_errors()` once at setup, or `raise_if_budget_exceeded(agent)` after a run; see [Griptape](#griptape).
+
+`litellm.batch_completion` runs each item on its own thread and returns a refused item's `BudgetExceededError` as that item's entry in the result list instead of raising it, so check each entry:
 
 ```python
-from revenium_middleware.openai import BudgetExceededError
+import litellm
+from revenium_middleware import BudgetExceededError
+
+batch = [[{"role": "user", "content": "Summarize A"}], [{"role": "user", "content": "Summarize B"}]]
+results = litellm.batch_completion(model="gpt-4o-mini", messages=batch)
+refused = [r for r in results if isinstance(r, BudgetExceededError)]
+```
+
+`litellm.batch_completion_models_all_responses` leaves a refused model out of its result list without raising.
+
+```python
+from revenium_middleware import BudgetExceededError
 import openai
 
 client = openai.OpenAI()
@@ -1865,6 +2266,55 @@ revenium_middleware.initialize_metering(
 `initialize_metering()` returns `True` when metering is enabled after the
 call; invoke it with no arguments to re-read the environment.
 
+#### Metering Several Customers in One Process
+
+`initialize_metering()` sets one key for the whole process. The record of a non-streamed
+OpenAI (chat, Responses or embeddings), Anthropic `messages.create` (including
+Claude on Bedrock through the Anthropic client), LiteLLM, Ollama or Perplexity
+call is filed under the key that is current when the call returns. The
+exceptions are an Anthropic `with_streaming_response` call and a Perplexity
+response read raw or lazily, which keep the key from when they started. Every
+other record, including streamed calls, `@meter_tool` tool events, and Google
+Gemini, Vertex AI, OpenAI audio, fal.ai and raw boto3 Bedrock calls, keeps the
+key that was current when it started; one started while metering was off is not
+recorded. A call that fails with a provider error is also filed under the key
+from when it started. A call made through LangChain, CrewAI or Griptape follows
+the rule of the provider client it uses, except that a LangChain call recorded
+by the Revenium callback rather than by a provider client, such as
+`wrap(ChatOllama(...))` without the Ollama middleware, keeps the key from when the
+run started. So switching keys with
+`initialize_metering()` while another thread or asyncio task still has a call
+or a metered tool running can send that record under the new key.
+
+To meter several of your own customers at once, give each thread or asyncio
+task its own key with `metering_key()`:
+
+```python
+import revenium_middleware
+
+with revenium_middleware.metering_key("hak_customer_key"):
+    client.chat.completions.create(...)
+```
+
+The key applies to the usage records and tool events of calls made inside the
+block, on that thread or asyncio task only: a thread started inside the block
+does not inherit it, while an asyncio task created inside it does. Wrap the
+thread's target with `carry_context` to carry the key.
+`base_url` is optional and defaults to the address set with
+`initialize_metering()` or `REVENIUM_METERING_BASE_URL`. An empty or malformed
+key raises `ValueError`.
+
+- A key set with `configure(api_key=...)` still wins for tool events, and those events go to the address set with `configure(metering_url=...)`, else the process-wide address, never to the block's `base_url`. Without a `configure()` key, tool events in the block go out with the block's key and the block's address together, even when the block sets no `base_url` (the block's key then goes to the process-wide address); `configure(metering_url=...)` alone does not redirect them.
+- Spending caps follow the process-wide key (the environment or
+  `initialize_metering()`) and `REVENIUM_TEAM_ID`, never the key of a
+  `metering_key()` block. A service that sets keys only with `metering_key()`
+  has no process-wide key, so it gets no spending caps, and with
+  `REVENIUM_CB_FAIL_MODE=closed` every call is refused.
+- Outcomes and jobs are not covered: they need a write key (`rev_sk_`).
+- Delivery pauses for the whole process while Revenium is not answering at
+  any one address (see [Metering Delivery and Timeouts](#metering-delivery-and-timeouts));
+  the records held back meanwhile are replayed later under their own key.
+
 ### Metering Delivery and Timeouts
 
 Usage records are never sent on your request path. A metered call puts its
@@ -1881,8 +2331,8 @@ a few idle threads and the queue's memory, never a thread per call.
 | `REVENIUM_METERING_CONNECT_TIMEOUT_SECONDS` | `5` | Seconds one attempt waits for a connection |
 | `REVENIUM_METERING_MAX_RETRIES` | `2` | Retries after the first attempt |
 
-The two timeouts also apply to tool events, which are sent once without
-retries, and a replay from the store-and-forward buffer is a single attempt
+The two timeouts also apply to tool events, including those sent with
+`emit_tool_event`, which are sent once without retries, and a replay from the store-and-forward buffer is a single attempt
 that waits at most `REVENIUM_METERING_TIMEOUT_SECONDS`.
 
 Each thread sends one record at a time, so the threads keep up with about one
@@ -1957,7 +2407,7 @@ steps against one budget of `REVENIUM_SHUTDOWN_TIMEOUT_SECONDS` (5 seconds by
 default), each using whatever time the previous ones left: it waits for the
 background threads to send the records still queued, builds the records that
 overflowed to the store-and-forward buffer, then flushes the buffer, oldest
-first and one attempt per record. Once a usage record or a tool event fails
+first, up to 32 records at a time, one attempt per record. Once a usage record or a tool event fails
 in a way worth retrying (unreachable, timed out, 429 or 5xx), the flush sends
 no more records of that kind, leaving them unsent, and keeps sending the other
 kind, since tool events can go to a different endpoint. Records still queued, being sent, unbuilt
@@ -1973,6 +2423,43 @@ replaces the SDK's. The flush then happens only if that handler exits
 normally: a handler that restores SIGTERM's default action and re-raises it,
 as uvicorn does after its own shutdown, ends the process before `atexit` runs.
 
+#### Worker processes
+
+A `multiprocessing` child started with the fork or forkserver start method
+(the Linux default) ends through `os._exit`, which skips `atexit`. The SDK
+therefore also flushes a `multiprocessing.Process` child when its target
+returns, with the same budget and the same warning. Both start methods fork
+the child from a process that has imported the SDK, and a forked child starts
+with its own metering queue, buffer and connections: it never sends records
+its parent queued, and its warning counts only its own records.
+
+Some worker shapes still need a call from you, or are not covered:
+
+- `multiprocessing.Pool` workers flush when the worker process exits (after
+  `pool.close(); pool.join()`, or at `maxtasksperchild`), not after each task.
+  Leaving a `with Pool() as pool:` block calls `terminate()`, which kills the
+  workers and can still lose their last records.
+- A raw `os.fork()` worker, or an RQ work horse, that ends with `os._exit`
+  must call `flush_metering()` at the end of each job.
+- Celery's prefork pool (billiard) is not covered; call `flush_metering()` at
+  the end of a task if its worker processes end that way.
+- Under fork and forkserver, records made by threads still running after the
+  target returns are not delivered.
+
+```python
+import revenium_middleware
+
+def job():
+    ...  # model calls
+    left = revenium_middleware.flush_metering()  # waits up to REVENIUM_SHUTDOWN_TIMEOUT_SECONDS
+    # left == 0: every record was sent; otherwise that many are still unsent
+```
+
+`flush_metering(timeout_seconds=None)` sends the records queued or held so
+far and returns how many are still unsent. Metering carries on afterwards, so
+a long-lived worker can call it after every job. A negative or non-finite
+timeout raises `ValueError`.
+
 ### Optional Environment Variables
 
 | Variable | Default | Description |
@@ -1980,24 +2467,26 @@ as uvicorn does after its own shutdown, ends the process before `atexit` runs.
 | `REVENIUM_METERING_BASE_URL` | `https://api.revenium.ai` | Revenium API endpoint |
 | `REVENIUM_LOG_LEVEL` | `INFO` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
 | `REVENIUM_CAPTURE_PROMPTS` | `false` | Enable prompt capture |
+| `REVENIUM_CAPTURE_ERROR_MESSAGES` | `false` | Send the exception message, redacted and capped at 2048 characters, with failed `@meter_tool` events and auto-failed `JobContext` outcomes, and cut to 255 characters (keeping its "(HTTP <status>)" ending) on the record of a failed OpenAI, Anthropic, LiteLLM, Google, Perplexity or Ollama call; off sends the exception class only (with the HTTP status for a failed call). A provider HTTP error's message, which can quote the request, is sent only when `REVENIUM_CAPTURE_PROMPTS` is also on |
 | `REVENIUM_SELECTIVE_METERING` | `false` | Only meter `@revenium_meter` decorated functions |
 | `REVENIUM_TEAM_ID` | - | Team ID for cost lookups and outcome reporting (JobContext team resolution) |
 | `REVENIUM_ENVIRONMENT` | - | Deployment environment (auto-detects from `ENVIRONMENT`, `DEPLOYMENT_ENV`) |
 | `REVENIUM_REGION` | - | Cloud region (auto-detects from `AWS_REGION`, `AZURE_REGION`, `GCP_REGION`) |
-| `REVENIUM_CREDENTIAL_ALIAS` | - | Human-readable API key name |
+| `REVENIUM_CREDENTIAL_ALIAS` | - | Provider API key name, recorded as the subscriber's credential name on calls with no subscriber id or email |
 | `REVENIUM_TRACE_TYPE` | - | Workflow category identifier |
 | `REVENIUM_TRACE_NAME` | - | Human-readable trace label |
 | `REVENIUM_PARENT_TRANSACTION_ID` | - | Parent transaction ID for distributed tracing |
 | `REVENIUM_TRANSACTION_NAME` | - | Human-friendly operation name |
 | `REVENIUM_RETRY_NUMBER` | - | Retry attempt number |
-| `REVENIUM_AGENTIC_JOB_ID` | - | Agentic job instance ID attached to all completions in the process (triggers backend job auto-creation) |
+| `REVENIUM_AGENTIC_JOB_ID` | - | Agentic job instance ID attached to all completions in the process (triggers backend job auto-creation; same format rule as `JobContext`) |
 | `REVENIUM_AGENTIC_JOB_NAME` | - | Human-readable agentic job name |
 | `REVENIUM_AGENTIC_JOB_TYPE` | - | Agentic job type category |
 | `REVENIUM_AGENTIC_JOB_VERSION` | - | Agentic job version |
 | `REVENIUM_WRITE_API_KEY` | - | Primary write-scope key (`rev_sk_`) for the agentic outcomes API (report/amend/history); falls back to `REVENIUM_OUTCOME_API_KEY` (deprecated), then `REVENIUM_METERING_API_KEY` |
 | `REVENIUM_OUTCOME_API_KEY` | - | Deprecated fallback name for the write-scope key; used only when `REVENIUM_WRITE_API_KEY` is unset |
-| `REVENIUM_PROFITSTREAM_BASE_URL` | `https://api.revenium.io` | Agentic outcomes API base URL |
-| `REVENIUM_BEDROCK_DISABLE` | - | Set to `1` to disable Bedrock auto-detection; Foundry detection is unaffected |
+| `REVENIUM_PROFITSTREAM_BASE_URL` | same address as `REVENIUM_METERING_BASE_URL` | Agentic outcomes API base URL. Only needed when outcomes live at a different address than usage. By default it follows the `REVENIUM_METERING_BASE_URL` environment variable: a trailing `/meter` is removed and a path prefix is kept. `AgenticOutcomeClient` also follows a usage address set in code with `initialize_metering(base_url=...)` or a `metering_key(..., base_url=...)` block, for its jobs and outcomes as for its usage records, unless this variable or `profitstream_base_url=` sets an outcome address, or `meter_base_url=` names an address other than the one in `REVENIUM_METERING_BASE_URL`. |
+| `REVENIUM_BEDROCK_DISABLE` | - | Set to `1` to stop Anthropic clients being detected as Bedrock; Foundry detection is unaffected. Raw boto3 calls metered with `REVENIUM_BEDROCK_TRANSPORT`, and LangChain's `ChatBedrock` and `ChatBedrockConverse`, are still recorded as AWS |
+| `REVENIUM_BEDROCK_TRANSPORT` | - | Set to `1` or `true` to meter Claude models called through a raw `boto3.client("bedrock-runtime")` (`invoke_model`, `invoke_model_with_response_stream`, `converse`, `converse_stream`); other Bedrock models are never metered this way |
 | `REVENIUM_BUFFER_MAX_SIZE` | `20000` | Store-and-forward buffer capacity (oldest events evicted when full) |
 | `REVENIUM_BUFFER_FLUSH_INTERVAL` | `30` | Seconds between automatic replay attempts for buffered events |
 | `REVENIUM_METERING_WORKERS` | `32` | Background threads that send usage records (see [Metering Delivery and Timeouts](#metering-delivery-and-timeouts)) |
@@ -2007,6 +2496,8 @@ as uvicorn does after its own shutdown, ends the process before `atexit` runs.
 | `REVENIUM_METERING_MAX_RETRIES` | `2` | Retries after the first attempt before a record moves to the buffer |
 | `REVENIUM_SHUTDOWN_TIMEOUT_SECONDS` | `5` | Total seconds the exit hook may spend sending queued usage records, building overflowed ones and flushing the buffer |
 | `REVENIUM_INSTALL_SIGNAL_HANDLERS` | `false` | Set to `1` to flush metering before SIGTERM's default action ends the process (see [Shutdown](#shutdown)) |
+
+On/off and mode settings ignore case and surrounding spaces or line endings; a value the SDK does not recognise keeps the default and logs one warning naming the setting. `REVENIUM_DEBUG` and `REVENIUM_BEDROCK_DISABLE` are the exceptions: they ignore surrounding spaces or line endings, but `REVENIUM_DEBUG` accepts only `true`, `1` or `yes`, `REVENIUM_BEDROCK_DISABLE` accepts only `1`, and neither logs a warning for any other value.
 
 Per-call `usage_metadata` values take precedence over the `REVENIUM_AGENTIC_JOB_*` environment variables, and the LiteLLM proxy path sources job fields from `x-revenium-*` headers only — these process-level env fallbacks do not apply to proxied traffic.
 
@@ -2038,18 +2529,18 @@ Per-call `usage_metadata` values take precedence over the `REVENIUM_AGENTIC_JOB_
 | **No data in dashboard** | Enable debug logging with `REVENIUM_LOG_LEVEL=DEBUG` |
 | **Import errors** | Ensure the correct extra is installed (e.g., `pip install revenium-python-sdk[openai]`) |
 | **Azure: wrong model name** | Middleware auto-resolves deployment names; check with debug logging |
-| **Bedrock: AccessDenied** | Ensure `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` permissions |
+| **Bedrock: AccessDenied** | Ensure `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` permissions; add `bedrock:GetInferenceProfile` for application inference profile ARNs with `REVENIUM_BEDROCK_TRANSPORT=1`, or with `AnthropicBedrock` and cost controls on, and `bedrock:GetProvisionedModelThroughput` for Provisioned Throughput ARNs with `REVENIUM_BEDROCK_TRANSPORT=1` |
 | **Bedrock: requests go to Anthropic** | Verify AWS credentials: `aws sts get-caller-identity` |
-| **Google: embeddings show 0 tokens** | Expected with Google AI SDK; use Vertex AI for full token counting |
+| **Google: embeddings show 0 tokens** | Expected on the Gemini API, which returns no embedding token count; use google-genai with `vertexai=True` (Vertex AI) for counted embeddings |
 | **Google: "No module named 'vertexai'"** | Install correct extra: `pip install "revenium-python-sdk[google-vertex]"` |
 | **Vertex AI: authentication errors** | Run `gcloud auth application-default login` |
 | **Ollama: connection errors** | Ensure Ollama is running: `ollama serve` |
 | **LangChain: provider shows "unknown"** | Ensure you're using a supported LangChain LLM class |
 | **Streaming errors** | Check provider credentials; middleware auto-falls back gracefully |
 
-**Debug mode:** Set `REVENIUM_LOG_LEVEL=DEBUG` to see detailed provider detection, routing decisions, and metering payloads.
+**Debug mode:** Set `REVENIUM_LOG_LEVEL=DEBUG` (or `REVENIUM_DEBUG=true`, which is the same for every integration) to see detailed provider detection, routing decisions, and metering payloads, with credentials, emails and prompt or reply text redacted. Token counts, ids, model names and attribution names still print.
 
-**Force direct Anthropic API (instead of Bedrock):** Set `REVENIUM_BEDROCK_DISABLE=1` to disable Bedrock auto-detection. Foundry detection is unaffected - a Foundry client is still labelled `Foundry`.
+**Stop Bedrock detection on Anthropic clients:** Set `REVENIUM_BEDROCK_DISABLE=1` to disable Bedrock auto-detection on Anthropic clients. It does not send your calls to Anthropic directly: an `AnthropicBedrock` call still goes to AWS and is billed by AWS, but is recorded as provider `anthropic` at the Anthropic price. Foundry detection is unaffected - a Foundry client is still labelled `Foundry`. Raw boto3 calls metered with `REVENIUM_BEDROCK_TRANSPORT` and LangChain's `ChatBedrock` and `ChatBedrockConverse` are still recorded as AWS.
 
 **Check initialization status (Anthropic):** Use `revenium_middleware.anthropic.is_initialized()` to verify setup.
 
@@ -2073,6 +2564,8 @@ Available log levels:
 - `WARNING`: Warning messages only
 - `ERROR`: Error messages only
 - `CRITICAL`: Critical error messages only
+
+`REVENIUM_DEBUG=true` is the same as `REVENIUM_LOG_LEVEL=DEBUG` for every integration, and takes precedence over `REVENIUM_LOG_LEVEL`. Both are read when `revenium_middleware` is first imported; a level your application sets on the `revenium_middleware` logger afterwards takes precedence.
 
 ## Compatibility
 

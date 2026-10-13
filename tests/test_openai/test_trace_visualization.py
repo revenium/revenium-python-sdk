@@ -319,6 +319,12 @@ class TestOperationTypeDetection:
         assert op_type['operationType'] == 'TOOL_CALL'
         assert op_type['operationSubtype'] == 'function_call'
 
+    def test_xai_tool_call_keeps_function_call_subtype(self):
+        request_body = {'tools': [{'type': 'function'}]}
+        op_type = detect_operation_type('XAI', '/chat/completions', request_body)
+        assert op_type['operationType'] == 'TOOL_CALL'
+        assert op_type['operationSubtype'] == 'function_call'
+
     def test_embeddings(self):
         """Test detection of embeddings operation."""
         op_type = detect_operation_type('openai', '/v1/embeddings', {})

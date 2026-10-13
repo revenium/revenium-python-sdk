@@ -161,7 +161,7 @@ def test_extract_usage_data_does_not_sum_mutually_exclusive_cache_details():
     assert usage_data["cache_read_token_count"] == 22
 
 
-@patch("revenium_middleware.openai.middleware.get_client", lambda: object())
+@patch("revenium_middleware.openai.middleware.current_client", lambda: object())
 @patch("revenium_middleware.openai.middleware.submit_ai_event")
 @patch("revenium_middleware.openai.middleware.run_async_in_thread")
 def test_create_metering_call_forwards_cache_creation_and_read_counts(
@@ -182,7 +182,7 @@ def test_create_metering_call_forwards_cache_creation_and_read_counts(
     assert payload["cache_read_token_count"] == 55
 
 
-@patch("revenium_middleware.openai.middleware.get_client", lambda: object())
+@patch("revenium_middleware.openai.middleware.current_client", lambda: object())
 @patch("revenium_middleware.openai.middleware.submit_ai_event")
 def test_log_token_usage_legacy_cached_tokens_fall_back_to_cache_reads(mock_submit):
     mock_submit.return_value = SimpleNamespace(id="completion-legacy-cache-test")
@@ -208,7 +208,7 @@ def test_log_token_usage_legacy_cached_tokens_fall_back_to_cache_reads(mock_subm
     assert payload["cache_read_token_count"] == 42
 
 
-@patch("revenium_middleware.openai.middleware.get_client", lambda: object())
+@patch("revenium_middleware.openai.middleware.current_client", lambda: object())
 @patch("revenium_middleware.openai.middleware.submit_ai_event")
 def test_log_token_usage_explicit_zero_cache_read_overrides_legacy_cached_tokens(
     mock_submit,
@@ -237,7 +237,7 @@ def test_log_token_usage_explicit_zero_cache_read_overrides_legacy_cached_tokens
     assert payload["cache_read_token_count"] == 0
 
 
-@patch("revenium_middleware.openai.middleware.get_client", lambda: object())
+@patch("revenium_middleware.openai.middleware.current_client", lambda: object())
 @patch("revenium_middleware.openai.middleware.submit_ai_event")
 @patch("revenium_middleware.openai.middleware.run_async_in_thread")
 def test_sync_streaming_chat_forwards_openai_cached_tokens_as_reads(
@@ -264,7 +264,7 @@ def test_sync_streaming_chat_forwards_openai_cached_tokens_as_reads(
     assert payload["cache_read_token_count"] == 66
 
 
-@patch("revenium_middleware.openai.middleware.get_client", lambda: object())
+@patch("revenium_middleware.openai.middleware.current_client", lambda: object())
 @patch("revenium_middleware.openai.middleware.submit_ai_event")
 @patch("revenium_middleware.openai.middleware.run_async_in_thread")
 def test_sync_streaming_chat_preserves_anthropic_shaped_cache_details(
@@ -295,7 +295,7 @@ def test_sync_streaming_chat_preserves_anthropic_shaped_cache_details(
     assert payload["cache_read_token_count"] == 34
 
 
-@patch("revenium_middleware.openai.middleware.get_client", lambda: object())
+@patch("revenium_middleware.openai.middleware.current_client", lambda: object())
 @patch("revenium_middleware.openai.middleware.submit_ai_event")
 @patch("revenium_middleware.openai.middleware.run_async_in_thread")
 def test_streaming_responses_api_forwards_cached_tokens_as_reads(
@@ -321,7 +321,7 @@ def test_streaming_responses_api_forwards_cached_tokens_as_reads(
     assert payload["cache_read_token_count"] == 77
 
 
-@patch("revenium_middleware.openai.middleware.get_client", lambda: object())
+@patch("revenium_middleware.openai.middleware.current_client", lambda: object())
 @patch("revenium_middleware.openai.middleware.submit_ai_event")
 @patch("revenium_middleware.openai.middleware.run_async_in_thread")
 def test_async_streaming_chat_preserves_openai_cached_tokens_as_reads(
@@ -548,3 +548,210 @@ def test_langchain_mock_response_preserves_anthropic_raw_usage_shape():
     )
     assert usage_data["cache_creation_token_count"] == 14
     assert usage_data["cache_read_token_count"] == 9522
+
+
+def _langchain_mock_usage_data(usage, ls_provider, response_model=None, response_model_provider=None):
+    try:
+        from revenium_middleware.openai.langchain.unified_handler import (
+            UnifiedReveniumCallbackHandler,
+        )
+    except ImportError:
+        pytest.skip("LangChain not installed")
+
+    run_info = {
+        "serialized": {"model": "claude-sonnet-4-5"},
+        "invocation_params": {},
+        "run_metadata": {"ls_provider": ls_provider},
+        "start_time": datetime.datetime.now(datetime.timezone.utc).timestamp(),
+        "response_model": response_model,
+        "response_model_provider": response_model_provider,
+    }
+    mock_response = UnifiedReveniumCallbackHandler()._create_mock_response(usage, run_info)
+    usage_data, _ = extract_usage_data(
+        mock_response,
+        OperationType.CHAT,
+        "2026-10-08T12:00:00Z",
+        "2026-10-08T12:00:01Z",
+        1000,
+    )
+    return usage_data, mock_response
+
+
+# langchain-anthropic's pooled shape once it has seen a split: the write is
+# moved out of ``cache_creation`` (left 0) into the ephemeral keys.
+POOLED_USAGE_WITH_A_SPLIT = {
+    "input_tokens": 5016,
+    "output_tokens": 6,
+    "total_tokens": 5022,
+    "input_token_details": {
+        "cache_read": 2000,
+        "cache_creation": 0,
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 3000,
+    },
+}
+
+
+@pytest.mark.parametrize("ls_provider", ["anthropic", "anthropic-bedrock", "anthropic-mantle", "anthropicvertex"])
+def test_a_pooled_claude_record_counts_the_split_write_once(ls_provider):
+    """ChatAnthropicBedrock (BACK-3993) and ChatAnthropicMantle (BACK-4210) subclass
+    ChatAnthropic and pool their usage the same way; langchain-google-vertexai's
+    ChatAnthropicVertex ships its own copy of that pooling (BACK-4222)."""
+    from revenium_middleware._core.cache_tokens import extract_cache_creation_ttl_counts
+
+    usage_data, mock_response = _langchain_mock_usage_data(POOLED_USAGE_WITH_A_SPLIT, ls_provider)
+
+    assert usage_data["input_token_count"] == 16
+    assert usage_data["cache_read_token_count"] == 2000
+    assert usage_data["cache_creation_token_count"] == 3000
+    assert extract_cache_creation_ttl_counts(mock_response.usage) == {
+        "cache_creation5m_token_count": 0,
+        "cache_creation1h_token_count": 3000,
+    }
+
+
+# langchain-openrouter's usage_metadata: OpenRouter's gross prompt_tokens with
+# its cached_tokens as the read and no write reported.
+OPENROUTER_POOLED_USAGE = {
+    "input_tokens": 1013,
+    "output_tokens": 5,
+    "total_tokens": 1018,
+    "input_token_details": {"cache_read": 1000, "cache_creation": None},
+    "output_token_details": {"reasoning": None},
+}
+
+
+@pytest.mark.parametrize("usage, ls_provider, response_model, expected_input, expected_read", [
+    pytest.param(POOLED_USAGE_WITH_A_SPLIT, "some-new-claude-host", None, 16, 2000, id="unknown-class"),
+    pytest.param(OPENROUTER_POOLED_USAGE, "openrouter", "anthropic/claude-sonnet-4.5", 13, 1000, id="openrouter"),
+])
+def test_an_unlisted_class_serving_claude_counts_the_pooled_cache_once(
+        usage, ls_provider, response_model, expected_input, expected_read):
+    """The platform never nets Claude's cache, so a LangChain class Revenium
+    does not know that pools it into input_tokens is netted here (BACK-4222)."""
+    usage_data, _ = _langchain_mock_usage_data(usage, ls_provider, response_model=response_model)
+
+    assert usage_data["input_token_count"] == expected_input
+    assert usage_data["cache_read_token_count"] == expected_read
+
+
+def test_an_unlisted_class_serving_another_model_keeps_its_gross_input():
+    """The platform nets a Groq model's cache reads itself."""
+    usage_data, _ = _langchain_mock_usage_data(
+        POOLED_USAGE_WITH_A_SPLIT, "groq", response_model="llama-3.1-8b-instant",
+    )
+
+    assert usage_data["input_token_count"] == 5016
+    assert usage_data["cache_read_token_count"] == 2000
+
+
+CONVERSE_CLAUDE = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+
+def test_a_pooled_converse_claude_record_counts_the_cache_once(monkeypatch):
+    """ChatBedrockConverse pools the cache into ``input_tokens`` for Claude (BACK-4210)."""
+    from revenium_middleware.openai.langchain import _model_call
+
+    monkeypatch.setattr(_model_call, "_installed_langchain_aws_version", lambda: "1.8.1")
+    usage_data, mock_response = _langchain_mock_usage_data(
+        POOLED_USAGE_WITH_A_SPLIT, "amazon_bedrock",
+        response_model=CONVERSE_CLAUDE, response_model_provider="bedrock_converse",
+    )
+
+    assert usage_data["input_token_count"] == 16
+    assert usage_data["cache_read_token_count"] == 2000
+    assert usage_data["cache_creation_token_count"] == 3000
+
+
+@pytest.mark.parametrize("response_model, response_model_provider", [
+    pytest.param(CONVERSE_CLAUDE, "bedrock", id="chat-bedrock-invoke"),
+    pytest.param(CONVERSE_CLAUDE, None, id="no-marker"),
+    pytest.param("us.amazon.nova-micro-v1:0", "bedrock_converse", id="converse-nova"),
+])
+def test_an_amazon_bedrock_record_without_the_converse_marker_keeps_its_input(
+        response_model, response_model_provider):
+    usage_data, _ = _langchain_mock_usage_data(
+        POOLED_USAGE_WITH_A_SPLIT, "amazon_bedrock",
+        response_model=response_model, response_model_provider=response_model_provider,
+    )
+
+    assert usage_data["input_token_count"] == 5016
+    assert usage_data["cache_read_token_count"] == 2000
+
+
+def test_an_openai_langchain_record_keeps_its_gross_input():
+    """The platform nets OpenAI cache reads itself, so the callback leaves them in."""
+    usage_data, _ = _langchain_mock_usage_data(
+        {
+            "input_tokens": 90,
+            "output_tokens": 10,
+            "total_tokens": 100,
+            "input_token_details": {"cache_read": 34},
+        },
+        "openai",
+    )
+
+    assert usage_data["input_token_count"] == 90
+    assert usage_data["cache_read_token_count"] == 34
+
+
+UNCACHED = 6000
+ALREADY_NET_READ = 2000
+ALREADY_NET_WRITE = 500
+
+
+def _already_net_record_through_the_callback(usage):
+    usage_data, _ = _langchain_mock_usage_data(usage, "anthropic")
+    return usage_data
+
+
+def _already_net_record_through_extract_usage_data(usage):
+    response = SimpleNamespace(
+        id="already-net-claude",
+        model="claude-sonnet-4-5",
+        usage=SimpleNamespace(
+            input_tokens=usage["input_tokens"],
+            output_tokens=usage["output_tokens"],
+            total_tokens=usage["total_tokens"],
+            input_token_details=SimpleNamespace(**usage["input_token_details"]),
+        ),
+        choices=[SimpleNamespace(finish_reason="stop")],
+        system_fingerprint=None,
+    )
+    usage_data, _ = extract_usage_data(
+        response, OperationType.CHAT, "2026-10-10T12:00:00Z", "2026-10-10T12:00:01Z", 1000,
+    )
+    return usage_data
+
+
+ALREADY_NET_SHAPES = {
+    # ChatAnthropic's pooled usage_metadata; the callback takes the cache out once.
+    "pooled_input_token_details": (_already_net_record_through_the_callback, {
+        "input_tokens": UNCACHED + ALREADY_NET_READ + ALREADY_NET_WRITE, "output_tokens": 20,
+        "total_tokens": UNCACHED + ALREADY_NET_READ + ALREADY_NET_WRITE + 20,
+        "input_token_details": {"cache_read": ALREADY_NET_READ, "cache_creation": ALREADY_NET_WRITE},
+    }),
+    # A non-streamed ChatAnthropic result's raw usage, already net.
+    "raw_flat_keys": (_already_net_record_through_the_callback, {
+        "input_tokens": UNCACHED, "output_tokens": 20, "total_tokens": UNCACHED + 20,
+        "cache_read_input_tokens": ALREADY_NET_READ, "cache_creation_input_tokens": ALREADY_NET_WRITE,
+    }),
+    "net_input_token_details": (_already_net_record_through_extract_usage_data, {
+        "input_tokens": UNCACHED, "output_tokens": 20, "total_tokens": UNCACHED + 20,
+        "input_token_details": {"cache_read": ALREADY_NET_READ, "cache_creation": ALREADY_NET_WRITE},
+    }),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(ALREADY_NET_SHAPES))
+def test_already_net_claude_langchain_records_are_not_netted_again(shape):
+    """Regression guard for BACK-4240: only an OpenAI-shaped gateway count for
+    Claude is netted. An Anthropic-shaped LangChain record arrives net, and
+    netting it again would record 3500 instead of 6000."""
+    record_for, usage = ALREADY_NET_SHAPES[shape]
+
+    usage_data = record_for(usage)
+
+    assert usage_data["input_token_count"] == UNCACHED
+    assert usage_data["cache_read_token_count"] == ALREADY_NET_READ
+    assert usage_data["cache_creation_token_count"] == ALREADY_NET_WRITE

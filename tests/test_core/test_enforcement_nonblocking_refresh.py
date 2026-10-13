@@ -129,6 +129,14 @@ class TestTheCheckNeverWaitsOnTheEndpoint:
             enforcement.check_enforcement({})
         assert time.perf_counter() - started < CHECK_BOUND_SECONDS
 
+    @pytest.mark.parametrize("mode", ["closed ", "closed\r"], ids=["space", "carriage-return"])
+    def test_a_padded_closed_fail_mode_refuses_before_rules_arrive(self, endpoint, monkeypatch, mode):
+        endpoint(HANG)
+        monkeypatch.setenv("REVENIUM_CB_FAIL_MODE", mode)
+
+        with pytest.raises(BudgetExceededError, match="uninitialized"):
+            enforcement.check_enforcement({})
+
 
 class TestRulesStillArriveAndStillBlock:
     """Moving the refresh off the caller changes when rules land, never what they block."""
@@ -344,6 +352,6 @@ class TestThePollerKeepsItsCadenceThroughABackoff:
         clock = FakeClock()
         monkeypatch.setattr(enforcement, "time", clock)
 
-        remaining = enforcement._begin_refresh_cooldown(999999)
+        remaining = enforcement._begin_refresh_cooldown(999999, enforcement._current_owner())
 
         assert remaining == pytest.approx(enforcement._REFRESH_COOLDOWN_CEILING_SECONDS)

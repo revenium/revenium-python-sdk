@@ -8,9 +8,11 @@ import logging
 from typing import Dict, Any, Optional
 
 from griptape.drivers.prompt.openai_chat_prompt_driver import OpenAiChatPromptDriver
+from griptape.drivers.prompt.azure_openai_chat_prompt_driver import AzureOpenAiChatPromptDriver
 from griptape.common.prompt_stack.prompt_stack import PromptStack
 
 from ._metadata import strip_revenium_auth_keys
+from ._retry import stop_retrying_budget_errors
 
 # Import the revenium OpenAI middleware - this automatically patches OpenAI calls
 try:
@@ -78,6 +80,7 @@ class ReveniumOpenAiDriver(OpenAiChatPromptDriver):
     ):
         # Initialize parent OpenAI driver
         super().__init__(**kwargs)
+        stop_retrying_budget_errors(self)
         
         # Store usage metadata for injection into OpenAI calls
         # NOTE: We do NOT store auth credentials here to prevent state corruption
@@ -131,3 +134,17 @@ class ReveniumOpenAiDriver(OpenAiChatPromptDriver):
     def __repr__(self) -> str:
         """String representation showing Revenium enhancement."""
         return f"ReveniumOpenAiDriver(model={self.model}, revenium_enabled={REVENIUM_AVAILABLE})" 
+
+
+class ReveniumAzureOpenAiDriver(ReveniumOpenAiDriver, AzureOpenAiChatPromptDriver):
+    """
+    Azure OpenAI driver with automatic Revenium usage metering.
+
+    Griptape's Azure driver builds the AzureOpenAI client from its endpoint,
+    deployment, API version and AD token; the Revenium OpenAI driver adds the
+    usage metadata. Created by ReveniumDriver when it wraps an
+    AzureOpenAiChatPromptDriver.
+    """
+
+    def __repr__(self) -> str:
+        return f"ReveniumAzureOpenAiDriver(model={self.model}, revenium_enabled={REVENIUM_AVAILABLE})"

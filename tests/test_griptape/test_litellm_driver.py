@@ -1,4 +1,7 @@
 """Tests for the Revenium LiteLLM Griptape driver."""
+import logging
+import re
+
 import pytest
 
 pytest.importorskip("griptape")
@@ -25,9 +28,10 @@ def test_build_revenium_headers():
 
     assert headers["x-revenium-trace-id"] == "trace-123"
     assert headers["x-revenium-task-type"] == "unit-test"
-    # Nested subscriber dict is flattened to the header the proxy
-    # middleware actually reads; other subscriber fields are dropped.
+    # Nested subscriber dict is flattened to the headers the proxy
+    # middleware actually reads.
     assert headers["x-revenium-subscriber-id"] == "sub-1"
+    assert headers["x-revenium-subscriber-email"] == "user@example.com"
     assert "x-revenium-subscriber" not in headers
     # Only x-revenium-* headers, never credentials
     assert "Authorization" not in headers
@@ -253,7 +257,7 @@ def test_revenium_headers_strip_auth_keys(monkeypatch):
 
 
 def test_proxy_call_redacts_authorization_in_logs(monkeypatch, caplog):
-    """DEBUG logs never contain the proxy API key; Authorization is redacted."""
+    """DEBUG logs never contain the proxy API key; Authorization and the subscriber email are redacted."""
     import logging
 
     captured = _patch_requests_post(monkeypatch)
@@ -263,7 +267,7 @@ def test_proxy_call_redacts_authorization_in_logs(monkeypatch, caplog):
         model="gemini/gemini-1.5-flash",
         proxy_url="https://proxy.internal/chat/completions",
         proxy_api_key="sk-secret-123",
-        usage_metadata={"trace_id": "t"},
+        usage_metadata={"trace_id": "t", "subscriber": {"id": "jane@example.com"}},
     )
 
     with caplog.at_level(
@@ -275,7 +279,11 @@ def test_proxy_call_redacts_authorization_in_logs(monkeypatch, caplog):
     assert captured["headers"]["Authorization"] == "Bearer sk-secret-123"
     # ...but never appears in logs.
     assert "sk-secret-123" not in caplog.text
-    assert "Bearer ***" in caplog.text
+    assert "'Authorization'" in caplog.text
+    assert "Injected usage metadata via headers" in caplog.text
+    assert "Bearer" not in caplog.text
+    assert captured["headers"]["x-revenium-subscriber-id"] == "jane@example.com"
+    assert "jane@example.com" not in caplog.text
 
 
 class _StubArtifact:
@@ -318,16 +326,337 @@ def test_extract_message_content_joins_text(monkeypatch):
     assert driver._extract_message_content(message) == "hello\nworld"
 
 
-def test_revenium_headers_flatten_subscriber_id(monkeypatch):
-    """A nested subscriber object becomes the flat header the proxy middleware reads."""
+def test_revenium_headers_flatten_subscriber_id_and_email(monkeypatch):
+    """A nested subscriber object becomes the flat headers the proxy middleware reads."""
     driver = _make_driver(
         monkeypatch,
         model="gemini/gemini-1.5-flash",
-        usage_metadata={"subscriber": {"id": "user-123", "email": "u@example.com"}},
+        usage_metadata={"subscriber": {"id": "user-123", "email": "u@example.com", "credential": "c"}},
     )
 
     headers = driver._build_revenium_headers()
 
-    assert headers == {"x-revenium-subscriber-id": "user-123"}
+    assert headers == {"x-revenium-subscriber-id": "user-123", "x-revenium-subscriber-email": "u@example.com"}
     assert "x-revenium-subscriber" not in headers
-    assert "u@example.com" not in str(headers)
+
+
+PROXY_ENV_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+DRIVER_LOGGER = "revenium_middleware.griptape.litellm_driver"
+
+
+def _lowercased(headers):
+    return {key.lower(): value for key, value in headers.items()}
+
+
+def _revenium_headers_sent(captured):
+    return {key: value for key, value in _lowercased(captured["headers"]).items() if key.startswith("x-revenium-")}
+
+
+def _user_stack():
+    from griptape.common import PromptStack
+
+    stack = PromptStack()
+    stack.add_user_message("hi")
+    return stack
+
+
+class _ProxyStub:
+    """A real HTTP server on localhost that answers like the LiteLLM proxy and records request headers."""
+
+    def __init__(self):
+        import http.server
+        import json
+        import threading
+
+        received = self.received = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                received.append({key.lower(): value for key, value in self.headers.items()})
+                body = json.dumps({"choices": [{"message": {"content": "stub reply"}}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/chat/completions"
+        self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self._thread.join(timeout=5)
+
+
+@pytest.fixture
+def proxy_stub(monkeypatch):
+    for name in PROXY_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    monkeypatch.setenv("no_proxy", "127.0.0.1")
+    monkeypatch.delenv("LITELLM_API_KEY", raising=False)
+    stub = _ProxyStub()
+    yield stub
+    stub.close()
+
+
+def test_proxy_headers_use_names_the_proxy_reads(monkeypatch):
+    """camelCase keys and the nested subscriber email reach the header names the proxy reads."""
+    captured = _patch_requests_post(monkeypatch)
+    driver = _make_driver(
+        monkeypatch,
+        model="gemini/gemini-1.5-flash",
+        proxy_url="https://proxy.internal/chat/completions",
+        usage_metadata={
+            "traceId": "t-1", "taskType": "triage", "agenticJobId": "job-1", "organizationName": "Acme",
+            "subscriber": {"id": "u-1", "email": "dev@example.com"},
+        },
+    )
+
+    driver._make_proxy_call([{"role": "user", "content": "hi"}])
+
+    assert _revenium_headers_sent(captured) == {
+        "x-revenium-trace-id": "t-1",
+        "x-revenium-task-type": "triage",
+        "x-revenium-agentic-job-id": "job-1",
+        "x-revenium-organization-name": "Acme",
+        "x-revenium-subscriber-id": "u-1",
+        "x-revenium-subscriber-email": "dev@example.com",
+    }
+
+
+@pytest.mark.parametrize("metadata,expected", [
+    pytest.param({"trace_id": "snake", "traceId": "camel"}, {"x-revenium-trace-id": "snake"}, id="snake-first"),
+    pytest.param({"traceId": "camel", "trace_id": "snake"}, {"x-revenium-trace-id": "snake"}, id="camel-first"),
+    pytest.param({"subscriber": {"email": "nested@example.com"}, "subscriber_email": "flat@example.com"},
+                 {"x-revenium-subscriber-email": "nested@example.com"}, id="nested-subscriber-first"),
+    pytest.param({"subscriberEmail": "flat@example.com", "subscriber": {"email": "nested@example.com"}},
+                 {"x-revenium-subscriber-email": "nested@example.com"}, id="flat-subscriber-first"),
+])
+def test_proxy_headers_collision_rules(monkeypatch, metadata, expected):
+    """Two spellings of one tag produce one header, chosen by rule rather than by dict order."""
+    driver = _make_driver(monkeypatch, model="gemini/gemini-1.5-flash", usage_metadata=metadata)
+
+    assert _lowercased(driver._build_revenium_headers()) == expected
+
+
+UNSENDABLE_TAGS = [
+    pytest.param({"organization_name": "株式会社"}, "x-revenium-organization-name", None, id="non-latin"),
+    pytest.param({"trace_id": "t-1\n"}, "x-revenium-trace-id", "t-1", id="trailing-newline"),
+    pytest.param({"task_type": "summarize\r\n"}, "x-revenium-task-type", "summarize", id="trailing-crlf"),
+    pytest.param({"task_type": "a\r\nX-Injected: yes"}, "x-revenium-task-type", None, id="embedded-crlf"),
+]
+
+
+@pytest.mark.parametrize("metadata,header,expected", UNSENDABLE_TAGS)
+def test_proxy_call_survives_unsendable_tag_values(monkeypatch, caplog, proxy_stub, metadata, header, expected):
+    """A tag value no HTTP header can carry is dropped with a warning; the customer's call still succeeds."""
+    import logging
+
+    driver = _make_driver(monkeypatch, model="gpt-4o-mini", proxy_url=proxy_stub.url, usage_metadata=metadata)
+
+    with caplog.at_level(logging.WARNING, logger=DRIVER_LOGGER):
+        message = driver.try_run(_user_stack())
+
+    assert message.to_text() == "stub reply"
+    received = proxy_stub.received[-1]
+    assert "x-injected" not in received
+    assert received.get(header) == expected
+    if expected is None:
+        (key,) = metadata
+        assert key in caplog.text
+        assert metadata[key] not in caplog.text
+
+
+@pytest.mark.parametrize("metadata,header,expected", UNSENDABLE_TAGS + [
+    pytest.param({"organization_name": "Café"}, "x-revenium-organization-name", None, id="non-ascii"),
+])
+def test_streaming_proxy_headers_are_sendable_by_httpx(monkeypatch, metadata, header, expected):
+    """The litellm.completion path hands its headers to httpx, which only sends ASCII."""
+    httpx = pytest.importorskip("httpx")
+    driver = _make_driver(
+        monkeypatch, model="gpt-4o-mini", proxy_url="http://proxy.invalid/chat/completions",
+        usage_metadata=metadata,
+    )
+
+    params = driver._build_litellm_params(None)
+    request = httpx.Request("POST", "http://proxy.invalid/chat/completions", headers=params["extra_headers"])
+
+    assert request.headers.get(header) == expected
+    assert "x-injected" not in request.headers
+
+
+UNSENDABLE_TAG_NAMES = [
+    pytest.param("customer name", id="space"),
+    pytest.param("cost/center", id="slash"),
+    pytest.param("team:region", id="colon"),
+    pytest.param("ab\tcd", id="tab"),
+    pytest.param("ab\x01cd", id="control-byte"),
+    pytest.param("\u00e9quipe", id="accented"),
+    pytest.param("\u90e8\u7f72", id="japanese"),
+    pytest.param("s\u212Aill_name", id="kelvin-sign"),
+    pytest.param(1, id="integer"),
+    pytest.param(("a", "b"), id="tuple"),
+]
+
+SENDABLE_HEADER_NAME = re.compile(r"x-revenium-[a-z0-9-]+")
+
+
+def _all_sendable(header_names):
+    return all(
+        SENDABLE_HEADER_NAME.fullmatch(name.lower())
+        for name in header_names
+        if name.lower().startswith("x-revenium")
+    )
+
+
+@pytest.mark.parametrize("key", UNSENDABLE_TAG_NAMES)
+def test_proxy_call_survives_unsendable_tag_names(monkeypatch, caplog, proxy_stub, key):
+    """BACK-4260: a tag name no HTTP header can carry is skipped with a warning
+    naming it; the customer's call still succeeds and the other tags still flow."""
+    driver = _make_driver(
+        monkeypatch, model="gpt-4o-mini", proxy_url=proxy_stub.url,
+        usage_metadata={key: "Acme", "trace_id": "t-1"},
+    )
+
+    with caplog.at_level(logging.WARNING, logger=DRIVER_LOGGER):
+        message = driver.try_run(_user_stack())
+
+    assert message.to_text() == "stub reply"
+    assert proxy_stub.received[-1]["x-revenium-trace-id"] == "t-1"
+    assert _all_sendable(driver._build_revenium_headers(encoding="latin-1"))
+    assert repr(key) in caplog.text
+    assert "Acme" not in caplog.text
+
+
+@pytest.mark.parametrize("key", UNSENDABLE_TAG_NAMES)
+def test_streaming_proxy_headers_skip_unsendable_tag_names(monkeypatch, key):
+    """The litellm.completion path builds its headers the same way, so httpx can send them."""
+    httpx = pytest.importorskip("httpx")
+    driver = _make_driver(
+        monkeypatch, model="gpt-4o-mini", proxy_url="http://proxy.invalid/chat/completions",
+        usage_metadata={key: "Acme", "trace_id": "t-1"},
+    )
+
+    params = driver._build_litellm_params(None)
+    request = httpx.Request("POST", "http://proxy.invalid/chat/completions", headers=params["extra_headers"])
+
+    assert request.headers.get("x-revenium-trace-id") == "t-1"
+    assert _all_sendable(request.headers.keys())
+
+
+def test_an_unsendable_tag_name_is_warned_about_once(monkeypatch, caplog, proxy_stub):
+    """An agent loop makes many calls; the warning for one bad key must not repeat on each."""
+    driver = _make_driver(
+        monkeypatch, model="gpt-4o-mini", proxy_url=proxy_stub.url,
+        usage_metadata={"customer name": "Acme", "trace_id": "t-1"},
+    )
+
+    with caplog.at_level(logging.WARNING, logger=DRIVER_LOGGER):
+        driver.try_run(_user_stack())
+        driver.try_run(_user_stack())
+
+    assert len(proxy_stub.received) == 2
+    assert caplog.text.count(repr("customer name")) == 1
+
+
+def test_a_non_ascii_spelling_never_replaces_a_valid_tag(monkeypatch):
+    """A key that only lowercases to a known tag name, such as one with the Kelvin sign,
+    is skipped, so the caller's real tag still arrives."""
+    driver = _make_driver(
+        monkeypatch, model="gemini/gemini-1.5-flash",
+        usage_metadata={"s\u212Aill_name": "forged", "skillName": "real"},
+    )
+
+    assert _lowercased(driver._build_revenium_headers())["x-revenium-skill-name"] == "real"
+
+
+def test_proxy_headers_skip_none_values(monkeypatch):
+    """A tag left as None sends no header rather than the text "None"."""
+    driver = _make_driver(
+        monkeypatch, model="gemini/gemini-1.5-flash", usage_metadata={"trace_id": None, "task_type": "triage"},
+    )
+
+    assert _lowercased(driver._build_revenium_headers()) == {"x-revenium-task-type": "triage"}
+
+
+def test_proxy_debug_log_never_contains_tag_values(monkeypatch, caplog):
+    """DEBUG logging names the headers sent, never their values (trace ids, emails)."""
+    import logging
+
+    captured = _patch_requests_post(monkeypatch)
+    driver = _make_driver(
+        monkeypatch,
+        model="gemini/gemini-1.5-flash",
+        proxy_url="https://proxy.internal/chat/completions",
+        usage_metadata={"trace_id": "trace-value-123", "subscriber": {"id": "u-1", "email": "dev@example.com"}},
+    )
+
+    with caplog.at_level(logging.DEBUG, logger=DRIVER_LOGGER):
+        driver._make_proxy_call([{"role": "user", "content": "hi"}])
+
+    assert _revenium_headers_sent(captured)["x-revenium-trace-id"] == "trace-value-123"
+    assert "x-revenium-trace-id" in caplog.text
+    assert "trace-value-123" not in caplog.text
+    assert "dev@example.com" not in caplog.text
+
+
+def test_proxy_call_keeps_latin1_tag_values(monkeypatch, proxy_stub):
+    """The direct proxy call sends latin-1 header text, so an accented tag still arrives intact."""
+    driver = _make_driver(
+        monkeypatch, model="gpt-4o-mini", proxy_url=proxy_stub.url, usage_metadata={"organization_name": "Café"},
+    )
+
+    driver.try_run(_user_stack())
+
+    assert proxy_stub.received[-1]["x-revenium-organization-name"] == "Café"
+
+
+@pytest.mark.parametrize("configured,posted", [
+    ("https://proxy.internal", "https://proxy.internal/chat/completions"),
+    ("https://proxy.internal/", "https://proxy.internal/chat/completions"),
+    ("https://proxy.internal/v1", "https://proxy.internal/v1/chat/completions"),
+    ("https://proxy.internal/v1?tenant=a", "https://proxy.internal/v1/chat/completions?tenant=a"),
+    ("https://proxy.internal/chat/completions", "https://proxy.internal/chat/completions"),
+    ("https://proxy.internal/chat/completions?tenant=a", "https://proxy.internal/chat/completions?tenant=a"),
+    ("https://proxy.internal/chat/completions/", "https://proxy.internal/chat/completions"),
+])
+def test_proxy_call_posts_to_chat_completions_for_any_gateway_address(monkeypatch, configured, posted):
+    captured = _patch_requests_post(monkeypatch)
+    driver = _make_driver(monkeypatch, model="gpt-4o-mini", proxy_url=configured)
+
+    driver._make_proxy_call([{"role": "user", "content": "hi"}])
+
+    assert captured["url"] == posted
+
+
+@pytest.mark.parametrize("configured,api_base", [
+    ("https://proxy.internal", "https://proxy.internal"),
+    ("https://proxy.internal/", "https://proxy.internal"),
+    ("https://proxy.internal/v1/", "https://proxy.internal/v1"),
+    ("https://proxy.internal/chat/completions", "https://proxy.internal"),
+    ("https://proxy.internal/chat/completions/", "https://proxy.internal"),
+    ("https://proxy.internal/chat/completions?tenant=a", "https://proxy.internal?tenant=a"),
+])
+def test_streaming_call_sends_litellm_the_gateway_base_for_any_gateway_address(monkeypatch, configured, api_base):
+    import revenium_middleware.griptape.litellm_driver as driver_module
+
+    sent = {}
+
+    def fake_completion(**kwargs):
+        sent.update(kwargs)
+        return iter(())
+
+    monkeypatch.setattr(driver_module.litellm, "completion", fake_completion)
+    driver = _make_driver(monkeypatch, model="gpt-4o-mini", proxy_url=configured)
+
+    list(driver.try_stream(_user_stack()))
+
+    assert sent["api_base"] == api_base

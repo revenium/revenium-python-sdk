@@ -23,6 +23,7 @@ from .._response import (
     async_to_streamed_response_wrapper,
 )
 from .._base_client import make_request_options
+from ..._core.subscriber import subscriber_with_credential_alias
 from ..types.metering_response_resource import MeteringResponseResource
 
 __all__ = ["AIResource", "AsyncAIResource"]
@@ -76,6 +77,7 @@ class AIResource(SyncAPIResource):
         cache_read_token_count: int | NotGiven = NOT_GIVEN,
         coding_assistant_account_uuid: str | NotGiven = NOT_GIVEN,
         effort: str | NotGiven = NOT_GIVEN,
+        client_surface: str | NotGiven = NOT_GIVEN,
         prompt_id: str | NotGiven = NOT_GIVEN,
         prompt_length: int | NotGiven = NOT_GIVEN,
         query_source: str | NotGiven = NOT_GIVEN,
@@ -219,6 +221,10 @@ class AIResource(SyncAPIResource):
               otherwise coerced -- and the backend validates it (at most 16 characters
               matching ^[A-Za-z0-9_-]+$).
 
+          client_surface: The first-party app that sent this coding-assistant call, for example
+              claude-code (terminal CLI) or claude-code-desktop (desktop app); the backend
+              owns the vocabulary (max 64 chars)
+
           prompt_id: Identifier of the user prompt that produced this completion, so every call
               made while serving one prompt can be grouped (max 64 chars)
 
@@ -296,7 +302,9 @@ class AIResource(SyncAPIResource):
 
           trace_id: Trace multiple LLM calls belonging to same overall request
 
-          credential_alias: Human-readable name for the API key being used
+          credential_alias: Human-readable name for the API key being used, sent as
+              subscriber.credential.name unless the subscriber has an id or email, or
+              already names or values a credential
 
           environment: Deployment environment identifier (e.g., 'production', 'staging',
               'development')
@@ -394,6 +402,7 @@ class AIResource(SyncAPIResource):
                     "cache_read_token_count": cache_read_token_count,
                     "coding_assistant_account_uuid": coding_assistant_account_uuid,
                     "effort": effort,
+                    "client_surface": client_surface,
                     "prompt_id": prompt_id,
                     "prompt_length": prompt_length,
                     "query_source": query_source,
@@ -413,7 +422,7 @@ class AIResource(SyncAPIResource):
                     "reasoning_token_count": reasoning_token_count,
                     "response_quality_score": response_quality_score,
                     "skip_reason": skip_reason,
-                    "subscriber": subscriber,
+                    "subscriber": subscriber_with_credential_alias(subscriber, credential_alias),
                     "subscriber_email_source": subscriber_email_source,
                     "subscription_id": subscription_id,
                     "system_fingerprint": system_fingerprint,
@@ -422,7 +431,6 @@ class AIResource(SyncAPIResource):
                     "time_to_first_token": time_to_first_token,
                     "total_cost": total_cost,
                     "trace_id": trace_id,
-                    "credential_alias": credential_alias,
                     "environment": environment,
                     "operation_subtype": operation_subtype,
                     "parent_transaction_id": parent_transaction_id,
@@ -666,7 +674,9 @@ class AIResource(SyncAPIResource):
 
           model_source: The source of the AI model used
 
-          credential_alias: Human-readable name for the API key being used
+          credential_alias: Human-readable name for the API key being used, sent as
+              subscriber.credential.name unless the subscriber has an id or email, or
+              already names or values a credential
 
           actual_service_tier: The service tier the provider actually used
 
@@ -717,7 +727,7 @@ class AIResource(SyncAPIResource):
                     "error_code": error_code,
                     "billing_skipped": billing_skipped,
                     "skip_reason": skip_reason,
-                    "subscriber": subscriber,
+                    "subscriber": subscriber_with_credential_alias(subscriber, credential_alias),
                     "subscriber_email": subscriber_email,
                     "subscriber_id": subscriber_id,
                     "subscription_id": subscription_id,
@@ -748,7 +758,6 @@ class AIResource(SyncAPIResource):
                     "retry_number": retry_number,
                     "middleware_source": middleware_source,
                     "model_source": model_source,
-                    "credential_alias": credential_alias,
                     "actual_service_tier": actual_service_tier,
                     "requested_service_tier": requested_service_tier,
                     "pricing_tier": pricing_tier,
@@ -951,7 +960,9 @@ class AIResource(SyncAPIResource):
 
           model_source: The source of the AI model used
 
-          credential_alias: Human-readable name for the API key being used
+          credential_alias: Human-readable name for the API key being used, sent as
+              subscriber.credential.name unless the subscriber has an id or email, or
+              already names or values a credential
 
           actual_service_tier: The service tier the provider actually used
 
@@ -999,7 +1010,7 @@ class AIResource(SyncAPIResource):
                     "error_code": error_code,
                     "billing_skipped": billing_skipped,
                     "skip_reason": skip_reason,
-                    "subscriber": subscriber,
+                    "subscriber": subscriber_with_credential_alias(subscriber, credential_alias),
                     "subscriber_email": subscriber_email,
                     "subscriber_id": subscriber_id,
                     "subscription_id": subscription_id,
@@ -1030,7 +1041,6 @@ class AIResource(SyncAPIResource):
                     "retry_number": retry_number,
                     "middleware_source": middleware_source,
                     "model_source": model_source,
-                    "credential_alias": credential_alias,
                     "actual_service_tier": actual_service_tier,
                     "requested_service_tier": requested_service_tier,
                     "pricing_tier": pricing_tier,
@@ -1231,7 +1241,9 @@ class AIResource(SyncAPIResource):
 
           model_source: The source of the AI model used
 
-          credential_alias: Human-readable name for the API key being used
+          credential_alias: Human-readable name for the API key being used, sent as
+              subscriber.credential.name unless the subscriber has an id or email, or
+              already names or values a credential
 
           actual_service_tier: The service tier the provider actually used
 
@@ -1278,7 +1290,7 @@ class AIResource(SyncAPIResource):
                     "error_code": error_code,
                     "billing_skipped": billing_skipped,
                     "skip_reason": skip_reason,
-                    "subscriber": subscriber,
+                    "subscriber": subscriber_with_credential_alias(subscriber, credential_alias),
                     "subscriber_email": subscriber_email,
                     "subscriber_id": subscriber_id,
                     "subscription_id": subscription_id,
@@ -1309,7 +1321,6 @@ class AIResource(SyncAPIResource):
                     "retry_number": retry_number,
                     "middleware_source": middleware_source,
                     "model_source": model_source,
-                    "credential_alias": credential_alias,
                     "actual_service_tier": actual_service_tier,
                     "requested_service_tier": requested_service_tier,
                     "pricing_tier": pricing_tier,
@@ -1373,6 +1384,7 @@ class AsyncAIResource(AsyncAPIResource):
         cache_read_token_count: int | NotGiven = NOT_GIVEN,
         coding_assistant_account_uuid: str | NotGiven = NOT_GIVEN,
         effort: str | NotGiven = NOT_GIVEN,
+        client_surface: str | NotGiven = NOT_GIVEN,
         prompt_id: str | NotGiven = NOT_GIVEN,
         prompt_length: int | NotGiven = NOT_GIVEN,
         query_source: str | NotGiven = NOT_GIVEN,
@@ -1516,6 +1528,10 @@ class AsyncAIResource(AsyncAPIResource):
               otherwise coerced -- and the backend validates it (at most 16 characters
               matching ^[A-Za-z0-9_-]+$).
 
+          client_surface: The first-party app that sent this coding-assistant call, for example
+              claude-code (terminal CLI) or claude-code-desktop (desktop app); the backend
+              owns the vocabulary (max 64 chars)
+
           prompt_id: Identifier of the user prompt that produced this completion, so every call
               made while serving one prompt can be grouped (max 64 chars)
 
@@ -1593,7 +1609,9 @@ class AsyncAIResource(AsyncAPIResource):
 
           trace_id: Trace multiple LLM calls belonging to same overall request
 
-          credential_alias: Human-readable name for the API key being used
+          credential_alias: Human-readable name for the API key being used, sent as
+              subscriber.credential.name unless the subscriber has an id or email, or
+              already names or values a credential
 
           environment: Deployment environment identifier (e.g., 'production', 'staging',
               'development')
@@ -1691,6 +1709,7 @@ class AsyncAIResource(AsyncAPIResource):
                     "cache_read_token_count": cache_read_token_count,
                     "coding_assistant_account_uuid": coding_assistant_account_uuid,
                     "effort": effort,
+                    "client_surface": client_surface,
                     "prompt_id": prompt_id,
                     "prompt_length": prompt_length,
                     "query_source": query_source,
@@ -1710,7 +1729,7 @@ class AsyncAIResource(AsyncAPIResource):
                     "reasoning_token_count": reasoning_token_count,
                     "response_quality_score": response_quality_score,
                     "skip_reason": skip_reason,
-                    "subscriber": subscriber,
+                    "subscriber": subscriber_with_credential_alias(subscriber, credential_alias),
                     "subscriber_email_source": subscriber_email_source,
                     "subscription_id": subscription_id,
                     "system_fingerprint": system_fingerprint,
@@ -1719,7 +1738,6 @@ class AsyncAIResource(AsyncAPIResource):
                     "time_to_first_token": time_to_first_token,
                     "total_cost": total_cost,
                     "trace_id": trace_id,
-                    "credential_alias": credential_alias,
                     "environment": environment,
                     "operation_subtype": operation_subtype,
                     "parent_transaction_id": parent_transaction_id,
@@ -1963,7 +1981,9 @@ class AsyncAIResource(AsyncAPIResource):
 
           model_source: The source of the AI model used
 
-          credential_alias: Human-readable name for the API key being used
+          credential_alias: Human-readable name for the API key being used, sent as
+              subscriber.credential.name unless the subscriber has an id or email, or
+              already names or values a credential
 
           actual_service_tier: The service tier the provider actually used
 
@@ -2014,7 +2034,7 @@ class AsyncAIResource(AsyncAPIResource):
                     "error_code": error_code,
                     "billing_skipped": billing_skipped,
                     "skip_reason": skip_reason,
-                    "subscriber": subscriber,
+                    "subscriber": subscriber_with_credential_alias(subscriber, credential_alias),
                     "subscriber_email": subscriber_email,
                     "subscriber_id": subscriber_id,
                     "subscription_id": subscription_id,
@@ -2045,7 +2065,6 @@ class AsyncAIResource(AsyncAPIResource):
                     "retry_number": retry_number,
                     "middleware_source": middleware_source,
                     "model_source": model_source,
-                    "credential_alias": credential_alias,
                     "actual_service_tier": actual_service_tier,
                     "requested_service_tier": requested_service_tier,
                     "pricing_tier": pricing_tier,
@@ -2248,7 +2267,9 @@ class AsyncAIResource(AsyncAPIResource):
 
           model_source: The source of the AI model used
 
-          credential_alias: Human-readable name for the API key being used
+          credential_alias: Human-readable name for the API key being used, sent as
+              subscriber.credential.name unless the subscriber has an id or email, or
+              already names or values a credential
 
           actual_service_tier: The service tier the provider actually used
 
@@ -2296,7 +2317,7 @@ class AsyncAIResource(AsyncAPIResource):
                     "error_code": error_code,
                     "billing_skipped": billing_skipped,
                     "skip_reason": skip_reason,
-                    "subscriber": subscriber,
+                    "subscriber": subscriber_with_credential_alias(subscriber, credential_alias),
                     "subscriber_email": subscriber_email,
                     "subscriber_id": subscriber_id,
                     "subscription_id": subscription_id,
@@ -2327,7 +2348,6 @@ class AsyncAIResource(AsyncAPIResource):
                     "retry_number": retry_number,
                     "middleware_source": middleware_source,
                     "model_source": model_source,
-                    "credential_alias": credential_alias,
                     "actual_service_tier": actual_service_tier,
                     "requested_service_tier": requested_service_tier,
                     "pricing_tier": pricing_tier,
@@ -2528,7 +2548,9 @@ class AsyncAIResource(AsyncAPIResource):
 
           model_source: The source of the AI model used
 
-          credential_alias: Human-readable name for the API key being used
+          credential_alias: Human-readable name for the API key being used, sent as
+              subscriber.credential.name unless the subscriber has an id or email, or
+              already names or values a credential
 
           actual_service_tier: The service tier the provider actually used
 
@@ -2575,7 +2597,7 @@ class AsyncAIResource(AsyncAPIResource):
                     "error_code": error_code,
                     "billing_skipped": billing_skipped,
                     "skip_reason": skip_reason,
-                    "subscriber": subscriber,
+                    "subscriber": subscriber_with_credential_alias(subscriber, credential_alias),
                     "subscriber_email": subscriber_email,
                     "subscriber_id": subscriber_id,
                     "subscription_id": subscription_id,
@@ -2606,7 +2628,6 @@ class AsyncAIResource(AsyncAPIResource):
                     "retry_number": retry_number,
                     "middleware_source": middleware_source,
                     "model_source": model_source,
-                    "credential_alias": credential_alias,
                     "actual_service_tier": actual_service_tier,
                     "requested_service_tier": requested_service_tier,
                     "pricing_tier": pricing_tier,

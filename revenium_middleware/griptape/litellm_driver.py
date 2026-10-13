@@ -7,10 +7,12 @@ Cohere, Azure OpenAI, AWS Bedrock, and many others not directly supported by Gri
 import inspect
 import logging
 import os
+import re
 import requests
 import json
+import unicodedata
 import urllib.parse
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 
 from griptape.drivers.prompt.base_prompt_driver import BasePromptDriver
 from griptape.common.prompt_stack.prompt_stack import PromptStack
@@ -18,7 +20,10 @@ from griptape.common.prompt_stack.messages.message import Message
 from griptape.tokenizers import BaseTokenizer, DummyTokenizer
 from griptape.artifacts import TextArtifact
 
+from revenium_middleware._core.log_sanitize import sanitize_for_logging
+
 from ._metadata import strip_revenium_auth_keys
+from ._retry import stop_retrying_budget_errors
 
 # Import LiteLLM for actual API calls
 try:
@@ -66,6 +71,25 @@ if not MIDDLEWARE_AVAILABLE:
 logger = logging.getLogger(__name__)
 
 
+def _gateway_base_url(proxy_url: Optional[str]) -> Optional[str]:
+    """The gateway address without a trailing slash or a trailing /chat/completions, query kept."""
+    if not proxy_url:
+        return proxy_url
+    address, separator, query = proxy_url.partition("?")
+    address = address.rstrip("/")
+    if address.endswith("/chat/completions"):
+        address = address[: -len("/chat/completions")]
+    return address + separator + query
+
+
+def _chat_completions_url(proxy_url: Optional[str]) -> Optional[str]:
+    """The address a gateway answers chat requests on, for a base address or a full one."""
+    if not proxy_url:
+        return proxy_url
+    address, separator, query = _gateway_base_url(proxy_url).partition("?")
+    return address + "/chat/completions" + separator + query
+
+
 class ReveniumLiteLLMDriver(BasePromptDriver):
     """
     LiteLLM prompt driver with Revenium usage metering.
@@ -95,8 +119,14 @@ class ReveniumLiteLLMDriver(BasePromptDriver):
     - Griptape tool calling is not supported: configured tools are not sent
       to the model and tool-call responses are not parsed. Use the Tier-1
       drivers (OpenAI/Anthropic/Ollama) for tool support.
-    - Through the LiteLLM proxy, only subscriber.id is forwarded from a
-      nested subscriber object; other subscriber fields have no header path.
+    - Through the LiteLLM proxy, subscriber.id and subscriber.email are
+      forwarded from a nested subscriber object; other subscriber fields have
+      no header path. A tag value that cannot travel in an HTTP header (a line
+      break or control character, or text outside latin-1, or outside ASCII
+      when streaming) is dropped with a warning instead of failing the call.
+      A tag whose name cannot be an HTTP header name (anything but ASCII letters,
+      digits, hyphens and underscores, or a key that is not a string) is
+      skipped with one warning per key instead of failing the call.
     """
 
     def __init__(self, 
@@ -139,9 +169,11 @@ class ReveniumLiteLLMDriver(BasePromptDriver):
         litellm_kwargs = {key: value for key, value in kwargs.items() if key not in base_param_names}
 
         super().__init__(model=model, tokenizer=tokenizer, **base_kwargs)
+        stop_retrying_budget_errors(self)
 
         # Store metadata for injection into LiteLLM calls
         self.usage_metadata = usage_metadata or {}
+        self._reported_unsendable_tag_names = set()
 
         # Store additional LiteLLM parameters
         self.litellm_kwargs = litellm_kwargs
@@ -158,14 +190,13 @@ class ReveniumLiteLLMDriver(BasePromptDriver):
         self.proxy_api_key = proxy_api_key or os.getenv("LITELLM_API_KEY")
         self.proxy_timeout = proxy_timeout
         
-        # Fix URL for OpenAI client usage - remove /chat/completions if present
-        # The OpenAI client automatically adds /chat/completions to base_url
-        if self.proxy_url and self.proxy_url.endswith('/chat/completions'):
-            self.proxy_base_url = self.proxy_url[:-len('/chat/completions')]
+        # The OpenAI client adds /chat/completions to its base address itself
+        self.proxy_base_url = _gateway_base_url(self.proxy_url)
+        if self.proxy_base_url != self.proxy_url:
             logger.debug(f"Adjusted proxy base URL for OpenAI client: {self.proxy_base_url}")
-        else:
-            self.proxy_base_url = self.proxy_url
-        
+
+        self.proxy_chat_completions_url = _chat_completions_url(self.proxy_url)
+
         # Check dependencies
         if not LITELLM_AVAILABLE:
             raise ImportError(
@@ -222,37 +253,31 @@ class ReveniumLiteLLMDriver(BasePromptDriver):
             # Use standard LiteLLM for direct provider calls
             return self._make_litellm_call(messages, prompt_stack)
 
-    def _build_revenium_headers(self) -> Dict[str, str]:
+    def _build_revenium_headers(self, encoding: str = "ascii") -> Dict[str, str]:
         """
         Build x-revenium-* attribution headers from usage_metadata.
 
         Returns a dict containing only the x-revenium-* headers (no
         Content-Type or Authorization). Empty dict if no usage_metadata.
+        Values that the transport cannot send in ``encoding`` are dropped.
         """
-        headers: Dict[str, str] = {}
-
         metadata = strip_revenium_auth_keys(self.usage_metadata) if self.usage_metadata else {}
-        if metadata:
-            for key, value in metadata.items():
-                header_key = f"x-revenium-{key.replace('_', '-')}"
-                if key == 'subscriber' and isinstance(value, dict):
-                    # The LiteLLM proxy middleware consumes only the flat
-                    # x-revenium-subscriber-id header; a JSON-encoded
-                    # x-revenium-subscriber blob is read by nothing.
-                    subscriber_id = value.get('id')
-                    if subscriber_id:
-                        headers['x-revenium-subscriber-id'] = str(subscriber_id)
-                    dropped = sorted(set(value) - {'id'})
-                    if dropped:
-                        logger.warning(
-                            f"Subscriber fields {dropped} have no supported header "
-                            f"path through the LiteLLM proxy; only subscriber.id is forwarded"
-                        )
-                else:
-                    # Convert key to proper header format
-                    headers[header_key] = str(value)
-
+        tags, unsendable_keys = _attribution_tags(metadata)
+        self._warn_once_about_unsendable_tag_names(unsendable_keys)
+        headers: Dict[str, str] = {}
+        for header, (key, value) in tags.items():
+            text = _header_value(key, value, encoding)
+            if text is not None:
+                headers[header] = text
         return headers
+
+    def _warn_once_about_unsendable_tag_names(self, keys: List[Any]) -> None:
+        for key in keys:
+            if key in self._reported_unsendable_tag_names:
+                continue
+            self._reported_unsendable_tag_names.add(key)
+            logger.warning(f"Usage metadata key {key!r} cannot be an HTTP header name; "
+                           f"it is not sent to the LiteLLM proxy")
 
     def _make_proxy_call(self, messages: List[Dict[str, str]]) -> Message:
         """
@@ -276,14 +301,10 @@ class ReveniumLiteLLMDriver(BasePromptDriver):
 
             # Inject metadata via x-revenium-* headers (official approach)
             if self.usage_metadata:
-                headers.update(self._build_revenium_headers())
+                # requests sends header text as latin-1
+                headers.update(self._build_revenium_headers(encoding="latin-1"))
 
-                logger.debug(f"Injected usage metadata via headers: {list(headers.keys())}")
-                # Redact the Authorization header (if present) before logging
-                redacted_headers = {**headers}
-                if "Authorization" in redacted_headers:
-                    redacted_headers["Authorization"] = "Bearer ***"
-                logger.debug(f"Full headers being sent: {redacted_headers}")
+                logger.debug(f"Injected usage metadata via headers: {sanitize_for_logging(list(headers))}")
             else:
                 logger.warning("No usage_metadata provided to proxy call")
 
@@ -303,7 +324,7 @@ class ReveniumLiteLLMDriver(BasePromptDriver):
 
             # Make the API call using the official approach
             response = requests.post(
-                self.proxy_url,
+                self.proxy_chat_completions_url,
                 headers=headers,
                 data=json.dumps(data),
                 timeout=self.proxy_timeout
@@ -525,3 +546,89 @@ class ReveniumLiteLLMDriver(BasePromptDriver):
         proxy_status = f", proxy={self.proxy_url}" if self.proxy_url else ""
         return (f"ReveniumLiteLLMDriver(model={self.model}, "
                 f"middleware_enabled={MIDDLEWARE_AVAILABLE}{proxy_status})") 
+
+
+# Lower-or-digit followed by upper marks a camelCase word boundary.
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+# A tag is skipped rather than cleaned into this shape: cleaning would let a
+# key such as "subscriber id" forge the x-revenium-subscriber-id header.
+_SENDABLE_HEADER_NAME = re.compile(r"x-revenium-[a-z0-9-]+")
+
+# Which spelling wins when two metadata keys map to one header: a nested
+# subscriber object first, then the snake_case key, then its camelCase twin.
+_NESTED_SUBSCRIBER, _SNAKE_CASE, _CAMEL_CASE = range(3)
+_FORWARDED_SUBSCRIBER_FIELDS = ("id", "email")
+
+
+def _header_name(key: str) -> str:
+    return "x-revenium-" + _CAMEL_BOUNDARY.sub("-", key).replace("_", "-").lower()
+
+
+def _sendable_header_name(key: Any) -> Optional[str]:
+    if not isinstance(key, str) or not key.isascii():
+        return None
+    header = _header_name(key)
+    return header if _SENDABLE_HEADER_NAME.fullmatch(header) else None
+
+
+def _key_rank(key: Any) -> int:
+    return _CAMEL_CASE if isinstance(key, str) and key != key.lower() else _SNAKE_CASE
+
+
+def _subscriber_tags(subscriber: Dict[str, Any]):
+    dropped = sorted(set(subscriber) - set(_FORWARDED_SUBSCRIBER_FIELDS))
+    if dropped:
+        logger.warning(
+            f"Subscriber fields {dropped} have no supported header path through the "
+            f"LiteLLM proxy; only subscriber.id and subscriber.email are forwarded"
+        )
+    for field in _FORWARDED_SUBSCRIBER_FIELDS:
+        if field in subscriber:
+            yield f"subscriber_{field}", f"subscriber.{field}", subscriber[field], _NESTED_SUBSCRIBER
+
+
+def _ranked_tags(metadata: Dict[str, Any]):
+    for key, value in metadata.items():
+        if key == "subscriber" and isinstance(value, dict):
+            yield from _subscriber_tags(value)
+        else:
+            yield key, key, value, _key_rank(key)
+
+
+def _attribution_tags(metadata: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Any]]:
+    """Header name to (metadata key, value), one entry per header, chosen by rank,
+    and the metadata keys skipped because no header name can carry them."""
+    chosen: Dict[str, Any] = {}
+    unsendable_keys: List[Any] = []
+    for name_key, key, value, rank in _ranked_tags(metadata):
+        if value is None:
+            continue
+        header = _sendable_header_name(name_key)
+        if header is None:
+            unsendable_keys.append(key)
+            continue
+        if header not in chosen or rank < chosen[header][0]:
+            chosen[header] = (rank, key, value)
+    tags = {header: (key, value) for header, (_, key, value) in chosen.items()}
+    return tags, unsendable_keys
+
+
+def _header_value(key: str, value: Any, encoding: str) -> Optional[str]:
+    """The tag value as header text, or None when no header can carry it.
+
+    Warnings name the metadata key only: tag values can be personal data.
+    """
+    text = str(value).strip()
+    if not text:
+        return None
+    if any(unicodedata.category(char) == "Cc" for char in text):
+        logger.warning(f"Usage metadata '{key}' contains a line break or control character; "
+                       f"it is not sent to the LiteLLM proxy")
+        return None
+    try:
+        text.encode(encoding)
+    except UnicodeEncodeError:
+        logger.warning(f"Usage metadata '{key}' is not representable in an HTTP header; "
+                       f"it is not sent to the LiteLLM proxy")
+        return None
+    return text

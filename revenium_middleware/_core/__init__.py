@@ -5,7 +5,9 @@ This subpackage contains the foundational components shared across all
 provider-specific middleware implementations.
 """
 
-from .metering import run_async_in_thread, shutdown_event, client, get_client, initialize_metering
+from .metering import (
+    run_async_in_thread, shutdown_event, client, get_client, initialize_metering, metering_key, flush_metering,
+)
 from .metering_buffer import get_buffer_stats
 from .metering_submission import submit_ai_event
 from .exceptions import BudgetExceededError
@@ -28,6 +30,7 @@ from .context import (
     idempotency_key,
     get_idempotency_key,
     set_idempotency_key,
+    carry_context,
 )
 from .decorators import revenium_meter, revenium_metadata, track_usage
 from .config import is_selective_metering_enabled
@@ -59,6 +62,8 @@ __all__ = [
     "client",
     "get_client",
     "initialize_metering",
+    "metering_key",
+    "flush_metering",
     "get_buffer_stats",
     "run_async_in_thread",
     "shutdown_event",
@@ -86,6 +91,7 @@ __all__ = [
     "idempotency_key",
     "get_idempotency_key",
     "set_idempotency_key",
+    "carry_context",
     # Config
     "is_selective_metering_enabled",
     # Field extraction

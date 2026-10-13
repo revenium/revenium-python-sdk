@@ -30,6 +30,7 @@ except ImportError:
     from langchain.schema import HumanMessage, SystemMessage
 
 # Revenium middleware imports
+from revenium_middleware import revenium_metadata
 from revenium_middleware.openai.langchain import wrap, attach_to
 
 
@@ -75,18 +76,13 @@ async def async_streaming_example():
     print("\n Async streaming completed\n")
 
 
+@revenium_metadata(trace_id="async-embed-001", task_type="document-embedding")
 async def async_embeddings_example():
     """Async embeddings generation with batch processing."""
     print("Async Embeddings Example")
     
-    # Wrap embeddings model
-    embeddings = wrap(
-        OpenAIEmbeddings(model="text-embedding-3-small"),
-        usage_metadata={
-            "trace_id": "async-embed-001",
-            "task_type": "document-embedding"
-        }
-    )
+    # Embeddings models run no callbacks, so tags come from @revenium_metadata, not wrap()
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
     
     # Generate embeddings asynchronously
     texts = [
@@ -110,15 +106,13 @@ async def concurrent_operations_example():
         usage_metadata={"task_type": "concurrent-chat"}
     )
     
-    embedding_model = wrap(
-        OpenAIEmbeddings(model="text-embedding-3-small"),
-        usage_metadata={"task_type": "concurrent-embedding"}
-    )
+    embedding_model = OpenAIEmbeddings(model="text-embedding-3-small")
     
     # Define concurrent tasks
     async def chat_task():
         return await chat_llm.ainvoke("What is concurrency?")
     
+    @revenium_metadata(task_type="concurrent-embedding")
     async def embedding_task():
         return await embedding_model.aembed_query("Concurrency in programming")
     

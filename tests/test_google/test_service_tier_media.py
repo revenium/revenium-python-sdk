@@ -103,7 +103,7 @@ def test_completion_path_forwards_all_tier_fields():
     cost_multiplier, and must not carry priority_tier."""
     from revenium_middleware.google.common import utils
 
-    with patch.object(utils, "get_client", return_value=object()), \
+    with patch.object(utils, "current_client", return_value=object()), \
             patch.object(utils, "submit_ai_event") as mock_submit:
         asyncio.run(utils.log_token_usage(
             transaction_id="txn-google-tier",

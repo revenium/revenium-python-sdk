@@ -13,6 +13,7 @@ included:
   from the bytes as the caller reads them, through parse() or iter_bytes() alike.
 """
 
+import base64
 import importlib
 import inspect
 import json
@@ -127,6 +128,49 @@ class _SSEUsageDecoder:
         self._state.ingest(_as_attributes(event))
 
 
+class _BedrockEventStreamUsageDecoder:
+    """Feeds the Messages events carried in Bedrock's eventstream frames into a
+    StreamUsageState."""
+
+    def __init__(self, state, finalize):
+        self._state = state
+        self._finalize_cb = finalize
+        try:
+            from botocore.eventstream import EventStreamBuffer
+        except ImportError:
+            logger.debug("botocore is not installed; Bedrock streamed response not metered")
+            self._buffer = None
+        else:
+            self._buffer = EventStreamBuffer()
+
+    def feed(self, chunk):
+        if self._buffer is None:
+            return
+        self._buffer.add_data(chunk)
+        try:
+            frames = [frame.to_response_dict() for frame in self._buffer]
+        except Exception as e:
+            logger.debug("Bedrock eventstream frame could not be decoded; metering stopped: %s", e)
+            self._buffer = None
+            return
+        for frame in frames:
+            event = _bedrock_chunk_event(frame)
+            if event is not None:
+                self._state.ingest(_as_attributes(event))
+
+    def finish(self):
+        self._finalize_cb(self._state)
+
+
+def _bedrock_chunk_event(response_dict):
+    if response_dict.get("status_code") != 200:
+        return None
+    try:
+        return json.loads(base64.b64decode(json.loads(response_dict["body"])["bytes"]))
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
 class _MessageBodyDecoder:
     """Rebuilds the message from a JSON body once the caller has read all of it;
     a body abandoned part-way is not metered."""
@@ -149,8 +193,9 @@ class _MessageBodyDecoder:
 
 
 class _BodyTap:
-    def __init__(self, decoder):
+    def __init__(self, decoder, on_error=None):
         self._decoder = decoder
+        self._on_error = on_error
         self._finished = False
 
     def feed(self, chunk):
@@ -166,45 +211,66 @@ class _BodyTap:
         except Exception as e:
             logger.warning("Error finalizing raw-response metering: %s", e)
 
+    def failed(self, error):
+        if self._on_error is None or self._finished:
+            return
+        try:
+            self._on_error(error)
+        except Exception as e:
+            logger.warning("Error recording a failed raw-response stream: %s", e)
 
-def _tap_body(raw_response, decoder):
+
+def _tap_body(raw_response, decoder, on_error=None):
     http_response = raw_response.http_response
     read_bytes = http_response.iter_bytes
-    tap = _BodyTap(decoder)
+    tap = _BodyTap(decoder, on_error)
 
     def iter_bytes(*args, **kwargs):
         try:
             for chunk in read_bytes(*args, **kwargs):
                 tap.feed(chunk)
                 yield chunk
+        except Exception as error:
+            tap.failed(error)
+            raise
         finally:
             tap.finish()
 
     http_response.iter_bytes = iter_bytes
 
 
-def _tap_async_body(raw_response, decoder):
+def _tap_async_body(raw_response, decoder, on_error=None):
     http_response = raw_response.http_response
     read_bytes = http_response.aiter_bytes
-    tap = _BodyTap(decoder)
+    tap = _BodyTap(decoder, on_error)
 
     async def aiter_bytes(*args, **kwargs):
         try:
             async for chunk in read_bytes(*args, **kwargs):
                 tap.feed(chunk)
                 yield chunk
+        except Exception as error:
+            tap.failed(error)
+            raise
         finally:
             tap.finish()
 
     http_response.aiter_bytes = aiter_bytes
 
 
+def _stream_usage_decoder(raw_response, state, finalize):
+    content_type = raw_response.http_response.headers.get("content-type", "")
+    if content_type.startswith("application/vnd.amazon.eventstream"):
+        return _BedrockEventStreamUsageDecoder(state, finalize)
+    return _SSEUsageDecoder(state, finalize)
+
+
 def tap_sse_body(raw_response, state, finalize):
-    _tap_body(raw_response, _SSEUsageDecoder(state, finalize))
+    _tap_body(raw_response, _stream_usage_decoder(raw_response, state, finalize), state.record_failure)
 
 
 def tap_async_sse_body(raw_response, state, finalize):
-    _tap_async_body(raw_response, _SSEUsageDecoder(state, finalize))
+    _tap_async_body(raw_response, _stream_usage_decoder(raw_response, state, finalize), state.record_failure)
 
 
 def tap_message_body(raw_response, on_message, message_type):

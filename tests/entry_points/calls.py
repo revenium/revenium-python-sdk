@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
@@ -21,6 +22,8 @@ ANTHROPIC_MODEL = "claude-sonnet-4-5"
 GEMINI_MODEL = "gemini-2.0-flash"
 GEMINI_EMBED_MODEL = "text-embedding-004"
 IMAGEN_MODEL = "imagen-3.0-generate-002"
+VEO_MODEL = "veo-3.0-fast-generate-001"
+VEO_SECONDS = 6
 OLLAMA_MODEL = "llama3"
 LITELLM_MODEL = "gpt-4o-mini"
 PERPLEXITY_MODEL = "sonar"
@@ -128,11 +131,42 @@ _EMBEDDING = {"object": "list", "model": "text-embedding-3-small",
               "usage": {"prompt_tokens": INPUT_TOKENS, "total_tokens": INPUT_TOKENS}}
 
 
+_AUDIO_FILE = ("clip.mp3", b"ID3-not-really-audio")
+_SPEECH_BYTES = b"not-really-mp3"
+_TRANSCRIPTION = {"text": "hi", "usage": {"type": "duration", "seconds": 3.2}}
+_TRANSCRIPTION_EVENTS = [
+    {"type": "transcript.text.delta", "delta": "hi"},
+    {"type": "transcript.text.done", "text": "hi",
+     "usage": {"type": "tokens", "input_tokens": INPUT_TOKENS, "output_tokens": OUTPUT_TOKENS,
+               "total_tokens": INPUT_TOKENS + OUTPUT_TOKENS}},
+]
+
+
+def _openai_audio_answer(request):
+    """Audio requests are multipart (speech is JSON with a binary answer), so they are routed before the JSON parse."""
+    path = request.url.path
+    if path.endswith("/audio/speech"):
+        return httpx.Response(200, content=_SPEECH_BYTES, headers={"content-type": "audio/mpeg"})
+    if path.endswith("/audio/translations"):
+        return httpx.Response(200, json={"text": "hi"})
+    if not path.endswith("/audio/transcriptions"):
+        return None
+    if b'name="stream"' in request.content:
+        return httpx.Response(200, content=_sse([(None, e) for e in _TRANSCRIPTION_EVENTS]),
+                              headers={"content-type": "text/event-stream"})
+    return httpx.Response(200, json=_TRANSCRIPTION)
+
+
 def _openai_compatible_handler(model, usage=_OPENAI_USAGE):
     def handler(request):
+        audio = _openai_audio_answer(request)
+        if audio is not None:
+            return audio
         body = json.loads(request.content or b"{}")
         path = request.url.path
         streamed = bool(body.get("stream"))
+        if request.method == "GET" and "/responses/" in path:
+            return httpx.Response(200, json={**_response(), "background": True})
         if path.endswith("/chat/completions"):
             if streamed:
                 return httpx.Response(200, content=_chat_chunks(model, usage),
@@ -142,6 +176,9 @@ def _openai_compatible_handler(model, usage=_OPENAI_USAGE):
             if streamed:
                 return httpx.Response(200, content=_response_events(),
                                       headers={"content-type": "text/event-stream"})
+            if body.get("background"):
+                return httpx.Response(200, json={**_response(status="queued", output=[], usage=None),
+                                                 "background": True})
             return httpx.Response(200, json=_response())
         if path.endswith("/embeddings"):
             return httpx.Response(200, json=_EMBEDDING)
@@ -244,6 +281,20 @@ async def _():
         pass
 
 
+@call("openai.responses.background.retrieve.sync")
+def _():
+    client = _openai()
+    queued = client.responses.create(model=OPENAI_MODEL, input="hi", background=True)
+    client.responses.retrieve(queued.id)
+
+
+@call("openai.responses.background.retrieve.async")
+async def _():
+    client = _async_openai()
+    queued = await client.responses.create(model=OPENAI_MODEL, input="hi", background=True)
+    await client.responses.retrieve(queued.id)
+
+
 @call("openai.responses.stream_helper.sync")
 def _():
     with _openai().responses.stream(model=OPENAI_MODEL, input="hi") as stream:
@@ -268,6 +319,64 @@ async def _():
     await _async_openai().responses.parse(model=OPENAI_MODEL, input="hi", text_format=_structured_output())
 
 
+@call("openai.chat.raw.sync.stream")
+def _():
+    raw = _openai().chat.completions.with_raw_response.create(**_chat_kwargs(), stream=True)
+    for _chunk in raw.parse():
+        pass
+
+
+@call("openai.chat.raw.async.stream")
+async def _():
+    raw = await _async_openai().chat.completions.with_raw_response.create(**_chat_kwargs(), stream=True)
+    async for _chunk in raw.parse():
+        pass
+
+
+@call("openai.chat.streaming_response.sync.stream")
+def _():
+    with _openai().chat.completions.with_streaming_response.create(**_chat_kwargs(), stream=True) as response:
+        for _chunk in response.parse():
+            pass
+
+
+@call("openai.chat.streaming_response.async.stream")
+async def _():
+    async with _async_openai().chat.completions.with_streaming_response.create(
+            **_chat_kwargs(), stream=True) as response:
+        async for _chunk in await response.parse():
+            pass
+
+
+@call("openai.responses.raw.sync.stream")
+def _():
+    raw = _openai().responses.with_raw_response.create(model=OPENAI_MODEL, input="hi", stream=True)
+    for _event in raw.parse():
+        pass
+
+
+@call("openai.responses.raw.async.stream")
+async def _():
+    raw = await _async_openai().responses.with_raw_response.create(model=OPENAI_MODEL, input="hi", stream=True)
+    async for _event in raw.parse():
+        pass
+
+
+@call("openai.responses.streaming_response.sync.stream")
+def _():
+    with _openai().responses.with_streaming_response.create(model=OPENAI_MODEL, input="hi", stream=True) as response:
+        for _event in response.parse():
+            pass
+
+
+@call("openai.responses.streaming_response.async.stream")
+async def _():
+    async with _async_openai().responses.with_streaming_response.create(
+            model=OPENAI_MODEL, input="hi", stream=True) as response:
+        async for _event in await response.parse():
+            pass
+
+
 @call("openai.embeddings.create.sync")
 def _():
     _openai().embeddings.create(model="text-embedding-3-small", input="hi")
@@ -276,6 +385,53 @@ def _():
 @call("openai.embeddings.create.async")
 async def _():
     await _async_openai().embeddings.create(model="text-embedding-3-small", input="hi")
+
+
+@call("openai.audio.transcriptions.create.sync")
+def _():
+    _openai().audio.transcriptions.create(model="whisper-1", file=_AUDIO_FILE)
+
+
+@call("openai.audio.transcriptions.create.sync.stream")
+def _():
+    for _event in _openai().audio.transcriptions.create(model="gpt-4o-mini-transcribe", file=_AUDIO_FILE,
+                                                        stream=True):
+        pass
+
+
+@call("openai.audio.transcriptions.create.async")
+async def _():
+    await _async_openai().audio.transcriptions.create(model="whisper-1", file=_AUDIO_FILE)
+
+
+@call("openai.audio.transcriptions.raw.sync")
+def _():
+    _openai().audio.transcriptions.with_raw_response.create(model="whisper-1", file=_AUDIO_FILE).parse()
+
+
+@call("openai.audio.translations.create.sync")
+def _():
+    _openai().audio.translations.create(model="whisper-1", file=_AUDIO_FILE)
+
+
+@call("openai.audio.translations.create.async")
+async def _():
+    await _async_openai().audio.translations.create(model="whisper-1", file=_AUDIO_FILE)
+
+
+@call("openai.audio.speech.create.sync")
+def _():
+    _openai().audio.speech.create(model="tts-1", voice="alloy", input="hi").read()
+
+
+@call("openai.audio.speech.create.async")
+async def _():
+    await (await _async_openai().audio.speech.create(model="tts-1", voice="alloy", input="hi")).aread()
+
+
+@call("openai.audio.speech.raw.sync")
+def _():
+    _openai().audio.speech.with_raw_response.create(model="tts-1", voice="alloy", input="hi").parse().read()
 
 
 # --- Anthropic ---------------------------------------------------------------
@@ -436,12 +592,50 @@ _GEMINI_EMBEDDING = {"embeddings": [{"values": [0.1, 0.2]}]}
 _GEMINI_IMAGES = {"predictions": [{"bytesBase64Encoded": "aGk=", "mimeType": "image/png"}]}
 
 
+_veo_sample_counts = {}
+
+
+def _veo_operation_name(path):
+    model_path = path.split(":", 1)[0].split("/", 2)[-1]
+    return f"{model_path}/operations/{uuid.uuid4()}"
+
+
+def _veo_gemini_done(name):
+    samples = [{"video": {"uri": f"https://stub/v{i}.mp4"}} for i in range(_veo_sample_counts.get(name, 1))]
+    return {"name": name, "done": True, "response": {"generateVideoResponse": {"generatedSamples": samples}}}
+
+
+def _veo_vertex_done(name):
+    videos = [{"gcsUri": f"gs://stub/v{i}.mp4", "mimeType": "video/mp4"}
+              for i in range(_veo_sample_counts.get(name, 1))]
+    return {"name": name, "done": True, "response": {"videos": videos}}
+
+
 class _GeminiHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def _reply(self, payload, content_type="application/json"):
+        body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("content-type", content_type)
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        name = self.path.split("?", 1)[0].split("/", 2)[-1]
+        self._reply(_veo_gemini_done(name))
+
     def do_POST(self):
-        self.rfile.read(int(self.headers.get("content-length") or 0))
+        request = self.rfile.read(int(self.headers.get("content-length") or 0))
+        if ":predictLongRunning" in self.path:
+            name = _veo_operation_name(self.path)
+            parameters = (json.loads(request or b"{}").get("parameters") or {})
+            _veo_sample_counts[name] = parameters.get("sampleCount", 1)
+            return self._reply({"name": name, "done": False})
+        if ":fetchPredictOperation" in self.path:
+            return self._reply(_veo_vertex_done(json.loads(request)["operationName"]))
         if "streamGenerateContent" in self.path:
             body, content_type = _sse([(None, _GEMINI_RESPONSE)]), "text/event-stream"
         elif "embedContent" in self.path or "batchEmbedContents" in self.path:
@@ -482,6 +676,11 @@ def _genai(**client_kwargs):
     return client
 
 
+def _veo_source():
+    from google.genai import types
+    return types.GenerateVideosSource(prompt="a cat")
+
+
 def _genai_vertex_express():
     """google-genai serves generate_images only in Vertex mode; an API key selects express mode, no ADC needed."""
     return _genai(vertexai=True)
@@ -519,6 +718,25 @@ def _():
     _genai_vertex_express().models.generate_images(model=IMAGEN_MODEL, prompt="a cat")
 
 
+def _poll_video_twice(client, operation):
+    done = client.operations.get(operation)
+    client.operations.get(done)
+
+
+@call("genai.models.generate_videos.sync")
+def _():
+    client = _genai()
+    _poll_video_twice(client, client.models.generate_videos(
+        model=VEO_MODEL, source=_veo_source(), config={"duration_seconds": VEO_SECONDS}))
+
+
+@call("genai.models.generate_videos.vertex.sync")
+def _():
+    client = _genai_vertex_express()
+    _poll_video_twice(client, client.models.generate_videos(
+        model=VEO_MODEL, source=_veo_source(), config={"duration_seconds": VEO_SECONDS}))
+
+
 @call("genai.aio.models.generate_content.async")
 async def _():
     await _genai().aio.models.generate_content(model=GEMINI_MODEL, contents="hi")
@@ -549,6 +767,15 @@ async def _():
 @call("genai.aio.models.generate_images.async")
 async def _():
     await _genai_vertex_express().aio.models.generate_images(model=IMAGEN_MODEL, prompt="a cat")
+
+
+@call("genai.aio.models.generate_videos.async")
+async def _():
+    client = _genai()
+    operation = await client.aio.models.generate_videos(
+        model=VEO_MODEL, source=_veo_source(), config={"duration_seconds": VEO_SECONDS})
+    done = await client.aio.operations.get(operation)
+    await client.aio.operations.get(done)
 
 
 # --- Ollama ------------------------------------------------------------------
@@ -888,6 +1115,90 @@ async def _():
         pass
 
 
+
+def _perplexity_compatible():
+    return _openai(base_url=PERPLEXITY_BASE_URL, model=PERPLEXITY_MODEL, usage=_PERPLEXITY_USAGE)
+
+
+def _async_perplexity_compatible():
+    return _async_openai(base_url=PERPLEXITY_BASE_URL, model=PERPLEXITY_MODEL, usage=_PERPLEXITY_USAGE)
+
+
+@call("perplexity.openai_compatible.chat.parse.sync")
+def _():
+    _perplexity_compatible().chat.completions.parse(**_chat_kwargs(PERPLEXITY_MODEL),
+                                                    response_format=_structured_output())
+
+
+@call("perplexity.openai_compatible.chat.parse.async")
+async def _():
+    await _async_perplexity_compatible().chat.completions.parse(**_chat_kwargs(PERPLEXITY_MODEL),
+                                                                response_format=_structured_output())
+
+
+_PERPLEXITY_SYNC_CLIENTS = {"native": _perplexity_native, "openai_compatible": _perplexity_compatible}
+_PERPLEXITY_ASYNC_CLIENTS = {"native": _async_perplexity_native, "openai_compatible": _async_perplexity_compatible}
+
+
+def _read_sync_raw_response(raw, stream):
+    parsed = raw.parse()
+    if stream:
+        for _chunk in parsed:
+            pass
+
+
+async def _read_async_raw_response(raw, stream):
+    parsed = raw.parse()
+    if asyncio.iscoroutine(parsed):
+        parsed = await parsed
+    if stream:
+        async for _chunk in parsed:
+            pass
+
+
+def _perplexity_raw_call(kind, stream):
+    def run():
+        create = _PERPLEXITY_SYNC_CLIENTS[kind]().chat.completions.with_raw_response.create
+        _read_sync_raw_response(create(model=PERPLEXITY_MODEL, messages=USER_MESSAGES, stream=stream), stream)
+    return run
+
+
+def _perplexity_streaming_response_call(kind, stream):
+    def run():
+        create = _PERPLEXITY_SYNC_CLIENTS[kind]().chat.completions.with_streaming_response.create
+        with create(model=PERPLEXITY_MODEL, messages=USER_MESSAGES, stream=stream) as raw:
+            _read_sync_raw_response(raw, stream)
+    return run
+
+
+def _async_perplexity_raw_call(kind, stream):
+    async def run():
+        create = _PERPLEXITY_ASYNC_CLIENTS[kind]().chat.completions.with_raw_response.create
+        await _read_async_raw_response(await create(model=PERPLEXITY_MODEL, messages=USER_MESSAGES, stream=stream),
+                                       stream)
+    return run
+
+
+def _async_perplexity_streaming_response_call(kind, stream):
+    async def run():
+        create = _PERPLEXITY_ASYNC_CLIENTS[kind]().chat.completions.with_streaming_response.create
+        async with create(model=PERPLEXITY_MODEL, messages=USER_MESSAGES, stream=stream) as raw:
+            await _read_async_raw_response(raw, stream)
+    return run
+
+
+_PERPLEXITY_RAW_FORMS = {
+    ("raw", "sync"): _perplexity_raw_call,
+    ("raw", "async"): _async_perplexity_raw_call,
+    ("streaming_response", "sync"): _perplexity_streaming_response_call,
+    ("streaming_response", "async"): _async_perplexity_streaming_response_call,
+}
+
+for (_form, _mode), _make_call in _PERPLEXITY_RAW_FORMS.items():
+    for _kind in _PERPLEXITY_SYNC_CLIENTS:
+        for _stream in (False, True):
+            call(f"perplexity.{_kind}.chat.{_form}.{_mode}{'.stream' if _stream else ''}")(_make_call(_kind, _stream))
+
 # --- fal -----------------------------------------------------------------------
 
 _FAL_RESULT = {"images": [{"url": "https://stub/y.png", "width": 1024, "height": 1024,
@@ -1195,15 +1506,26 @@ def _vertex_init():
     vertexai.init(project=VERTEX_PROJECT, location=VERTEX_LOCATION, credentials=AnonymousCredentials())
 
 
-# The SDK builds its gapic clients lazily and reuses whatever it finds cached
-# under these attributes, so the request still goes through the SDK's own
-# request building and response parsing, and never reaches the network.
+# The SDK builds its gapic clients lazily and reuses whatever it finds cached,
+# so the request still goes through the SDK's own request building and response
+# parsing, and never reaches the network. google-cloud-aiplatform 1.x reads the
+# cache from `_prediction_client_value` behind a property; 2.x caches the client
+# in a functools.cached_property named `_prediction_client`, which an entry in
+# the instance dict overrides. Setting both serves every supported version.
+def cache_vertex_prediction_clients(model, sync_client, async_client=None):
+    model._prediction_client_value = sync_client
+    vars(model)["_prediction_client"] = sync_client
+    if async_client is not None:
+        model._prediction_async_client_value = async_client
+        vars(model)["_prediction_async_client"] = async_client
+
+
 def vertex_model(module_path=VERTEX_GA):
     import importlib
     _vertex_init()
     model = importlib.import_module(module_path).GenerativeModel(GEMINI_MODEL)
-    model._prediction_client_value = _VertexPredictionClient(module_path)
-    model._prediction_async_client_value = _VertexPredictionAsyncClient(module_path)
+    cache_vertex_prediction_clients(
+        model, _VertexPredictionClient(module_path), _VertexPredictionAsyncClient(module_path))
     return model
 
 
@@ -1305,9 +1627,10 @@ def run_isolated(call_ids, middleware_modules):
     return outcomes
 
 
-PAYLOAD_FIELDS = ("model", "provider", "operation_type", "input_token_count",
+PAYLOAD_FIELDS = ("model", "provider", "operation_type", "operation_subtype", "input_token_count",
                   "output_token_count", "cache_read_token_count", "reasoning_token_count",
-                  "actual_image_count", "requested_image_count")
+                  "actual_image_count", "requested_image_count", "duration_seconds",
+                  "requested_duration_seconds", "character_count")
 OPERATIONS = ("completion", "image", "video", "audio")
 
 

@@ -1,6 +1,7 @@
 """Prompt, speed-mode and subagent attribution from usage_metadata (BACK-3388).
 
-The five fields exist only on /v2/ai/completions, so the resolver is wired
+The client surface (BACK-3905) shares the map. These fields exist only on
+/v2/ai/completions, so the resolver is wired
 into completion metering sites alone. These tests pin the alias table, the
 resolver and the typed client surface it feeds.
 """
@@ -14,6 +15,7 @@ from revenium_middleware._core.fields import (
 )
 
 FIELDS = {
+    "client_surface": "claude-code-desktop",
     "prompt_id": "prompt-42",
     "prompt_length": 1834,
     "query_source": "repl_main_thread",
@@ -22,6 +24,7 @@ FIELDS = {
 }
 
 CAMEL_METADATA = {
+    "clientSurface": "claude-code-desktop",
     "promptId": "prompt-42",
     "promptLength": 1834,
     "querySource": "repl_main_thread",

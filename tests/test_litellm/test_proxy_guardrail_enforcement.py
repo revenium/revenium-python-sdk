@@ -27,14 +27,20 @@ pytest.importorskip("litellm")
 pytest.importorskip("fastapi")
 
 from fastapi import HTTPException  # noqa: E402
-from unittest.mock import MagicMock  # noqa: E402
+from unittest.mock import MagicMock, patch  # noqa: E402
 
 from revenium_middleware._core import enforcement  # noqa: E402
 from revenium_middleware._core.exceptions import BudgetExceededError  # noqa: E402
 from revenium_middleware.litellm.proxy import guardrail as gmod  # noqa: E402
 from revenium_middleware.litellm.proxy.guardrail import ReveniumGuardrail  # noqa: E402
 
-from .proxy_hook_harness import guardrail_data, make_key_dict  # noqa: E402
+from .proxy_hook_harness import (  # noqa: E402
+    GuardrailResponse,
+    after_pre_call,
+    drive_metering,
+    guardrail_data,
+    make_key_dict,
+)
 
 
 @pytest.fixture
@@ -96,6 +102,28 @@ async def _run(guardrail, data, key_dict=None):
     )
 
 
+@pytest.fixture
+def metered():
+    """The guardrail's metering submissions, run inline."""
+    with patch.object(gmod, "submit_ai_event") as submit, \
+            patch.object(gmod, "run_async_in_thread", side_effect=drive_metering):
+        yield submit
+
+
+async def _refusal(guardrail):
+    with pytest.raises(HTTPException) as exc_info:
+        await _run(guardrail, guardrail_data())
+    return exc_info.value
+
+
+async def _fail(guardrail, error):
+    await guardrail.async_post_call_failure_hook(
+        request_data=after_pre_call(guardrail_data()),
+        original_exception=error,
+        user_api_key_dict=make_key_dict(),
+    )
+
+
 class TestAllow:
     """The request reaches the provider."""
 
@@ -122,6 +150,13 @@ class TestAllow:
     async def test_shadow_mode_rule_does_not_block(self, guardrail, seeded_rules):
         """A shadow rule is observe-and-log: it must never refuse a call."""
         seeded_rules([_rule(shadowMode=True)])
+        data = guardrail_data()
+        assert await _run(guardrail, data) is data
+
+    @pytest.mark.asyncio
+    async def test_warn_only_rule_does_not_block(self, guardrail, seeded_rules):
+        """A warn-only rule is a notice: a breach must not answer 429."""
+        seeded_rules([_rule(action="WARN_ONLY")])
         data = guardrail_data()
         assert await _run(guardrail, data) is data
 
@@ -163,6 +198,28 @@ class TestBlock:
         assert any("blocking" in record.message for record in caplog.records)
 
     @pytest.mark.asyncio
+    async def test_a_cap_refusal_sends_no_failed_call_record(self, guardrail, seeded_rules, metered):
+        """BACK-4362: a refused request never reached a provider, so, as with the
+        client integrations, it is not a failed call."""
+        seeded_rules([_rule()])
+        for _ in range(3):
+            await _fail(guardrail, await _refusal(guardrail))
+
+        assert metered.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_a_provider_error_is_still_recorded_after_a_refusal(self, guardrail, seeded_rules, metered):
+        seeded_rules([_rule()])
+        await _fail(guardrail, await _refusal(guardrail))
+
+        provider_rate_limit = HTTPException(status_code=429, detail={"error": {"type": "rate_limit"}})
+        await _fail(guardrail, provider_rate_limit)
+        await _fail(guardrail, Exception("provider exploded"))
+
+        assert metered.call_count == 2
+        assert [call.args[1]["stop_reason"] for call in metered.call_args_list] == ["ERROR", "ERROR"]
+
+    @pytest.mark.asyncio
     async def test_subscriber_attribution_reaches_the_breaker(
         self, guardrail, seeded_rules, monkeypatch
     ):
@@ -175,7 +232,7 @@ class TestBlock:
         seeded_rules([])
         seen = {}
         monkeypatch.setattr(
-            gmod, "check_enforcement", lambda metadata: seen.update(metadata)
+            gmod, "check_enforcement", lambda metadata, **_keywords: seen.update(metadata)
         )
         data = guardrail_data(
             headers={
@@ -199,7 +256,7 @@ class TestFailOpen:
 
     @pytest.mark.asyncio
     async def test_unreachable_enforcement_allows_the_call(self, guardrail, monkeypatch):
-        def unreachable(_metadata):
+        def unreachable(*_args, **_kwargs):
             raise ConnectionError("enforcement API unreachable")
 
         monkeypatch.setattr(gmod, "check_enforcement", unreachable)
@@ -208,7 +265,7 @@ class TestFailOpen:
 
     @pytest.mark.asyncio
     async def test_fail_open_logs_a_warning(self, guardrail, monkeypatch, caplog):
-        def unreachable(_metadata):
+        def unreachable(*_args, **_kwargs):
             raise ConnectionError("enforcement API unreachable")
 
         monkeypatch.setattr(gmod, "check_enforcement", unreachable)
@@ -235,3 +292,180 @@ class TestFailOpen:
         )
         with pytest.raises(HTTPException):
             await _run(guardrail, guardrail_data())
+
+
+class TestScopedCaps:
+    """A cap's filters are judged against what the proxy will meter (BACK-4176)."""
+
+    @pytest.mark.asyncio
+    async def test_guardrail_checks_with_the_request_model_and_the_litellm_provider(
+        self, guardrail, seeded_rules, monkeypatch
+    ):
+        """The request's ``model`` is the operator's alias for a deployment,
+        not the model the proxy meters, so the check is told it does not know."""
+        seeded_rules([])
+        seen = []
+        monkeypatch.setattr(
+            gmod, "check_enforcement",
+            lambda metadata=None, **keywords: seen.append(keywords),
+        )
+        await _run(guardrail, guardrail_data())
+        assert seen == [{"model": None, "provider": "LITELLM"}]
+
+    @pytest.mark.asyncio
+    async def test_a_model_filtered_cap_still_blocks_a_request_to_an_alias(
+        self, guardrail, seeded_rules
+    ):
+        """Regression guard: an alias never takes a request out of a model cap."""
+        seeded_rules([_rule(filters=[{"dimension": "MODEL", "operator": "IS", "value": "gpt-4o"}])])
+        data = guardrail_data(model="fast-chat")
+        with pytest.raises(HTTPException) as raised:
+            await _run(guardrail, data)
+        assert raised.value.status_code == 429
+
+
+PIN_SETTING = "REVENIUM_LITELLM_PIN_ORGANIZATION_TO_KEY_TEAM"
+
+
+def _organization_rule(organization):
+    """A tripped, blocking cap scoped to one organization."""
+    return _rule(
+        name="%s Budget" % organization,
+        filters=[{"dimension": "ORGANIZATION", "operator": "IS", "value": organization}],
+    )
+
+
+class TestOrganizationPinnedToTheKeyTeam:
+    """With the operator's pin on, a caller's organization header cannot step out of the key team's cap (BACK-4363)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("header, value", [
+        ("x-revenium-organization-name", "SomeoneElse"),
+        ("x-revenium-organization-id", "SomeoneElseOld"),
+    ], ids=["organization-name", "retired-organization-id"])
+    async def test_a_pinned_key_team_is_blocked_whatever_organization_header_it_sends(
+        self, guardrail, seeded_rules, monkeypatch, header, value
+    ):
+        monkeypatch.setenv(PIN_SETTING, "true")
+        seeded_rules([_organization_rule("AcmeTeam")])
+
+        with pytest.raises(HTTPException) as raised:
+            await _run(
+                guardrail,
+                guardrail_data(headers={header: value}),
+                key_dict=make_key_dict(team_alias="AcmeTeam"),
+            )
+
+        assert raised.value.status_code == 429
+        assert "AcmeTeam Budget" in raised.value.detail["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_without_the_setting_the_organization_header_still_decides_the_cap(
+        self, guardrail, seeded_rules, monkeypatch
+    ):
+        monkeypatch.delenv(PIN_SETTING, raising=False)
+        seeded_rules([_organization_rule("AcmeTeam")])
+        data = guardrail_data(headers={"x-revenium-organization-name": "SomeoneElse"})
+
+        assert await _run(guardrail, data, key_dict=make_key_dict(team_alias="AcmeTeam")) is data
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("team_alias", [None, "", "   "], ids=["none", "empty", "whitespace"])
+    async def test_a_pinned_key_with_no_team_alias_is_checked_under_the_header_organization(
+        self, guardrail, seeded_rules, monkeypatch, team_alias
+    ):
+        monkeypatch.setenv(PIN_SETTING, "true")
+        seeded_rules([_organization_rule("SomeoneElse")])
+
+        with pytest.raises(HTTPException) as raised:
+            await _run(
+                guardrail,
+                guardrail_data(headers={"x-revenium-organization-name": "SomeoneElse"}),
+                key_dict=make_key_dict(team_alias=team_alias),
+            )
+
+        assert raised.value.status_code == 429
+
+    @pytest.mark.asyncio
+    async def test_a_pinned_team_ignores_a_team_alias_planted_in_the_request_body(
+        self, guardrail, seeded_rules, monkeypatch
+    ):
+        """On /v1/messages ``metadata`` is the caller's body; only the key names its team.
+
+        LiteLLM 1.105 strips a caller's ``user_api_key_*`` keys before the hook
+        runs, so this guards older LiteLLM releases inside the supported range.
+        """
+        monkeypatch.setenv(PIN_SETTING, "true")
+        seeded_rules([_organization_rule("SomeoneElse")])
+        data = guardrail_data(
+            headers={"x-revenium-organization-name": "SomeoneElse"},
+            metadata={"user_api_key_team_alias": "AcmeTeam"},
+            metadata_key="litellm_metadata",
+        )
+
+        with pytest.raises(HTTPException) as raised:
+            await _run(guardrail, data, key_dict=make_key_dict(team_alias=None))
+        assert raised.value.status_code == 429
+
+
+class TestACapFillsWhateverCallIdTheCallerSends:
+    """A caller repeating ``x-litellm-call-id`` is metered and capped like any other (BACK-4371)."""
+
+    @pytest.mark.asyncio
+    async def test_a_cap_on_a_caller_sending_a_fixed_call_id_counts_every_call_and_blocks_them(
+        self, seeded_rules
+    ):
+        """Every call is a record attributed to the capped subscriber, then the cap blocks.
+
+        A unit test cannot show the server-side total growing; the records the
+        SDK sends are its whole part of that. The block itself never read the
+        call id and passes before the fix too.
+        """
+        from revenium_middleware.litellm.proxy import _metering_owner
+
+        _metering_owner.reset_metering_owner()
+        capped = ReveniumGuardrail(
+            guardrail_name="revenium", event_hook=["pre_call", "post_call"], default_on=True
+        )
+        seeded_rules([])
+
+        def capped_request():
+            data = guardrail_data(headers={"x-revenium-subscriber-id": "sub-capped"})
+            data["litellm_call_id"] = "11111111-2222-4333-8444-555555555555"
+            return data
+
+        with patch("revenium_middleware.litellm.proxy.guardrail.submit_ai_event") as submit, \
+                patch("revenium_middleware.litellm.proxy.guardrail.run_async_in_thread",
+                      side_effect=drive_metering):
+            for index in range(3):
+                data = capped_request()
+                await _run(capped, data)
+                await capped.async_post_call_success_hook(
+                    data=data,
+                    user_api_key_dict=make_key_dict(),
+                    response=GuardrailResponse(response_id="chatcmpl-%d" % index),
+                )
+
+        _metering_owner.reset_metering_owner()
+        assert submit.call_count == 3
+        assert [call[0][1]["subscriber"]["id"] for call in submit.call_args_list] == [
+            "sub-capped"
+        ] * 3
+
+        seeded_rules([_rule(filters=[{"dimension": "SUBSCRIBER", "operator": "IS", "value": "sub-capped"}])])
+        with pytest.raises(HTTPException) as raised:
+            await _run(capped, capped_request())
+        assert raised.value.status_code == 429
+
+
+class TestDenyMessage:
+    """BACK-4407: the message the customer wrote for a blocking rule reaches the proxy's caller."""
+
+    @pytest.mark.asyncio
+    async def test_the_429_body_carries_the_rules_deny_message(self, guardrail, seeded_rules):
+        seeded_rules([_rule(denyMessage="Ask the user before retrying.")])
+        with pytest.raises(HTTPException) as exc_info:
+            await _run(guardrail, guardrail_data())
+        assert exc_info.value.status_code == 429
+        assert exc_info.value.detail["error"]["message"] == (
+            "Request blocked by Revenium enforcement rule: Team Budget. Ask the user before retrying.")

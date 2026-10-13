@@ -6,13 +6,18 @@ and Vertex AI SDK middleware implementations.
 """
 
 import datetime
+import hashlib
 import logging
-import os
+import re
 import uuid
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, NamedTuple, Optional
 
 from revenium_middleware import client, get_client, run_async_in_thread, shutdown_event
+from revenium_middleware._core.metering import current_client
 from revenium_middleware._core import submit_ai_event
+from revenium_middleware._core.config import is_debug_enabled
+from revenium_middleware._core.context import _MAX_IDEMPOTENCY_KEY_LENGTH, next_idempotency_key
+from revenium_middleware._core.log_sanitize import sanitize_for_logging
 from revenium_middleware._core.fields import (
     extract_field_with_fallback as _core_extract_field_with_fallback,
     extract_org_and_product,
@@ -22,6 +27,7 @@ from revenium_middleware._core.fields import (
     extract_service_tier_fields,
     extract_effort_field,
     extract_prompt_context_fields,
+    extract_skill_fields,
     merge_extra_body,
 )
 
@@ -40,14 +46,7 @@ def is_debug_logging_enabled() -> bool:
     Returns:
         bool: True if debug logging is enabled, False otherwise
     """
-    # Check environment variable first
-    log_level_str = os.getenv("REVENIUM_LOG_LEVEL", "INFO").upper()
-    if log_level_str == "DEBUG":
-        return True
-
-    # Check actual logger level as fallback
-    revenium_logger = logging.getLogger("revenium_middleware")
-    return revenium_logger.getEffectiveLevel() <= logging.DEBUG
+    return is_debug_enabled()
 
 
 def generate_transaction_id() -> str:
@@ -98,6 +97,10 @@ async def log_token_usage(
     input_messages: Optional[str] = None,
     output_response: Optional[str] = None,
     prompts_truncated: Optional[bool] = None,
+    error_reason: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    error_code: Optional[int] = None,
+    reasoning_tokens: int = 0,
 ) -> None:
     """
     Log token usage to Revenium.
@@ -123,8 +126,12 @@ async def log_token_usage(
         input_messages: Input messages as JSON string
         output_response: Output response text
         prompts_truncated: Whether any prompts were truncated
+        error_reason: Why the provider refused or broke off a failed call
+        idempotency_key: Key of the record's own, for a failed call's record
+        error_code: HTTP error status the provider answered a failed call with
+        reasoning_tokens: Thinking tokens, already included in completion_tokens
     """
-    if get_client() is None:
+    if current_client() is None:
         return  # metering disabled (no API key configured)
     if shutdown_event.is_set():
         logger.warning("Skipping metering call during shutdown")
@@ -151,7 +158,7 @@ async def log_token_usage(
         "input_token_count": prompt_tokens,
         "provider": provider,
         "model_source": model_source,
-        "reasoning_token_count": 0,
+        "reasoning_token_count": reasoning_tokens,
         "request_time": request_time,
         "response_time": response_time,
         "completion_start_time": response_time,
@@ -162,7 +169,7 @@ async def log_token_usage(
         "is_streamed": is_streamed,
         "operation_type": operation_type.value,  # Convert enum to string
         "time_to_first_token": time_to_first_token,
-        "middleware_source": "python",  # Required parameter for Google Python middleware
+        "middleware_source": "PYTHON",
     }
 
     organization_name, product_name = extract_org_and_product(usage_metadata)
@@ -180,12 +187,12 @@ async def log_token_usage(
         completion_args["subscription_id"] = meta["subscription_id"]
     if meta["agent"]:
         completion_args["agent"] = meta["agent"]
-    if meta["response_quality_score"]:
+    if meta["response_quality_score"] is not None:
         completion_args["response_quality_score"] = meta["response_quality_score"]
 
     # Add vision content flag if detected
     if usage_metadata.get("has_vision_content"):
-        completion_args["has_vision_content"] = True
+        completion_args["extra_body"] = {"hasVisionContent": True}
 
     # Add trace visualization fields (v0.2.0+)
     # These fields support both environment variables and usage_metadata parameters
@@ -259,6 +266,7 @@ async def log_token_usage(
     # Reasoning effort level (caller-supplied, forwarded verbatim)
     completion_args.update(extract_effort_field(usage_metadata))
     completion_args.update(extract_prompt_context_fields(usage_metadata))
+    completion_args.update(extract_skill_fields(usage_metadata))
 
     # Parent transaction ID field
     parent_transaction_id = (
@@ -275,9 +283,8 @@ async def log_token_usage(
         completion_args["transaction_name"] = transaction_name
 
     # Retry number field
-    retry_number = trace_fields.get_retry_number()
-    if retry_number > 0:
-        completion_args["retry_number"] = retry_number
+    retry_number = trace_fields.get_retry_number(usage_metadata)
+    completion_args["retry_number"] = retry_number
 
     # Build subscriber object - support both nested and flat formats
     subscriber_data = {}
@@ -337,6 +344,10 @@ async def log_token_usage(
         completion_args["output_response"] = output_response
     if prompts_truncated is not None:
         completion_args["prompts_truncated"] = prompts_truncated
+    if error_reason is not None:
+        completion_args["error_reason"] = error_reason
+    if error_code is not None:
+        completion_args["error_code"] = error_code
 
     # Log the arguments at debug level (redact sensitive prompt data)
     safe_args = {k: v for k, v in completion_args.items()
@@ -347,7 +358,8 @@ async def log_token_usage(
         safe_args['input_messages'] = '[REDACTED]'
     if 'output_response' in completion_args:
         safe_args['output_response'] = '[REDACTED]'
-    logger.debug("Calling client.ai.create_completion with args: %s", safe_args)
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("Calling client.ai.create_completion with args: %s", sanitize_for_logging(safe_args))
 
     agentic_fields = extract_agentic_job_fields(usage_metadata)
     extra_body = merge_extra_body(completion_args.get("extra_body"), agentic_fields)
@@ -359,7 +371,7 @@ async def log_token_usage(
     )
 
     try:
-        result = submit_ai_event("completion", completion_args)
+        result = submit_ai_event("completion", completion_args, idempotency_key=idempotency_key)
         logger.debug("Metering call result: %s", result)
         _log_sent("Metering call", result)
     except Exception as e:
@@ -400,18 +412,24 @@ def create_metering_call(
     input_messages: Optional[str] = None,
     output_response: Optional[str] = None,
     prompts_truncated: Optional[bool] = None,
+    error_reason: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    error_code: Optional[int] = None,
+    image_output: Optional["ImageOutput"] = None,
 ) -> None:
     """
     Create and execute a metering call using UsageData.
 
     This is a higher-level function that uses the standardized UsageData structure.
+    An ``image_output`` sends the answer's images as an image record beside the
+    completion, which then carries the text tokens only.
     """
     # Override streaming and timing info
     usage_data.is_streamed = is_streamed
     usage_data.time_to_first_token = time_to_first_token
 
     # Create async metering call
-    async def metering_call():
+    async def metering_call(key=idempotency_key):
         await log_token_usage(
             transaction_id=usage_data.transaction_id,
             model=usage_data.model,
@@ -434,10 +452,123 @@ def create_metering_call(
             input_messages=input_messages,
             output_response=output_response,
             prompts_truncated=prompts_truncated,
+            error_reason=error_reason,
+            idempotency_key=key,
+            error_code=error_code,
+            reasoning_tokens=usage_data.reasoning_token_count,
         )
 
-    # Execute in background thread
-    run_async_in_thread(metering_call())
+    if image_output is None:
+        run_async_in_thread(metering_call())
+        return
+    _remove_image_share(usage_data, image_output)
+    run_async_in_thread(_send_with_image_record(metering_call, usage_data, usage_metadata, image_output, idempotency_key))
+
+
+class ImageOutput(NamedTuple):
+    """The images a Gemini answer generated and the output tokens Google reports for them."""
+
+    image_count: int
+    image_tokens: int
+
+
+def _items(value: Any) -> List[Any]:
+    try:
+        return list(value or [])
+    except TypeError:
+        return []
+
+
+def _is_thought(part: Any) -> bool:
+    # The vertexai Part wrapper exposes no ``thought``; the gapic part under it does.
+    thought = safe_getattr(part, "thought")
+    if thought is None:
+        thought = safe_getattr(safe_getattr(part, "_raw_part"), "thought")
+    return thought is True
+
+
+def _is_generated_image(part: Any) -> bool:
+    mime_type = safe_getattr(safe_getattr(part, "inline_data"), "mime_type")
+    return isinstance(mime_type, str) and mime_type.startswith("image/") and not _is_thought(part)
+
+
+def generated_image_count(response: Any) -> int:
+    """The final images across every candidate of a Gemini answer or stream chunk; interim thought images excluded."""
+    return sum(
+        1
+        for candidate in _items(safe_getattr(response, "candidates"))
+        for part in _items(safe_getattr(safe_getattr(candidate, "content"), "parts"))
+        if _is_generated_image(part)
+    )
+
+
+def image_output_token_count(usage_metadata: Any) -> int:
+    """The output tokens Google's ``candidates_tokens_details`` attributes to the IMAGE modality."""
+    total = 0
+    for detail in _items(safe_getattr(usage_metadata, "candidates_tokens_details")):
+        modality = safe_getattr(detail, "modality")
+        token_count = safe_getattr(detail, "token_count")
+        if getattr(modality, "name", modality) == "IMAGE" and isinstance(token_count, int) and token_count > 0:
+            total += token_count
+    return total
+
+
+def image_output_of(response: Any, image_count: Optional[int] = None) -> Optional[ImageOutput]:
+    """The answer's image output, or None when it generated no image (its record then stays chat only)."""
+    try:
+        if image_count is None:
+            image_count = generated_image_count(response)
+        if not image_count:
+            return None
+        return ImageOutput(image_count, image_output_token_count(safe_getattr(response, "usage_metadata")))
+    except Exception as e:
+        logger.warning("Could not read the images of a Gemini answer; recording it as chat only: %s", e)
+        return None
+
+
+def _remove_image_share(usage_data: UsageData, image_output: ImageOutput) -> None:
+    share = min(image_output.image_tokens, usage_data.output_token_count)
+    usage_data.output_token_count -= share
+    usage_data.total_token_count = max(usage_data.total_token_count - share, 0)
+
+
+def _image_idempotency_key(main_key: str) -> str:
+    derived = f"{main_key}-image"
+    if len(derived) <= _MAX_IDEMPOTENCY_KEY_LENGTH:
+        return derived
+    return f"{hashlib.sha256(main_key.encode()).hexdigest()}-image"
+
+
+async def _send_with_image_record(send_completion, usage_data: UsageData, usage_metadata: Dict[str, Any],
+                                  image_output: ImageOutput, idempotency_key: Optional[str]) -> None:
+    """Send the completion, then the image record, even when the completion failed.
+
+    The completion's key is drawn here, on the metering worker, as every other
+    record's is. The image record takes a key derived from it: left to
+    submit_ai_event, it would draw from an idempotency_key() block's counter and
+    shift the key of every later call in the block.
+    """
+    main_key = idempotency_key if idempotency_key is not None else next_idempotency_key()
+    image_transaction_id = f"{usage_data.transaction_id}-image"
+    try:
+        await send_completion(main_key)
+    finally:
+        try:
+            await log_image_usage(
+                transaction_id=image_transaction_id,
+                model=usage_data.model,
+                requested_image_count=image_output.image_count,
+                actual_image_count=image_output.image_count,
+                request_time=usage_data.request_time,
+                response_time=usage_data.response_time,
+                request_duration=usage_data.request_duration,
+                usage_metadata=usage_metadata,
+                provider=usage_data.provider,
+                model_source=usage_data.model_source,
+                idempotency_key=_image_idempotency_key(main_key) if main_key else image_transaction_id,
+            )
+        except Exception as e:
+            logger.warning("Image metering call for %s failed: %s", image_transaction_id, e)
 
 
 def _build_common_metadata_args(usage_metadata: Dict[str, Any]) -> Dict[str, Any]:
@@ -519,9 +650,8 @@ def _build_common_metadata_args(usage_metadata: Dict[str, Any]) -> Dict[str, Any
     if transaction_name:
         args["transaction_name"] = transaction_name
 
-    retry_number = trace_fields.get_retry_number()
-    if retry_number > 0:
-        args["retry_number"] = retry_number
+    retry_number = trace_fields.get_retry_number(usage_metadata)
+    args["retry_number"] = retry_number
 
     # Subscriber data
     subscriber_data = {}
@@ -577,6 +707,7 @@ async def log_image_usage(
     quality: Optional[str] = None,
     style: Optional[str] = None,
     aspect_ratio: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> None:
     """
     Log image generation usage to Revenium via /meter/v2/ai/images.
@@ -597,8 +728,9 @@ async def log_image_usage(
         quality: Image quality setting
         style: Image style setting
         aspect_ratio: Aspect ratio (e.g., "16:9")
+        idempotency_key: Key that lets the backend drop a repeat of this record
     """
-    if get_client() is None:
+    if current_client() is None:
         return  # metering disabled (no API key configured)
     if shutdown_event.is_set():
         logger.warning("Skipping image metering call during shutdown")
@@ -621,7 +753,7 @@ async def log_image_usage(
         "requested_image_count": requested_image_count,
         "actual_image_count": actual_image_count,
         "operation_subtype": operation_subtype,
-        "middleware_source": "python",
+        "middleware_source": "PYTHON",
     }
 
     if resolution:
@@ -655,10 +787,13 @@ async def log_image_usage(
     if extra_body:
         image_args["extra_body"] = extra_body
 
-    logger.debug("Calling client.ai.create_image with args: %s", image_args)
+    logger.debug("Calling client.ai.create_image with args: %s", sanitize_for_logging(image_args))
 
     try:
-        result = submit_ai_event("image", image_args)
+        if idempotency_key is None:
+            result = submit_ai_event("image", image_args)
+        else:
+            result = submit_ai_event("image", image_args, idempotency_key=idempotency_key)
         logger.debug("Image metering call result: %s", result)
         _log_sent("Image metering call", result)
     except Exception as e:
@@ -695,6 +830,11 @@ async def log_video_usage(
     aspect_ratio: Optional[str] = None,
     video_job_id: Optional[str] = None,
     async_operation: bool = False,
+    requested_duration_seconds: Optional[float] = None,
+    completion_status: Optional[str] = None,
+    error_code: Optional[int] = None,
+    idempotency_key: Optional[str] = None,
+    agentic_job_fields: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Log video generation usage to Revenium via /meter/v2/ai/video.
@@ -715,8 +855,13 @@ async def log_video_usage(
         aspect_ratio: Aspect ratio (e.g., "16:9")
         video_job_id: Job ID for async operations
         async_operation: Whether this was an async operation
+        requested_duration_seconds: Duration the caller asked for
+        completion_status: "SUCCESS" or "FAILED"
+        error_code: Integer error code of a failed job
+        agentic_job_fields: Job fields resolved when the video was submitted; used instead of the current job context
+        idempotency_key: Key that lets the backend drop a repeat of this record
     """
-    if get_client() is None:
+    if current_client() is None:
         return  # metering disabled (no API key configured)
     if shutdown_event.is_set():
         logger.warning("Skipping video metering call during shutdown")
@@ -738,7 +883,7 @@ async def log_video_usage(
         "transaction_id": transaction_id,
         "duration_seconds": duration_seconds,
         "operation_subtype": operation_subtype,
-        "middleware_source": "python",
+        "middleware_source": "PYTHON",
     }
 
     if resolution:
@@ -751,6 +896,12 @@ async def log_video_usage(
         video_args["video_job_id"] = video_job_id
     if async_operation:
         video_args["async_operation"] = async_operation
+    if requested_duration_seconds is not None:
+        video_args["requested_duration_seconds"] = requested_duration_seconds
+    if completion_status:
+        video_args["completion_status"] = completion_status
+    if error_code is not None:
+        video_args["error_code"] = error_code
 
     # Add common metadata
     video_args.update(_build_common_metadata_args(usage_metadata))
@@ -769,15 +920,19 @@ async def log_video_usage(
     # Service tier and pricing fields
     video_args.update(extract_service_tier_fields(usage_metadata, "video"))
 
-    agentic_fields = extract_agentic_job_fields(usage_metadata)
+    agentic_fields = (
+        agentic_job_fields if agentic_job_fields is not None else extract_agentic_job_fields(usage_metadata))
     extra_body = merge_extra_body(video_args.get("extra_body"), agentic_fields)
     if extra_body:
         video_args["extra_body"] = extra_body
 
-    logger.debug("Calling client.ai.create_video with args: %s", video_args)
+    logger.debug("Calling client.ai.create_video with args: %s", sanitize_for_logging(video_args))
 
     try:
-        result = submit_ai_event("video", video_args)
+        if idempotency_key is None:
+            result = submit_ai_event("video", video_args)
+        else:
+            result = submit_ai_event("video", video_args, idempotency_key=idempotency_key)
         logger.debug("Video metering call result: %s", result)
         _log_sent("Video metering call", result)
     except Exception as e:
@@ -855,9 +1010,15 @@ def create_video_metering_call(
     aspect_ratio: Optional[str] = None,
     video_job_id: Optional[str] = None,
     async_operation: bool = False,
+    requested_duration_seconds: Optional[float] = None,
+    completion_status: Optional[str] = None,
+    error_code: Optional[int] = None,
+    transaction_id: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    agentic_job_fields: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Create and execute a video metering call in a background thread."""
-    transaction_id = generate_transaction_id()
+    transaction_id = transaction_id or generate_transaction_id()
     request_time = format_timestamp(request_time_dt)
     response_time = format_timestamp(response_time_dt)
     request_duration = calculate_duration_ms(request_time_dt, response_time_dt)
@@ -879,9 +1040,29 @@ def create_video_metering_call(
             aspect_ratio=aspect_ratio,
             video_job_id=video_job_id,
             async_operation=async_operation,
+            requested_duration_seconds=requested_duration_seconds,
+            completion_status=completion_status,
+            error_code=error_code,
+            idempotency_key=idempotency_key,
+            agentic_job_fields=agentic_job_fields,
         )
 
     run_async_in_thread(metering_call())
+
+
+_GOOGLE_MODEL_PATH_PREFIX = re.compile(
+    r"^(projects/[^/]+/locations/[^/]+/)?(publishers/google/models/|models/|google/(?!.*/))"
+)
+
+
+def base_model_name(model: Any) -> Any:
+    """The model id without one Google resource path prefix, e.g. ``models/veo-3.0`` -> ``veo-3.0``.
+
+    Tuned models, endpoints and other publishers keep their full name; non-strings pass through.
+    """
+    if not isinstance(model, str):
+        return model
+    return _GOOGLE_MODEL_PATH_PREFIX.sub("", model, count=1)
 
 
 @safe_extract
@@ -1012,6 +1193,41 @@ def extract_token_counts(response: Any, operation_type: OperationType) -> TokenC
         total_tokens=total_tokens,
         cached_tokens=cached_tokens,
     )
+
+
+def generation_token_counts(usage_metadata: Any) -> TokenCounts:
+    """Gemini usage: tool results fed back to the model are billed as input, and an absent count is zero.
+
+    Google bills thinking tokens at the output rate but reports them outside
+    ``candidates_token_count``, so the output count is candidates plus thoughts and
+    the reasoning count is the thinking part of it.
+    """
+    input_tokens = get_token_count(usage_metadata, ["prompt_token_count"]) + get_token_count(
+        usage_metadata, ["tool_use_prompt_token_count"]
+    )
+    reasoning_tokens = get_token_count(usage_metadata, ["thoughts_token_count"])
+    output_tokens = get_token_count(usage_metadata, ["candidates_token_count"]) + reasoning_tokens
+    return TokenCounts(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=get_token_count(usage_metadata, ["total_token_count"]) or input_tokens + output_tokens,
+        cached_tokens=get_token_count(usage_metadata, ["cached_content_token_count"]),
+        reasoning_tokens=reasoning_tokens,
+    )
+
+
+def embedding_statistics_token_total(embeddings: List[Any]) -> Optional[int]:
+    """The summed statistics token_count of every embedding, or None when the list is empty or any embedding lacks one."""
+    counts = []
+    for embedding in embeddings:
+        statistics = getattr(embedding, "statistics", None)
+        count = getattr(statistics, "token_count", None) if statistics else None
+        if count is None:
+            return None
+        counts.append(count)
+    if not counts:
+        return None
+    return int(round(sum(counts)))
 
 
 def create_usage_data(

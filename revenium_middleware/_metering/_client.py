@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import logging
 from typing import Any, Union, Mapping
 from typing_extensions import Self, override
 
@@ -40,6 +41,38 @@ __all__ = [
     "Client",
     "AsyncClient",
 ]
+
+
+_address_logger = logging.getLogger("revenium_middleware")
+
+
+def normalize_meter_base_url(url: str | httpx.URL) -> tuple[str, bool]:
+    """Return the address ending in its last ``meter`` path segment (appended when absent) with a trailing slash,
+    and whether a query string or fragment was dropped from it."""
+    parsed = httpx.URL(str(url))
+    without_query = parsed.copy_with(query=None, fragment=None)
+    segments = without_query.raw_path.decode('utf-8').rstrip('/').split('/')
+    meter_positions = [index for index, segment in enumerate(segments) if segment.lower() == 'meter']
+    if meter_positions:
+        segments = segments[: meter_positions[-1] + 1]
+    else:
+        segments.append('meter')
+    normalized = without_query.copy_with(raw_path=('/'.join(segments) + '/').encode('utf-8'))
+    return str(normalized), without_query != parsed
+
+
+def warn_that_the_address_query_was_dropped() -> None:
+    _address_logger.warning(
+        "The Revenium metering address has a query string or fragment; it is ignored and usage records "
+        "and tool events are sent to the address without it"
+    )
+
+
+def _normalize_client_base_url(url: str | httpx.URL) -> str:
+    normalized, dropped = normalize_meter_base_url(url)
+    if dropped:
+        warn_that_the_address_query_was_dropped()
+    return normalized
 
 
 class ReveniumMetering(SyncAPIClient):
@@ -114,47 +147,7 @@ class ReveniumMetering(SyncAPIClient):
 
     @staticmethod
     def _normalize_base_url(url: str | httpx.URL) -> str:
-        """
-        Normalize the base URL to ensure it includes the /meter path segment.
-
-        This method handles both input scenarios:
-        - If the URL doesn't include /meter, it will be added
-        - If the URL already includes /meter, it won't be duplicated
-
-        Args:
-            url: The base URL to normalize (can be a string or httpx.URL)
-
-        Returns:
-            The normalized base URL as a string with /meter path segment
-        """
-        # Convert to string if it's an httpx.URL
-        url_str = str(url)
-
-        # Remove trailing slash for consistent processing
-        url_str = url_str.rstrip('/')
-
-        # Parse the URL to extract components
-        parsed = httpx.URL(url_str)
-        path = parsed.raw_path.decode('utf-8').rstrip('/')
-
-        # Check if /meter is already in the path (case-insensitive)
-        path_lower = path.lower()
-
-        # If /meter is not present, add it
-        if not path_lower.endswith('/meter'):
-            # Check if there's a /meter somewhere in the middle (shouldn't happen, but handle it)
-            if '/meter' in path_lower:
-                # Find the position of /meter and keep everything up to and including it
-                meter_index = path_lower.rfind('/meter')
-                path = path[:meter_index + 6]  # 6 is the length of '/meter'
-            else:
-                # Add /meter to the path
-                path = f"{path}/meter"
-
-        # Reconstruct the URL with the normalized path and trailing slash
-        normalized_url = parsed.copy_with(raw_path=f"{path}/".encode('utf-8'))
-
-        return str(normalized_url)
+        return _normalize_client_base_url(url)
 
     @property
     @override
@@ -333,47 +326,7 @@ class AsyncReveniumMetering(AsyncAPIClient):
 
     @staticmethod
     def _normalize_base_url(url: str | httpx.URL) -> str:
-        """
-        Normalize the base URL to ensure it includes the /meter path segment.
-
-        This method handles both input scenarios:
-        - If the URL doesn't include /meter, it will be added
-        - If the URL already includes /meter, it won't be duplicated
-
-        Args:
-            url: The base URL to normalize (can be a string or httpx.URL)
-
-        Returns:
-            The normalized base URL as a string with /meter path segment
-        """
-        # Convert to string if it's an httpx.URL
-        url_str = str(url)
-
-        # Remove trailing slash for consistent processing
-        url_str = url_str.rstrip('/')
-
-        # Parse the URL to extract components
-        parsed = httpx.URL(url_str)
-        path = parsed.raw_path.decode('utf-8').rstrip('/')
-
-        # Check if /meter is already in the path (case-insensitive)
-        path_lower = path.lower()
-
-        # If /meter is not present, add it
-        if not path_lower.endswith('/meter'):
-            # Check if there's a /meter somewhere in the middle (shouldn't happen, but handle it)
-            if '/meter' in path_lower:
-                # Find the position of /meter and keep everything up to and including it
-                meter_index = path_lower.rfind('/meter')
-                path = path[:meter_index + 6]  # 6 is the length of '/meter'
-            else:
-                # Add /meter to the path
-                path = f"{path}/meter"
-
-        # Reconstruct the URL with the normalized path and trailing slash
-        normalized_url = parsed.copy_with(raw_path=f"{path}/".encode('utf-8'))
-
-        return str(normalized_url)
+        return _normalize_client_base_url(url)
 
     @property
     @override

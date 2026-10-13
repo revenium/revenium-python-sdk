@@ -28,7 +28,7 @@ def _log(usage_metadata):
     )
 
 
-@patch("revenium_middleware.openai.middleware.get_client", lambda: object())
+@patch("revenium_middleware.openai.middleware.current_client", lambda: object())
 @patch("revenium_middleware.openai.middleware.submit_ai_event")
 def test_usage_metadata_coding_assistant_uuid_forwarded_as_typed_kwarg(mock_submit):
     mock_submit.return_value = SimpleNamespace(id="completion-coding-assistant-test")
@@ -41,7 +41,7 @@ def test_usage_metadata_coding_assistant_uuid_forwarded_as_typed_kwarg(mock_subm
     assert "codingAssistantAccountUuid" not in extra_body
 
 
-@patch("revenium_middleware.openai.middleware.get_client", lambda: object())
+@patch("revenium_middleware.openai.middleware.current_client", lambda: object())
 @patch("revenium_middleware.openai.middleware.submit_ai_event")
 def test_unset_coding_assistant_uuid_omitted_from_payload(mock_submit):
     mock_submit.return_value = SimpleNamespace(id="completion-coding-assistant-test")

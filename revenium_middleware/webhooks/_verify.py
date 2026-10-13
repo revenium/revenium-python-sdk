@@ -19,7 +19,7 @@ def verify_signature(
     All malformed input (wrong types, unparseable timestamp, no sha256= entries,
     empty secrets list) returns False. The function never raises.
     """
-    if not secrets:
+    if not isinstance(secrets, (list, tuple)) or not secrets:
         return False
     if not all(isinstance(s, str) and s for s in secrets):
         return False

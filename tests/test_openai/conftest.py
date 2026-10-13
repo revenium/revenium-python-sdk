@@ -44,6 +44,9 @@ def mock_revenium_client():
     All metering calls will be intercepted and return a success response.
     """
     mock_client = MagicMock()
+    # Strings, as on a real client: spending caps read their rules with them.
+    mock_client.api_key = "hak_test_dummy_key_for_ci_testing_only"
+    mock_client.base_url = "https://api.test.revenium.ai/meter/"
     mock_client.ai.create_completion.return_value = {'status': 'success'}
     # This local fixture SHADOWS the root conftest fixture of the same name
     # for everything under tests/test_openai/, so it must patch the single

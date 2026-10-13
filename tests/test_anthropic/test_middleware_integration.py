@@ -222,7 +222,7 @@ class TestBedrockRequestHandler:
         """Test _handle_bedrock_request function."""
         # Setup mocks
         mock_create_payload.return_value = {"messages": [{"role": "user", "content": "Hello"}]}
-        mock_bedrock_invoke.return_value = ("Hello from Bedrock!", 10, 5, 0, 0)
+        mock_bedrock_invoke.return_value = ("Hello from Bedrock!", 10, 5, 0, 0, None)
         mock_response = {
             "id": "bedrock-123",
             "model": "claude-3-sonnet-20240229",
@@ -257,7 +257,8 @@ class TestBedrockRequestHandler:
             output_tokens=5,
             model="claude-3-sonnet-20240229",
             cache_creation_tokens=0,
-            cache_read_tokens=0
+            cache_read_tokens=0,
+            cache_creation=None,
         )
         mock_metering.assert_called_once()
 
@@ -281,8 +282,8 @@ class TestBedrockRequestHandler:
         import asyncio
         import datetime
 
-        # Return a 5-tuple with non-zero cache values
-        mock_bedrock_invoke.return_value = ("Hello!", 10, 5, 100, 50)
+        # Return the tuple with non-zero cache values and no per-TTL split
+        mock_bedrock_invoke.return_value = ("Hello!", 10, 5, 100, 50, None)
         mock_create_payload.return_value = {"messages": [{"role": "user", "content": "Hello"}]}
 
         mock_response = MagicMock()
@@ -877,6 +878,66 @@ class TestStreamProviderAttribution:
 
         assert len(payloads) == 1
         assert payloads[0]["provider"] == "ANTHROPIC"
+
+
+class TestStreamManagerBeforeEnter:
+    """A metered messages.stream() manager inspected before its with block.
+
+    Tracing and debugging tools probe attributes on whatever a call returns.
+    The manager used to recurse until RecursionError on any such probe,
+    where the unwrapped SDK manager raises AttributeError (BACK-4452 S1).
+    """
+
+    @staticmethod
+    def _stream_call(mw):
+        wrapper = getattr(mw.stream_wrapper, "_self_wrapper", mw.stream_wrapper)
+        instance = MagicMock()
+        instance._client = anthropic.Anthropic(api_key="test-key")
+        wrapped = MagicMock(return_value=_FakeMessageStream(TestStreamProviderAttribution._final_message()))
+        return lambda: wrapper(wrapped, instance, (),
+                               {"model": "claude-3-5-sonnet-20241022",
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "max_tokens": 16})
+
+    @staticmethod
+    def _metering_patches(mw, payloads):
+        from contextlib import ExitStack
+        stack = ExitStack()
+        stack.enter_context(patch.object(mw, 'submit_ai_event',
+                                         side_effect=lambda op, args: payloads.append(args)))
+        stack.enter_context(patch.object(mw, '_safe_run_async_in_thread',
+                                         side_effect=_run_metering_inline))
+        stack.enter_context(patch.object(mw, '_get_thread_safe_client', return_value=MagicMock()))
+        return stack
+
+    def test_inspecting_the_stream_manager_before_with_returns_false(self, monkeypatch):
+        import revenium_middleware.anthropic.middleware as mw
+        monkeypatch.delenv("REVENIUM_BEDROCK_DISABLE", raising=False)
+        payloads = []
+        sentinel = object()
+
+        with self._metering_patches(mw, payloads):
+            manager = self._stream_call(mw)()
+
+            assert hasattr(manager, "anything") is False
+            assert getattr(manager, "anything", sentinel) is sentinel
+            with pytest.raises(AttributeError):
+                manager.text_stream
+
+    def test_an_inspected_stream_manager_still_meters_when_entered(self, monkeypatch):
+        import revenium_middleware.anthropic.middleware as mw
+        monkeypatch.delenv("REVENIUM_BEDROCK_DISABLE", raising=False)
+        payloads = []
+
+        with self._metering_patches(mw, payloads):
+            manager = self._stream_call(mw)()
+            hasattr(manager, "anything")
+            with manager:
+                pass
+
+        assert len(payloads) == 1
+        assert payloads[0]["input_token_count"] == 13
+        assert payloads[0]["is_streamed"] is True
 
 
 class TestBedrockTransportLoad:

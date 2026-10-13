@@ -5,8 +5,8 @@ When you install and import this library, it will automatically hook
 fal_client's SyncClient and AsyncClient (run, subscribe, stream and the
 submit / status / result queue) using wrapt, which covers the module-level
 functions bound to the default clients too, and meter usage to Revenium for
-image, video, and audio generation tracking. A queued job is metered once,
-when its result is fetched.
+image, video, and audio generation and for language model calls. A queued job
+is metered once, when its result is fetched.
 """
 
 import logging

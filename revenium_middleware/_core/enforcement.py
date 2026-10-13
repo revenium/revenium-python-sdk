@@ -62,6 +62,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 from email.utils import parsedate_to_datetime
@@ -70,9 +71,17 @@ from urllib.parse import quote, urlparse
 
 import httpx
 
-from .config import Config, env_flag_enabled
+from .call_ownership import peek_callback_metadata
+from .closable_scope import ClosableScope
+from .config import Config, env_choice, env_flag_enabled
+from .context import merge_metadata, overlay_metadata
 from .exceptions import BudgetExceededError
-from .subscriber import extract_subscriber_from_metadata
+from .fields import extract_common_metadata, extract_organization_name, extract_product_name
+from .log_sanitize import sanitize_for_logging
+from .subscriber import extract_subscriber_from_metadata, subscriber_with_credential_alias
+from .trace_fields import get_credential_alias
+from .vendor_model_aliases import SERVED_MODEL_BY_ALIAS
+from .wire_guards import stored_subscriber_value
 
 logger = logging.getLogger("revenium_middleware.extension")
 
@@ -121,14 +130,21 @@ _INSPECTION_RETRY_AFTER_GIVE_UP_SECONDS = 20.0
 # limits cannot go stale for hours on the strength of a single response. Any
 # realistic value (60 s, 120 s, 300 s) is honoured exactly.
 _REFRESH_COOLDOWN_CEILING_SECONDS = 300.0
-_RULES_CACHE_FILENAME = "revenium_enforcement_rules.json"
+# Snapshot file names are ``<prefix>.<scope>.json``, where the scope names the
+# team and the environment the rules were read for (``_snapshot_scope``). Two
+# teams' services on one host often share one REVENIUM_CACHE_DIR, and an
+# unscoped name let a restarted process enforce another team's rules and hold
+# that team's people's email addresses. The legacy unscoped files are never
+# read and never deleted: an older SDK still running beside this one may own
+# them.
+_RULES_CACHE_FILE_PREFIX = "revenium_enforcement_rules"
 # Department-budget map snapshot. A SEPARATE file, and not a new shape for the
 # rules snapshot, on purpose: an older SDK's loader accepts only a bare list,
 # so changing the rules file's shape would make a rollback silently discard
 # the whole cache (fail-closed would then block everything during an API
 # outage). The old loader never looks at this filename, so it can carry the
 # new data without being load-bearing for a downgrade.
-_ORG_UNIT_BLOCKS_CACHE_FILENAME = "revenium_enforcement_org_unit_blocks.json"
+_ORG_UNIT_BLOCKS_CACHE_FILE_PREFIX = "revenium_enforcement_org_unit_blocks"
 
 # Top-level keys of the server-computed department-budget map on the API
 # response, current spelling first (see ``_wire_value``).
@@ -154,6 +170,14 @@ _ORG_UNIT_ID_KEYS = ("departmentId", "orgUnitId")
 # rules (a stale or racing payload). The server deliberately fails toward
 # enforcing here, so the block still happens — just without a rule name.
 _ORG_UNIT_FALLBACK_RULE_NAME = "Department budget"
+# A rule's ``windowEnd`` once any ``[Zone]`` suffix is cut and a trailing ``Z``
+# is spelled ``+00:00``: the server writes the last nanosecond of the window,
+# e.g. ``2026-10-31T23:59:59.999999999Z``. Python 3.10's ``fromisoformat``
+# accepts neither ``Z`` nor nine fraction digits, so the fraction is cut to
+# the six it does accept before parsing.
+_WINDOW_END_PATTERN = re.compile(
+    r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?([+-]\d{2}:\d{2})?"
+)
 
 _cached_rules: List[dict] = []
 # Server-computed subscriber-email -> blocking-rule-id map for department
@@ -176,6 +200,10 @@ _cached_org_unit_block_balances: Dict[str, float] = {}
 _cached_org_unit_warnings: Dict[str, int] = {}
 _cache_lock = threading.Lock()
 _cache_timestamp = 0.0
+# The (enforcement base URL, team id) the cached rules were loaded for, the
+# scope the saved snapshot is kept under too. None until a call, a fetch or a
+# snapshot load adopts the current one. Read and written under _cache_lock.
+_cache_owner: Optional[Tuple[str, str]] = None
 # True once any successful fetch (even an empty list / HTTP 204) or a disk
 # snapshot load has populated the cache. Distinguishes "server says no rules
 # apply" from "we have never heard back from the server" — fail-closed must
@@ -230,14 +258,47 @@ _cache_generation = 0
 _warn_dedupe_lock = threading.Lock()
 _warned_org_unit_callers: Set[Tuple[int, str, int]] = set()
 
+# Rule id -> the ``windowEnd`` of the breach last warned about for a breached
+# rule whose action does not block. An entry for a rule the refreshed cache
+# still serves survives _begin_cache_generation: a refresh every poll interval
+# would otherwise repeat the line once a minute for the rest of the window. An
+# entry for a rule no longer served is dropped there, so the map is bounded by
+# the current rule set. A new window brings a new ``windowEnd`` and so a new
+# line. Guarded by _warn_dedupe_lock and mutated in place so a test can clear
+# it.
+_warned_non_blocking_rules: Dict[str, object] = {}
+
+# (rule id, dimension, operator, reason) for every rule filter the SDK has
+# logged that it cannot evaluate, so the debug line appears once rather than
+# on every call. Guarded by _warn_dedupe_lock and mutated in place so a test
+# can clear it.
+_noted_unevaluable_filters: Set[Tuple[str, str, str, str]] = set()
+
+# id(groupBreakdown list) -> (that list, {groupValue: entry}), so a per-person
+# lookup is a dict hit instead of a walk of every person on the team on every
+# call. One slot per list, so several per-person caps never evict each other.
+# The list is held beside its index so its id cannot be reused by another list
+# while the slot lives. Built lazily, outside any lock: two threads building
+# the same index is harmless, and a published index is never mutated. Cleared
+# by _begin_cache_generation, which every refresh and disk load calls, and
+# published only under _cache_lock while the building check's generation is
+# still current, so a check that read the rules before a refresh cannot pin
+# the replaced lists here. Kept out of the rule dicts on purpose: those are
+# persisted and fingerprinted.
+_group_indexes: Dict[int, Tuple[list, Dict[str, dict]]] = {}
+
 # Monotonic deadline before which no refresh may issue a request, set when the
 # fetch declines to wait out a Retry-After (``_begin_refresh_cooldown``) and
 # when a refresh fails for any other reason (``_begin_failure_backoff``). 0.0
 # means no cooldown in force. Read and written under _cache_lock.
 _refresh_cooldown_until = 0.0
+# The owner (see _cache_owner) whose fetch set _refresh_cooldown_until, so a
+# switch to another team drops it. Read and written under _cache_lock.
+_refresh_cooldown_owner: Optional[Tuple[str, str]] = None
 
 # Single-shot warnings so misconfigured environments don't spam logs
 _team_id_warned = False
+_api_key_warned = False
 _disk_load_attempted = False
 
 
@@ -249,6 +310,27 @@ def is_circuit_breaker_enabled() -> bool:
 def is_bypass_enabled() -> bool:
     """``REVENIUM_BYPASS=true`` short-circuits enforcement at every callsite."""
     return env_flag_enabled(Config.ENV_REVENIUM_BYPASS)
+
+
+_outer_wrapper_check = ClosableScope("revenium_call_checked_by_outer_wrapper")
+
+
+def checked_by_outer_wrapper():
+    """Mark the provider call made inside this scope as already checked.
+
+    A wrapper that calls through another metered client (LiteLLM over the
+    OpenAI SDK) checks the call with the identity it resolved, then makes the
+    inner call without it. The inner wrapper would check again with only the
+    decorator's identity and could refuse a call the outer check allowed.
+
+    The mark is shared with every context copied inside the scope and closed
+    when the scope ends, so a task the call starts (an async LiteLLM success
+    callback) that makes its own call after the outer call returned is checked."""
+    return _outer_wrapper_check.entered()
+
+
+def _checked_by_outer_wrapper() -> bool:
+    return _outer_wrapper_check.is_active()
 
 
 def _poll_interval_seconds() -> int:
@@ -278,21 +360,41 @@ def _refresh_failure_backoff_seconds() -> float:
 
 def _fail_mode_is_closed() -> bool:
     """``REVENIUM_CB_FAIL_MODE=closed`` raises when no usable cache exists."""
-    return os.environ.get(Config.ENV_REVENIUM_CB_FAIL_MODE, "open").lower() == "closed"
+    return env_choice(Config.ENV_REVENIUM_CB_FAIL_MODE, ("open", "closed"), "open") == "closed"
 
 
-def _cache_file_path() -> Optional[str]:
-    cache_dir = os.environ.get(Config.ENV_REVENIUM_CACHE_DIR, "")
-    if not cache_dir:
+def _current_owner() -> Tuple[str, str]:
+    """The enforcement base URL and team id the cache is for: whose rules these are."""
+    return _get_enforcement_base_url(), os.environ.get(Config.ENV_REVENIUM_TEAM_ID, "")
+
+
+def _snapshot_scope(owner: Optional[Tuple[str, str]] = None) -> Optional[str]:
+    """Short digest of the environment and team the cached rules belong to.
+
+    ``None`` without ``REVENIUM_TEAM_ID``: no team means no fetch, so there is
+    nothing of this process's own to save or load. Hashed so neither the team
+    id nor any path character from it reaches a file name.
+    """
+    base_url, team_id = owner or _current_owner()
+    if not team_id:
         return None
-    return os.path.join(cache_dir, _RULES_CACHE_FILENAME)
+    return hashlib.sha256(f"{base_url}|{team_id}".encode("utf-8")).hexdigest()[:16]
 
 
-def _org_unit_blocks_cache_file_path() -> Optional[str]:
+def _scoped_cache_file_path(prefix: str, owner: Optional[Tuple[str, str]] = None) -> Optional[str]:
     cache_dir = os.environ.get(Config.ENV_REVENIUM_CACHE_DIR, "")
-    if not cache_dir:
+    scope = _snapshot_scope(owner)
+    if not cache_dir or scope is None:
         return None
-    return os.path.join(cache_dir, _ORG_UNIT_BLOCKS_CACHE_FILENAME)
+    return os.path.join(cache_dir, f"{prefix}.{scope}.json")
+
+
+def _cache_file_path(owner: Optional[Tuple[str, str]] = None) -> Optional[str]:
+    return _scoped_cache_file_path(_RULES_CACHE_FILE_PREFIX, owner)
+
+
+def _org_unit_blocks_cache_file_path(owner: Optional[Tuple[str, str]] = None) -> Optional[str]:
+    return _scoped_cache_file_path(_ORG_UNIT_BLOCKS_CACHE_FILE_PREFIX, owner)
 
 
 def _rules_fingerprint(rules: list) -> str:
@@ -324,17 +426,32 @@ def _write_private_json(path: str, payload: object) -> None:
         json.dump(payload, handle)
 
 
+def _process_metering_client():
+    """The process-wide metering client, never a ``metering_key()`` block's: caps belong to the process."""
+    # Imported lazily: the metering module does not import this one.
+    from revenium_middleware._core.metering import process_client
+    return process_client()
+
+
+def _process_metering_url() -> Optional[str]:
+    from revenium_middleware._core.metering import _valid_base_url
+    client = _process_metering_client()
+    return _valid_base_url(str(client.base_url)) if client is not None else None
+
+
 def _get_enforcement_base_url() -> str:
     """Base URL for enforcement API calls.
 
     Prefers ``REVENIUM_ENFORCEMENT_BASE_URL`` so a context-path
     (``http://localhost:8080/profitstream``) survives intact. Falls back to
-    the origin of the metering URL when unset.
+    the origin of the metering client's URL, set by ``initialize_metering()``
+    or ``REVENIUM_METERING_BASE_URL``.
     """
     explicit = os.environ.get(Config.ENV_REVENIUM_ENFORCEMENT_BASE_URL, "")
     if explicit:
         return explicit.rstrip("/")
-    metering_url = os.environ.get(Config.ENV_REVENIUM_BASE_URL, "https://api.revenium.ai/meter/")
+    metering_url = _process_metering_url() or os.environ.get(
+        Config.ENV_REVENIUM_BASE_URL, "https://api.revenium.ai/meter/")
     parsed = urlparse(metering_url)
     return f"{parsed.scheme}://{parsed.netloc}"
 
@@ -436,7 +553,7 @@ def _coerce_balances(raw) -> Dict[str, float]:
     return balances
 
 
-def _load_department_budgets_from_disk(rules: list) -> _DepartmentBudgets:
+def _load_department_budgets_from_disk(rules: list, owner: Optional[Tuple[str, str]] = None) -> _DepartmentBudgets:
     """Read the department-budget snapshot written beside ``rules``.
 
     The maps live in their own file; absent or malformed means no department
@@ -448,7 +565,7 @@ def _load_department_budgets_from_disk(rules: list) -> _DepartmentBudgets:
     successful fetch.
     """
     empty = _DepartmentBudgets({}, {}, {})
-    blocks_path = _org_unit_blocks_cache_file_path()
+    blocks_path = _org_unit_blocks_cache_file_path(owner)
     if not blocks_path or not os.path.exists(blocks_path):
         return empty
     try:
@@ -484,14 +601,15 @@ def _load_department_budgets_from_disk(rules: list) -> _DepartmentBudgets:
 def _load_cache_from_disk() -> None:
     global _cached_rules, _cached_org_unit_blocks, _cached_org_unit_block_balances
     global _cached_org_unit_warnings
-    global _cache_timestamp, _disk_load_attempted, _cache_initialized
+    global _cache_timestamp, _disk_load_attempted, _cache_initialized, _cache_owner
     # Check-and-set under _cache_lock so two cold-start callers can't both
     # observe _disk_load_attempted=False and race on the snapshot read.
     with _cache_lock:
         if _disk_load_attempted:
             return
         _disk_load_attempted = True
-    path = _cache_file_path()
+    owner = _current_owner()
+    path = _cache_file_path(owner)
     if not path or not os.path.exists(path):
         return
     try:
@@ -507,8 +625,11 @@ def _load_cache_from_disk() -> None:
             rules = data["rules"]
         else:
             return
-        departments = _load_department_budgets_from_disk(rules)
+        departments = _load_department_budgets_from_disk(rules, owner)
         with _cache_lock:
+            if _cache_owner not in (None, owner):
+                return
+            _cache_owner = owner
             _cached_rules = rules
             _cached_org_unit_blocks = departments.blocks
             _cached_org_unit_block_balances = departments.balances
@@ -529,14 +650,15 @@ def _load_cache_from_disk() -> None:
 
 def _persist_cache_to_disk(rules: list, org_unit_blocks: Optional[dict] = None,
                            org_unit_block_balances: Optional[dict] = None,
-                           org_unit_warnings: Optional[dict] = None) -> None:
+                           org_unit_warnings: Optional[dict] = None,
+                           owner: Optional[Tuple[str, str]] = None) -> None:
     """Write the rules snapshot (legacy bare-list shape) and the maps beside it.
 
     The rules file keeps the exact shape every published SDK version reads —
     a bare JSON list — so a rollback after this version has written a
     snapshot still loads it instead of silently discarding the cache. The
     department map rides in its own file (see
-    ``_ORG_UNIT_BLOCKS_CACHE_FILENAME``), written 0600 because it is keyed by
+    ``_ORG_UNIT_BLOCKS_CACHE_FILE_PREFIX``), written 0600 because it is keyed by
     subscriber email. The map's envelope carries the
     fingerprint of the rules it was computed against, so however a crash
     interleaves the two writes, the loader can only ever pair a map with the
@@ -545,14 +667,15 @@ def _persist_cache_to_disk(rules: list, org_unit_blocks: Optional[dict] = None,
 
     The map arguments are optional so callers that only have rules (and the
     existing tests) keep working; an omitted map is written empty, which is
-    also what an envelope predating that map loads as.
+    also what an envelope predating that map loads as. ``owner`` is whose
+    rules these are, the current owner when omitted.
     """
-    path = _cache_file_path()
+    path = _cache_file_path(owner)
     if not path:
         return
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        blocks_path = _org_unit_blocks_cache_file_path()
+        blocks_path = _org_unit_blocks_cache_file_path(owner)
         if blocks_path:
             _write_private_json(blocks_path, {
                 "rules_fingerprint": _rules_fingerprint(rules),
@@ -602,7 +725,7 @@ def _retry_after_seconds(response: "httpx.Response") -> Optional[float]:
     return max(0.0, delay)
 
 
-def _begin_refresh_cooldown(seconds: float) -> float:
+def _begin_refresh_cooldown(seconds: float, owner: Tuple[str, str]) -> Optional[float]:
     """Stop issuing refresh requests for the ``Retry-After`` the fetch declined to wait.
 
     Giving up on the header is only half of honouring it. Without a cooldown
@@ -614,29 +737,39 @@ def _begin_refresh_cooldown(seconds: float) -> float:
 
     Clamped to ``_REFRESH_COOLDOWN_CEILING_SECONDS`` -- a sanity bound on how
     long one header may suppress refreshes, not a truncated wait; see that
-    constant. Returns the seconds remaining until the deadline now in effect.
+    constant. Returns the seconds remaining until the deadline now in effect,
+    or ``None`` when ``owner`` no longer owns the cache.
     """
-    return _extend_refresh_cooldown(min(max(0.0, seconds), _REFRESH_COOLDOWN_CEILING_SECONDS))
+    return _extend_refresh_cooldown(min(max(0.0, seconds), _REFRESH_COOLDOWN_CEILING_SECONDS), owner)
 
 
-def _begin_failure_backoff() -> float:
+def _begin_failure_backoff(owner: Tuple[str, str]) -> Optional[float]:
     """Stop issuing refresh requests for ``_refresh_failure_backoff_seconds``.
 
     Not clamped by ``_REFRESH_COOLDOWN_CEILING_SECONDS``: that bounds what one
     server header can impose, while this is the operator's own poll interval,
     so a one-hour interval means one attempt an hour during an outage too.
-    Returns the seconds remaining until the deadline now in effect.
+    Returns the seconds remaining until the deadline now in effect, or
+    ``None`` when ``owner`` no longer owns the cache.
     """
-    return _extend_refresh_cooldown(_refresh_failure_backoff_seconds())
+    return _extend_refresh_cooldown(_refresh_failure_backoff_seconds(), owner)
 
 
-def _extend_refresh_cooldown(seconds: float) -> float:
-    """Move the cooldown deadline ``seconds`` out, never shortening one in force."""
-    global _refresh_cooldown_until
+def _extend_refresh_cooldown(seconds: float, owner: Tuple[str, str]) -> Optional[float]:
+    """Move ``owner``'s cooldown deadline ``seconds`` out, never shortening one in force.
+
+    A fetch that fails after the process switched to another team sets
+    nothing and returns ``None``: its cooldown would hold off the new team's
+    refresh for a whole poll interval.
+    """
+    global _refresh_cooldown_until, _refresh_cooldown_owner
     now = time.monotonic()
     deadline = now + max(0.0, seconds)
     with _cache_lock:
+        if _cache_owner not in (None, owner):
+            return None
         _refresh_cooldown_until = max(_refresh_cooldown_until, deadline)
+        _refresh_cooldown_owner = owner
         return _refresh_cooldown_until - now
 
 
@@ -663,7 +796,7 @@ class _RetryPlan(NamedTuple):
 
 
 def _plan_retry(response: "httpx.Response", backoff: float, budget_remaining: float,
-                budget_total: float) -> _RetryPlan:
+                budget_total: float, owner: Tuple[str, str]) -> _RetryPlan:
     """Decide how to handle a retryable response, spending the Retry-After budget.
 
     Three outcomes, and the ``None`` is the one that matters:
@@ -682,7 +815,9 @@ def _plan_retry(response: "httpx.Response", backoff: float, budget_remaining: fl
     if retry_after is None:
         return _RetryPlan(backoff, budget_remaining)
     if retry_after > budget_remaining:
-        cooldown = _begin_refresh_cooldown(retry_after)
+        cooldown = _begin_refresh_cooldown(retry_after, owner)
+        if cooldown is None:
+            return _RetryPlan(None, budget_remaining)
         logger.warning(
             "Enforcement rule fetch got HTTP %d asking for %.0fs with %.0fs of the %.0fs "
             "Retry-After budget left; failing open on the previous cache and not "
@@ -749,6 +884,7 @@ class _FetchTarget(NamedTuple):
 
     api_key: str
     team_url: str
+    owner: Tuple[str, str]
 
 
 def _fetch_target() -> Optional[_FetchTarget]:
@@ -757,11 +893,23 @@ def _fetch_target() -> Optional[_FetchTarget]:
     ``None`` when the SDK is not configured to read enforcement at all, which
     every caller treats as "no reading available" rather than as an error.
     """
-    global _team_id_warned
+    global _team_id_warned, _api_key_warned
 
-    api_key = os.environ.get(Config.ENV_REVENIUM_API_KEY, "")
+    client = _process_metering_client()
+    api_key = client.api_key if client is not None else ""
     if not api_key:
-        logger.debug("No API key configured, skipping enforcement rule fetch")
+        if not _api_key_warned:
+            if _fail_mode_is_closed():
+                logger.warning(
+                    "Every AI call is refused (REVENIUM_CB_FAIL_MODE=closed): no Revenium API key is configured. "
+                    "Set REVENIUM_METERING_API_KEY or call revenium_middleware.initialize_metering(api_key=...)."
+                )
+            else:
+                logger.warning(
+                    "Spending caps are not enforced: no Revenium API key is configured. "
+                    "Set REVENIUM_METERING_API_KEY or call revenium_middleware.initialize_metering(api_key=...)."
+                )
+            _api_key_warned = True
         return None
 
     team_id = os.environ.get(Config.ENV_REVENIUM_TEAM_ID, "")
@@ -779,12 +927,13 @@ def _fetch_target() -> Optional[_FetchTarget]:
     # containing '/', '..', or '?' cannot retarget the request to a
     # different endpoint on the same origin.
     safe_team_id = quote(team_id, safe="")
-    return _FetchTarget(api_key, f"{base_url}/v2/api/ai/enforcement-rules/{safe_team_id}")
+    return _FetchTarget(api_key, f"{base_url}/v2/api/ai/enforcement-rules/{safe_team_id}",
+                        (base_url, team_id))
 
 
 def _get_enforcement(url: str, api_key: str, resource: str,
                      params: Optional[dict], retry_after_budget: float,
-                     ) -> Optional["httpx.Response"]:
+                     owner: Tuple[str, str]) -> Optional["httpx.Response"]:
     """GET one enforcement resource under the shared retry and Retry-After budget.
 
     Returns the first response the retry policy does not retry -- the caller
@@ -801,7 +950,8 @@ def _get_enforcement(url: str, api_key: str, resource: str,
     which is what the unfiltered team-wide read has always sent.
     ``retry_after_budget`` is the server-requested wait this read may spend in
     total across every attempt; it depends on whose thread the read runs on
-    (see ``_REFRESH_RETRY_AFTER_GIVE_UP_SECONDS``).
+    (see ``_REFRESH_RETRY_AFTER_GIVE_UP_SECONDS``). ``owner`` is whose
+    cooldown a declined ``Retry-After`` starts.
     """
     budget_total = retry_after_budget
     for attempt in range(_FETCH_MAX_ATTEMPTS):
@@ -822,7 +972,7 @@ def _get_enforcement(url: str, api_key: str, resource: str,
         if not _is_retryable_status(response.status_code):
             return response
 
-        plan = _plan_retry(response, backoff, retry_after_budget, budget_total)
+        plan = _plan_retry(response, backoff, retry_after_budget, budget_total, owner)
         retry_after_budget = plan.budget_remaining
         if plan.wait_seconds is None:
             # Give up without waiting and without retrying: the cooldown
@@ -867,7 +1017,7 @@ def _fetch_rules(rule_id: Optional[str] = None,
 
     params = {"ruleId": rule_id} if rule_id else None
     response = _get_enforcement(target.team_url, target.api_key, "rule", params,
-                                retry_after_budget)
+                                retry_after_budget, target.owner)
     if response is None:
         return None
 
@@ -918,7 +1068,8 @@ def _fetch_roster(rule_id: str, page: int = 0, size: int = 25,
         params["band"] = band
 
     response = _get_enforcement(f"{target.team_url}/roster", target.api_key,
-                                "roster", params, _INSPECTION_RETRY_AFTER_GIVE_UP_SECONDS)
+                                "roster", params, _INSPECTION_RETRY_AFTER_GIVE_UP_SECONDS,
+                                target.owner)
     if response is None:
         return None
 
@@ -1031,20 +1182,36 @@ def _refresh_cache_holding_lock() -> None:
     """
     global _cached_rules, _cached_org_unit_blocks, _cached_org_unit_block_balances
     global _cached_org_unit_warnings
-    global _cache_timestamp, _cache_initialized
+    global _cache_timestamp, _cache_initialized, _cache_owner
     if _refresh_is_on_cooldown():
         logger.debug("Enforcement refresh skipped: a cooldown is still in force")
         return
+    owner = _current_owner()
     fetched = _fetch_rules()
     if fetched is None:
-        backoff = _begin_failure_backoff()
-        logger.warning(
-            "Enforcement rules could not be refreshed; enforcing the rules already "
-            "cached (none, if no fetch has succeeded yet) and trying again in %.0fs",
-            backoff,
-        )
+        backoff = _begin_failure_backoff(owner)
+        if backoff is None:
+            logger.debug("Dropped a failed enforcement fetch for the team the process switched away from")
+            return
+        # A missing key or team was already reported, once, by _fetch_target.
+        if _fetch_target() is not None:
+            logger.warning(
+                "Enforcement rules for team %s could not be refreshed; enforcing the rules already "
+                "cached (none, if no fetch has succeeded yet) and trying again in %.0fs",
+                owner[1], backoff,
+            )
+        return
+    # The process moved to another team or address while this fetch was in
+    # flight: its rules must not judge the new team's calls or land in the new
+    # team's snapshot.
+    if _current_owner() != owner:
+        logger.debug("Dropped enforcement rules fetched for the team the process switched away from")
         return
     with _cache_lock:
+        if _cache_owner not in (None, owner):
+            logger.debug("Dropped enforcement rules fetched for the team the process switched away from")
+            return
+        _cache_owner = owner
         _cached_rules = fetched.rules
         _cached_org_unit_blocks = fetched.org_unit_blocks
         _cached_org_unit_block_balances = fetched.org_unit_block_balances
@@ -1054,7 +1221,7 @@ def _refresh_cache_holding_lock() -> None:
         _cache_initialized = True
     _persist_cache_to_disk(fetched.rules, fetched.org_unit_blocks,
                            fetched.org_unit_block_balances,
-                           fetched.org_unit_warnings)
+                           fetched.org_unit_warnings, owner)
 
 
 def _poll_loop() -> None:
@@ -1079,6 +1246,39 @@ def _next_poll_wait_seconds(interval: float) -> float:
     """
     remaining = _refresh_cooldown_remaining()
     return remaining if remaining > 0.0 else interval
+
+
+def _forget_another_owners_rules() -> None:
+    """Drop rules, department maps and backoff cached for another enforcement address or team.
+
+    A process that switches teams must not judge the new team's calls by the
+    old team's caps or email list. The next disk load then reads the new
+    team's own snapshot, and the poller is woken to fetch its rules. A cache
+    nobody owns yet (never loaded, or seeded by hand) is adopted as it is.
+    """
+    global _cached_rules, _cached_org_unit_blocks, _cached_org_unit_block_balances
+    global _cached_org_unit_warnings, _cache_timestamp, _cache_initialized
+    global _disk_load_attempted, _refresh_cooldown_until, _cache_owner
+    owner = _current_owner()
+    if _cache_owner == owner:
+        return
+    with _cache_lock:
+        previous, _cache_owner = _cache_owner, owner
+        if _refresh_cooldown_owner not in (None, owner):
+            _refresh_cooldown_until = 0.0
+        if previous is None or previous == owner:
+            return
+        _cached_rules = []
+        _cached_org_unit_blocks = {}
+        _cached_org_unit_block_balances = {}
+        _cached_org_unit_warnings = {}
+        _begin_cache_generation()
+        _cache_timestamp = 0.0
+        _cache_initialized = False
+        _disk_load_attempted = False
+        _refresh_cooldown_until = 0.0
+    logger.info("Enforcement rules of the previous team were dropped; loading the rules of team %s", owner[1])
+    _poll_wakeup.set()
 
 
 def _ensure_poller_running() -> None:
@@ -1140,14 +1340,82 @@ def _coerce_float(value) -> Optional[float]:
         return None
 
 
-def _matching_group_entry(breakdown: list, usage_metadata: Optional[dict]) -> Optional[dict]:
+def _group_index(breakdown: list,
+                 generation: Optional[int] = None) -> Dict[str, dict]:
+    """This ``groupBreakdown`` keyed by ``groupValue``, built once per list.
+
+    Only dict entries with a string ``groupValue`` are indexed, and the first
+    entry for a value wins, exactly as the first match of a scan would.
+
+    ``generation`` is the cache generation the breakdown was read under. A
+    freshly built index is still returned when that generation has since been
+    replaced, but it is not kept. ``None`` means the caller vouches that the
+    breakdown is current.
+    """
+    cached = _group_indexes.get(id(breakdown))
+    if cached is not None and cached[0] is breakdown:
+        return cached[1]
+    index: Dict[str, dict] = {}
+    for entry in breakdown:
+        if isinstance(entry, dict):
+            group_value = entry.get("groupValue")
+            if isinstance(group_value, str):
+                index.setdefault(group_value, entry)
+    with _cache_lock:
+        if generation is None or generation == _cache_generation:
+            _group_indexes[id(breakdown)] = (breakdown, index)
+    return index
+
+
+def _subscriber_id_key(value) -> Optional[str]:
+    """The ``groupValue`` the server stores for this subscriber id, if any."""
+    if isinstance(value, str):
+        return value or None
+    if type(value) is int and value != 0:
+        return str(value)
+    return None
+
+
+def _group_lookup_keys(subscriber: dict, metadata: dict):
+    """The caller's candidate ``groupValue`` keys, ids first, then emails.
+
+    Ids are looked up as the text the server stores for them: a text id
+    exactly as given (ids are opaque, so case matters), an integer id as its
+    decimal text. Bools, floats, a zero id and every other type are not looked
+    up and fail open; a zero id is not looked up, as the shared extractor
+    drops it. Garbage a caller might put in subscriber_id must never abort the
+    pre-provider hook with a TypeError. Emails are tried in the server's
+    normalized form first (the key it writes for an email), then as given, so
+    a server that stored a raw email still matches. The flat ``subscriber_id``
+    is consulted only when the extracted subscriber carries no usable id, as
+    metering sends the extracted id alone and a second person's balance must
+    not refuse this caller.
+    """
+    for candidate in (subscriber.get("id"), metadata.get("subscriber_id")):
+        key = _subscriber_id_key(stored_subscriber_value("id", candidate))
+        if key is not None:
+            yield key
+            break
+    for raw in (subscriber.get("email"), metadata.get("subscriber_email")):
+        candidate = stored_subscriber_value("email", raw)
+        if isinstance(candidate, str) and candidate:
+            normalized = normalize_email(candidate)
+            if normalized:
+                yield normalized
+            yield candidate
+
+
+def _matching_group_entry(breakdown: list, usage_metadata: Optional[dict],
+                          generation: Optional[int] = None) -> Optional[dict]:
     """Find this caller's entry in a rule's ``groupBreakdown``.
 
     ``EnforcementGroupEntry.groupValue`` is documented as "subscriber id,
     else email, else the unattributed sentinel", so the id is tried before
     the email — matching on email first would mis-attribute a caller who
     supplies both. Both are tried as separate lookups because a caller may
-    send only one of them while the entry carries the other.
+    send only one of them while the entry carries the other. The server
+    writes an email key trimmed and lower-cased, so the caller's email is
+    looked up in that form; see ``_group_lookup_keys``.
 
     Returns ``None`` when no group key resolves from the metadata or when no
     entry matches. The caller treats that as fail-open (no block): the
@@ -1163,28 +1431,77 @@ def _matching_group_entry(breakdown: list, usage_metadata: Optional[dict]) -> Op
     """
     metadata = usage_metadata or {}
     subscriber = extract_subscriber_from_metadata(metadata)
-    candidates = (
-        subscriber.get("id"),
-        metadata.get("subscriber_id"),
-        subscriber.get("email"),
-        metadata.get("subscriber_email"),
-    )
+    index = _group_index(breakdown, generation)
     seen = set()
-    for key in candidates:
-        # Only strings are meaningful group keys (groupValue is a string in
-        # the spec); anything else — including unhashable garbage a caller
-        # might put in subscriber_id — must fail open, never abort the
-        # pre-provider hook with a TypeError.
-        if not isinstance(key, str) or not key or key in seen:
+    for key in _group_lookup_keys(subscriber, metadata):
+        if key in seen:
             continue
         seen.add(key)
-        for entry in breakdown:
-            if isinstance(entry, dict) and entry.get("groupValue") == key:
-                return entry
+        entry = index.get(key)
+        if entry is not None:
+            return entry
     return None
 
 
-def _rule_blocks(rule: dict, usage_metadata: Optional[dict]) -> Tuple[bool, Optional[float]]:
+def _parse_window_end(raw) -> Optional[datetime.datetime]:
+    """``windowEnd`` as an aware UTC-comparable datetime, else ``None``.
+
+    A value with no offset is read as UTC, the zone the server writes in.
+    """
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip().split("[", 1)[0]
+    if text[-1:] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    match = _WINDOW_END_PATTERN.fullmatch(text)
+    if match is None:
+        return None
+    seconds, fraction, offset = match.groups()
+    parsed = datetime.datetime.fromisoformat(
+        f"{seconds}.{(fraction or '')[:6].ljust(6, '0')}{offset or ''}"
+    )
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed
+
+
+def _window_has_ended(rule: dict) -> bool:
+    """True once the rule's budget window is over, judged on this call.
+
+    A breach is a verdict about one window. When the rules service cannot be
+    reached the cached verdict is all the SDK has, and without this check a
+    cap breached yesterday would go on blocking after its window reset, across
+    restarts too. Judged per call against the wall clock, never at load time,
+    so a long-lived process and a restarted one agree. An absent or
+    unreadable ``windowEnd`` is "not ended": the rule keeps the verdict it
+    always had, and nothing here may raise on the pre-provider path.
+    """
+    try:
+        window_end = _parse_window_end(rule.get("windowEnd"))
+        return window_end is not None and window_end <= datetime.datetime.now(datetime.timezone.utc)
+    except Exception:
+        return False
+
+
+def _is_per_person_rule(rule: dict, breakdown) -> bool:
+    """True when ``groupBreakdown`` holds the verdict for this rule.
+
+    A non-empty list always does. An empty one does only on a rule that names
+    a ``groupBy``: there the server sends ``[]`` with ``breached`` set when it
+    could not read the per-person balances, and the rule-level flag then only
+    says that somebody is over, not who.
+    """
+    if not isinstance(breakdown, list):
+        return False
+    group_by = rule.get("groupBy")
+    return bool(breakdown) or (isinstance(group_by, str) and bool(group_by.strip()))
+
+
+def _rule_blocks(
+    rule: dict,
+    usage_metadata: Optional[dict],
+    generation: Optional[int] = None,
+) -> Tuple[bool, Optional[float]]:
     """Decide whether ``rule`` blocks this caller, and with which balance.
 
     Returns ``(blocks, current_value)`` where ``current_value`` is the
@@ -1201,14 +1518,20 @@ def _rule_blocks(rule: dict, usage_metadata: Optional[dict]) -> Tuple[bool, Opti
     to the per-group balance is correct under either answer, whereas trusting
     the aggregate flag would apply one verdict to every caller.
 
-    A missing, null, or empty ``groupBreakdown`` is normal and never an
-    error: the field is null for pooled rules and is populated on API reads
-    only (it is absent from the Redis snapshot), so those rules keep the
-    rule-level behaviour unchanged.
+    A missing or null ``groupBreakdown`` is normal and never an error: the
+    field is null for pooled rules and is populated on API reads only (it is
+    absent from the Redis snapshot), so those rules keep the rule-level
+    behaviour unchanged. An empty list keeps it too on a pooled rule, but on a
+    rule with a ``groupBy`` it means the balances could not be read, and then
+    nobody is blocked by it (see ``_is_per_person_rule``).
+
+    A rule whose window has ended blocks nobody, whatever it last said.
     """
+    if _window_has_ended(rule):
+        return False, None
     breakdown = rule.get("groupBreakdown")
-    if isinstance(breakdown, list) and breakdown:
-        entry = _matching_group_entry(breakdown, usage_metadata)
+    if _is_per_person_rule(rule, breakdown):
+        entry = _matching_group_entry(breakdown, usage_metadata, generation)
         if entry is None or not entry.get("breached", False):
             return False, None
         return True, _coerce_float(entry.get("currentValue"))
@@ -1217,6 +1540,327 @@ def _rule_blocks(rule: dict, usage_metadata: Optional[dict]) -> Tuple[bool, Opti
     # nucleus schema) or ``blocked`` (legacy).
     tripped = rule.get("breached", False) or rule.get("blocked", False)
     return bool(tripped), _coerce_float(rule.get("currentValue"))
+
+
+_FILTER_OPERATORS = frozenset({"IS", "IS_NOT", "CONTAINS", "STARTS_WITH", "ENDS_WITH", "IN"})
+
+# The server's ProviderVocabulary.ALIAS_BUCKETS (hypercurrent commons): the
+# provider values a call carrying the key label also counts toward. One way
+# only, so a cap on FOUNDRY never covers direct Anthropic calls.
+_PROVIDER_ALIAS_BUCKETS = {
+    "FOUNDRY": frozenset({"FOUNDRY", "ANTHROPIC"}),
+    "CLAUDECODE": frozenset({"CLAUDECODE", "ANTHROPIC"}),
+    "CLAUDECOWORK": frozenset({"CLAUDECOWORK", "ANTHROPIC"}),
+    "CODEXCLI": frozenset({"CODEXCLI", "OPENAI"}),
+    "GEMINICLI": frozenset({"GEMINICLI", "GOOGLE"}),
+}
+
+# Dimensions whose value the SDK itself puts on the metering record, so a call
+# that carries none is compared the way the server compares it: outside every
+# filter except IS_NOT. Emptying this set would hold such a call to the rule.
+_DIMENSIONS_COMPARED_WHEN_ABSENT = frozenset(
+    {"AGENT", "TASK_TYPE", "PRODUCT", "ORGANIZATION", "SUBSCRIBER", "CREDENTIAL"})
+
+_MODEL_SNAPSHOT = r"(?:\d{4}-\d{2}-\d{2}|\d{8}|\d{4})"
+_MODEL_CARRIES_SNAPSHOT = re.compile(r"-" + _MODEL_SNAPSHOT + r"(?=-|$)")
+_MODEL_SNAPSHOT_TAIL = re.compile(r"-" + _MODEL_SNAPSHOT + r"$")
+_VERTEX_SNAPSHOT_SEPARATOR = re.compile(r"@(?=" + _MODEL_SNAPSHOT + r"$)")
+_SPELLING_FOLDED_OPERATORS = frozenset({"IS", "IN"})
+_MODEL_LATEST_SUFFIX = "-latest"
+_GEMINI_LATEST_ALIAS = re.compile(r"gemini-([a-z][a-z-]*?)-latest")
+_GEMINI_SERVED_VERSION = r"gemini-\d+(?:\.\d+)*-"
+_GEMINI_SERVED_REVISION = r"(?:-preview(?:-\d{2}-\d{2}(?:\d{2})?)?|-\d{3})?"
+_AZURE_MODEL_PREFIXES = ("azure/", "azure_ai/")
+
+_SCALAR_COMPARISONS = {
+    "IS": lambda actual, expected: actual == expected,
+    "IS_NOT": lambda actual, expected: actual != expected,
+    "CONTAINS": lambda actual, expected: expected in actual,
+    "STARTS_WITH": lambda actual, expected: actual.startswith(expected),
+    "ENDS_WITH": lambda actual, expected: actual.endswith(expected),
+}
+_EMAIL_EQUALITY_OPERATORS = frozenset({"IS", "IS_NOT", "IN"})
+
+
+class _SubscriberEmail(str):
+    """A subscriber value the server compares as an email, not as an id."""
+
+
+def _subscriber_value(metadata: dict):
+    subscriber = extract_subscriber_from_metadata(metadata)
+    email = stored_subscriber_value("email", subscriber.get("email"))
+    if isinstance(email, str) and email.strip():
+        return _SubscriberEmail(email)
+    if email is not None and not isinstance(email, str):
+        return email
+    return stored_subscriber_value("id", subscriber.get("id"))
+
+
+def _credential_value(metadata: dict):
+    subscriber = subscriber_with_credential_alias(
+        extract_subscriber_from_metadata(metadata), get_credential_alias(metadata))
+    credential = subscriber.get("credential") or {}
+    name = credential.get("name")
+    return name if name is not None else credential.get("value")
+
+
+_METADATA_DIMENSION_READERS = {
+    "AGENT": lambda metadata: extract_common_metadata(metadata)["agent"],
+    "TASK_TYPE": lambda metadata: extract_common_metadata(metadata)["task_type"],
+    "PRODUCT": extract_product_name,
+    "ORGANIZATION": extract_organization_name,
+    "SUBSCRIBER": _subscriber_value,
+    "CREDENTIAL": _credential_value,
+}
+
+
+class _CallScope:
+    """The call's value under each filter dimension, each read on first use.
+
+    Only a rule carrying filters asks, so a check against unfiltered rules
+    runs none of the extractors (two of which warn on deprecated keys). The
+    readers are the ones the metering record is built with, so the SDK
+    compares what the server will.
+    """
+
+    def __init__(self, usage_metadata: Optional[dict], model, provider):
+        self._metadata = usage_metadata or {}
+        self._values = {"MODEL": model, "PROVIDER": provider}
+
+    @staticmethod
+    def knows(dimension: str) -> bool:
+        return dimension in ("MODEL", "PROVIDER") or dimension in _METADATA_DIMENSION_READERS
+
+    def value(self, dimension: str):
+        if dimension not in self._values:
+            self._values[dimension] = _METADATA_DIMENSION_READERS[dimension](self._metadata)
+        return self._values[dimension]
+
+
+def _filter_cannot_be_evaluated(rule: dict, dimension, operator, reason: str) -> bool:
+    """Keep the rule applying, and say why once per rule and filter.
+
+    Names the rule, the dimension and the operator, never a value: a
+    SUBSCRIBER value is an email and a CREDENTIAL value can be a key.
+    """
+    rule_id = str(_rule_identifier(rule))
+    key = (rule_id, str(dimension), str(operator), reason)
+    with _warn_dedupe_lock:
+        first = key not in _noted_unevaluable_filters
+        _noted_unevaluable_filters.add(key)
+    if first:
+        logger.debug(
+            "Revenium enforcement rule %s: cannot evaluate its %s %s filter (%s); the rule still applies",
+            rule_id, sanitize_for_logging(dimension), sanitize_for_logging(operator), reason,
+        )
+    return True
+
+
+def _expected_values(entry: dict, operator: str) -> List[str]:
+    """The filter's values. IN reads ``values`` only: the server also writes
+    them comma-joined into ``value``, which would never equal a call value."""
+    if operator == "IN":
+        values = entry.get("values")
+        return [value for value in values if isinstance(value, str)] if isinstance(values, list) else []
+    value = entry.get("value")
+    return [value] if isinstance(value, str) else []
+
+
+def _compare(operator: str, actual: str, expected: List[str]) -> bool:
+    if operator == "IN":
+        return actual in expected
+    return _SCALAR_COMPARISONS[operator](actual, expected[0])
+
+
+def _as_given(value: str) -> str:
+    return value
+
+
+def _comparison_form(dimension: str, operator: str, actual: str):
+    """How both sides are put before comparing: a subscriber email ignores
+    case, and is trimmed as well for the equality operators."""
+    if isinstance(actual, _SubscriberEmail):
+        return normalize_email if operator in _EMAIL_EQUALITY_OPERATORS else str.lower
+    return _as_given
+
+
+def _satisfies_via_alias(actual: str, expected: str) -> bool:
+    return expected.upper() in _PROVIDER_ALIAS_BUCKETS.get(actual.upper(), ())
+
+
+def _provider_filter_matches(operator: str, actual: str, expected: List[str]) -> bool:
+    """PROVIDER ignores case, and an aliased label is inside the filters that
+    name its alias target. Substring operators skip the alias: it says who the
+    provider is, not which characters its label carries."""
+    if operator == "IN":
+        return any(value.lower() == actual.lower() or _satisfies_via_alias(actual, value) for value in expected)
+    if operator in ("IS", "IS_NOT") and _satisfies_via_alias(actual, expected[0]):
+        return operator == "IS"
+    return _compare(operator, actual.lower(), [value.lower() for value in expected])
+
+
+class ModelKnownByAliases(str):
+    """A model a cap may name in more than one way: the string is the model
+    the record carries, ``aliases`` the other names of the same model."""
+
+    def __new__(cls, model: str, *aliases: str):
+        instance = super().__new__(cls, model)
+        instance.aliases = frozenset(aliases)
+        return instance
+
+
+def _dash_dated(model: str) -> str:
+    """``model`` with Vertex AI's ``@`` before a trailing snapshot written as a
+    dash, so ``claude-haiku-4-5@20251001`` reads ``claude-haiku-4-5-20251001``."""
+    return _VERTEX_SNAPSHOT_SEPARATOR.sub("-", model)
+
+
+def _metered_model_forms(model: str) -> Set[str]:
+    """The names the server may meter for a requested model: as requested,
+    under each of its aliases, without a leading ``provider/`` segment, with
+    a Vertex ``@`` snapshot written as a dash, and without a ``-latest`` tail."""
+    forms = {model, *getattr(model, "aliases", ())}
+    if "/" in model:
+        forms.add(model.split("/", 1)[1])
+    forms.update(_dash_dated(form) for form in list(forms))
+    forms.update(form[:-len(_MODEL_LATEST_SUFFIX)] for form in list(forms) if form.endswith(_MODEL_LATEST_SUFFIX))
+    return forms
+
+
+_XAI_PROVIDER_LABELS = frozenset({"XAI"})
+_XAI_ROUTE_PREFIXES = ("xai/",)
+_GOOGLE_PROVIDER_LABELS = frozenset({"GOOGLE", "GEMINICLI"})
+_GOOGLE_ROUTE_PREFIXES = ("gemini/", "vertex_ai/", "vertex_ai_beta/")
+_LITELLM_PROVIDER_LABEL = "LITELLM"
+
+
+def _may_reach_vendor(provider, model: str, labels: frozenset, route_prefixes: tuple) -> bool:
+    """Whether a call can go to a vendor whose names only mean its own models:
+    its provider label, a LiteLLM route to it or a bare LiteLLM model, which
+    LiteLLM may send to it, or a provider the SDK was not told, which a filter
+    must not use to weaken a cap."""
+    if not isinstance(provider, str):
+        return True
+    if provider.upper() == _LITELLM_PROVIDER_LABEL and "/" not in model:
+        return True
+    return provider.upper() in labels or model.lower().startswith(route_prefixes)
+
+
+def _metered_model_candidates(model: str, expected: List[str], provider) -> Set[str]:
+    """The metered forms of the request, each also with the snapshot tail of
+    an expected value when the form carries no snapshot of its own: OpenAI
+    meters ``gpt-4o-mini-2024-07-18`` for ``gpt-4o-mini``, so a filter naming
+    a dated model is judged against the request as the server will see it.
+    A vendor's own alias for a model also yields the expected values the
+    vendor may serve it as, on a call that can reach that vendor."""
+    forms = _metered_model_forms(model)
+    tails = {tail.group(0) for tail in map(_MODEL_SNAPSHOT_TAIL.search, expected) if tail}
+    undated = [form for form in forms if not _MODEL_CARRIES_SNAPSHOT.search(form)]
+    widened = {form + tail for form in undated for tail in tails}
+    candidates = forms | widened
+    if _may_reach_vendor(provider, model, _GOOGLE_PROVIDER_LABELS, _GOOGLE_ROUTE_PREFIXES):
+        candidates |= _served_by_a_gemini_latest_alias(forms, expected)
+    if _may_reach_vendor(provider, model, _XAI_PROVIDER_LABELS, _XAI_ROUTE_PREFIXES):
+        candidates |= _served_by_a_vendor_alias(forms)
+    return candidates
+
+
+def _served_by_a_gemini_latest_alias(forms: Set[str], expected: List[str]) -> Set[str]:
+    """The expected values Google may meter a ``gemini-<tier>-latest`` form
+    as: the alias moves to each new model of its tier, so any version of the
+    tier, ``gemini-<version>-<tier>`` with an optional preview date or
+    revision, and never another tier or a TTS, audio or image variant."""
+    aliases = (_GEMINI_LATEST_ALIAS.fullmatch(form.rsplit("/", 1)[-1]) for form in forms)
+    served = [re.compile(_GEMINI_SERVED_VERSION + re.escape(alias.group(1)) + _GEMINI_SERVED_REVISION)
+              for alias in aliases if alias]
+    return {value for value in expected if any(name.fullmatch(value) for name in served)}
+
+
+def _served_by_a_vendor_alias(forms: Set[str]) -> Set[str]:
+    """Every model a vendor lists a form under as one of its published names."""
+    return {served for form in forms for served in SERVED_MODEL_BY_ALIAS.get(form.rsplit("/", 1)[-1], ())}
+
+
+def _model_filter_matches(operator: str, expected: List[str], model: str, provider) -> bool:
+    """MODEL is judged on the requested model, but the server compares the one
+    it meters, which can carry a snapshot date the request did not. So the
+    filter matches when it would match any plausible metered form of the
+    request, and an Azure deployment name, which says nothing about the model,
+    always matches. IS_NOT excludes only a request that already names its
+    snapshot, since an undated one may be metered under a date the filter
+    does not name, and judges it only by the model the record carries, never
+    an alias, because the server compares that."""
+    is_azure = (isinstance(provider, str) and provider.lower() == "azure") or model.lower().startswith(
+        _AZURE_MODEL_PREFIXES)
+    if is_azure:
+        return True
+    if operator == "IS_NOT":
+        if not _MODEL_CARRIES_SNAPSHOT.search(model):
+            return True
+        return not any(_compare("IS", form, expected) for form in _metered_model_forms(str(model)))
+    return any(_compare(operator, candidate, values)
+               for values in _filter_spellings(operator, expected)
+               for candidate in _metered_model_candidates(model, values, provider))
+
+
+def _filter_spellings(operator: str, expected: List[str]) -> List[List[str]]:
+    """The filter values as written and, for an equality filter that names a
+    Vertex ``@`` snapshot, with that snapshot written as a dash too."""
+    if operator not in _SPELLING_FOLDED_OPERATORS:
+        return [expected]
+    dash_dated = [_dash_dated(value) for value in expected]
+    return [expected] if dash_dated == expected else [expected, dash_dated]
+
+
+def _filter_matches(rule: dict, entry, scope: _CallScope) -> bool:
+    """Whether the call is inside one entry of a rule's ``filters``.
+
+    Mirrors the server's matcher, except that a filter the SDK cannot judge
+    (a malformed entry, an unknown dimension or operator, a model or provider
+    it was not told, a value that is not a string) matches, so the cap keeps
+    applying rather than being weakened.
+    """
+    if not isinstance(entry, dict):
+        return _filter_cannot_be_evaluated(rule, None, None, "malformed entry")
+    dimension, operator = entry.get("dimension"), entry.get("operator")
+    if not isinstance(dimension, str) or not isinstance(operator, str):
+        return _filter_cannot_be_evaluated(rule, dimension, operator, "malformed entry")
+    if operator not in _FILTER_OPERATORS:
+        return _filter_cannot_be_evaluated(rule, dimension, operator, "unknown operator")
+    if not scope.knows(dimension):
+        return _filter_cannot_be_evaluated(rule, dimension, operator, "unknown dimension")
+    expected = _expected_values(entry, operator)
+    if not expected:
+        return True
+    actual = scope.value(dimension)
+    if actual is None and dimension in _DIMENSIONS_COMPARED_WHEN_ABSENT:
+        return operator == "IS_NOT"
+    if not isinstance(actual, str):
+        return _filter_cannot_be_evaluated(rule, dimension, operator, "call value unknown")
+    if dimension == "MODEL":
+        return _model_filter_matches(operator, expected, actual, scope.value("PROVIDER"))
+    if dimension == "PROVIDER":
+        return _provider_filter_matches(operator, actual, expected)
+    form = _comparison_form(dimension, operator, actual)
+    return _compare(operator, form(actual), [form(value) for value in expected])
+
+
+def _rule_applies_to_call(rule: dict, scope: _CallScope) -> bool:
+    """True when the call is inside every one of the rule's ``filters``.
+
+    A rule with no filters applies to every call. Anything that goes wrong
+    while judging them keeps the rule applying: this runs before the paid
+    provider call, so it must neither raise nor weaken a cap.
+    """
+    filters = rule.get("filters")
+    if filters is None or filters == []:
+        return True
+    if not isinstance(filters, list):
+        return _filter_cannot_be_evaluated(rule, None, None, "filters not a list")
+    try:
+        return all(_filter_matches(rule, entry, scope) for entry in filters)
+    except Exception:
+        return _filter_cannot_be_evaluated(rule, None, None, "evaluation failed")
 
 
 def _is_org_unit_rule(rule: dict) -> bool:
@@ -1281,7 +1925,8 @@ def _caller_emails(usage_metadata: Optional[dict]) -> List[str]:
     # spoofed flat email block the caller against a department that is not
     # theirs. Only strings are meaningful map keys, and a non-string lookup
     # key could be unhashable — neither may abort the pre-provider hook.
-    for candidate in (subscriber.get("email"), metadata.get("subscriber_email")):
+    for raw in (subscriber.get("email"), metadata.get("subscriber_email")):
+        candidate = stored_subscriber_value("email", raw)
         if isinstance(candidate, str) and candidate:
             # Normalization can only empty an address that was whitespace
             # alone, which is no identity; the nested key still suppresses the
@@ -1377,6 +2022,91 @@ def _rule_by_id(rules: list, rule_id: int) -> Optional[dict]:
     return None
 
 
+def _action_blocks(rule: dict) -> bool:
+    """True when the rule's ``action`` asks for the call to be refused.
+
+    Only ``BLOCK`` blocks: the server's own live block is
+    ``!shadowMode && action == "BLOCK"``, and ``WARN_ONLY`` (or the legacy
+    ``THROTTLE``) is a notice the customer chose instead of a stop. An absent
+    ``action`` is treated as BLOCK, so a payload that omits the field falls
+    toward enforcing, not toward spend; the server always sends it.
+    """
+    action = rule.get("action")
+    if action is None:
+        return True
+    return isinstance(action, str) and action.strip().upper() == "BLOCK"
+
+
+def _rule_identifier(rule: dict):
+    return rule.get("ruleId") or rule.get("id")
+
+
+def _claim_non_blocking_warning(rule: dict) -> bool:
+    """True the first time a non-blocking breach of this rule is seen in its window."""
+    key = str(_rule_identifier(rule))
+    window_end = rule.get("windowEnd")
+    with _warn_dedupe_lock:
+        if key in _warned_non_blocking_rules and _warned_non_blocking_rules[key] == window_end:
+            return False
+        _warned_non_blocking_rules[key] = window_end
+        return True
+
+
+def _warn_non_blocking_breach(rule: dict) -> None:
+    """Log, once per breach, that a rule which does not block has been crossed.
+
+    Names the rule, never a caller: for a per-person rule the matched entry is
+    keyed by an email address.
+    """
+    if not _claim_non_blocking_warning(rule):
+        return
+    logger.warning(
+        "Revenium enforcement rule %s (id %s) is over its threshold (action=%s); "
+        "not blocking",
+        sanitize_for_logging(rule.get("name", "cost limit")), _rule_identifier(rule), rule.get("action"),
+    )
+
+
+def _deny_message(rule) -> Optional[str]:
+    """The message the customer wrote for ``rule``, shown as written apart from
+    surrounding whitespace being trimmed (a blank message names no message):
+    a placeholder in it is never filled, and a value that is not text names
+    no message, so a block can never fail on it."""
+    if not isinstance(rule, dict):
+        return None
+    deny = rule.get("denyMessage")
+    if not isinstance(deny, str):
+        return None
+    return deny.strip() or None
+
+
+def _block_message(rule_name, deny: Optional[str]) -> str:
+    message = f"Request blocked by Revenium enforcement rule: {rule_name}"
+    return message if deny is None else f"{message}. {deny}"
+
+
+def _act_on_breached_rule(rule: dict, current_value: Optional[float]) -> None:
+    """Raise ``BudgetExceededError`` for a breached rule whose action blocks.
+
+    A breached rule that only warns is logged instead, once per breach, and
+    the caller's loop goes on to the rules after it.
+    """
+    if not _action_blocks(rule):
+        _warn_non_blocking_breach(rule)
+        return
+    rule_name = rule.get("name", "cost limit")
+    deny = _deny_message(rule)
+    raise BudgetExceededError(
+        message=_block_message(rule_name, deny),
+        rule_name=rule_name,
+        current_value=current_value,
+        threshold=_coerce_float(rule.get("threshold")),
+        resets_at=rule.get("resetsAt"),
+        rule_id=_rule_identifier(rule),
+        deny_message=deny,
+    )
+
+
 def _raise_org_unit_block(rules: list, departments: _DepartmentBudgets,
                           usage_metadata: Optional[dict]) -> None:
     """Raise ``BudgetExceededError`` when the department map blocks the caller.
@@ -1407,31 +2137,33 @@ def _raise_org_unit_block(rules: list, departments: _DepartmentBudgets,
             rule_id=rule_id,
         )
 
+    if _window_has_ended(rule):
+        logger.debug("Department budget rule %s is from a window that has ended; not blocking", rule_id)
+        return
+
     # Observe-and-log only. Other rules still evaluate normally.
     if rule.get("shadowMode", False):
         logger.debug("Department budget rule %s is in shadow mode; not blocking", rule_id)
         return
 
-    # A rule that only warns must not block. An absent ``action`` is treated
-    # as BLOCK: the map itself is the server's blocking decision, so a
-    # payload that omits the field falls toward enforcing, not toward spend.
-    action = rule.get("action")
-    if action is not None and (not isinstance(action, str) or action.strip().upper() != "BLOCK"):
+    if not _action_blocks(rule):
         logger.warning(
             "Department budget threshold crossed for rule %s (action=%s); not blocking",
-            rule_id, action,
+            rule_id, rule.get("action"),
         )
         return
 
     rule_name = rule.get("name") or _ORG_UNIT_FALLBACK_RULE_NAME
+    deny = _deny_message(rule)
     raise BudgetExceededError(
-        message=f"Request blocked by Revenium enforcement rule: {rule_name}",
+        message=_block_message(rule_name, deny),
         rule_name=rule_name,
         current_value=(own_balance if own_balance is not None
                        else _coerce_float(rule.get("currentValue"))),
         threshold=_coerce_float(rule.get("threshold")),
         resets_at=rule.get("resetsAt"),
         rule_id=rule.get("ruleId") or rule.get("id") or rule_id,
+        deny_message=deny,
     )
 
 
@@ -1447,11 +2179,22 @@ def _begin_cache_generation() -> None:
 
     Clearing the set only bounds it. What keeps a stale claim from silencing
     this generation is that the generation is part of every key.
+
+    The per-person lookup indexes (``_group_indexes``) belong to the replaced
+    rules, so they are dropped here too, as are the warn-only dedupe entries of
+    rules the new cache no longer serves.
     """
     global _cache_generation
     _cache_generation += 1
+    _group_indexes.clear()
+    served = {str(_rule_identifier(rule))
+              for rule in _cached_rules if isinstance(rule, dict)}
     with _warn_dedupe_lock:
         _warned_org_unit_callers.clear()
+        for rule_id in set(_warned_non_blocking_rules) - served:
+            del _warned_non_blocking_rules[rule_id]
+        _noted_unevaluable_filters.difference_update(
+            [key for key in _noted_unevaluable_filters if key[0] not in served])
 
 
 def _claim_org_unit_warning(generation: int, caller_key: str, rule_id: int) -> bool:
@@ -1544,7 +2287,8 @@ def _check_org_unit_block(rules: list, departments: _DepartmentBudgets,
         logger.debug("Department budget check failed; falling open", exc_info=True)
 
 
-def check_enforcement(usage_metadata: Optional[dict] = None) -> None:
+def check_enforcement(usage_metadata: Optional[dict] = None, *,
+                      model: Optional[str] = None, provider: Optional[str] = None) -> None:
     """Pre-call enforcement check.
 
     Invoke before the upstream provider call. No-op when the circuit breaker
@@ -1555,11 +2299,14 @@ def check_enforcement(usage_metadata: Optional[dict] = None) -> None:
     the poller thread's job. Until the first fetch lands there are none, and
     the call goes through -- or, with ``REVENIUM_CB_FAIL_MODE=closed``, is
     refused -- at once. The only I/O is the first call's read of the
-    ``REVENIUM_CACHE_DIR`` snapshot, a local file read once per process.
+    ``REVENIUM_CACHE_DIR`` snapshot saved for this process's own team, a
+    local file read once per process.
 
     Subscriber-grouped rules are evaluated against the caller's own balance
     from ``groupBreakdown`` rather than the rule-level aggregate; see
-    ``_rule_blocks``.
+    ``_rule_blocks``. Only a breached rule whose ``action`` is ``BLOCK`` (or
+    absent) refuses the call; a breached ``WARN_ONLY`` rule lets it through and
+    logs one warning per rule per window (``_warn_non_blocking_breach``).
 
     Department budgets are decided before and independently of the
     per-rule loop, from the server's ``departmentBudgetBlocks`` email map, looked
@@ -1568,6 +2315,18 @@ def check_enforcement(usage_metadata: Optional[dict] = None) -> None:
     (``departmentBudgetWarnings``) is never blocked and never raised on: they get
     one log line per refreshed verdict, so the block is not the first thing
     they hear about their department budget. See ``_warn_org_unit_threshold``.
+
+    A rule that carries ``filters`` (a cap scoped to an agent, model, provider,
+    subscriber, credential, task type, product or organization) blocks or
+    warns only a call that matches every entry, compared as the server
+    compares it; see ``_filter_matches``. ``model`` and ``provider`` are the
+    requested model and the provider label the call's metering record will
+    carry. A call that carries no agent, task type, product, organization,
+    subscriber or credential is outside a filter on it, except an ``IS_NOT``
+    one, because the server never counts such a call toward that cap. A filter
+    the SDK cannot judge (a model or provider not passed, an unknown dimension
+    or operator, a malformed entry) keeps the rule applying, so a cap is never
+    weakened. Department rules stay decided by the department map alone.
 
     Raises:
         BudgetExceededError: when a cost-limit rule blocks the call.
@@ -1578,11 +2337,12 @@ def check_enforcement(usage_metadata: Optional[dict] = None) -> None:
             department budget it is the caller's own balance from
             ``departmentBudgetBlockBalances`` when the server publishes one.
     """
-    if is_bypass_enabled():
+    if is_bypass_enabled() or _checked_by_outer_wrapper():
         return
     if not is_circuit_breaker_enabled():
         return
 
+    _forget_another_owners_rules()
     _load_cache_from_disk()
     _ensure_poller_running()
     rules, departments, initialized = _get_rules()
@@ -1604,6 +2364,7 @@ def check_enforcement(usage_metadata: Optional[dict] = None) -> None:
     _check_org_unit_block(rules, departments, usage_metadata)
 
     credential = (usage_metadata or {}).get("subscriber_credential", "")
+    scope = _CallScope(usage_metadata, model, provider)
 
     for rule in rules:
         if not isinstance(rule, dict):
@@ -1627,22 +2388,31 @@ def check_enforcement(usage_metadata: Optional[dict] = None) -> None:
         # carrying the field. Per-caller attribution for compiled rules goes
         # through ``groupBy``/``groupBreakdown`` (see ``_rule_blocks``).
         rule_credential = rule.get("credential", "")
-        if rule_credential and rule_credential != credential:
+        if (rule_credential and rule_credential != credential) or not _rule_applies_to_call(rule, scope):
             continue
 
-        blocks, current_value = _rule_blocks(rule, usage_metadata)
-        if not blocks:
-            continue
+        blocks, current_value = _rule_blocks(
+            rule, usage_metadata, departments.generation)
+        if blocks:
+            _act_on_breached_rule(rule, current_value)
 
-        rule_name = rule.get("name", "cost limit")
-        raise BudgetExceededError(
-            message=f"Request blocked by Revenium enforcement rule: {rule_name}",
-            rule_name=rule_name,
-            current_value=current_value,
-            threshold=_coerce_float(rule.get("threshold")),
-            resets_at=rule.get("resetsAt"),
-            rule_id=rule.get("ruleId") or rule.get("id"),
-        )
+
+def check_unmetered_call(api_metadata: Optional[dict] = None, *, model: Optional[str] = None,
+                         provider: Optional[str] = None, callback_transport: Optional[str] = None) -> None:
+    """Run the pre-call check for a call that gets no metering record of its own.
+
+    Selective metering, or an outer wrapper that meters the call, leaves the
+    provider call unmetered here, but a breached cap must still refuse it. The
+    caller's attribution is the record's would-be identity: the decorator's
+    metadata, the LangChain callback's publication for ``callback_transport``
+    (read without consuming it, so the record that does meter the call still
+    gets it), and the call's own ``usage_metadata`` on top.
+    """
+    if not is_circuit_breaker_enabled() or is_bypass_enabled():
+        return
+    callback_metadata = peek_callback_metadata(callback_transport) if callback_transport else {}
+    check_enforcement(merge_metadata(overlay_metadata(callback_metadata, api_metadata)),
+                      model=model, provider=provider)
 
 
 def stop_polling() -> None:

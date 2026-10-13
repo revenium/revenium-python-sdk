@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
+from revenium_middleware._core import metering_pool
 from revenium_middleware import shutdown_event
 from revenium_middleware._metering import AsyncReveniumMetering, ReveniumMetering
 from revenium_middleware.anthropic import middleware as anthropic_middleware
@@ -310,6 +311,7 @@ class TestBedrockStreamAdapterPath:
         assert self._emit({"effort": "medium"})["effort"] == "medium"
 
 
+@pytest.mark.usefixtures("isolated_metering")
 class TestAgenticOutcomePath:
     @staticmethod
     def _emit(extra_payload):
@@ -340,6 +342,7 @@ class TestAgenticOutcomePath:
                 metering_client=metering_client,
             )
             client.emit_completion(payload)
+            assert metering_pool.wait_until_idle(10)
         return recorder.body
 
     def test_absent_effort_is_omitted_from_the_wire(self):

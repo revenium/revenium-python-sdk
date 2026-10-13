@@ -10,9 +10,14 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 # Add project root to path
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
+
+pytestmark = pytest.mark.e2e
+MISSING_KEYS = "ANTHROPIC_API_KEY and REVENIUM_METERING_API_KEY are needed for this live test"
 
 def load_env():
     """Load environment variables from .env file."""
@@ -40,8 +45,7 @@ def test_nested_subscriber_metadata():
 
     # Verify API keys
     if not os.getenv("ANTHROPIC_API_KEY") or not os.getenv("REVENIUM_METERING_API_KEY"):
-        print("❌ API keys not set")
-        return False
+        pytest.skip(MISSING_KEYS)
 
     print("✅ API keys found")
     print()
@@ -58,62 +62,52 @@ def test_nested_subscriber_metadata():
     print("   Using CORRECT pattern: subscriber.id, subscriber.email, subscriber.credential")
     print()
 
-    try:
-        # Use CORRECT nested structure
-        message = client.messages.create(
-            model="claude-3-haiku-20240307",
-            max_tokens=50,
-            messages=[{"role": "user", "content": "Hello"}],
-            usage_metadata={
-                "subscriber": {
-                    "id": "test-user-123",
-                    "email": "testuser@example.com",
-                    "credential": {
-                        "name": "test-api-key",
-                        "value": "test-key-value-123"
-                    }
-                },
-                "organization_id": "e2e-test-nested-subscriber",
-                "trace_id": "test-nested-subscriber-001"
-            }
-        )
+    # Use CORRECT nested structure
+    message = client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=50,
+        messages=[{"role": "user", "content": "Hello"}],
+        usage_metadata={
+            "subscriber": {
+                "id": "test-user-123",
+                "email": "testuser@example.com",
+                "credential": {
+                    "name": "test-api-key",
+                    "value": "test-key-value-123"
+                }
+            },
+            "organization_id": "e2e-test-nested-subscriber",
+            "trace_id": "test-nested-subscriber-001"
+        }
+    )
 
-        assert message.content[0].text
+    assert message.content[0].text
 
-        print("✅ API call successful!")
-        print(f"   Response: {message.content[0].text[:100]}...")
-        print(f"   Tokens: {message.usage.input_tokens} + {message.usage.output_tokens}")
-        print()
+    print("✅ API call successful!")
+    print(f"   Response: {message.content[0].text[:100]}...")
+    print(f"   Tokens: {message.usage.input_tokens} + {message.usage.output_tokens}")
+    print()
 
-        print("=" * 80)
-        print("MANUAL VERIFICATION REQUIRED")
-        print("=" * 80)
-        print()
-        print("1. Go to Revenium dashboard")
-        print("2. Filter by organization_id: 'e2e-test-nested-subscriber'")
-        print("3. Find event with trace_id: 'test-nested-subscriber-001'")
-        print("4. Verify subscriber fields are POPULATED:")
-        print()
-        print("   CRITICAL - Subscriber Data:")
-        print("   ✓ subscriber.id: 'test-user-123'")
-        print("   ✓ subscriber.email: 'testuser@example.com'")
-        print("   ✓ subscriber.credential.name: 'test-api-key'")
-        print("   ✓ subscriber.credential.value: 'test-key-value-123'")
-        print()
-        print("5. Verify you CAN filter/group by subscriber.id")
-        print("6. This proves nested structure is working correctly")
-        print()
-        print("=" * 80)
-
-        return True
-
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+    print("=" * 80)
+    print("MANUAL VERIFICATION REQUIRED")
+    print("=" * 80)
+    print()
+    print("1. Go to Revenium dashboard")
+    print("2. Filter by organization_id: 'e2e-test-nested-subscriber'")
+    print("3. Find event with trace_id: 'test-nested-subscriber-001'")
+    print("4. Verify subscriber fields are POPULATED:")
+    print()
+    print("   CRITICAL - Subscriber Data:")
+    print("   ✓ subscriber.id: 'test-user-123'")
+    print("   ✓ subscriber.email: 'testuser@example.com'")
+    print("   ✓ subscriber.credential.name: 'test-api-key'")
+    print("   ✓ subscriber.credential.value: 'test-key-value-123'")
+    print()
+    print("5. Verify you CAN filter/group by subscriber.id")
+    print("6. This proves nested structure is working correctly")
+    print()
+    print("=" * 80)
 
 
 if __name__ == "__main__":
-    success = test_nested_subscriber_metadata()
-    sys.exit(0 if success else 1)
+    test_nested_subscriber_metadata()

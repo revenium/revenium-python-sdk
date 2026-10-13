@@ -1,12 +1,13 @@
-"""A backend-rejected reasoning effort must fail visibly (BACK-2710).
+"""A record the metering API refuses with a 400 must fail visibly (BACK-2710).
 
-The SDK forwards ``effort`` verbatim, so a malformed level (over 16
-characters, or with a character outside ^[A-Za-z0-9_-]+$) is only caught at
-the backend, as a 400 on the metering call. That rejection must never be
-absorbed quietly: the whole completion event would disappear and the customer
-would see "metering worked" while the row never landed.
+A value that breaks a field rule the SDK knows (an ``effort`` over 16
+characters, or with a character outside ^[A-Za-z0-9_-]+$) is left off the
+record before it is sent (BACK-4339), so it no longer costs the record. Any
+other 400 still loses the whole completion event, and that must never be
+absorbed quietly: the customer would see "metering worked" while the row never
+landed.
 
-These tests pin the three ways the failure surfaces:
+These tests pin the three ways such a failure surfaces:
 
 * it is classified permanent, so the store-and-forward buffer does not
   swallow it as a "transient" event awaiting replay;
@@ -32,17 +33,17 @@ from revenium_middleware._core.metering_status import (
 )
 from revenium_middleware._metering._exceptions import APIStatusError
 
-# Values the backend rejects: the pattern forbids spaces, and the length cap
-# is 16 characters.
-REJECTED_EFFORTS = ["much too high", "a" * 17]
+# Values outside the backend rule: the pattern forbids spaces, and the length
+# cap is 16 characters.
+MALFORMED_EFFORTS = ["much too high", "a" * 17]
 
 
-def effort_rejected_error():
-    """The 400 the metering API returns for a malformed effort value."""
+def permanent_rejection_error():
+    """A 400 the metering API returns for a record it refuses."""
     request = httpx.Request("POST", "https://api.test/meter/v2/ai/completions")
     response = httpx.Response(400, request=request)
     return APIStatusError(
-        "effort must match ^[A-Za-z0-9_-]+$ and be at most 16 characters",
+        "Error code: 400 - record refused",
         response=response,
         body=None,
     )
@@ -59,8 +60,8 @@ def isolated_buffer(monkeypatch):
 @pytest.fixture
 def rejecting_client(monkeypatch):
     client = MagicMock()
-    client.ai.create_completion.side_effect = effort_rejected_error()
-    monkeypatch.setattr(metering_submission, "get_client", lambda: client)
+    client.ai.create_completion.side_effect = permanent_rejection_error()
+    monkeypatch.setattr(metering_submission, "current_client", lambda: client)
     return client
 
 
@@ -71,33 +72,33 @@ def clean_status():
     reset_metering_status()
 
 
-@pytest.mark.parametrize("effort", REJECTED_EFFORTS)
-def test_rejected_effort_is_still_sent_rather_than_filtered_client_side(effort):
-    """The SDK has no allow-list, so the malformed value does reach the API."""
+@pytest.mark.parametrize("effort", MALFORMED_EFFORTS)
+def test_effort_is_extracted_verbatim(effort):
+    """Extraction has no allow-list; the send guard decides what reaches the API."""
     from revenium_middleware._core.fields import extract_effort_field
 
     assert extract_effort_field({"effort": effort}) == {"effort": effort}
 
 
-def test_a_400_on_the_effort_field_is_not_retryable():
-    assert is_retryable_failure(effort_rejected_error()) is False
+def test_a_400_from_the_metering_api_is_not_retryable():
+    assert is_retryable_failure(permanent_rejection_error()) is False
 
 
-def test_rejected_effort_raises_and_is_not_buffered(isolated_buffer, rejecting_client):
+def test_a_refused_record_raises_and_is_not_buffered(isolated_buffer, rejecting_client):
     with pytest.raises(APIStatusError):
         metering_submission.submit_ai_event(
-            "completion", {"model": "gpt-test", "effort": "much too high"}
+            "completion", {"model": "gpt-test", "effort": "high"}
         )
 
     assert isolated_buffer.stats()["size"] == 0
 
 
-def test_rejected_effort_is_recorded_in_the_metering_status(
+def test_a_refused_record_is_recorded_in_the_metering_status(
     isolated_buffer, rejecting_client
 ):
     with pytest.raises(APIStatusError):
         metering_submission.submit_ai_event(
-            "completion", {"model": "gpt-test", "effort": "much too high"}
+            "completion", {"model": "gpt-test", "effort": "high"}
         )
 
     status = get_metering_status()
@@ -106,32 +107,32 @@ def test_rejected_effort_is_recorded_in_the_metering_status(
     assert isinstance(status.last_error, APIStatusError)
 
 
-def test_rejected_effort_notifies_error_callbacks(isolated_buffer, rejecting_client):
+def test_a_refused_record_notifies_error_callbacks(isolated_buffer, rejecting_client):
     seen = []
     on_metering_error(seen.append)
 
     with pytest.raises(APIStatusError):
         metering_submission.submit_ai_event(
-            "completion", {"model": "gpt-test", "effort": "much too high"}
+            "completion", {"model": "gpt-test", "effort": "high"}
         )
 
     assert len(seen) == 1
     assert seen[0].operation == "completion"
 
 
-def test_rejected_effort_is_logged_as_a_permanent_failure(
+def test_a_refused_record_is_logged_as_a_permanent_failure(
     isolated_buffer, rejecting_client, caplog
 ):
     with caplog.at_level(logging.ERROR, logger="revenium_middleware"):
         with pytest.raises(APIStatusError):
             metering_submission.submit_ai_event(
-                "completion", {"model": "gpt-test", "effort": "much too high"}
+                "completion", {"model": "gpt-test", "effort": "high"}
             )
 
     assert "failed permanently" in caplog.text
 
 
-def test_openai_path_logs_the_rejection_instead_of_dropping_it(caplog):
+def test_openai_path_logs_a_refused_record_instead_of_dropping_it(caplog):
     """End of the chain: the provider path surfaces the failure in the log.
 
     Metering runs on a background thread and must not raise into customer
@@ -143,15 +144,15 @@ def test_openai_path_logs_the_rejection_instead_of_dropping_it(caplog):
     from revenium_middleware.openai.middleware import log_token_usage
 
     with patch(
-        "revenium_middleware.openai.middleware.get_client", lambda: object()
+        "revenium_middleware.openai.middleware.current_client", lambda: object()
     ), patch(
         "revenium_middleware.openai.middleware.submit_ai_event",
-        side_effect=effort_rejected_error(),
+        side_effect=permanent_rejection_error(),
     ):
         with caplog.at_level(logging.ERROR):
             asyncio.run(
                 log_token_usage(
-                    response_id="completion-effort-rejected",
+                    response_id="completion-refused",
                     model="gpt-4o-mini",
                     prompt_tokens=10,
                     completion_tokens=5,
@@ -161,7 +162,7 @@ def test_openai_path_logs_the_rejection_instead_of_dropping_it(caplog):
                     request_time="2026-08-23T12:00:00Z",
                     response_time="2026-08-23T12:00:01Z",
                     request_duration=1000,
-                    usage_metadata={"effort": "much too high"},
+                    usage_metadata={"effort": "high"},
                 )
             )
 

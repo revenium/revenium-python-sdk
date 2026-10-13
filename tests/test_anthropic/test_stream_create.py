@@ -13,7 +13,9 @@ import pytest
 
 from revenium_middleware.anthropic import middleware as anthropic_middleware
 from revenium_middleware.anthropic.provider import Provider
-from revenium_middleware.anthropic.stream_create import StreamUsageState
+from revenium_middleware.anthropic.stream_create import (
+    StreamUsageState, meter_async_stream_helper_events, meter_stream_helper_events,
+)
 
 
 def _middleware_fn(obj):
@@ -369,3 +371,106 @@ class TestMeterRawStream:
         payload = mock_submit.call_args[0][1]
         assert payload["completion_start_time"] == "2023-01-01T12:00:05Z"
         assert payload["time_to_first_token"] == 5000
+
+
+def _message_start(usage):
+    return SimpleNamespace(type="message_start", message=SimpleNamespace(id="msg_1", model="claude-sonnet-5", usage=usage))
+
+
+def _message_delta(usage):
+    return SimpleNamespace(type="message_delta", delta=SimpleNamespace(stop_reason="end_turn"), usage=usage)
+
+
+class TestStreamUsageStateIterations:
+    """BACK-3997: message_delta usage is cumulative and carries the turn's iterations."""
+
+    def test_message_delta_iterations_replace_message_start(self):
+        first_pass = [{"type": "message", "input_tokens": 5, "output_tokens": 1}]
+        whole_turn = first_pass + [{"type": "compaction", "input_tokens": 90, "output_tokens": 10}]
+        state = StreamUsageState()
+        state.ingest(_message_start(SimpleNamespace(input_tokens=5, output_tokens=1, iterations=first_pass)))
+        state.ingest(_message_delta(SimpleNamespace(output_tokens=4, iterations=whole_turn)))
+        state.ingest(_message_delta(SimpleNamespace(output_tokens=6, iterations=None)))
+        assert getattr(state, "iterations", None) == whole_turn
+        assert state.output_tokens == 6
+
+    @pytest.mark.parametrize("entry", [
+        {"type": "advisor_message", "model": "claude-opus-5", "input_tokens": 8, "output_tokens": 9},
+        SimpleNamespace(type="advisor_message", model="claude-opus-5", input_tokens=8, output_tokens=9),
+    ], ids=["dict", "object"])
+    def test_dict_and_object_iterations_are_kept(self, entry):
+        state = StreamUsageState()
+        state.ingest(_message_start(SimpleNamespace(input_tokens=5, output_tokens=1, iterations=None)))
+        state.ingest(_message_delta(SimpleNamespace(output_tokens=4, iterations=[entry])))
+        assert getattr(state, "iterations", None) == [entry]
+
+    def test_message_delta_overwrites_cumulative_input_and_cache(self):
+        state = StreamUsageState()
+        state.ingest(_message_start(SimpleNamespace(
+            input_tokens=5, output_tokens=1, cache_creation_input_tokens=1, cache_read_input_tokens=2)))
+        state.ingest(_message_delta(SimpleNamespace(
+            output_tokens=4, input_tokens=13, cache_creation_input_tokens=None, cache_read_input_tokens=4)))
+        assert (state.input_tokens, state.output_tokens) == (13, 4)
+        assert state.cache_creation_input_tokens == 1
+        assert state.cache_read_input_tokens == 4
+
+    def test_delta_total_change_drops_stale_ttl_split(self):
+        """BACK-3997: a cumulative total that outgrows the message_start split must not keep that split."""
+        state = StreamUsageState()
+        state.ingest(_message_start(SimpleNamespace(
+            input_tokens=5, output_tokens=1, cache_creation_input_tokens=100,
+            cache_creation=SimpleNamespace(ephemeral_5m_input_tokens=100))))
+        assert state.cache_creation_ttl_counts == {"cache_creation5m_token_count": 100}
+        state.ingest(_message_delta(SimpleNamespace(output_tokens=4, cache_creation_input_tokens=300)))
+        assert state.cache_creation_input_tokens == 300
+        assert state.cache_creation_ttl_counts == {}
+
+    def test_delta_with_same_total_keeps_ttl_split(self):
+        """BACK-3997: an unchanged total leaves the message_start split valid."""
+        state = StreamUsageState()
+        state.ingest(_message_start(SimpleNamespace(
+            input_tokens=5, output_tokens=1, cache_creation_input_tokens=100,
+            cache_creation=SimpleNamespace(ephemeral_5m_input_tokens=100))))
+        state.ingest(_message_delta(SimpleNamespace(output_tokens=4, cache_creation_input_tokens=100)))
+        assert state.cache_creation_ttl_counts == {"cache_creation5m_token_count": 100}
+
+    def test_delta_breakdown_replaces_ttl_split(self):
+        """BACK-3997: a delta carrying its own breakdown supplies the split for its total."""
+        state = StreamUsageState()
+        state.ingest(_message_start(SimpleNamespace(
+            input_tokens=5, output_tokens=1, cache_creation_input_tokens=100,
+            cache_creation=SimpleNamespace(ephemeral_5m_input_tokens=100))))
+        state.ingest(_message_delta(SimpleNamespace(
+            output_tokens=4, cache_creation_input_tokens=300,
+            cache_creation=SimpleNamespace(ephemeral_5m_input_tokens=100, ephemeral_1h_input_tokens=200))))
+        assert state.cache_creation_ttl_counts == {
+            "cache_creation5m_token_count": 100, "cache_creation1h_token_count": 200}
+
+
+async def _async_events():
+    for event in make_events():
+        yield event
+
+
+async def _drain(events):
+    return [event async for event in events]
+
+
+class TestStreamHelperRelay:
+    """The helper keeps the response text itself, so its relay holds usage only."""
+
+    def test_sync_relay_reads_usage_and_keeps_no_text(self):
+        helper = SimpleNamespace(_iterator=(event for event in make_events()))
+        state = StreamUsageState()
+        meter_stream_helper_events(helper, state)
+        relayed = list(helper._iterator)
+        assert [event.type for event in relayed] == [event.type for event in make_events()]
+        assert (state.message_id, state.output_tokens, state.accumulated_text) == ("msg_stream_1", 9, [])
+
+    def test_async_relay_reads_usage_and_keeps_no_text(self):
+        helper = SimpleNamespace(_iterator=_async_events())
+        state = StreamUsageState()
+        meter_async_stream_helper_events(helper, state)
+        relayed = asyncio.run(_drain(helper._iterator))
+        assert [event.type for event in relayed] == [event.type for event in make_events()]
+        assert (state.message_id, state.output_tokens, state.accumulated_text) == ("msg_stream_1", 9, [])

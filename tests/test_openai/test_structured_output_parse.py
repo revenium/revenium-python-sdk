@@ -11,7 +11,7 @@ import json
 import logging
 import threading
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import openai
@@ -26,6 +26,8 @@ from revenium_middleware._core.call_ownership import (
     OPENAI, claimed_by_transport, reset_claimed_response_ids, transport_claim_mark,
 )
 from revenium_middleware.openai import middleware as mw
+
+from .openai_transport import answer_every_transport, http_library_of
 
 MODEL = "gpt-4o-mini"
 CHAT_ID = "chatcmpl-parse-1"
@@ -77,15 +79,16 @@ class FakeOpenAI:
         self.finish_reason = "stop"
 
     def __call__(self, request):
+        http = http_library_of(request)
         self.requests.append(json.loads(request.content or b"{}"))
         if self.fail_next:
             self.fail_next = False
-            return httpx.Response(400, json={"error": {"message": "bad request", "type": "invalid_request"}})
+            return http.Response(400, json={"error": {"message": "bad request", "type": "invalid_request"}})
         if request.url.path.endswith("/chat/completions"):
-            return httpx.Response(200, json=_chat_completion(self.text, self.finish_reason))
+            return http.Response(200, json=_chat_completion(self.text, self.finish_reason))
         if request.url.path.endswith("/responses"):
-            return httpx.Response(200, json=_response(self.text))
-        return httpx.Response(404, json={"error": "unrouted"})
+            return http.Response(200, json=_response(self.text))
+        return http.Response(404, json={"error": "unrouted"})
 
     def sync_client(self):
         return OpenAI(api_key="sk-test", base_url=self.base_url, max_retries=0,
@@ -116,7 +119,7 @@ def payloads(monkeypatch):
         return SimpleNamespace(id="evt-test")
 
     reset_claimed_response_ids()
-    with patch.object(mw, "get_client", lambda: object()), \
+    with patch.object(mw, "current_client", lambda: object()), \
          patch.object(mw, "submit_ai_event", side_effect=record), \
          patch.object(mw, "run_async_in_thread", side_effect=_run_coro_to_completion):
         yield recorded
@@ -290,11 +293,20 @@ class TestParseThatFailsAfterTheProviderAnswered:
 
 
 PERPLEXITY_BASE_URL = "https://api.perplexity.ai"
+PERPLEXITY_REPORTED_COST = {"input_tokens_cost": 0.00011, "output_tokens_cost": 1e-05, "request_cost": 0.0025,
+                            "search_queries_cost": 0.005, "total_cost": 0.00762}
+PERPLEXITY_EXPECTED_COST = {"input_token_cost": 0.00011, "output_token_cost": 1e-05, "total_cost": 0.00762}
+PERPLEXITY_COST_FIELDS = ("input_token_cost", "output_token_cost", "total_cost")
 
 
 class TestPerplexityBoundParse:
-    """The Perplexity middleware wraps create() only, so a Perplexity-bound
-    parse() through the OpenAI client is enforced and metered here."""
+    """Without the Perplexity middleware loaded, a Perplexity-bound parse()
+    through the OpenAI client is enforced and metered here. Other tests import
+    it, so these pin that configuration (BACK-4247)."""
+
+    @pytest.fixture(autouse=True)
+    def _without_the_perplexity_middleware(self, monkeypatch):
+        monkeypatch.setattr(mw, "_perplexity_meters_parse", lambda instance: False)
 
     @pytest.fixture
     def perplexity(self):
@@ -328,6 +340,45 @@ class TestPerplexityBoundParse:
         sync_chat_parse(fake)
         assert payloads[0]["provider"] == "OPENAI"
         assert payloads[0]["model_source"] == "OPENAI"
+
+    @pytest.mark.parametrize("parse_call", [
+        pytest.param(sync_chat_parse, id="sync"),
+        pytest.param(async_chat_parse, id="async"),
+    ])
+    def test_the_cost_perplexity_reported_is_sent(self, perplexity, payloads, parse_call, monkeypatch):
+        monkeypatch.setitem(CHAT_USAGE, "cost", PERPLEXITY_REPORTED_COST)
+        parse_call(perplexity)
+        assert len(payloads) == 1
+        sent = {field: payloads[0][field] for field in PERPLEXITY_COST_FIELDS if field in payloads[0]}
+        assert sent == pytest.approx(PERPLEXITY_EXPECTED_COST)
+
+    def test_openai_bound_parse_sends_no_cost(self, fake, payloads, monkeypatch):
+        monkeypatch.setitem(CHAT_USAGE, "cost", PERPLEXITY_REPORTED_COST)
+        sync_chat_parse(fake)
+        assert len(payloads) == 1
+        assert [field for field in PERPLEXITY_COST_FIELDS if field in payloads[0]] == []
+
+
+@pytest.mark.parametrize("wrapper_name, provider", [
+    pytest.param("chat_parse_wrapper", MagicMock, id="sync"),
+    pytest.param("async_chat_parse_wrapper", AsyncMock, id="async"),
+])
+def test_a_perplexity_bound_parse_is_left_to_the_loaded_perplexity_middleware(
+        wrapper_name, provider, payloads, monkeypatch):
+    monkeypatch.setattr(mw, "_perplexity_meters_parse", lambda instance: True)
+    instance = SimpleNamespace(_client=SimpleNamespace(base_url=PERPLEXITY_BASE_URL))
+    wrapped = provider(return_value="parsed")
+    kwargs = {"model": "sonar", "messages": MESSAGES, "usage_metadata": {"agent": "a"}}
+
+    with patch.object(mw, "check_enforcement") as enforcement:
+        result = getattr(mw, wrapper_name)(wrapped, instance, (), dict(kwargs))
+        if asyncio.iscoroutine(result):
+            result = asyncio.run(result)
+
+    assert result == "parsed"
+    wrapped.assert_called_once_with(**kwargs)
+    enforcement.assert_not_called()
+    assert payloads == []
 
 
 def _delegating_parse(format_kwarg):
@@ -405,13 +456,7 @@ class TestLangChainStructuredOutput:
     def langchain_openai(self, monkeypatch, fake):
         module = pytest.importorskip("langchain_openai")
         monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
-        monkeypatch.setattr(httpx.HTTPTransport, "handle_request", lambda self, request: fake(request))
-
-        async def handle_async(self, request):
-            await request.aread()
-            return fake(request)
-
-        monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handle_async)
+        answer_every_transport(monkeypatch, fake)
         return module
 
     @staticmethod

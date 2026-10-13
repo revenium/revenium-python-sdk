@@ -95,3 +95,63 @@ class TestLiteLLMCacheTokenMapping:
         args = submitted_args(mock_submit)
         assert args["cache_read_token_count"] == 0
         assert args["cache_creation_token_count"] == 0
+
+    def test_openai_cache_writes_are_taken_out_of_the_prompt(self, mock_submit, _):
+        """An OpenAI upstream reports the write inside the prompt (BACK-3998)."""
+        from litellm.types.utils import Usage
+
+        usage = Usage(
+            prompt_tokens=4583,
+            completion_tokens=5,
+            total_tokens=4588,
+            prompt_tokens_details={"cached_tokens": 0, "cache_write_tokens": 4580},
+        )
+
+        mw.handle_response(make_response(usage), NOW, {}, False)
+
+        args = submitted_args(mock_submit)
+        assert args["input_token_count"] == 3
+        assert args["cache_creation_token_count"] == 4580
+        assert args["cache_read_token_count"] == 0
+        assert args["total_token_count"] == 4588
+
+    def test_openai_reads_stay_in_the_prompt_when_writes_are_taken_out(self, mock_submit, _):
+        """The platform removes reads itself; only the write leaves the prompt."""
+        from litellm.types.utils import Usage
+
+        usage = Usage(
+            prompt_tokens=6000,
+            completion_tokens=10,
+            total_tokens=6010,
+            prompt_tokens_details={"cached_tokens": 4000, "cache_write_tokens": 1500},
+        )
+
+        mw.handle_response(make_response(usage), NOW, {}, False)
+
+        args = submitted_args(mock_submit)
+        assert args["input_token_count"] == 4500
+        assert args["cache_read_token_count"] == 4000
+        assert args["cache_creation_token_count"] == 1500
+        assert args["total_token_count"] == 6010
+
+    def test_anthropic_cache_writes_keep_todays_counts(self, mock_submit, _):
+        """Regression guard: LiteLLM mirrors an Anthropic write into
+        ``prompt_tokens_details.cache_write_tokens``; that mirror is not an
+        OpenAI write and must not leave the prompt."""
+        from litellm.types.utils import Usage
+
+        usage = Usage(
+            prompt_tokens=100,
+            completion_tokens=5,
+            total_tokens=105,
+            cache_creation_input_tokens=40,
+            cache_read_input_tokens=30,
+        )
+        assert usage.prompt_tokens_details.cache_write_tokens == 40
+
+        mw.handle_response(make_response(usage), NOW, {}, False)
+
+        args = submitted_args(mock_submit)
+        assert args["cache_creation_token_count"] == 40
+        assert args["cache_read_token_count"] == 30
+        assert args["input_token_count"] == 100

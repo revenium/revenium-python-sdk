@@ -23,6 +23,7 @@ from .openai_embedding_driver import ReveniumOpenAiEmbeddingDriver
 from .anthropic_driver import ReveniumAnthropicDriver
 from .ollama_driver import ReveniumOllamaDriver
 from .litellm_driver import ReveniumLiteLLMDriver
+from .budget_errors import disable_budget_errors, enable_budget_errors, raise_if_budget_exceeded
 
 __all__ = [
     "ReveniumDriver",
@@ -32,4 +33,7 @@ __all__ = [
     "ReveniumAnthropicDriver",
     "ReveniumOllamaDriver",
     "ReveniumLiteLLMDriver",
+    "enable_budget_errors",
+    "disable_budget_errors",
+    "raise_if_budget_exceeded",
 ]

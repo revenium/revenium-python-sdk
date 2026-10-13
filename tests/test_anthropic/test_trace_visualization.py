@@ -209,7 +209,7 @@ class TestTraceVisualizationIntegration:
 
         # Make a simple API call with usage metadata
         response = client.messages.create(
-            model="claude-3-haiku-20240307",
+            model="claude-haiku-4-5",
             max_tokens=50,
             messages=[
                 {"role": "user", "content": "Say 'Hello, trace visualization!'"}

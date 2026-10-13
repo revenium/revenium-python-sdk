@@ -23,7 +23,6 @@ status that proves the origin rejected the request before processing it. A
 the reads are GETs, so both keep the default policy.
 """
 
-import os
 import urllib.parse
 from dataclasses import asdict, dataclass
 from typing import (
@@ -32,7 +31,7 @@ from typing import (
 
 import httpx
 
-from ._core.config import Config, resolve_write_api_key
+from ._core.config import get_profitstream_base_url, resolve_write_api_key
 from ._core.exceptions import OutcomeReportingError
 from ._core.outcomes import (
     _NON_IDEMPOTENT_RETRY_STATUSES,
@@ -40,8 +39,6 @@ from ._core.outcomes import (
     resolve_team_id,
     validate_outcome_key,
 )
-
-_DEFAULT_PROFITSTREAM_BASE_URL = "https://api.revenium.io"
 
 # Keep these literals aligned with HyperCurrent's JobTypeEconomicsRequests.kt
 # and JobTypeEconomicsResource.kt request contract.
@@ -158,7 +155,7 @@ def _request(
             "rev_sk_ key required)."
         )
     key = validate_outcome_key(key)
-    base_url = profitstream_base_url or os.getenv(Config.ENV_REVENIUM_PROFITSTREAM_BASE_URL) or _DEFAULT_PROFITSTREAM_BASE_URL
+    base_url = get_profitstream_base_url(profitstream_base_url)
     owns_client = http_client is None
     client = http_client or httpx.Client(timeout=60.0)
     try:

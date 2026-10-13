@@ -11,14 +11,38 @@ Tests cover:
 
 import asyncio
 import datetime
+import httpx
 import pytest
-from unittest.mock import Mock, MagicMock, patch, AsyncMock
+from google import genai
+from google.genai import types as genai_types
+from unittest.mock import Mock, MagicMock, patch, AsyncMock, create_autospec
 
+from revenium_middleware._core.metering_pool import wait_until_idle
+from revenium_middleware._metering.resources.ai import AIResource
 from revenium_middleware.google.common.types import OperationType
 from revenium_middleware.google.common.trace_fields import (
     detect_vision_content,
     _item_has_vision_content,
 )
+import revenium_middleware.google.google_ai.middleware  # noqa: F401
+
+PNG_1X1 = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010806000000")
+GEMINI_REPLY = {
+    "candidates": [{"content": {"role": "model", "parts": [{"text": "A dot"}]}, "finishReason": "STOP", "index": 0}],
+    "usageMetadata": {"promptTokenCount": 260, "candidatesTokenCount": 2, "totalTokenCount": 262},
+    "modelVersion": "gemini-2.5-flash-lite",
+    "responseId": "r1",
+}
+
+
+def _gemini_client():
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json=GEMINI_REPLY))
+    return genai.Client(api_key="stub", http_options=genai_types.HttpOptions(httpx_client=httpx.Client(transport=transport)))
+
+
+def _sent_completions(recorder):
+    wait_until_idle(10)
+    return [recorded.kwargs for recorded in recorder.ai.create_completion.call_args_list]
 
 
 # --- OperationType enum tests ---
@@ -235,7 +259,7 @@ class TestImageMeteringCall:
     """Test create_image_metering_call helper."""
 
     @patch("revenium_middleware.google.common.utils.run_async_in_thread")
-    @patch("revenium_middleware.google.common.utils.get_client")
+    @patch("revenium_middleware.google.common.utils.current_client")
     def test_create_image_metering_call(self, mock_client, mock_run_async):
         from revenium_middleware.google.common.utils import create_image_metering_call
 
@@ -257,7 +281,7 @@ class TestImageMeteringCall:
         assert mock_run_async.called
 
     @patch("revenium_middleware.google.common.utils.run_async_in_thread")
-    @patch("revenium_middleware.google.common.utils.get_client")
+    @patch("revenium_middleware.google.common.utils.current_client")
     def test_create_image_metering_call_with_edit_subtype(self, mock_client, mock_run_async):
         from revenium_middleware.google.common.utils import create_image_metering_call
 
@@ -284,7 +308,7 @@ class TestVideoMeteringCall:
     """Test create_video_metering_call helper."""
 
     @patch("revenium_middleware.google.common.utils.run_async_in_thread")
-    @patch("revenium_middleware.google.common.utils.get_client")
+    @patch("revenium_middleware.google.common.utils.current_client")
     def test_create_video_metering_call(self, mock_client, mock_run_async):
         from revenium_middleware.google.common.utils import create_video_metering_call
 
@@ -305,7 +329,7 @@ class TestVideoMeteringCall:
         assert mock_run_async.called
 
     @patch("revenium_middleware.google.common.utils.run_async_in_thread")
-    @patch("revenium_middleware.google.common.utils.get_client")
+    @patch("revenium_middleware.google.common.utils.current_client")
     def test_create_video_metering_call_with_job_id(self, mock_client, mock_run_async):
         from revenium_middleware.google.common.utils import create_video_metering_call
 
@@ -332,7 +356,7 @@ class TestLogImageUsage:
     """Test the async log_image_usage function."""
 
     @patch("revenium_middleware._core.metering.client")
-    @patch("revenium_middleware.google.common.utils.get_client")
+    @patch("revenium_middleware.google.common.utils.current_client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
     def test_log_image_usage_calls_create_image(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_image_usage
@@ -360,11 +384,11 @@ class TestLogImageUsage:
         assert call_kwargs["requested_image_count"] == 1
         assert call_kwargs["actual_image_count"] == 1
         assert call_kwargs["operation_subtype"] == "generation"
-        assert call_kwargs["middleware_source"] == "python"
+        assert call_kwargs["middleware_source"] == "PYTHON"
         assert call_kwargs["trace_id"] == "test-trace"
 
     @patch("revenium_middleware._core.metering.client")
-    @patch("revenium_middleware.google.common.utils.get_client")
+    @patch("revenium_middleware.google.common.utils.current_client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
     def test_log_image_usage_skips_during_shutdown(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_image_usage
@@ -385,7 +409,7 @@ class TestLogImageUsage:
         mock_metering_client.ai.create_image.assert_not_called()
 
     @patch("revenium_middleware._core.metering.client")
-    @patch("revenium_middleware.google.common.utils.get_client")
+    @patch("revenium_middleware.google.common.utils.current_client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
     def test_log_image_usage_passes_aspect_ratio(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_image_usage
@@ -418,7 +442,7 @@ class TestLogVideoUsage:
     """Test the async log_video_usage function."""
 
     @patch("revenium_middleware._core.metering.client")
-    @patch("revenium_middleware.google.common.utils.get_client")
+    @patch("revenium_middleware.google.common.utils.current_client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
     def test_log_video_usage_calls_create_video(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_video_usage
@@ -455,7 +479,7 @@ class TestLogVideoUsage:
         assert call_kwargs["trace_id"] == "vid-trace"
 
     @patch("revenium_middleware._core.metering.client")
-    @patch("revenium_middleware.google.common.utils.get_client")
+    @patch("revenium_middleware.google.common.utils.current_client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
     def test_log_video_usage_skips_during_shutdown(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_video_usage
@@ -475,7 +499,7 @@ class TestLogVideoUsage:
         mock_metering_client.ai.create_video.assert_not_called()
 
     @patch("revenium_middleware._core.metering.client")
-    @patch("revenium_middleware.google.common.utils.get_client")
+    @patch("revenium_middleware.google.common.utils.current_client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
     def test_log_video_usage_passes_aspect_ratio(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_video_usage
@@ -504,18 +528,16 @@ class TestLogVideoUsage:
 
 
 class TestHasVisionContentFlag:
-    """Test that has_vision_content flag is passed through to completion args."""
+    """The vision flag travels in extra_body as hasVisionContent, which the real client accepts (BACK-3996)."""
 
     @patch("revenium_middleware._core.metering.client")
-    @patch("revenium_middleware.google.common.utils.get_client")
+    @patch("revenium_middleware.google.common.utils.current_client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
     def test_has_vision_content_in_completion_args(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_token_usage
 
         mock_shutdown.is_set.return_value = False
-        mock_result = Mock()
-        mock_result.id = "test-result"
-        mock_metering_client.ai.create_completion.return_value = mock_result
+        mock_metering_client.ai = create_autospec(AIResource, instance=True)
 
         asyncio.run(log_token_usage(
             transaction_id="txn-vision-001",
@@ -532,19 +554,17 @@ class TestHasVisionContentFlag:
         ))
 
         mock_metering_client.ai.create_completion.assert_called_once()
-        call_kwargs = mock_metering_client.ai.create_completion.call_args[1]
-        assert call_kwargs.get("has_vision_content") is True
+        call_kwargs = mock_metering_client.ai.create_completion.call_args.kwargs
+        assert call_kwargs["extra_body"]["hasVisionContent"] is True
 
     @patch("revenium_middleware._core.metering.client")
-    @patch("revenium_middleware.google.common.utils.get_client")
+    @patch("revenium_middleware.google.common.utils.current_client")
     @patch("revenium_middleware.google.common.utils.shutdown_event")
     def test_no_vision_content_flag_when_not_set(self, mock_shutdown, mock_utils_client, mock_metering_client):
         from revenium_middleware.google.common.utils import log_token_usage
 
         mock_shutdown.is_set.return_value = False
-        mock_result = Mock()
-        mock_result.id = "test-result"
-        mock_metering_client.ai.create_completion.return_value = mock_result
+        mock_metering_client.ai = create_autospec(AIResource, instance=True)
 
         asyncio.run(log_token_usage(
             transaction_id="txn-text-001",
@@ -560,8 +580,54 @@ class TestHasVisionContentFlag:
             usage_metadata={},
         ))
 
-        call_kwargs = mock_metering_client.ai.create_completion.call_args[1]
+        call_kwargs = mock_metering_client.ai.create_completion.call_args.kwargs
         assert "has_vision_content" not in call_kwargs
+        assert "hasVisionContent" not in (call_kwargs.get("extra_body") or {})
+
+    def test_a_gemini_image_call_sends_one_record_marked_as_vision(self, mock_revenium_client):
+        client = _gemini_client()
+        client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=[genai_types.Part.from_bytes(data=PNG_1X1, mime_type="image/png"), "Describe this"],
+        )
+
+        sent = _sent_completions(mock_revenium_client)
+        assert len(sent) == 1
+        assert "has_vision_content" not in sent[0]
+        assert sent[0]["extra_body"]["hasVisionContent"] is True
+
+    def test_a_reused_usage_metadata_dict_does_not_mark_a_later_text_call_as_vision(self, mock_revenium_client):
+        mock_revenium_client.ai = create_autospec(AIResource, instance=True)
+        client = _gemini_client()
+        usage_metadata = {"trace_id": "t1"}
+
+        client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=[genai_types.Part.from_bytes(data=PNG_1X1, mime_type="image/png"), "Describe this"],
+            usage_metadata=usage_metadata,
+        )
+        client.models.generate_content(
+            model="gemini-2.5-flash-lite", contents="Just text", usage_metadata=usage_metadata
+        )
+
+        sent = _sent_completions(mock_revenium_client)
+        vision_flags = [(record.get("extra_body") or {}).get("hasVisionContent") for record in sent]
+        assert sorted(vision_flags, key=str) == [None, True]
+        assert usage_metadata == {"trace_id": "t1"}
+
+    def test_an_image_call_without_usage_metadata_still_sends_one_record(self, mock_revenium_client):
+        mock_revenium_client.ai = create_autospec(AIResource, instance=True)
+
+        client = _gemini_client()
+        client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=[genai_types.Part.from_bytes(data=PNG_1X1, mime_type="image/png"), "Describe this"],
+            usage_metadata=None,
+        )
+
+        sent = _sent_completions(mock_revenium_client)
+        assert len(sent) == 1
+        assert sent[0]["extra_body"]["hasVisionContent"] is True
 
 
 # --- Common metadata builder tests ---
@@ -597,3 +663,39 @@ class TestBuildCommonMetadataArgs:
 
         result = _build_common_metadata_args({"organization_name": "Test Org"})
         assert result["organization_name"] == "Test Org"
+
+
+GOOGLE_TIMES = {"request_time": "2026-10-11T00:00:00Z", "response_time": "2026-10-11T00:00:01Z",
+                "request_duration": 1000}
+
+
+def _log_google_completion():
+    from revenium_middleware.google.common.utils import log_token_usage
+    return log_token_usage(transaction_id="txn-google-source", model="gemini-2.5-flash-lite", prompt_tokens=10,
+                           completion_tokens=5, total_tokens=15, cached_tokens=0, stop_reason="END",
+                           usage_metadata={}, **GOOGLE_TIMES)
+
+
+def _log_google_image():
+    from revenium_middleware.google.common.utils import log_image_usage
+    return log_image_usage(transaction_id="txn-google-image-source", model="imagen-3.0", requested_image_count=1,
+                           actual_image_count=1, usage_metadata={}, **GOOGLE_TIMES)
+
+
+def _log_google_video():
+    from revenium_middleware.google.common.utils import log_video_usage
+    return log_video_usage(transaction_id="txn-google-video-source", model="veo-2.0", duration_seconds=5.0,
+                           usage_metadata={}, **GOOGLE_TIMES)
+
+
+@pytest.mark.parametrize("log_usage, record_method", [
+    pytest.param(_log_google_completion, "create_completion", id="completion"),
+    pytest.param(_log_google_image, "create_image", id="image"),
+    pytest.param(_log_google_video, "create_video", id="video"),
+])
+def test_every_google_record_carries_the_python_source(mock_revenium_client, log_usage, record_method):
+    """Gemini and Vertex AI records name the same source as every other Python integration (BACK-4413)."""
+    asyncio.run(log_usage())
+    wait_until_idle(10.0)
+    sent = getattr(mock_revenium_client.ai, record_method).call_args.kwargs
+    assert sent["middleware_source"] == "PYTHON"

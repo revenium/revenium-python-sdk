@@ -5,6 +5,8 @@ a beta-only content block and the beta-only usage fields, which the standard
 Message model rejects, so the beta path is exercised on its own types.
 """
 import asyncio
+import contextvars
+import hashlib
 import json
 import threading
 from unittest.mock import MagicMock, patch
@@ -15,6 +17,7 @@ anthropic = pytest.importorskip("anthropic")
 httpx2 = pytest.importorskip("httpx2")
 
 import revenium_middleware.anthropic  # noqa: E402,F401  installs the patches
+from revenium_middleware import idempotency_key as idempotency_block  # noqa: E402
 from revenium_middleware.anthropic.provider import Provider  # noqa: E402
 from revenium_middleware._core.call_ownership import (  # noqa: E402
     ANTHROPIC, claimed_by_transport, reset_claimed_response_ids, transport_claim_mark,
@@ -45,33 +48,39 @@ _MESSAGE = {
     "content": [_MCP_BLOCK, {"type": "text", "text": "hi"}], "stop_reason": "end_turn", "stop_sequence": None,
     "usage": _USAGE,
 }
-_SSE_EVENTS = [
-    ("message_start", {"type": "message_start", "message": {
-        **_MESSAGE, "content": [], "stop_reason": None, "usage": {**_USAGE, "output_tokens": 1}}}),
-    ("content_block_start", {"type": "content_block_start", "index": 0,
-                             "content_block": {"type": "text", "text": ""}}),
-    ("content_block_delta", {"type": "content_block_delta", "index": 0,
-                             "delta": {"type": "text_delta", "text": "hi"}}),
-    ("content_block_stop", {"type": "content_block_stop", "index": 0}),
-    ("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                       "usage": {"output_tokens": OUTPUT_TOKENS}}),
-    ("message_stop", {"type": "message_stop"}),
-]
-SSE_BODY = "".join(f"event: {name}\ndata: {json.dumps(data)}\n\n" for name, data in _SSE_EVENTS).encode()
-MESSAGE_BODY = json.dumps(_MESSAGE).encode()
-STANDARD_MESSAGE_BODY = json.dumps({**_MESSAGE, "content": [{"type": "text", "text": "hi"}]}).encode()
+
+
+def _sse_body(start_usage, delta_usage):
+    events = [
+        ("message_start", {"type": "message_start", "message": {
+            **_MESSAGE, "content": [], "stop_reason": None, "usage": start_usage}}),
+        ("content_block_start", {"type": "content_block_start", "index": 0,
+                                 "content_block": {"type": "text", "text": ""}}),
+        ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                 "delta": {"type": "text_delta", "text": "hi"}}),
+        ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        ("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                           "usage": delta_usage}),
+        ("message_stop", {"type": "message_stop"}),
+    ]
+    return "".join(f"event: {name}\ndata: {json.dumps(data)}\n\n" for name, data in events).encode()
 
 
 class StubAnthropic:
-    def __init__(self):
+    def __init__(self, usage=_USAGE, start_usage=None, delta_usage=None):
         self.requests = []
+        self._message_body = json.dumps({**_MESSAGE, "usage": usage}).encode()
+        self._standard_message_body = json.dumps(
+            {**_MESSAGE, "content": [{"type": "text", "text": "hi"}], "usage": usage}).encode()
+        self._sse_body = _sse_body(start_usage or {**usage, "output_tokens": 1},
+                                   delta_usage or {"output_tokens": OUTPUT_TOKENS})
 
     def _respond(self, request):
         assert request.url.host == STUB_HOST
         self.requests.append(request)
         if json.loads(request.content).get("stream"):
-            return httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=SSE_BODY)
-        body = MESSAGE_BODY if "beta=true" in str(request.url) else STANDARD_MESSAGE_BODY
+            return httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=self._sse_body)
+        body = self._message_body if "beta=true" in str(request.url) else self._standard_message_body
         return httpx2.Response(200, headers={"content-type": "application/json"}, content=body)
 
     def sync_client(self):
@@ -81,6 +90,17 @@ class StubAnthropic:
     def async_client(self):
         return anthropic.AsyncAnthropic(api_key="sk-ant-test", base_url=f"http://{STUB_HOST}", max_retries=0,
                                         http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(self._respond)))
+
+
+class UnbufferedStreamStub(StubAnthropic):
+    """Serves the event stream line by line, so the response stays open until it is drained or closed."""
+
+    def _respond(self, request):
+        assert request.url.host == STUB_HOST
+        self.requests.append(request)
+        self.stream_response = httpx2.Response(200, headers={"content-type": "text/event-stream"},
+                                               content=iter(self._sse_body.splitlines(keepends=True)))
+        return self.stream_response
 
 
 def _run_metering_synchronously(coro_func, *args, **kwargs):
@@ -373,3 +393,427 @@ class TestBetaToolRunner:
     def test_async(self, runner_stub, records, stream):
         asyncio.run(_run_async_tool_runner(runner_stub.async_client(), stream))
         self.assert_one_record_per_step(runner_stub, records, stream)
+
+
+ADVISOR_MODEL = "claude-opus-5"
+FIRST_PASS_INPUT_TOKENS = 5
+_ITERATIONS = [
+    {"type": "message", "input_tokens": FIRST_PASS_INPUT_TOKENS, "output_tokens": 2,
+     "cache_creation_input_tokens": 0, "cache_read_input_tokens": CACHE_READ_TOKENS},
+    {"type": "advisor_message", "model": ADVISOR_MODEL, "input_tokens": 823, "output_tokens": 1612,
+     "cache_creation_input_tokens": 40, "cache_read_input_tokens": 7,
+     "cache_creation": {"ephemeral_5m_input_tokens": 40, "ephemeral_1h_input_tokens": 0}},
+    {"type": "compaction", "input_tokens": 1800, "output_tokens": 350},
+    {"type": "message", "input_tokens": INPUT_TOKENS - FIRST_PASS_INPUT_TOKENS, "output_tokens": 3,
+     "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+]
+_MESSAGE_ONLY_ITERATIONS = [_ITERATIONS[0], _ITERATIONS[3]]
+_EXECUTOR_CACHE_SPLIT = {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0}
+
+
+def iteration_stub(iterations=_ITERATIONS, start_input_tokens=FIRST_PASS_INPUT_TOKENS, stub_class=StubAnthropic):
+    """A turn whose executor ran several passes: message_start carries only the first
+    pass's input, and the cumulative input and the iterations arrive on message_delta."""
+    usage = {**_USAGE, "cache_creation": _EXECUTOR_CACHE_SPLIT, "iterations": iterations}
+    return stub_class(
+        usage,
+        start_usage={**usage, "input_tokens": start_input_tokens, "output_tokens": 1, "iterations": None},
+        delta_usage={"output_tokens": OUTPUT_TOKENS, "input_tokens": INPUT_TOKENS,
+                     "cache_creation_input_tokens": 0, "cache_read_input_tokens": CACHE_READ_TOKENS,
+                     "iterations": iterations},
+    )
+
+
+def _create_sync(messages, request):
+    messages.create(**request)
+
+
+def _create_async(messages, request):
+    asyncio.run(messages.create(**request))
+
+
+def _create_stream_sync(messages, request):
+    _drain_sync_create(messages, request)
+
+
+def _create_stream_async(messages, request):
+    asyncio.run(_drain_async_create(messages, request))
+
+
+def _stream_helper_sync(messages, request):
+    _drain_sync_stream(messages, request)
+
+
+def _stream_helper_async(messages, request):
+    asyncio.run(_drain_async_stream(messages, request))
+
+
+def _parse_sync(messages, request):
+    messages.parse(**request)
+
+
+def _parse_async(messages, request):
+    asyncio.run(messages.parse(**request))
+
+
+_SYNC_FORMS = {_create_sync, _create_stream_sync, _stream_helper_sync, _parse_sync}
+_STREAMED_FORMS = {_create_stream_sync, _create_stream_async, _stream_helper_sync, _stream_helper_async}
+_FORMS = [_create_sync, _create_async, _create_stream_sync, _create_stream_async,
+          _stream_helper_sync, _stream_helper_async, _parse_sync, _parse_async]
+
+
+def _call(form, resource, stub, request):
+    client = stub.sync_client() if form in _SYNC_FORMS else stub.async_client()
+    form(resource(client), request)
+
+
+_ITERATION_CELLS = [
+    pytest.param(form, resource, request, id=f"{form.__name__.lstrip('_')}-{resource_id}")
+    for resource, request, resource_id in [(_beta, BETA_REQUEST, "beta"), (_standard, REQUEST, "standard")]
+    for form in _FORMS
+]
+
+
+def _read_text_stream(stream):
+    return list(stream.text_stream)
+
+
+def _read_final_message(stream):
+    return stream.get_final_message()
+
+
+def _read_final_text(stream):
+    return stream.get_final_text()
+
+
+def _read_until_done(stream):
+    return stream.until_done()
+
+
+def _read_one_chunk_then_final_message(stream):
+    next(iter(stream.text_stream))
+    return stream.get_final_message()
+
+
+async def _aread_text_stream(stream):
+    return [chunk async for chunk in stream.text_stream]
+
+
+async def _aread_final_message(stream):
+    return await stream.get_final_message()
+
+
+async def _aread_final_text(stream):
+    return await stream.get_final_text()
+
+
+async def _aread_until_done(stream):
+    return await stream.until_done()
+
+
+_SYNC_READS = [_read_text_stream, _read_final_message, _read_final_text, _read_until_done,
+               _read_one_chunk_then_final_message]
+_ASYNC_READS = [_aread_text_stream, _aread_final_message, _aread_final_text, _aread_until_done]
+
+
+def _read_stream_helper(read, resource, stub, request):
+    if read in _SYNC_READS:
+        with resource(stub.sync_client()).stream(**request) as stream:
+            read(stream)
+        return
+
+    async def run():
+        async with resource(stub.async_client()).stream(**request) as stream:
+            await read(stream)
+    asyncio.run(run())
+
+_SSE_EVENT_TYPES = ["message_start", "content_block_start", "content_block_delta", "content_block_stop",
+                    "message_delta", "message_stop"]
+
+
+class _PlainEventIterator:
+    """The helper's events behind __next__ and __anext__ only: an iterator that is not a generator."""
+
+    def __init__(self, events):
+        self._events = events
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._events)
+
+    def __aiter__(self):
+        return self
+
+    def __anext__(self):
+        return self._events.__anext__()
+
+
+class _AssignedOnce:
+    """An attribute that takes the vendor's own assignment and refuses every later one."""
+
+    def __get__(self, instance, owner):
+        return instance.__dict__["_assigned_once"]
+
+    def __set__(self, instance, value):
+        if "_assigned_once" in instance.__dict__:
+            raise AttributeError("read-only")
+        instance.__dict__["_assigned_once"] = value
+
+
+def _serve_a_plain_event_iterator(monkeypatch, stream_class):
+    events = stream_class.__stream__
+    monkeypatch.setattr(stream_class, "__stream__", lambda self: _PlainEventIterator(events(self)))
+
+
+def _refuse_a_new_event_iterator(monkeypatch, stream_class):
+    monkeypatch.setattr(stream_class, "_iterator", _AssignedOnce(), raising=False)
+
+
+_INHERITED_FIELDS = ("trace_id", "subscriber", "organization_name", "product_name", "agent", "task_type",
+                     "provider", "model_source", "is_streamed", "operation_type", "request_time")
+
+
+def assert_iteration_records(stub, records, *, streamed, provider="ANTHROPIC", compaction_model=REQUEST["model"]):
+    assert len(stub.requests) == 1
+    assert len(records) == 3, records
+    main, advisor, compaction = records
+    assert_one_record(stub, [main], streamed=streamed, provider=provider)
+    assert main["input_token_count"] == INPUT_TOKENS
+
+    assert advisor["transaction_id"] == f"{MESSAGE_ID}-iteration-1"
+    assert advisor["parent_transaction_id"] == MESSAGE_ID
+    assert advisor["operation_subtype"] == "advisor_message"
+    assert advisor["model"] == ADVISOR_MODEL
+    assert (advisor["input_token_count"], advisor["output_token_count"], advisor["total_token_count"]) == (
+        823, 1612, 2435)
+    assert advisor["cache_read_token_count"] == 7
+    assert advisor["cache_creation_token_count"] == 40
+    assert advisor["cache_creation5m_token_count"] == 40
+    assert advisor["cache_creation1h_token_count"] == 0
+
+    assert compaction["transaction_id"] == f"{MESSAGE_ID}-iteration-2"
+    assert compaction["parent_transaction_id"] == MESSAGE_ID
+    assert compaction["operation_subtype"] == "compaction"
+    assert compaction["model"] == compaction_model
+    assert (compaction["input_token_count"], compaction["output_token_count"],
+            compaction["total_token_count"]) == (1800, 350, 2150)
+    assert compaction["cache_read_token_count"] == 0
+    assert compaction["cache_creation_token_count"] == 0
+    assert "cache_creation5m_token_count" not in compaction
+    assert "cache_creation1h_token_count" not in compaction
+
+    for extra in (advisor, compaction):
+        for field in _INHERITED_FIELDS:
+            assert extra[field] == main[field], field
+        assert extra["system_prompt"] is None
+        assert extra["input_messages"] is None
+        assert extra["output_response"] is None
+
+    assert sum(r["input_token_count"] for r in records) == INPUT_TOKENS + 823 + 1800
+    assert sum(r["output_token_count"] for r in records) == OUTPUT_TOKENS + 1612 + 350
+    return records
+
+
+@pytest.fixture
+def submissions():
+    """Every submit_ai_event call as (payload, idempotency_key)."""
+    captured = []
+
+    def record(operation, payload, idempotency_key=None):
+        captured.append((payload, idempotency_key))
+        return MagicMock(status_code=201)
+
+    with patch("revenium_middleware.anthropic.middleware._get_thread_safe_client", return_value=MagicMock()), \
+            patch("revenium_middleware.anthropic.middleware.submit_ai_event", side_effect=record), \
+            patch("revenium_middleware.anthropic.middleware._safe_run_async_in_thread",
+                  side_effect=_run_metering_synchronously):
+        yield captured
+
+
+def _run_metering_synchronously_in_caller_context(coro_func, *args, **kwargs):
+    context = contextvars.copy_context()
+    thread = threading.Thread(target=lambda: context.run(asyncio.run, coro_func(*args, **kwargs)))
+    thread.start()
+    thread.join(timeout=10)
+    return thread
+
+
+class TestUsageIterations:
+    """BACK-3997: advisor and compaction passes are billed outside the top-level usage."""
+
+    @pytest.mark.parametrize("form, resource, request_kwargs", _ITERATION_CELLS)
+    def test_advisor_and_compaction_get_their_own_records(self, records, form, resource, request_kwargs):
+        stub = iteration_stub()
+        _call(form, resource, stub, request_kwargs)
+        assert_iteration_records(stub, records, streamed=form in _STREAMED_FORMS)
+
+    @pytest.mark.parametrize("form, resource, request_kwargs", [
+        pytest.param(_create_sync, _beta, BETA_REQUEST, id="create_sync-beta"),
+        pytest.param(_create_stream_sync, _standard, REQUEST, id="create_stream_sync-standard"),
+    ])
+    def test_pass_records_carry_no_captured_prompt_with_capture_on(self, records, monkeypatch, form, resource,
+                                                                    request_kwargs):
+        monkeypatch.setenv("REVENIUM_CAPTURE_PROMPTS", "true")
+        _call(form, resource, iteration_stub(), dict(request_kwargs, system="SECRET SYSTEM"))
+
+        main, advisor, compaction = records
+        for field in ("system_prompt", "input_messages", "output_response"):
+            assert main[field] is not None, field
+            assert advisor[field] is None, field
+            assert compaction[field] is None, field
+
+    @pytest.mark.parametrize("read", _SYNC_READS + _ASYNC_READS, ids=lambda read: read.__name__.lstrip("_"))
+    @pytest.mark.parametrize("resource, request_kwargs", RESOURCES)
+    def test_stream_helper_bills_the_passes_however_the_stream_is_read(self, records, resource, request_kwargs, read):
+        stub = iteration_stub()
+        _read_stream_helper(read, resource, stub, request_kwargs)
+        assert_iteration_records(stub, records, streamed=True)
+
+    @pytest.mark.parametrize("iterations", [None, [], _MESSAGE_ONLY_ITERATIONS],
+                             ids=["none", "empty", "message_only"])
+    @pytest.mark.parametrize("form", [_stream_helper_sync, _stream_helper_async], ids=["sync", "async"])
+    @pytest.mark.parametrize("resource, request_kwargs", RESOURCES)
+    def test_stream_helper_sends_one_record_without_billed_iterations(self, records, form, resource,
+                                                                      request_kwargs, iterations):
+        stub = iteration_stub(iterations=iterations, start_input_tokens=INPUT_TOKENS)
+        _call(form, resource, stub, request_kwargs)
+        assert_one_record(stub, records, streamed=True)
+
+    @pytest.mark.parametrize("resource, request_kwargs", RESOURCES)
+    def test_stream_helper_left_before_the_final_usage_sends_only_the_main_record(self, records, resource,
+                                                                                  request_kwargs):
+        stub = iteration_stub(stub_class=UnbufferedStreamStub)
+        with resource(stub.sync_client()).stream(**request_kwargs) as stream:
+            for event in stream:
+                if event.type == "content_block_delta":
+                    break
+            assert not stub.stream_response.is_closed
+        assert stub.stream_response.is_closed
+        assert [record["transaction_id"] for record in records] == [MESSAGE_ID]
+
+    @pytest.mark.parametrize("disturb", [_serve_a_plain_event_iterator, _refuse_a_new_event_iterator],
+                             ids=["not_a_generator", "not_assignable"])
+    @pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+    def test_stream_helper_with_an_unexpected_event_iterator_still_streams_and_sends_one_record(
+            self, records, monkeypatch, asynchronous, disturb):
+        from anthropic.lib.streaming import AsyncMessageStream, MessageStream
+        disturb(monkeypatch, AsyncMessageStream if asynchronous else MessageStream)
+        stub = iteration_stub()
+        if asynchronous:
+            events = asyncio.run(_drain_async_stream(stub.async_client().messages, REQUEST))
+        else:
+            events = _drain_sync_stream(stub.sync_client().messages, REQUEST)
+        assert [event.type for event in events if event.type in _SSE_EVENT_TYPES] == _SSE_EVENT_TYPES
+        assert_one_record(stub, records, streamed=True)
+
+    @pytest.mark.parametrize("form", [_create_stream_sync, _create_stream_async], ids=["sync", "async"])
+    @pytest.mark.parametrize("resource, request_kwargs", RESOURCES)
+    def test_raw_stream_main_record_counts_input_from_message_delta(self, records, form, resource, request_kwargs):
+        stub = iteration_stub(iterations=_MESSAGE_ONLY_ITERATIONS)
+        _call(form, resource, stub, request_kwargs)
+        assert_one_record(stub, records, streamed=True)
+
+    @pytest.mark.parametrize("iterations", [None, [], _MESSAGE_ONLY_ITERATIONS],
+                             ids=["none", "empty", "message_only"])
+    @pytest.mark.parametrize("form", [_create_sync, _create_stream_sync], ids=["create", "create_stream"])
+    def test_no_extra_records_without_billed_iterations(self, records, form, iterations):
+        stub = iteration_stub(iterations=iterations, start_input_tokens=INPUT_TOKENS)
+        _call(form, _beta, stub, BETA_REQUEST)
+        assert_one_record(stub, records, streamed=form in _STREAMED_FORMS)
+
+    def test_iteration_records_carry_their_transaction_id_as_idempotency_key(self, submissions):
+        _call(_create_sync, _beta, iteration_stub(), BETA_REQUEST)
+        assert [key for _, key in submissions] == [
+            None, f"{MESSAGE_ID}-iteration-1", f"{MESSAGE_ID}-iteration-2"]
+
+    @pytest.mark.parametrize("form, resource, request_kwargs", [
+        pytest.param(_create_sync, _beta, BETA_REQUEST, id="create_sync-beta"),
+        pytest.param(_stream_helper_sync, _standard, REQUEST, id="stream_helper_sync-standard"),
+    ])
+    def test_idempotency_block_numbering_is_unchanged_by_iteration_records(self, form, resource, request_kwargs):
+        metering_client = MagicMock()
+        metering_client.ai.create_completion = MagicMock(return_value=MagicMock(status_code=201))
+        stub = iteration_stub()
+        with patch("revenium_middleware._core.metering_submission.current_client", lambda: metering_client), \
+                patch("revenium_middleware.anthropic.middleware._get_thread_safe_client",
+                      return_value=metering_client), \
+                patch("revenium_middleware.anthropic.middleware._safe_run_async_in_thread",
+                      side_effect=_run_metering_synchronously_in_caller_context):
+            with idempotency_block("blk"):
+                _call(form, resource, stub, request_kwargs)
+                _call(form, resource, stub, request_kwargs)
+        sent = [(call.kwargs["transaction_id"], call.kwargs["extra_headers"]["Idempotency-Key"])
+                for call in metering_client.ai.create_completion.call_args_list]
+        assert sent == [
+            (MESSAGE_ID, "blk"),
+            (f"{MESSAGE_ID}-iteration-1", "blk-iteration-1"),
+            (f"{MESSAGE_ID}-iteration-2", "blk-iteration-2"),
+            (MESSAGE_ID, "blk:2"),
+            (f"{MESSAGE_ID}-iteration-1", "blk:2-iteration-1"),
+            (f"{MESSAGE_ID}-iteration-2", "blk:2-iteration-2"),
+        ]
+
+    def test_over_long_block_key_hashes_the_iteration_keys(self):
+        metering_client = MagicMock()
+        metering_client.ai.create_completion = MagicMock(return_value=MagicMock(status_code=201))
+        block_key = "k" * 255
+        digest = hashlib.sha256(block_key.encode()).hexdigest()
+        with patch("revenium_middleware._core.metering_submission.current_client", lambda: metering_client), \
+                patch("revenium_middleware.anthropic.middleware._get_thread_safe_client",
+                      return_value=metering_client), \
+                patch("revenium_middleware.anthropic.middleware._safe_run_async_in_thread",
+                      side_effect=_run_metering_synchronously_in_caller_context):
+            with idempotency_block(block_key):
+                _call(_create_sync, _beta, iteration_stub(), BETA_REQUEST)
+        keys = [call.kwargs["extra_headers"]["Idempotency-Key"]
+                for call in metering_client.ai.create_completion.call_args_list]
+        assert keys == [block_key, f"{digest}-iteration-1", f"{digest}-iteration-2"]
+        assert all(len(key) <= 255 for key in keys)
+
+    @pytest.mark.parametrize("key_length, hashed", [(255 - len("-iteration-1"), False),
+                                                    (255 - len("-iteration-1") + 1, True)])
+    def test_iteration_idempotency_key_boundary(self, key_length, hashed):
+        from revenium_middleware._core.usage_iterations import iteration_idempotency_key
+        key = "k" * key_length
+        result = iteration_idempotency_key(key, 1)
+        assert len(result) <= 255
+        expected = hashlib.sha256(key.encode()).hexdigest() if hashed else key
+        assert result == f"{expected}-iteration-1"
+
+    def test_iteration_records_still_sent_when_main_submit_fails(self, submissions):
+        def reject_main_record(operation, payload, idempotency_key=None):
+            submissions.append((payload, idempotency_key))
+            if payload["transaction_id"] == MESSAGE_ID:
+                raise ValueError("main record rejected")
+            return MagicMock(status_code=201)
+
+        with patch("revenium_middleware.anthropic.middleware.submit_ai_event", side_effect=reject_main_record):
+            message = iteration_stub().sync_client().beta.messages.create(**BETA_REQUEST)
+        assert message.id == MESSAGE_ID
+        assert [payload["transaction_id"] for payload, _ in submissions] == [
+            MESSAGE_ID, f"{MESSAGE_ID}-iteration-1", f"{MESSAGE_ID}-iteration-2"]
+
+    def test_zero_token_iteration_still_recorded(self, records):
+        silent_advisor = {"type": "advisor_message", "model": ADVISOR_MODEL, "input_tokens": 0, "output_tokens": 0}
+        stub = iteration_stub(iterations=[_ITERATIONS[0], silent_advisor, _ITERATIONS[3]])
+        _call(_create_sync, _beta, stub, BETA_REQUEST)
+        assert len(records) == 2, records
+        advisor = records[1]
+        assert advisor["operation_subtype"] == "advisor_message"
+        assert (advisor["input_token_count"], advisor["output_token_count"], advisor["total_token_count"]) == (0, 0, 0)
+
+    def test_advisor_record_model_is_iteration_model_verbatim_on_bedrock(self, records):
+        with patch("revenium_middleware.anthropic.middleware.detect_provider", return_value=Provider.BEDROCK), \
+                patch("revenium_middleware.anthropic.middleware._handle_bedrock_request") as fast_create:
+            stub = iteration_stub()
+            _call(_create_sync, _beta, stub, BETA_REQUEST)
+        fast_create.assert_not_called()
+        assert_iteration_records(stub, records, streamed=False, provider="AWS")
+
+    def test_streaming_response_raw_stream_meters_iterations(self, records):
+        stub = iteration_stub()
+        with stub.sync_client().beta.messages.with_streaming_response.create(stream=True, **BETA_REQUEST) as response:
+            b"".join(response.iter_bytes())
+        assert_iteration_records(stub, records, streamed=True)

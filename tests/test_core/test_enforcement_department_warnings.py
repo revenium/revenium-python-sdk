@@ -28,6 +28,7 @@ What is pinned here:
 import inspect
 import json
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -530,7 +531,7 @@ class TestTheWarningsMapSurvivesTheDiskSnapshot:
         enforcement._persist_cache_to_disk(
             [org_unit_rule()], {BLOCKED_EMAIL: BLOCK_RULE_ID}, {BLOCKED_EMAIL: 1450.0},
         )
-        path = department_snapshot_dir / enforcement._ORG_UNIT_BLOCKS_CACHE_FILENAME
+        path = Path(enforcement._org_unit_blocks_cache_file_path())
         envelope = json.loads(path.read_text(encoding="utf-8"))
         envelope.pop("warnings", None)
         path.write_text(json.dumps(envelope), encoding="utf-8")
@@ -548,7 +549,7 @@ class TestTheWarningsMapSurvivesTheDiskSnapshot:
         enforcement._persist_cache_to_disk(
             [org_unit_rule()], {}, {}, {WARNED_EMAIL: WARN_RULE_ID},
         )
-        rules_path = department_snapshot_dir / enforcement._RULES_CACHE_FILENAME
+        rules_path = Path(enforcement._cache_file_path())
         rules_path.write_text(json.dumps([org_unit_rule(ruleId=1)]), encoding="utf-8")
 
         enforcement._load_cache_from_disk()
@@ -559,7 +560,7 @@ class TestTheWarningsMapSurvivesTheDiskSnapshot:
         self, department_snapshot_dir
     ):
         enforcement._persist_cache_to_disk([org_unit_rule()], {}, {}, {})
-        path = department_snapshot_dir / enforcement._ORG_UNIT_BLOCKS_CACHE_FILENAME
+        path = Path(enforcement._org_unit_blocks_cache_file_path())
         envelope = json.loads(path.read_text(encoding="utf-8"))
         envelope["warnings"] = {" Warned-User@Example.Test ": WARN_RULE_ID}
         path.write_text(json.dumps(envelope), encoding="utf-8")
@@ -572,7 +573,7 @@ class TestTheWarningsMapSurvivesTheDiskSnapshot:
         self, department_snapshot_dir
     ):
         enforcement._persist_cache_to_disk([org_unit_rule()], {BLOCKED_EMAIL: BLOCK_RULE_ID})
-        path = department_snapshot_dir / enforcement._ORG_UNIT_BLOCKS_CACHE_FILENAME
+        path = Path(enforcement._org_unit_blocks_cache_file_path())
         envelope = json.loads(path.read_text(encoding="utf-8"))
         envelope["warnings"] = "nope"
         path.write_text(json.dumps(envelope), encoding="utf-8")

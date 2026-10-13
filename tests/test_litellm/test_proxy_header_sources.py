@@ -49,16 +49,23 @@ pytest.importorskip("litellm")
 pytest.importorskip("fastapi")
 
 import warnings  # noqa: E402
-from unittest.mock import patch  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+from unittest.mock import MagicMock, patch  # noqa: E402
 
+from fastapi import HTTPException  # noqa: E402
+
+from revenium_middleware._core import enforcement  # noqa: E402
+from revenium_middleware._metering import ReveniumMetering  # noqa: E402
 from revenium_middleware.litellm.proxy import _metering_owner  # noqa: E402
 from revenium_middleware.litellm.proxy import guardrail as gmod  # noqa: E402
 from revenium_middleware.litellm.proxy import middleware as mw  # noqa: E402
 from revenium_middleware.litellm.proxy.guardrail import ReveniumGuardrail  # noqa: E402
 
 from .proxy_hook_harness import (  # noqa: E402
+    HOST_TRACE_VARIABLES,
     GuardrailResponse,
     SubscriptableResponse,
+    after_pre_call,
     base_kwargs,
     drive_metering,
     guardrail_data,
@@ -205,7 +212,7 @@ async def drive_guardrail_failure(guardrail, data, error=None):
     with patch.object(gmod, "submit_ai_event") as submit, \
             patch.object(gmod, "run_async_in_thread", side_effect=drive_metering):
         await guardrail.async_post_call_failure_hook(
-            request_data=data,
+            request_data=after_pre_call(data),
             original_exception=error if error is not None
             else Exception("provider exploded"),
             user_api_key_dict=make_key_dict(),
@@ -377,9 +384,10 @@ class TestGuardrailHeaderSources:
 
         The guardrail's hooks swallow what they raise, so an AttributeError in
         the header read is not an error the operator sees. It is a missing
-        metering row.
+        metering row. The pre-call stamp rides in ``litellm_params``, as on a
+        pass-through route, the one container these values leave whole.
         """
-        data = {"model": "gpt-4o-mini"}
+        data = {"model": "gpt-4o-mini", "litellm_params": after_pre_call({})}
         data.update(container)
         submit = await drive(guardrail, data)
         assert submitted_args(submit)["trace_id"] is None
@@ -606,7 +614,8 @@ class TestFailureIdentity:
     appends a mandatory ":err:<8 hex>" minted per event. Uniqueness comes
     entirely from the suffix, so the prefix choice cannot weaken it, and the
     marker cannot collide with any success identity: those are a provider
-    response id, a litellm_call_id or a bare UUID, and none contains ":err:".
+    response id or a bare UUID, and neither contains ":err:". Correlation by
+    prefix therefore holds only where the success carries the provider's id.
     """
 
     @pytest.mark.asyncio
@@ -711,3 +720,266 @@ class TestFailureIdentity:
         assert IDLESS_FAILURE_ID.fullmatch(callback_id), callback_id
 
         assert guardrail_id != callback_id
+
+
+HOST_TRACE_SETTINGS = {
+    "REVENIUM_ENVIRONMENT": "production",
+    "REVENIUM_REGION": "us-east-1",
+    "REVENIUM_TRANSACTION_NAME": "env-txn",
+    "REVENIUM_TRACE_TYPE": "env-trace-type",
+    "REVENIUM_TRACE_NAME": "env-trace-name",
+    "REVENIUM_PARENT_TRANSACTION_ID": "env-parent-txn",
+    "REVENIUM_RETRY_NUMBER": "2",
+    "REVENIUM_SKILL_NAME": "env-skill",
+    "REVENIUM_SKILL_SOURCE": "env-skill-source",
+    "REVENIUM_SKILL_KIND": "workflow",
+    "REVENIUM_SKILL_PLUGIN_NAME": "env-plugin",
+    "REVENIUM_SKILL_MARKETPLACE_NAME": "env-marketplace",
+    "REVENIUM_SKILL_INVOCATION_TRIGGER": "user-slash",
+    "REVENIUM_TICKET_ID": "JIRA-123",
+}
+
+# The record field each host setting above must fill.
+HOST_TRACE_RECORD = {
+    "environment": "production",
+    "region": "us-east-1",
+    "transaction_name": "env-txn",
+    "trace_type": "env-trace-type",
+    "trace_name": "env-trace-name",
+    "parent_transaction_id": "env-parent-txn",
+    "retry_number": 2,
+    "skill_name": "env-skill",
+    "skill_source": "env-skill-source",
+    "skill_kind": "workflow",
+    "skill_plugin_name": "env-plugin",
+    "skill_marketplace_name": "env-marketplace",
+    "skill_invocation_trigger": "user-slash",
+    "ticket_id": "JIRA-123",
+}
+
+PER_CALL_HEADERS = {
+    "x-revenium-environment": "staging",
+    "x-revenium-region": "eu-west-2",
+    "x-revenium-transaction-name": "header-txn",
+    "x-revenium-trace-type": "header-trace-type",
+    "x-revenium-trace-name": "header-trace-name",
+    "x-revenium-parent-transaction-id": "header-parent-txn",
+    "x-revenium-retry-number": "5",
+    "x-revenium-skill-name": "header-skill",
+    "x-revenium-skill-source": "header-skill-source",
+    "x-revenium-skill-kind": "header-kind",
+    "x-revenium-skill-plugin-name": "header-plugin",
+    "x-revenium-skill-marketplace-name": "header-marketplace",
+    "x-revenium-skill-invocation-trigger": "header-trigger",
+    "x-revenium-ticket-id": "JIRA-999",
+}
+
+PER_CALL_RECORD = {
+    "environment": "staging",
+    "region": "eu-west-2",
+    "transaction_name": "header-txn",
+    "trace_type": "header-trace-type",
+    "trace_name": "header-trace-name",
+    "parent_transaction_id": "header-parent-txn",
+    "retry_number": 5,
+    "skill_name": "header-skill",
+    "skill_source": "header-skill-source",
+    "skill_kind": "header-kind",
+    "skill_plugin_name": "header-plugin",
+    "skill_marketplace_name": "header-marketplace",
+    "skill_invocation_trigger": "header-trigger",
+    "ticket_id": "JIRA-999",
+}
+
+HOST_ALIAS = "team-openai-key"
+OWNER_EMAIL = "owner@example.com"
+
+
+def wire_body(args):
+    """The body the metering client puts on the wire for these args."""
+    client = ReveniumMetering(api_key="test-key")
+    mock_post = MagicMock(return_value=SimpleNamespace(id="evt-1"))
+    with patch.object(client.ai, "_post", mock_post):
+        client.ai.create_completion(**args)
+    return mock_post.call_args.kwargs["body"]
+
+
+def wire_subscriber(args):
+    """The subscriber the metering client puts on the wire for these args."""
+    return wire_body(args).get("subscriber")
+
+
+async def guardrail_success_for_key(guardrail, handler, headers, owner_email):
+    metadata = {"user_api_key_user_email": owner_email} if owner_email else None
+    return await drive_guardrail_success(
+        guardrail, guardrail_data(headers=headers, metadata=metadata)
+    )
+
+
+async def callback_success_for_key(guardrail, handler, headers, owner_email):
+    kwargs = callback_kwargs(headers=headers)
+    if owner_email:
+        kwargs["litellm_params"]["metadata"]["user_api_key_user_email"] = owner_email
+    return drive_callback_success(handler, kwargs)
+
+
+SUCCESS_PATHS_FOR_KEY = [
+    pytest.param(guardrail_success_for_key, id="guardrail-success"),
+    pytest.param(callback_success_for_key, id="callback-success"),
+]
+
+
+def credential_cap(alias):
+    """A breached blocking rule on the CREDENTIAL dimension, IS ``alias``."""
+    return {
+        "ruleId": 4241,
+        "name": "Credential cap",
+        "metricType": "TOTAL_COST",
+        "threshold": 1.0,
+        "currentValue": 2.5,
+        "windowType": "DAILY",
+        "windowEnd": "2999-01-01T00:00:00Z",
+        "action": "BLOCK",
+        "breached": True,
+        "shadowMode": False,
+        "filters": [{"dimension": "CREDENTIAL", "operator": "IS", "value": alias}],
+    }
+
+
+class TestHostTraceSettingsReachGatewayRecords:
+    """BACK-4241: the gateway host's trace settings fill every gateway record,
+    and a per-call x-revenium-* header wins over them, as on a direct call."""
+
+    @pytest.fixture(autouse=True)
+    def _no_host_settings(self, monkeypatch):
+        for name in HOST_TRACE_VARIABLES:
+            monkeypatch.delenv(name, raising=False)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ALL_PATHS)
+    async def test_host_settings_reach_every_gateway_record(
+        self, guardrail, handler, path, monkeypatch
+    ):
+        for name, value in HOST_TRACE_SETTINGS.items():
+            monkeypatch.setenv(name, value)
+        args = submitted_args(await path(guardrail, handler, {}, "metadata"))
+        assert {field: args.get(field) for field in HOST_TRACE_RECORD} == HOST_TRACE_RECORD
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ALL_PATHS)
+    async def test_a_per_call_header_beats_the_host_setting(
+        self, guardrail, handler, path, monkeypatch
+    ):
+        for name, value in HOST_TRACE_SETTINGS.items():
+            monkeypatch.setenv(name, value)
+        args = submitted_args(await path(guardrail, handler, PER_CALL_HEADERS, "metadata"))
+        assert {field: args.get(field) for field in PER_CALL_RECORD} == PER_CALL_RECORD
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ALL_PATHS)
+    async def test_aws_region_alone_reaches_the_gateway_record(
+        self, guardrail, handler, path, monkeypatch
+    ):
+        monkeypatch.setenv("AWS_REGION", "eu-west-1")
+        args = submitted_args(await path(guardrail, handler, {}, "metadata"))
+        assert args.get("region") == "eu-west-1"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", SUCCESS_PATHS_FOR_KEY)
+    async def test_host_alias_names_the_credential_without_a_key_alias(
+        self, guardrail, handler, path, monkeypatch
+    ):
+        monkeypatch.setenv("REVENIUM_CREDENTIAL_ALIAS", HOST_ALIAS)
+        args = submitted_args(await path(guardrail, handler, {}, None))
+        assert args.get("credential_alias") == HOST_ALIAS
+        assert wire_subscriber(args) == {"credential": {"name": HOST_ALIAS}}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", SUCCESS_PATHS_FOR_KEY)
+    async def test_host_alias_never_names_a_key_owners_credential(
+        self, guardrail, handler, path, monkeypatch
+    ):
+        monkeypatch.setenv("REVENIUM_CREDENTIAL_ALIAS", HOST_ALIAS)
+        args = submitted_args(await path(guardrail, handler, {}, OWNER_EMAIL))
+        assert wire_subscriber(args) == {"email": OWNER_EMAIL}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", SUCCESS_PATHS_FOR_KEY)
+    async def test_host_alias_never_names_a_subscribers_credential(
+        self, guardrail, handler, path, monkeypatch
+    ):
+        monkeypatch.setenv("REVENIUM_CREDENTIAL_ALIAS", HOST_ALIAS)
+        headers = {"x-revenium-subscriber-id": "user-b@example.com"}
+        args = submitted_args(await path(guardrail, handler, headers, None))
+        assert wire_subscriber(args) == {"id": "user-b@example.com"}
+
+    @pytest.mark.asyncio
+    async def test_cap_check_and_record_use_the_same_alias(self, guardrail, monkeypatch):
+        monkeypatch.setenv("REVENIUM_CREDENTIAL_ALIAS", "alias-a")
+        monkeypatch.setenv("REVENIUM_CIRCUIT_BREAKER_ENABLED", "true")
+        monkeypatch.delenv("REVENIUM_BYPASS", raising=False)
+        monkeypatch.setattr(enforcement, "_cached_rules", [credential_cap("alias-a")])
+        monkeypatch.setattr(enforcement, "_cache_timestamp", float("inf"))
+        monkeypatch.setattr(enforcement, "_cache_initialized", True)
+        monkeypatch.setattr(enforcement, "_load_cache_from_disk", lambda: None)
+        monkeypatch.setattr(enforcement, "_ensure_poller_running", lambda: None)
+        monkeypatch.setattr(enforcement, "_fetch_rules", lambda: None)
+
+        async def pre_call(headers):
+            data = guardrail_data(headers=headers)
+            return await guardrail.async_pre_call_hook(
+                user_api_key_dict=make_key_dict(), cache=MagicMock(), data=data,
+                call_type="completion",
+            ), data
+
+        with pytest.raises(HTTPException):
+            await pre_call({})
+
+        headers = {"x-revenium-credential-alias": "alias-b"}
+        allowed, data = await pre_call(headers)
+        assert allowed is data
+        args = submitted_args(await drive_guardrail_success(guardrail, guardrail_data(headers=headers)))
+        assert args.get("credential_alias") == "alias-b"
+        assert wire_subscriber(args) == {"credential": {"name": "alias-b"}}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ALL_PATHS)
+    async def test_an_unparseable_retry_header_sends_no_retry_number(
+        self, guardrail, handler, path, monkeypatch
+    ):
+        monkeypatch.setenv("REVENIUM_ENVIRONMENT", "production")
+        headers = {"x-revenium-retry-number": "abc"}
+        args = submitted_args(await path(guardrail, handler, headers, "metadata"))
+        assert args.get("environment") == "production"
+        assert "retry_number" not in args
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ALL_PATHS)
+    async def test_unset_host_settings_add_nothing(self, guardrail, handler, path):
+        args = submitted_args(await path(guardrail, handler, {}, "metadata"))
+        new_fields = set(HOST_TRACE_RECORD) | {"credential_alias"}
+        assert new_fields.isdisjoint(args)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ALL_PATHS)
+    async def test_a_ticket_header_reaches_every_gateway_record(
+        self, guardrail, handler, path, monkeypatch
+    ):
+        monkeypatch.setenv("REVENIUM_TICKET_ID", "JIRA-123")
+        headers = {"x-revenium-ticket-id": "JIRA-999"}
+        args = submitted_args(await path(guardrail, handler, headers, "metadata"))
+        assert args.get("ticket_id") == "JIRA-999"
+        assert wire_body(args).get("ticketId") == "JIRA-999"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ALL_PATHS)
+    @pytest.mark.parametrize("headers", [
+        pytest.param({}, id="no-header"),
+        pytest.param({"x-revenium-ticket-id": "   "}, id="blank-header"),
+    ])
+    async def test_the_host_ticket_id_reaches_every_gateway_record(
+        self, guardrail, handler, path, headers, monkeypatch
+    ):
+        monkeypatch.setenv("REVENIUM_TICKET_ID", "JIRA-123")
+        args = submitted_args(await path(guardrail, handler, headers, "metadata"))
+        assert args.get("ticket_id") == "JIRA-123"

@@ -1,9 +1,9 @@
 """Import the provider SDKs and middleware of one test environment; a missing extra fails the importing test.
 
-``REVENIUM_MATRIX_ENV`` selects the environment. ``vertex`` exists because
-vertexai pins google-cloud-aiplatform and does not co-install with the other
-provider extras, so its rows run in a venv of their own (the ``vertex-matrix``
-CI job).
+``REVENIUM_MATRIX_ENV`` selects the environment. ``vertex`` runs in a venv of
+its own (the ``vertex-matrix`` CI job), so its rows can also run on the oldest
+google-cloud-aiplatform the ``google-vertex`` extra allows, with the protobuf
+release that version needs.
 """
 import importlib
 import os

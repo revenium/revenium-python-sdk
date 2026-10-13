@@ -22,6 +22,27 @@ logger = logging.getLogger("revenium_middleware.extension")
 _azure_model_cache: Dict[str, str] = {}
 _cache_lock = threading.Lock()
 
+# Real OpenAI model ids only: a custom deployment name must reach the family
+# heuristics so it is recorded under a priced id.
+_OPENAI_MODEL_IDS = frozenset({
+    'gpt-3.5-turbo', 'gpt-3.5-turbo-16k', 'gpt-3.5-turbo-instruct',
+    'gpt-4', 'gpt-4-32k', 'gpt-4-turbo', 'gpt-4-turbo-preview', 'gpt-4-vision-preview',
+    'gpt-4-1106-preview', 'gpt-4-1106-vision-preview', 'gpt-4-0125-preview',
+    'gpt-4o', 'gpt-4o-mini', 'gpt-4o-audio-preview', 'gpt-4o-mini-audio-preview',
+    'gpt-4o-realtime-preview', 'gpt-4o-mini-realtime-preview',
+    'gpt-4o-search-preview', 'gpt-4o-mini-search-preview',
+    'gpt-4o-transcribe', 'gpt-4o-mini-transcribe', 'gpt-4o-mini-tts', 'chatgpt-4o-latest',
+    'gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano', 'gpt-4.5-preview',
+    'o1', 'o1-mini', 'o1-preview', 'o1-pro',
+    'o3', 'o3-mini', 'o3-pro', 'o3-deep-research',
+    'o4-mini', 'o4-mini-deep-research',
+})
+_SNAPSHOT_DATE = re.compile(r'-\d{4}(?:-\d{2}-\d{2})?$')
+
+
+def _is_openai_model_id(name: str) -> bool:
+    return name in _OPENAI_MODEL_IDS or _SNAPSHOT_DATE.sub('', name) in _OPENAI_MODEL_IDS
+
 
 def resolve_azure_model_name(deployment_name: str, base_url: Optional[str] = None, 
                            headers: Optional[Dict[str, str]] = None, 
@@ -80,6 +101,18 @@ def resolve_azure_model_name(deployment_name: str, base_url: Optional[str] = Non
         return deployment_name
 
 
+def _gpt4o_audio_model(name_lower: str) -> Optional[str]:
+    if not re.search(r'gpt-?4o', name_lower):
+        return None
+    if 'transcribe' in name_lower:
+        if 'diarize' in name_lower:
+            return 'gpt-4o-transcribe-diarize'
+        return 'gpt-4o-mini-transcribe' if 'mini' in name_lower else 'gpt-4o-transcribe'
+    if 'tts' in name_lower:
+        return 'gpt-4o-mini-tts'
+    return None
+
+
 def _heuristic_model_mapping(deployment_name: str) -> Optional[str]:
     """
     Fast pattern matching for common Azure deployment naming patterns.
@@ -92,21 +125,41 @@ def _heuristic_model_mapping(deployment_name: str) -> Optional[str]:
     Returns:
         LiteLLM model name if pattern matched, None otherwise
     """
+    name = deployment_name.lower()
+    if _is_openai_model_id(name):
+        return name
+
     # Normalize deployment name for pattern matching
-    name_lower = deployment_name.lower().replace('_', '-').replace('.', '-')
+    name_lower = name.replace('_', '-').replace('.', '-')
     
+    audio_model = _gpt4o_audio_model(name_lower)
+    if audio_model:
+        return audio_model
+
     # GPT-4o family patterns (highest priority - newest models)
-    if re.search(r'gpt-?4o', name_lower) or re.search(r'o4', name_lower):
+    if re.search(r'gpt-?4o', name_lower):
         if 'mini' in name_lower:
             return 'gpt-4o-mini'
         return 'gpt-4o'
+
+    o_series = re.search(r'(?<![a-z0-9])o([1-9])-?(mini|pro)?(?![a-z0-9])', name_lower)
+    if o_series:
+        if o_series[2]:
+            return f'o{o_series[1]}-{o_series[2]}'
+        return f'o{o_series[1]}'
+
+    if re.search(r'gpt-?4-?1(?!\d)', name_lower):
+        for size in ('mini', 'nano'):
+            if size in name_lower:
+                return f'gpt-4.1-{size}'
+        return 'gpt-4.1'
     
     # GPT-4 family patterns
     if re.search(r'gpt-?4', name_lower):
         # Check for specific variants first
         if any(variant in name_lower for variant in ['turbo', '1106', '0125', '0613']):
             return 'gpt-4-turbo'
-        if any(variant in name_lower for variant in ['vision', 'v', 'preview']):
+        if any(variant in name_lower for variant in ['vision', 'preview']):
             return 'gpt-4-vision-preview'
         if '32k' in name_lower:
             return 'gpt-4-32k'

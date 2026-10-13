@@ -16,13 +16,16 @@ entire verdict. The SDK never resolves the caller's org unit, so
 ``groupBy=DEPARTMENT`` rules are skipped by the per-rule loop.
 """
 import json
+import logging
 import os
 import time
 
 import pytest
 
 from revenium_middleware._core import enforcement
+from revenium_middleware._core.decorators import revenium_metadata
 from revenium_middleware._core.exceptions import BudgetExceededError
+from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
 
 RULE_NAME = "Monthly subscriber cap"
 POOLED_NAME = "Team monthly cap"
@@ -30,6 +33,9 @@ DEPARTMENT_NAME = "Engineering monthly budget"
 ORG_UNIT_RULE_ID = 7777
 DEPT_EMAIL = "dept-user@example.test"
 OTHER_EMAIL = "other-user@example.test"
+# ``windowEnd`` as the server writes it: the last nanosecond of the window, UTC.
+ENDED_WINDOW = "2000-01-31T23:59:59.999999999Z"
+OPEN_WINDOW = "2999-01-31T23:59:59.999999999Z"
 
 
 def group_entry(group_value, current_value, breached, usage_percent=None):
@@ -139,6 +145,7 @@ def load_rules(monkeypatch):
 def cold_cache(monkeypatch, tmp_path):
     """A snapshot directory plus a cache that has never been loaded."""
     monkeypatch.setenv("REVENIUM_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("REVENIUM_TEAM_ID", "team-snapshot")
     monkeypatch.setattr(enforcement, "_disk_load_attempted", False)
     monkeypatch.setattr(enforcement, "_cached_rules", [])
     monkeypatch.setattr(enforcement, "_cached_org_unit_blocks", {})
@@ -201,6 +208,22 @@ class TestPerGroupEvaluation:
         with pytest.raises(BudgetExceededError):
             enforcement.check_enforcement(subscriber_metadata(email="a@example.test"))
 
+    def test_overlong_subscriber_id_matches_the_entry_keyed_by_its_stored_prefix(self, load_rules):
+        """BACK-4358: the record stores 255 characters, so the server keys the balance by them."""
+        long_id = "u" * 300
+        load_rules([grouped_rule([group_entry(long_id[:255], 900.0, True)], breached=True)])
+
+        with pytest.raises(BudgetExceededError):
+            enforcement.check_enforcement(subscriber_metadata(subscriber_id=long_id))
+
+    def test_overlong_subscriber_email_matches_the_entry_keyed_by_its_stored_prefix(self, load_rules):
+        """BACK-4358: the email is cut to 255 characters before the server keys the balance."""
+        long_email = "e" * 300 + "@example.test"
+        load_rules([grouped_rule([group_entry(long_email[:255], 900.0, True)], breached=True)])
+
+        with pytest.raises(BudgetExceededError):
+            enforcement.check_enforcement(subscriber_metadata(email=long_email))
+
     def test_flat_subscriber_metadata_pattern_matches(self, load_rules):
         """The legacy flat pattern resolves through the shared extractor too."""
         load_rules([two_group_rule(breached=True)])
@@ -259,6 +282,81 @@ class TestPerGroupEvaluation:
 
         assert enforcement.check_enforcement(subscriber_metadata(subscriber_id="sub-a")) is None
 
+    @pytest.mark.parametrize("metadata", [
+        subscriber_metadata(email="Dev@Example.com"),
+        subscriber_metadata(email=" dev@example.com "),
+        {"subscriber_email": "DEV@example.com"},
+    ], ids=["mixed-case", "padded", "flat-upper-case"])
+    def test_mixed_case_or_padded_email_matches_the_normalized_entry(self, load_rules, metadata):
+        """The server keys a per-person entry by the email trimmed and lower-cased."""
+        load_rules([grouped_rule([group_entry("dev@example.com", 140.0, True)], breached=True)])
+
+        with pytest.raises(BudgetExceededError) as excinfo:
+            enforcement.check_enforcement(metadata)
+
+        assert excinfo.value.current_value == 140.0
+
+    def test_subscriber_id_match_stays_case_sensitive(self, load_rules):
+        """An id is opaque on the server: ``sub-A`` and ``sub-a`` are two people."""
+        load_rules([grouped_rule([group_entry("sub-A", 140.0, True)], breached=True)])
+
+        assert enforcement.check_enforcement(subscriber_metadata(subscriber_id="sub-a")) is None
+
+    def test_group_breakdown_is_not_rescanned_on_every_call(self, load_rules):
+        class CountingList(list):
+            iterations = 0
+
+            def __iter__(self):
+                self.iterations += 1
+                return super().__iter__()
+
+        def breakdown(prefix):
+            return CountingList(
+                group_entry(f"{prefix}-{index}@example.com", 1.0, False) for index in range(1000)
+            )
+
+        first, second = breakdown("first"), breakdown("second")
+        load_rules([
+            grouped_rule(first, ruleId=1),
+            grouped_rule(second, ruleId=2, name="Second per-person cap"),
+        ])
+        newcomer = subscriber_metadata(subscriber_id="sub-new", email="new@example.com")
+
+        for _ in range(50):
+            assert enforcement.check_enforcement(newcomer) is None
+
+        iterations = {"first": first.iterations, "second": second.iterations}
+        assert max(iterations.values()) <= 1, iterations
+
+    def test_a_current_breakdown_index_is_kept(self, load_rules):
+        rule = two_group_rule(breached=False)
+        load_rules([rule])
+
+        enforcement.check_enforcement(subscriber_metadata(subscriber_id="sub-b"))
+
+        assert id(rule["groupBreakdown"]) in enforcement._group_indexes
+
+    def test_a_check_spanning_a_refresh_does_not_cache_the_replaced_breakdown(self, load_rules):
+        replaced = two_group_rule(breached=True)
+        load_rules([replaced])
+        _, departments, _ = enforcement._get_rules()
+        load_rules([two_group_rule(breached=True)])
+        enforcement._begin_cache_generation()
+
+        entry = enforcement._matching_group_entry(
+            replaced["groupBreakdown"], subscriber_metadata(subscriber_id="sub-a"), departments.generation)
+
+        assert entry is replaced["groupBreakdown"][0]
+        assert enforcement._group_indexes == {}
+
+    def test_empty_breakdown_on_a_per_person_rule_blocks_nobody(self, load_rules):
+        """An empty list on a breached per-person rule means the balances were
+        not read: the rule-level flag only says someone is over, not who."""
+        load_rules([grouped_rule([], breached=True)])
+
+        assert enforcement.check_enforcement(subscriber_metadata(email="bob@example.com")) is None
+        assert enforcement.check_enforcement(subscriber_metadata(email="carol@example.com")) is None
+
     def test_malformed_entries_are_skipped_not_fatal(self, load_rules):
         load_rules([grouped_rule(
             ["not-a-dict", None, group_entry("sub-a", 140.0, True)],
@@ -267,6 +365,76 @@ class TestPerGroupEvaluation:
 
         with pytest.raises(BudgetExceededError):
             enforcement.check_enforcement(subscriber_metadata(subscriber_id="sub-a"))
+
+    @pytest.mark.parametrize("metadata", [
+        {"subscriber": {"id": 12345}},
+        {"subscriber_id": 12345},
+    ], ids=["nested", "flat"])
+    def test_numeric_subscriber_id_is_blocked_by_its_breached_entry(self, load_rules, metadata):
+        """The server stores an integer id as its decimal text and keys the balance by it."""
+        load_rules([grouped_rule([group_entry("12345", 900.0, True)], breached=True)])
+
+        with pytest.raises(BudgetExceededError) as excinfo:
+            enforcement.check_enforcement(metadata)
+
+        assert excinfo.value.current_value == 900.0
+
+    def test_numeric_subscriber_id_from_the_decorator_is_blocked(self, load_rules):
+        load_rules([grouped_rule([group_entry("12345", 900.0, True)], breached=True)])
+
+        @revenium_metadata(subscriber={"id": 12345, "email": "n@example.test"})
+        def call_the_model():
+            enforcement.check_unmetered_call(None)
+
+        with pytest.raises(BudgetExceededError):
+            call_the_model()
+
+    def test_text_subscriber_id_is_still_blocked(self, load_rules):
+        load_rules([grouped_rule([group_entry("12345", 900.0, True)], breached=True)])
+
+        with pytest.raises(BudgetExceededError):
+            enforcement.check_enforcement({"subscriber": {"id": "12345"}})
+
+    @pytest.mark.parametrize("shape", ["nested", "flat"])
+    @pytest.mark.parametrize("bad_id", [True, False, 0, 12345.0, ""],
+                             ids=["true", "false", "zero", "float", "empty"])
+    def test_bool_zero_float_or_empty_subscriber_id_is_not_matched(self, load_rules, bad_id, shape):
+        load_rules([grouped_rule(
+            [group_entry(value, 900.0, True) for value in ("True", "1", "0", "12345")],
+            breached=True,
+        )])
+        metadata = {"subscriber": {"id": bad_id}} if shape == "nested" else {"subscriber_id": bad_id}
+
+        assert enforcement.check_enforcement(metadata) is None
+
+    def test_subscriber_extractor_keeps_a_numeric_id_unchanged(self):
+        """The metering record sends the id as given; only the cap lookup reads it as text."""
+        assert extract_subscriber_from_metadata({"subscriber": {"id": 12345}}) == {"id": 12345}
+        assert extract_subscriber_from_metadata({"subscriber_id": 12345}) == {"id": 12345}
+
+    def test_numeric_id_with_email_falls_back_to_the_email_entry(self, load_rules):
+        load_rules([grouped_rule([group_entry("n@example.test", 900.0, True)], breached=True)])
+
+        with pytest.raises(BudgetExceededError):
+            enforcement.check_enforcement({"subscriber": {"id": 12345, "email": "n@example.test"}})
+
+    def test_numeric_id_entry_wins_over_the_email_entry(self, load_rules):
+        load_rules([grouped_rule(
+            [group_entry("12345", 5.0, False), group_entry("n@example.test", 900.0, True)],
+            breached=True,
+        )])
+
+        assert enforcement.check_enforcement(
+            {"subscriber": {"id": 12345, "email": "n@example.test"}}) is None
+
+    @pytest.mark.parametrize("flat_id", [12345, "12345"], ids=["numeric", "text"])
+    def test_flat_id_is_not_tried_when_the_nested_id_has_no_entry(self, load_rules, flat_id):
+        """Metering sends the nested id alone, so another person's cap must not refuse this call."""
+        load_rules([grouped_rule([group_entry("12345", 900.0, True)], breached=True)])
+
+        metadata = {"subscriber": {"id": "current-user"}, "subscriber_id": flat_id}
+
+        assert enforcement.check_enforcement(metadata) is None
 
 
 class TestUnresolvableGroupFailsOpen:
@@ -342,6 +510,148 @@ class TestPooledRulesUnchanged:
             enforcement.check_enforcement(None)
 
 
+class TestNonBlockingActions:
+    """Only a ``BLOCK`` action refuses a call; a warn-only rule is a notice.
+
+    The server blocks only when ``!shadowMode && action == "BLOCK"``
+    (``WARN_ONLY`` and the legacy ``THROTTLE`` never block), and so do the
+    Node and Go SDKs. An absent ``action`` still counts as ``BLOCK``, as on
+    the department path.
+    """
+
+    @staticmethod
+    def warn_only_grouped_rule(action="WARN_ONLY"):
+        rule = two_group_rule(breached=True)
+        rule["action"] = action
+        return rule
+
+    @pytest.mark.parametrize("action", ["WARN_ONLY", "THROTTLE", "warn_only"])
+    @pytest.mark.parametrize("shape", ["pooled", "grouped"])
+    def test_breached_warn_only_rule_does_not_block(self, load_rules, action, shape):
+        if shape == "pooled":
+            load_rules([pooled_rule(action=action)])
+        else:
+            load_rules([self.warn_only_grouped_rule(action)])
+
+        assert enforcement.check_enforcement(subscriber_metadata(subscriber_id="sub-a")) is None
+
+    def test_breached_block_rule_still_raises(self, load_rules):
+        load_rules([pooled_rule(action="BLOCK")])
+
+        with pytest.raises(BudgetExceededError) as excinfo:
+            enforcement.check_enforcement(subscriber_metadata(subscriber_id="sub-a"))
+
+        assert excinfo.value.rule_name == POOLED_NAME
+        assert excinfo.value.current_value == 640.0
+        assert excinfo.value.rule_id == 99
+
+    @pytest.mark.parametrize("shape", ["pooled", "grouped"])
+    def test_warn_only_rule_does_not_shadow_a_later_block_rule(self, load_rules, shape):
+        if shape == "pooled":
+            warn_only = pooled_rule(ruleId=1, action="WARN_ONLY")
+        else:
+            warn_only = self.warn_only_grouped_rule()
+        load_rules([warn_only, pooled_rule(ruleId=2, name="hard", action="BLOCK")])
+
+        with pytest.raises(BudgetExceededError) as excinfo:
+            enforcement.check_enforcement(subscriber_metadata(subscriber_id="sub-a"))
+
+        assert excinfo.value.rule_name == "hard"
+
+    def test_warn_only_breach_is_logged_once_per_breach(self, load_rules, caplog):
+        def warnings_naming_the_rule():
+            return [r for r in caplog.records
+                    if r.levelno == logging.WARNING and "is over its threshold" in r.getMessage()]
+
+        window_end = "2999-01-31T23:59:59.999999999Z"
+        load_rules([pooled_rule(action="WARN_ONLY", windowEnd=window_end)])
+        with caplog.at_level(logging.WARNING, logger="revenium_middleware.extension"):
+            enforcement.check_enforcement(None)
+            enforcement.check_enforcement(None)
+            enforcement._begin_cache_generation()
+            load_rules([pooled_rule(action="WARN_ONLY", windowEnd=window_end)])
+            enforcement.check_enforcement(None)
+
+            assert len(warnings_naming_the_rule()) == 1
+
+            load_rules([pooled_rule(action="WARN_ONLY", windowEnd="2999-02-28T23:59:59.999999999Z")])
+            enforcement.check_enforcement(None)
+
+        assert len(warnings_naming_the_rule()) == 2
+
+    def test_a_refresh_drops_the_warning_record_of_a_rule_no_longer_served(self, load_rules):
+        load_rules([pooled_rule(ruleId=1, action="WARN_ONLY", windowEnd=OPEN_WINDOW)])
+        enforcement.check_enforcement(None)
+        assert "1" in enforcement._warned_non_blocking_rules
+
+        load_rules([pooled_rule(ruleId=2, action="BLOCK", breached=False)])
+        enforcement._begin_cache_generation()
+
+        assert enforcement._warned_non_blocking_rules == {}
+
+    def test_a_refresh_still_serving_the_rule_keeps_it_quiet_for_the_window(self, load_rules, caplog):
+        def warn_only():
+            return pooled_rule(ruleId=1, action="WARN_ONLY", windowEnd=OPEN_WINDOW)
+
+        with caplog.at_level(logging.WARNING, logger="revenium_middleware.extension"):
+            load_rules([warn_only()])
+            enforcement.check_enforcement(None)
+            load_rules([warn_only()])
+            enforcement._begin_cache_generation()
+            enforcement.check_enforcement(None)
+
+        assert enforcement._warned_non_blocking_rules == {"1": OPEN_WINDOW}
+        assert len([r for r in caplog.records if "is over its threshold" in r.getMessage()]) == 1
+
+
+class TestWindowHasEnded:
+    @pytest.mark.parametrize("window_end, ended", [
+        ("2000-01-31T23:59:59.999999999Z", True),
+        ("2000-01-31T23:59:59.9Z", True),
+        ("2000-01-31T23:59:59Z", True),
+        ("2000-01-31T23:59:59-05:00", True),
+        ("2000-01-31T23:59:59", True),
+        ("2000-01-31T23:59:59.999999999Z[UTC]", True),
+        (OPEN_WINDOW, False),
+        (949363199, False),
+        ({"epochSecond": 949363199}, False),
+        ("", False),
+        ("garbage", False),
+        (None, False),
+    ], ids=[
+        "nine-digits-z", "one-digit", "no-fraction", "offset", "naive", "zone-suffix",
+        "far-future", "int", "dict", "empty", "garbage", "none",
+    ])
+    def test_window_has_ended_parses_server_shapes(self, window_end, ended):
+        assert enforcement._window_has_ended({"windowEnd": window_end}) is ended
+
+
+class TestEndedWindowStopsBlocking:
+    """A breach belongs to its window; once ``windowEnd`` passes it is over,
+    even while the rules service cannot be reached to say so."""
+
+    @pytest.mark.parametrize("shape", ["pooled", "grouped"])
+    def test_breached_rule_whose_window_ended_does_not_block(self, load_rules, shape):
+        if shape == "pooled":
+            rule = pooled_rule(windowEnd=ENDED_WINDOW)
+        else:
+            rule = two_group_rule(breached=True)
+            rule["windowEnd"] = ENDED_WINDOW
+        load_rules([rule])
+
+        assert enforcement.check_enforcement(subscriber_metadata(subscriber_id="sub-a")) is None
+
+    @pytest.mark.parametrize("window_end", [OPEN_WINDOW, "garbage", None, "absent"])
+    def test_open_window_or_unparseable_window_still_blocks(self, load_rules, window_end):
+        rule = pooled_rule()
+        if window_end != "absent":
+            rule["windowEnd"] = window_end
+        load_rules([rule])
+
+        with pytest.raises(BudgetExceededError):
+            enforcement.check_enforcement(None)
+
+
 class TestLegacyCredentialFilter:
     """The ``credential`` filter is a legacy-payload shim, not group matching."""
 
@@ -398,6 +708,90 @@ class TestDiskSnapshotRoundTrip:
 
         assert "groupBreakdown" not in enforcement._cached_rules[0]
         assert enforcement._cache_initialized is True
+
+
+    def test_reloaded_snapshot_from_an_ended_window_does_not_block(self, cold_cache):
+        """A restart during a rules outage must not revive yesterday's breach."""
+        monkeypatch = cold_cache
+        monkeypatch.setenv("REVENIUM_CIRCUIT_BREAKER_ENABLED", "true")
+        monkeypatch.delenv("REVENIUM_BYPASS", raising=False)
+        monkeypatch.delenv("REVENIUM_CB_FAIL_MODE", raising=False)
+        monkeypatch.setattr(enforcement, "_ensure_poller_running", lambda: None)
+        enforcement._persist_cache_to_disk([
+            pooled_rule(ruleId=1, name="ended", windowEnd=ENDED_WINDOW),
+            pooled_rule(ruleId=2, name="open", windowEnd=OPEN_WINDOW),
+        ])
+        assert os.path.exists(enforcement._cache_file_path())
+
+        enforcement._load_cache_from_disk()
+        assert len(enforcement._cached_rules) == 2
+        assert enforcement._cache_initialized is True
+
+        with pytest.raises(BudgetExceededError) as excinfo:
+            enforcement.check_enforcement(None)
+        assert excinfo.value.rule_name == "open"
+
+
+class TestSnapshotIsPerTeam:
+    """Two teams' services on one host may share one ``REVENIUM_CACHE_DIR``.
+
+    A restarted process must load only the snapshot saved for its own team:
+    another team's rules would judge its calls, and another team's department
+    map is keyed by that team's people's email addresses.
+    """
+
+    @staticmethod
+    def forget_the_cache(monkeypatch):
+        monkeypatch.setattr(enforcement, "_disk_load_attempted", False)
+        monkeypatch.setattr(enforcement, "_cached_rules", [])
+        monkeypatch.setattr(enforcement, "_cached_org_unit_blocks", {})
+        monkeypatch.setattr(enforcement, "_cached_org_unit_block_balances", {})
+        monkeypatch.setattr(enforcement, "_cached_org_unit_warnings", {})
+        monkeypatch.setattr(enforcement, "_cache_initialized", False)
+
+    @staticmethod
+    def enforce_without_a_poller(monkeypatch):
+        monkeypatch.setenv("REVENIUM_CIRCUIT_BREAKER_ENABLED", "true")
+        monkeypatch.delenv("REVENIUM_BYPASS", raising=False)
+        monkeypatch.delenv("REVENIUM_CB_FAIL_MODE", raising=False)
+        monkeypatch.setattr(enforcement, "_ensure_poller_running", lambda: None)
+
+    def test_second_team_never_loads_the_first_teams_snapshot(self, cold_cache):
+        monkeypatch = cold_cache
+        self.enforce_without_a_poller(monkeypatch)
+        monkeypatch.setenv("REVENIUM_TEAM_ID", "team-a")
+        enforcement._persist_cache_to_disk(
+            [pooled_rule(name="Team A daily cap"), org_unit_rule()],
+            {DEPT_EMAIL: ORG_UNIT_RULE_ID},
+        )
+        assert os.path.exists(enforcement._cache_file_path())
+
+        self.forget_the_cache(monkeypatch)
+        monkeypatch.setenv("REVENIUM_TEAM_ID", "team-b")
+        enforcement._load_cache_from_disk()
+
+        assert enforcement._cached_rules == []
+        assert enforcement._cached_org_unit_blocks == {}
+        assert enforcement._cached_org_unit_block_balances == {}
+        assert enforcement._cached_org_unit_warnings == {}
+        assert enforcement._cache_initialized is False
+        assert enforcement.check_enforcement(None) is None
+
+    def test_same_team_still_reloads_its_snapshot(self, cold_cache):
+        monkeypatch = cold_cache
+        self.enforce_without_a_poller(monkeypatch)
+        monkeypatch.setenv("REVENIUM_TEAM_ID", "team-a")
+        enforcement._persist_cache_to_disk([pooled_rule(name="Team A daily cap")])
+        assert os.path.exists(enforcement._cache_file_path())
+
+        self.forget_the_cache(monkeypatch)
+        enforcement._load_cache_from_disk()
+
+        assert enforcement._cached_rules == [pooled_rule(name="Team A daily cap")]
+        assert enforcement._cache_initialized is True
+        with pytest.raises(BudgetExceededError) as excinfo:
+            enforcement.check_enforcement(None)
+        assert excinfo.value.rule_name == "Team A daily cap"
 
 
 class TestDepartmentBudgetBlocks:
@@ -501,12 +895,40 @@ class TestDepartmentBudgetBlocks:
         with pytest.raises(BudgetExceededError):
             enforcement.check_enforcement(subscriber_metadata(email=DEPT_EMAIL))
 
+    def test_department_block_for_an_ended_window_does_not_block(self, load_rules):
+        load_rules([org_unit_rule(windowEnd=ENDED_WINDOW)], {DEPT_EMAIL: ORG_UNIT_RULE_ID})
+
+        assert enforcement.check_enforcement(subscriber_metadata(email=DEPT_EMAIL)) is None
+
     def test_department_block_is_independent_of_the_rule_breached_flag(self, load_rules):
         """The map, not the rule's own flag, is the verdict."""
         load_rules([org_unit_rule(breached=False)], {DEPT_EMAIL: ORG_UNIT_RULE_ID})
 
         with pytest.raises(BudgetExceededError):
             enforcement.check_enforcement(subscriber_metadata(email=DEPT_EMAIL))
+
+    def test_a_department_block_carries_the_rules_deny_message(self, load_rules):
+        """BACK-4407: the message the customer wrote for the department's rule reaches the caller."""
+        deny = "Ask your manager before retrying. {spent} of {limit}"
+        load_rules([org_unit_rule(denyMessage=deny)], {DEPT_EMAIL: ORG_UNIT_RULE_ID})
+
+        with pytest.raises(BudgetExceededError) as excinfo:
+            enforcement.check_enforcement(subscriber_metadata(email=DEPT_EMAIL))
+
+        assert str(excinfo.value) == f"Request blocked by Revenium enforcement rule: {DEPARTMENT_NAME}. {deny}"
+        assert excinfo.value.deny_message == deny
+
+    @pytest.mark.parametrize("deny_message", [None, "", "   ", 42, ["x"], {"a": 1}],
+                             ids=["none", "empty", "blank", "number", "list", "dict"])
+    def test_a_department_block_with_an_unusable_deny_message_still_blocks_with_todays_text(
+            self, load_rules, deny_message):
+        load_rules([org_unit_rule(denyMessage=deny_message)], {DEPT_EMAIL: ORG_UNIT_RULE_ID})
+
+        with pytest.raises(BudgetExceededError) as excinfo:
+            enforcement.check_enforcement(subscriber_metadata(email=DEPT_EMAIL))
+
+        assert str(excinfo.value) == f"Request blocked by Revenium enforcement rule: {DEPARTMENT_NAME}"
+        assert getattr(excinfo.value, "deny_message", "unset") is None
 
 
 class TestNestedEmailIsAuthoritative:
@@ -691,12 +1113,12 @@ class TestDepartmentMapDiskSnapshot:
         rules = [org_unit_rule()]
         enforcement._persist_cache_to_disk(rules, {DEPT_EMAIL: ORG_UNIT_RULE_ID})
 
-        with open(tmp_path / "revenium_enforcement_rules.json", encoding="utf-8") as handle:
+        with open(enforcement._cache_file_path(), encoding="utf-8") as handle:
             on_disk = json.load(handle)
         assert on_disk == rules  # a bare list, not a dict wrapper
 
         with open(
-            tmp_path / "revenium_enforcement_org_unit_blocks.json", encoding="utf-8"
+            enforcement._org_unit_blocks_cache_file_path(), encoding="utf-8"
         ) as handle:
             envelope = json.load(handle)
         # The map rides in an envelope that names the rules snapshot it was cut
@@ -717,7 +1139,7 @@ class TestDepartmentMapDiskSnapshot:
         # Simulate the torn pair: the rules file is replaced (as an interrupted
         # later persist would) while the map file stays.
         older_rules = [pooled_rule()]
-        with open(tmp_path / "revenium_enforcement_rules.json", "w", encoding="utf-8") as handle:
+        with open(enforcement._cache_file_path(), "w", encoding="utf-8") as handle:
             json.dump(older_rules, handle)
 
         enforcement._load_cache_from_disk()
@@ -733,7 +1155,7 @@ class TestDepartmentMapDiskSnapshot:
 
         enforcement._persist_cache_to_disk([org_unit_rule()], {DEPT_EMAIL: ORG_UNIT_RULE_ID})
         with open(
-            tmp_path / "revenium_enforcement_org_unit_blocks.json", "w", encoding="utf-8"
+            enforcement._org_unit_blocks_cache_file_path(), "w", encoding="utf-8"
         ) as handle:
             json.dump({DEPT_EMAIL: ORG_UNIT_RULE_ID}, handle)
 
@@ -748,12 +1170,12 @@ class TestDepartmentMapDiskSnapshot:
         # world-readable via the process umask.
         enforcement._persist_cache_to_disk([pooled_rule()], {DEPT_EMAIL: ORG_UNIT_RULE_ID})
 
-        mode = os.stat(tmp_path / "revenium_enforcement_org_unit_blocks.json").st_mode & 0o777
+        mode = os.stat(enforcement._org_unit_blocks_cache_file_path()).st_mode & 0o777
         assert mode == 0o600
 
     def test_missing_map_file_loads_rules_with_no_department_blocks(self, cold_cache, tmp_path):
         enforcement._persist_cache_to_disk([pooled_rule()], {DEPT_EMAIL: ORG_UNIT_RULE_ID})
-        (tmp_path / "revenium_enforcement_org_unit_blocks.json").unlink()
+        os.unlink(enforcement._org_unit_blocks_cache_file_path())
 
         enforcement._load_cache_from_disk()
 
@@ -762,8 +1184,8 @@ class TestDepartmentMapDiskSnapshot:
 
     def test_legacy_bare_list_snapshot_loads_with_an_empty_map(self, cold_cache, tmp_path):
         """A snapshot written before the map existed must still load."""
-        path = tmp_path / enforcement._RULES_CACHE_FILENAME
-        path.write_text(json.dumps([pooled_rule()]), encoding="utf-8")
+        with open(enforcement._cache_file_path(), "w", encoding="utf-8") as handle:
+            json.dump([pooled_rule()], handle)
 
         enforcement._load_cache_from_disk()
 
