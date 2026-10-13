@@ -143,7 +143,7 @@ def detect_provider(client: Optional[Any] = None, base_url: Optional[str] = None
     """
     logger.debug("Detecting AI provider...")
 
-    if os.getenv("REVENIUM_BEDROCK_DISABLE") == "1":
+    if os.getenv("REVENIUM_BEDROCK_DISABLE", "").strip() == "1":
         logger.debug("Bedrock detection disabled via REVENIUM_BEDROCK_DISABLE")
     else:
         # 1. Check if client is boto3 bedrock-runtime client (most reliable)

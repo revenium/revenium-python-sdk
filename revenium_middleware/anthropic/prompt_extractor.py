@@ -7,11 +7,13 @@ requests and responses for optional storage in Revenium analytics.
 
 import json
 import logging
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 
 from .config import Config
-from revenium_middleware._core.prompt_extraction import (  # noqa: F401 — re-exported
+from revenium_middleware._core.config import is_capture_prompts_enabled
+from revenium_middleware._core.prompt_extraction import (  # noqa: F401  re-exported
     extract_streaming_response_content,
+    serialize_messages_within_limit,
 )
 
 logger = logging.getLogger("revenium_middleware.extension")
@@ -53,62 +55,12 @@ def extract_prompts_from_request(kwargs: Dict[str, Any]) -> Dict[str, Any]:
             prompts_truncated = True
             logger.debug(f"System prompt truncated to {Config.MAX_PROMPT_LENGTH} characters")
     
-    # Convert messages to JSON string
     input_messages = None
     if messages:
-        try:
-            # First, truncate individual message contents to avoid invalid JSON
-            marker = "...[TRUNCATED]"
-            marker_len = len(marker)
-            truncated_messages = []
-            
-            for msg in messages:
-                if not isinstance(msg, dict):
-                    continue
-                    
-                truncated_msg = msg.copy()
-                content = msg.get('content', '')
-                
-                # Handle content as string
-                if isinstance(content, str) and len(content) > Config.MAX_PROMPT_LENGTH // 2:
-                    truncate_at = (Config.MAX_PROMPT_LENGTH // 2) - marker_len
-                    truncated_msg['content'] = content[:truncate_at] + marker
-                    prompts_truncated = True
-                # Handle content as array (multimodal - text, images, etc.)
-                elif isinstance(content, list):
-                    truncated_content = []
-                    for block in content:
-                        if isinstance(block, dict):
-                            truncated_block = block.copy()
-                            # Truncate text blocks
-                            if block.get('type') == 'text':
-                                text = block.get('text', '')
-                                if len(text) > Config.MAX_PROMPT_LENGTH // 2:
-                                    truncate_at = (Config.MAX_PROMPT_LENGTH // 2) - marker_len
-                                    truncated_block['text'] = text[:truncate_at] + marker
-                                    prompts_truncated = True
-                            truncated_content.append(truncated_block)
-                        else:
-                            truncated_content.append(block)
-                    truncated_msg['content'] = truncated_content
-                
-                truncated_messages.append(truncated_msg)
+        dict_messages = [msg for msg in messages if isinstance(msg, dict)]
+        input_messages, input_truncated = serialize_messages_within_limit(dict_messages, Config.MAX_PROMPT_LENGTH)
+        prompts_truncated = prompts_truncated or input_truncated
 
-            input_messages = json.dumps(truncated_messages, ensure_ascii=False)
-
-            # Apply final truncation if still too long
-            if len(input_messages) > Config.MAX_PROMPT_LENGTH:
-                truncate_at = Config.MAX_PROMPT_LENGTH - marker_len
-                input_messages = input_messages[:truncate_at] + marker
-                prompts_truncated = True
-                logger.debug(
-                    f"Input messages truncated to "
-                    f"{Config.MAX_PROMPT_LENGTH} characters"
-                )
-        except (TypeError, ValueError) as e:
-            logger.warning(f"Failed to serialize input messages to JSON: {e}")
-            input_messages = None
-    
     return {
         'systemPrompt': system_prompt,
         'inputMessages': input_messages,
@@ -173,6 +125,78 @@ def extract_response_content(response: Any, prompts_truncated: bool = False) -> 
     }
 
 
+def extract_prompt_data_if_enabled(
+    request_body: Optional[Dict[str, Any]],
+    response: Any = None,
+    accumulated_content: str = None
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[bool]]:
+    """
+    Extract prompt data if capture is enabled.
 
-# extract_streaming_response_content is imported from _core.prompt_extraction
+    Args:
+        request_body: Request body containing messages and system prompt
+        response: API response object (for non-streaming)
+        accumulated_content: Accumulated streaming content (for streaming)
+
+    Returns:
+        Tuple of (system_prompt, input_messages, output_response, prompts_truncated)
+    """
+    if not is_capture_prompts_enabled() or not request_body:
+        return None, None, None, None
+
+    # Extract prompts from request
+    prompt_data = extract_prompts_from_request(request_body)
+    system_prompt = prompt_data.get('systemPrompt')
+    input_messages = prompt_data.get('inputMessages')
+    prompts_truncated = prompt_data.get('promptsTruncated', False)
+
+    # Extract response content
+    if accumulated_content is not None:
+        # Streaming response
+        response_data = extract_streaming_response_content(
+            accumulated_content, prompts_truncated
+        )
+    elif response is not None:
+        # Non-streaming response
+        response_data = extract_response_content(response, prompts_truncated)
+    else:
+        response_data = {'outputResponse': None, 'promptsTruncated': prompts_truncated}
+
+    output_response = response_data.get('outputResponse')
+    prompts_truncated = response_data.get('promptsTruncated', prompts_truncated)
+
+    logger.debug(
+        f"Prompt capture - system_prompt: {bool(system_prompt)}, "
+        f"input_messages: {bool(input_messages)}, "
+        f"output_response: {bool(output_response)}, "
+        f"truncated: {prompts_truncated}"
+    )
+
+    return system_prompt, input_messages, output_response, prompts_truncated
+
+
+def captured_prompt_fields(
+    request_body: Optional[Dict[str, Any]],
+    response: Any = None,
+    accumulated_content: Optional[str] = None
+) -> Dict[str, Any]:
+    """The prompt capture fields for a usage record, empty when capture is off.
+
+    Fields with no value are left out, so a record built with capture off is
+    exactly the record built before capture existed.
+    """
+    try:
+        system_prompt, input_messages, output_response, prompts_truncated = extract_prompt_data_if_enabled(
+            request_body, response=response, accumulated_content=accumulated_content
+        )
+    except Exception as exc:  # noqa: BLE001 - capture must never cost the usage record
+        logger.warning("Prompt capture skipped: %s", type(exc).__name__)
+        return {}
+    fields = {
+        "system_prompt": system_prompt,
+        "input_messages": input_messages,
+        "output_response": output_response,
+        "prompts_truncated": prompts_truncated,
+    }
+    return {name: value for name, value in fields.items() if value is not None}
 

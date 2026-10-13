@@ -1,10 +1,12 @@
 """Bounded metering delivery: fixed worker pool, bounded queue, overflow to the buffer (BACK-3904)."""
 import asyncio
+import collections
 import contextvars
 import datetime
 import gc
 import inspect
 import logging
+import os
 import subprocess
 import sys
 import textwrap
@@ -904,15 +906,14 @@ class TestDeferredDelivery:
         assert buffer._events[0].payload["args"]["model"] == "gpt-4o-mini"
 
     def test_tool_event_buffers_instead_of_posting(self, buffer, monkeypatch):
-        import httpx
-
+        from revenium_middleware._core import tool_event_transport
         from revenium_middleware._metering.context import ReveniumContext
         from revenium_middleware._metering.decorator import _send_tool_event_async
 
         def no_network(*args, **kwargs):
             raise AssertionError("deferred delivery must not open a connection")
 
-        monkeypatch.setattr(httpx, "AsyncClient", no_network)
+        monkeypatch.setattr(tool_event_transport, "post_tool_event", no_network)
 
         async def send():
             with delivery_deferred_to_buffer(enqueued_at=time.time()):
@@ -921,6 +922,7 @@ class TestDeferredDelivery:
                     duration_ms=5, success=True, error_message=None, usage_metadata=None,
                     context=ReveniumContext(),
                     occurred_at=datetime.datetime.now(datetime.timezone.utc),
+                    event_sequence="test:1",
                 )
 
         asyncio.run(send())
@@ -1114,3 +1116,263 @@ class TestShutdownDrain:
 
         assert metering_pool.drain(0.01) == 0
         assert metering_pool.wait_until_idle(0.01) is True
+
+
+FORKED_CHILD = textwrap.dedent("""
+    import logging, os, signal, sys, time
+
+    from revenium_middleware._core import metering, metering_pool
+    from revenium_middleware._core.metering_submission import submit_ai_event
+
+    ARGS = {args}
+    CHILD_BUDGET, CHILD_RECORDS = sys.argv[1], int(sys.argv[2])
+
+    async def integration_style_call(txn):
+        if metering.shutdown_event.is_set():
+            return
+        submit_ai_event("completion", dict(ARGS, transaction_id=txn))
+
+    class PrintWarnings(logging.Handler):
+        def emit(self, record):
+            if "shutdown budget" in record.getMessage():
+                print("child-warning " + record.getMessage(), flush=True)
+
+    for n in range(3):
+        metering.run_async_in_thread(integration_style_call("txn-p-%d" % n))
+    pool = metering_pool.get_pool(metering.shutdown_event.is_set)
+    deadline = time.monotonic() + 10
+    while pool._queue.qsize() != 2 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert pool._queue.qsize() == 2, "the parent's first record never went in flight"
+
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.environ["REVENIUM_SHUTDOWN_TIMEOUT_SECONDS"] = CHILD_BUDGET
+            logging.getLogger("revenium_middleware").addHandler(PrintWarnings())
+            for n in range(CHILD_RECORDS):
+                metering.run_async_in_thread(integration_style_call("txn-c-%d" % n))
+            metering.handle_exit()
+        finally:
+            os._exit(0)
+
+    waited_until = time.monotonic() + 20
+    while os.waitpid(pid, os.WNOHANG) == (0, 0):
+        if time.monotonic() > waited_until:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            sys.exit("the forked child was still running after 20s")
+        time.sleep(0.05)
+""")
+
+
+def _run_forked_child(stub, child_budget, child_records):
+    from .test_shutdown import COMPLETION_ARGS as SHUTDOWN_COMPLETION_ARGS, FORK_SAFE_PROXY_ENV, _child_env
+
+    args = {key: value for key, value in SHUTDOWN_COMPLETION_ARGS.items()
+            if key not in ("transaction_id", "extra_headers")}
+    env = _child_env(REVENIUM_METERING_BASE_URL=stub.base_url, REVENIUM_METERING_WORKERS="1", **FORK_SAFE_PROXY_ENV)
+    return subprocess.run([sys.executable, "-c", FORKED_CHILD.format(args=repr(args)), str(child_budget),
+                           str(child_records)], capture_output=True, text=True, timeout=60, env=env)
+
+
+requires_fork = pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork")
+
+
+@requires_fork
+def test_a_forked_child_sends_only_its_own_records_and_none_of_its_parents():
+    """BACK-4354: a child forked while its parent has one record in flight and two queued inherited the
+    parent's queue, sent those two again under new Idempotency-Keys, and could hang on the parent's sockets."""
+    from .test_shutdown import _MeteringStub
+
+    with _MeteringStub(delay=0.5) as stub:
+        completed = _run_forked_child(stub, child_budget=5, child_records=3)
+
+    assert completed.returncode == 0, completed.stderr[-2000:]
+    expected = [f"txn-p-{n}" for n in range(3)] + [f"txn-c-{n}" for n in range(3)]
+    assert collections.Counter(stub.received) == collections.Counter(expected), completed.stderr[-2000:]
+
+
+@requires_fork
+def test_a_forked_childs_exit_warning_counts_only_its_own_unsent_records():
+    """BACK-4354: the child's exit warning counted the three records its parent still held at the fork."""
+    from .test_shutdown import _MeteringStub
+
+    with _MeteringStub(delay=0.5) as stub:
+        completed = _run_forked_child(stub, child_budget=0.2, child_records=1)
+
+    assert completed.returncode == 0, completed.stderr[-2000:]
+    warnings = [line.split("child-warning ")[1].split(" metering event(s)")[0]
+                for line in completed.stdout.splitlines() if line.startswith("child-warning ")]
+    assert warnings == ["1"], completed.stdout + completed.stderr[-2000:]
+
+
+def _become_a_forked_child(monkeypatch):
+    parent_pid = os.getpid()
+    monkeypatch.setattr(os, "getpid", lambda: parent_pid + 1)
+
+
+def test_the_hostname_codec_is_loaded_before_a_worker_can_be_forked_halfway_through_loading_it():
+    """BACK-4354: a child forked while a worker's first send was importing encodings.idna got the half-built
+    module, so every hostname lookup in the child failed with "unknown encoding: idna"."""
+    probe = ("import sys, revenium_middleware._core.metering_pool; "
+             "print(hasattr(sys.modules.get('encodings.idna'), 'getregentry'))")
+    completed = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=60)
+
+    assert completed.stdout.strip() == "True", completed.stderr[-2000:]
+
+
+def test_importing_the_sdk_starts_no_subprocess():
+    """BACK-4354 merge review: probing the platform string at import started ``uname -p`` (and ``file -b`` on
+    macOS) in every process that imported the SDK, whether or not it ever metered."""
+    probe = textwrap.dedent("""
+        import subprocess
+
+        started = []
+
+        class RecordingPopen(subprocess.Popen):
+            def __init__(self, args, *rest, **kwargs):
+                started.append(args)
+                super().__init__(args, *rest, **kwargs)
+
+        subprocess.Popen = RecordingPopen
+        import revenium_middleware
+        print(started)
+    """)
+    completed = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=60)
+
+    assert completed.stdout.strip() == "[]", completed.stdout + completed.stderr[-2000:]
+
+
+def test_the_platform_is_probed_once_before_the_first_worker_starts(make_pool, monkeypatch):
+    """BACK-4354: platform.platform() imports plistlib on macOS; run on a worker's first send, a fork during
+    that import left the child waiting forever on the import lock."""
+    workers_alive_at_probe = []
+    pool = make_pool(workers=2)
+    monkeypatch.setattr(metering_pool, "_platform_probed", False)
+    monkeypatch.setattr(metering_pool.platform, "platform", lambda: workers_alive_at_probe.append(pool.live_workers()))
+
+    pool.submit(task_of(asyncio.sleep(0)))
+    pool.submit(task_of(asyncio.sleep(0)))
+
+    assert workers_alive_at_probe == [0]
+
+
+def test_after_fork_hooks_give_a_child_an_empty_pool_and_buffer_and_its_own_client(monkeypatch, gate):
+    """BACK-4354: what a forked child gets from the at-fork hooks, without forking the test process."""
+    from revenium_middleware._core import delivery_circuit, metering_status
+
+    for module, names in (
+        (metering, ("client", "_scoped_clients", "_scoped_clients_lock", "_scoped_http_client",
+                    "_client_settings_from_parent", "_client_rebuild_lock", "_exit_lock", "_running_exit_drain",
+                    "_child_exit_deadline", "_child_exit_flush_armed", "_child_exit_flush_lock")),
+        (metering_pool, ("_pool", "_pool_lock")),
+        (metering_buffer, ("_buffer", "_buffer_init_lock")),
+        (metering_status, ("_lock",)),
+    ):
+        for name in names:
+            monkeypatch.setattr(module, name, getattr(module, name))
+    monkeypatch.setattr(metering, "_held_from_parent", {})
+    monkeypatch.setattr(metering_pool, "_pools_left_by_parent", [])
+    monkeypatch.setattr(metering_buffer, "_buffers_left_by_parent", [])
+    monkeypatch.setattr(delivery_circuit._circuit, "_lock", delivery_circuit._circuit._lock)
+    monkeypatch.setattr(sys.modules["revenium_middleware._core"], "client", metering.client)
+
+    parent_pool = MeteringWorkerPool(1, 10, lambda task: None)
+    monkeypatch.setattr(metering_pool, "_pool", parent_pool)
+    parent_pool.submit(task_of(wait_on(gate)))
+    parent_pool.submit(task_of(wait_on(gate)))
+    parent_buffer = MeteringBuffer(flush_interval=3600, replay_fn=lambda event, timeout: None)
+    parent_buffer.push("ai", {"seq": "held by the parent"})
+    monkeypatch.setattr(metering_buffer, "_buffer", parent_buffer)
+    metering.initialize_metering(api_key="hak_test_fork_child", base_url="http://127.0.0.1:9/meter/")
+    parent_client = metering.client
+    held, release_held = threading.Event(), threading.Event()
+
+    def hold_the_parents_locks():
+        with metering_pool._pool_lock, metering_buffer._buffer_init_lock, metering_status._lock, \
+                delivery_circuit._circuit._lock:
+            held.set()
+            release_held.wait(10)
+
+    holder = threading.Thread(target=hold_the_parents_locks, daemon=True)
+    holder.start()
+    assert held.wait(5)
+    child_pool = None
+    try:
+        with metering.metering_key("hak_test_fork_scoped"):
+            parent_scoped = metering.get_client()
+            _become_a_forked_child(monkeypatch)
+            metering_pool._forget_parent_pool()
+            metering_buffer._forget_parent_buffer()
+            metering._forget_parent_clients()
+            delivery_circuit._forget_parent_lock()
+            metering_status._forget_parent_lock()
+            child_scoped = metering.get_client()
+
+        child_pool = metering_pool.get_pool(metering.shutdown_event.is_set)
+        child_client = metering.process_client()
+        ran = threading.Event()
+
+        async def deliver():
+            ran.set()
+
+        submitter = threading.Thread(target=lambda: child_pool.submit(task_of(deliver())), daemon=True)
+        submitter.start()
+        submitter.join(5)
+        assert ran.wait(5), "a submit in the child waited on a lock a parent thread held"
+        assert child_pool is not parent_pool
+        assert metering_buffer.get_buffer() is not parent_buffer
+        assert metering_buffer.get_buffer().undelivered() == 0
+        assert child_client is not parent_client
+        assert (child_client.api_key, str(child_client.base_url)) == (
+            parent_client.api_key, str(parent_client.base_url))
+        assert metering._client_settings_from_parent is None
+        assert child_scoped is not parent_scoped and child_scoped.api_key == "hak_test_fork_scoped"
+        assert child_scoped._client is not parent_scoped._client
+        assert parent_scoped._client.is_closed is False
+        metering_status.record_metering_success()
+        delivery_circuit.get_circuit().record_success()
+    finally:
+        release_held.set()
+        holder.join(5)
+        gate.set()
+        parent_pool.stop(timeout=5)
+        if child_pool is not None:
+            child_pool.stop(timeout=5)
+
+
+def test_a_child_forked_inside_a_block_whose_client_the_cache_evicted_gets_a_client_of_its_own(monkeypatch):
+    """BACK-4354: only clients still in the scoped-client cache were rebuilt in a forked child, so a block
+    whose client the cache had evicted kept sending through its parent's sockets."""
+    for name in ("client", "_scoped_clients", "_scoped_clients_lock", "_scoped_http_client",
+                 "_client_settings_from_parent", "_client_rebuild_lock", "_exit_lock", "_running_exit_drain", "_child_exit_deadline",
+                 "_child_exit_flush_armed", "_child_exit_flush_lock"):
+        monkeypatch.setattr(metering, name, getattr(metering, name))
+    monkeypatch.setattr(metering, "_scoped_clients", collections.OrderedDict())
+    monkeypatch.setattr(metering, "_held_from_parent", {})
+    monkeypatch.setattr(metering, "MAX_SCOPED_CLIENTS", 1)
+    base_url = "http://127.0.0.1:9/meter/"
+
+    with metering.metering_key("hak_test_fork_outer", base_url):
+        parent_scoped = metering.get_client()
+        with metering.metering_key("hak_test_fork_inner", base_url):
+            metering.get_client()
+        assert parent_scoped not in metering._scoped_clients.values()
+        _become_a_forked_child(monkeypatch)
+        metering._forget_parent_clients()
+        child_scoped = metering.get_client()
+
+    assert child_scoped is not parent_scoped
+    assert (child_scoped.api_key, str(child_scoped.base_url)) == ("hak_test_fork_outer", base_url)
+
+
+def test_initialize_metering_ends_the_fallback_to_the_parents_client_settings(monkeypatch):
+    """BACK-4354: a child that turns metering off must not get its parent's key back on its next record."""
+    monkeypatch.setattr(metering, "client", None)
+    monkeypatch.setattr(metering, "_client_settings_from_parent",
+                        ("hak_test_fork_child", "http://127.0.0.1:9/meter/"), raising=False)
+    monkeypatch.delenv("REVENIUM_METERING_API_KEY", raising=False)
+
+    assert metering.initialize_metering() is False
+    assert metering.process_client() is None

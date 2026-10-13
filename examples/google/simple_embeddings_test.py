@@ -185,10 +185,10 @@ def simple_embeddings_test():
         else:
             print("  No embeddings found in response")
 
-        # Show token usage - Google AI SDK limitation for embeddings
-        print("  Token usage: Not available (Google AI SDK limitation)")
+        print("  Token usage: Not available with a Gemini API key")
+        print("   Note: The Gemini Developer API returns no token counts for embeddings.")
         print(
-            "   Note: Vertex AI REST API has token counts, but Google AI SDK doesn't expose them"
+            "   On Vertex AI, genai.Client(vertexai=True) records the token counts Google returns."
         )
 
         print("\n Embeddings test completed successfully!")

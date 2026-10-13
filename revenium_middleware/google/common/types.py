@@ -170,6 +170,7 @@ class TokenCounts:
     output_tokens: int
     total_tokens: int
     cached_tokens: int = 0
+    reasoning_tokens: int = 0
 
     @property
     def has_counts(self) -> bool:
@@ -193,6 +194,11 @@ VERTEX_AI_STOP_REASONS = {
     "MAX_TOKENS": "TOKEN_LIMIT",
     "SAFETY": "ERROR",
     "RECITATION": "ERROR",
+    "BLOCKLIST": "ERROR",
+    "PROHIBITED_CONTENT": "ERROR",
+    "SPII": "ERROR",
+    "MALFORMED_FUNCTION_CALL": "ERROR",
+    "MODEL_ARMOR": "ERROR",
     "FINISH_REASON_UNSPECIFIED": "END",  # Default to END for unknown reasons
     None: "END",
 }

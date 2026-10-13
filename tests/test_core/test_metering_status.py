@@ -12,7 +12,7 @@ import time
 
 import httpx
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 from revenium_middleware._core.metering import _build_metering_client, run_async_in_thread
 from revenium_middleware._core.metering_status import (
@@ -46,7 +46,7 @@ def _api_status_error(status_code: int) -> APIStatusError:
 def mock_client():
     mock = MagicMock()
     mock.ai.create_completion = MagicMock(return_value="completion-result")
-    with patch("revenium_middleware._core.metering_submission.get_client", lambda: mock):
+    with patch("revenium_middleware._core.metering_submission.current_client", lambda: mock):
         yield mock
 
 
@@ -184,21 +184,16 @@ def test_submit_failure_invokes_subscribed_callback(mock_client):
 # ---------------------------------------------------------------------------
 
 def test_tool_event_success_records_success():
+    from revenium_middleware._core import tool_event_transport
     from revenium_middleware._metering.context import ReveniumContext
     from revenium_middleware._metering.decorator import _send_tool_event_async
 
     response = MagicMock()
     response.raise_for_status = MagicMock()
     client = MagicMock()
-    client.post = AsyncMock(return_value=response)
-    async_client = MagicMock()
-    async_client.__aenter__ = AsyncMock(return_value=client)
-    async_client.__aexit__ = AsyncMock(return_value=False)
+    client.post = MagicMock(return_value=response)
 
-    with patch(
-        "revenium_middleware._metering.decorator.httpx.AsyncClient",
-        return_value=async_client,
-    ):
+    with patch.object(tool_event_transport, "_client", client):
         asyncio.run(
             _send_tool_event_async(
                 url="https://api.revenium.ai/meter/v2/tool/events",
@@ -211,6 +206,7 @@ def test_tool_event_success_records_success():
                 usage_metadata=None,
                 context=ReveniumContext(),
                 occurred_at=datetime.datetime.now(datetime.timezone.utc),
+                event_sequence="test:1",
             )
         )
 

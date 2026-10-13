@@ -25,7 +25,11 @@ from test_core.enforcement_stub_server import (
 
 from .test_openai_sdk_entry_points import CHAT_REQUEST, RESPONSES_REQUEST, FakeOpenAI
 
-MAX_LOOP_LAG_SECONDS = 0.1
+# The defect holds the loop for a whole rules round trip (0.3s in the stub) or
+# the full refresh timeout. Healthy runs lag a few ms, except the first
+# responses call, which pays ~35ms of one-time SDK import locally and measured
+# 0.102-0.103s on GitHub runners. 0.25s clears that and sits under the defect.
+MAX_LOOP_LAG_SECONDS = 0.25
 
 
 class FakeOpenAIWithEmbeddings(FakeOpenAI):

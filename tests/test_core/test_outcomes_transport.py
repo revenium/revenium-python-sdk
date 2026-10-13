@@ -703,3 +703,193 @@ class TestRetryStatusesPolicy:
                             api_key="rev_sk_T_a", retry_statuses={429},
                             retry_initial_seconds=0.01, retry_max_seconds=0.02)
         assert len(seen) == 1
+
+
+OUTCOME_PATH = "/profitstream/v2/api/jobs/job-1/outcome"
+JOB_PATH = "/profitstream/v2/api/jobs/job-1"
+
+FIRST_REPORT_409_BODY = dict(REAL_409_BODY, details={
+    "guidance": "Use PATCH /v2/api/jobs/job-1/outcome to update",
+    "reportedAt": "2026-10-08T16:03:15.556Z",
+    "updateCount": "0",
+})
+
+FULL_REPORT = {
+    "executionStatus": "SUCCESS",
+    "outcomeType": "CONVERTED",
+    "outcomeValue": 12.5,
+    "outcomeCurrency": "USD",
+    "outcomeReason": "probe reason",
+    "metadata": '{"b": 2, "a": 1}',
+}
+
+
+def _stored_job(**overrides):
+    """The job resource as dev returns it after FULL_REPORT was stored once."""
+    job = {
+        "agenticJobId": "job-1",
+        "entityVersion": 1,
+        "executionStatus": "SUCCESS",
+        "hasOutcome": True,
+        "outcomeCurrency": "USD",
+        "outcomeMetadata": '{"b": 2, "a": 1}',
+        "outcomeReason": "probe reason",
+        "outcomeReportedAt": "2026-10-08T16:03:15.556Z",
+        "outcomeType": "CONVERTED",
+        "outcomeUpdateCount": 0,
+        "outcomeValue": 12.5,
+        "resourceType": "job",
+    }
+    job.update(overrides)
+    return job
+
+
+def _bare_stored_job(**overrides):
+    """The job resource after a report that carried only executionStatus."""
+    return _stored_job(**{
+        "outcomeCurrency": None,
+        "outcomeMetadata": None,
+        "outcomeReason": None,
+        "outcomeType": None,
+        "outcomeValue": None,
+        **overrides,
+    })
+
+
+def _conflict_after(first_status, job_read):
+    """A backend whose first outcome POST answers ``first_status`` and whose next answers 409.
+
+    ``job_read`` is what the job GET does: a response to return or an exception to raise.
+    """
+    seen = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        if req.method == "GET":
+            if isinstance(job_read, Exception):
+                raise job_read
+            return job_read
+        if sum(1 for r in seen if r.method == "POST") == 1:
+            return httpx.Response(first_status, json={})
+        return httpx.Response(409, json=FIRST_REPORT_409_BODY)
+
+    return _client(handler), seen
+
+
+def _report(client, payload):
+    return report_outcome_request(
+        client, BASE, "job-1", payload, team_id="t", api_key="rev_sk_T_a",
+        retry_initial_seconds=0.01, retry_max_seconds=0.02,
+    )
+
+
+def _calls(seen):
+    return [(req.method, req.url.path) for req in seen]
+
+
+class TestOutcomeRetriedAfterGatewayError:
+    @pytest.mark.parametrize("gateway_status", [502, 503, 504])
+    def test_409_after_a_gateway_error_returns_success_with_the_stored_version(self, gateway_status):
+        client, seen = _conflict_after(
+            gateway_status, httpx.Response(200, json=_stored_job(entityVersion=7))
+        )
+
+        response = _report(client, FULL_REPORT)
+
+        assert _calls(seen) == [("POST", OUTCOME_PATH), ("POST", OUTCOME_PATH), ("GET", JOB_PATH)]
+        assert seen[2].url.params.get("teamId") == "t"
+        assert seen[2].headers["x-api-key"] == "rev_sk_T_a"
+        assert parse_entity_version(response) == 7
+
+    def test_confirms_when_the_server_reformats_value_and_metadata(self):
+        stored = _stored_job(outcomeValue="12.50", outcomeMetadata='{"a":1,"b":2}')
+        client, _ = _conflict_after(502, httpx.Response(200, json=stored))
+
+        assert parse_entity_version(_report(client, FULL_REPORT)) == 1
+
+    def test_confirms_a_report_that_carried_only_the_execution_status(self):
+        client, _ = _conflict_after(502, httpx.Response(200, json=_bare_stored_job()))
+
+        assert parse_entity_version(_report(client, {"executionStatus": "SUCCESS"})) == 1
+
+    def test_409_after_a_502_still_raises_when_the_stored_outcome_differs(self):
+        stored = _stored_job(executionStatus="FAILED")
+        client, _ = _conflict_after(502, httpx.Response(200, json=stored))
+
+        with pytest.raises(OutcomeAlreadyReportedError):
+            _report(client, FULL_REPORT)
+
+    def test_confirms_nested_metadata_the_server_reordered(self):
+        sent = {**FULL_REPORT, "metadata": '{"a": {"x": 1, "y": [1, 2.0]}, "b": true}'}
+        stored = _stored_job(outcomeMetadata='{"b":true,"a":{"y":[1,2],"x":1.0}}')
+        client, _ = _conflict_after(502, httpx.Response(200, json=stored))
+
+        assert parse_entity_version(_report(client, sent)) == 1
+
+    @pytest.mark.parametrize(
+        "sent_metadata, stored_metadata",
+        [
+            ('{"approved": true}', '{"approved": 1}'),
+            ('{"approved": false}', '{"approved": 0}'),
+            ('{"flags": [true]}', '{"flags": [1]}'),
+            ('{"n": 1}', '{"n": true}'),
+        ],
+    )
+    def test_409_after_a_502_still_raises_when_stored_metadata_swaps_a_boolean_for_a_number(
+        self, sent_metadata, stored_metadata
+    ):
+        stored = _stored_job(outcomeMetadata=stored_metadata)
+        client, _ = _conflict_after(502, httpx.Response(200, json=stored))
+
+        with pytest.raises(OutcomeAlreadyReportedError):
+            _report(client, {**FULL_REPORT, "metadata": sent_metadata})
+
+    def test_409_after_a_502_still_raises_when_the_outcome_was_amended(self):
+        stored = _stored_job(outcomeUpdateCount=1, entityVersion=2)
+        client, _ = _conflict_after(502, httpx.Response(200, json=stored))
+
+        with pytest.raises(OutcomeAlreadyReportedError):
+            _report(client, FULL_REPORT)
+
+    def test_409_after_a_502_still_raises_when_another_writer_stored_more(self):
+        client, _ = _conflict_after(502, httpx.Response(200, json=_stored_job()))
+
+        with pytest.raises(OutcomeAlreadyReportedError):
+            _report(client, {"executionStatus": "SUCCESS"})
+
+    def test_409_after_a_502_still_raises_when_the_payload_has_a_field_that_cannot_be_checked(self):
+        client, _ = _conflict_after(502, httpx.Response(200, json=_stored_job()))
+
+        with pytest.raises(OutcomeAlreadyReportedError):
+            _report(client, {**FULL_REPORT, "customField": "x"})
+
+    def test_409_on_the_first_attempt_raises_without_reading_back(self):
+        seen = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen.append(req)
+            return httpx.Response(409, json=FIRST_REPORT_409_BODY)
+
+        with pytest.raises(OutcomeAlreadyReportedError):
+            _report(_client(handler), FULL_REPORT)
+        assert _calls(seen) == [("POST", OUTCOME_PATH)]
+
+    @pytest.mark.parametrize("first_status", [404, 429])
+    def test_409_after_a_404_or_429_raises_without_reading_back(self, first_status):
+        client, seen = _conflict_after(first_status, httpx.Response(200, json=_stored_job()))
+
+        with pytest.raises(OutcomeAlreadyReportedError):
+            _report(client, FULL_REPORT)
+        assert _calls(seen) == [("POST", OUTCOME_PATH), ("POST", OUTCOME_PATH)]
+
+    @pytest.mark.parametrize("job_read", [
+        httpx.Response(500, json={"error": "boom"}),
+        httpx.ConnectError("connection refused"),
+        httpx.Response(200, json=[_stored_job()]),
+        httpx.Response(200, json=_stored_job(hasOutcome=False)),
+    ], ids=["http-500", "connect-error", "non-object-body", "no-outcome-stored"])
+    def test_failed_read_back_falls_back_to_already_reported(self, job_read):
+        client, _ = _conflict_after(502, job_read)
+
+        with pytest.raises(OutcomeAlreadyReportedError):
+            _report(client, FULL_REPORT)

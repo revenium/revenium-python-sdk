@@ -1,8 +1,9 @@
 """A local OpenAI-compatible upstream for driving a real LiteLLM proxy offline.
 
 Serves ``/chat/completions`` (plain and streamed, with the usage chunk when
-``stream_options.include_usage`` asks for it) and ``/embeddings`` on a loopback
-port, so a proxy test exercises LiteLLM's own HTTP client and response parsing
+``stream_options.include_usage`` asks for it), ``/responses`` (plain and
+streamed, usage always in the final event, as the Responses API reports it) and
+``/embeddings`` on a loopback port, so a proxy test exercises LiteLLM's own HTTP client and response parsing
 instead of ``mock_response``, which short-circuits the provider call.
 
 Not a test module (no test_ prefix) so pytest imports it rather than collecting it.
@@ -55,6 +56,52 @@ def _completion(completion_id):
     }
 
 
+def _response(response_id, status="completed"):
+    completed = status == "completed"
+    response = {
+        "id": response_id,
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": status,
+        "model": UPSTREAM_MODEL,
+        "output": [
+            {
+                "type": "message",
+                "id": "msg_1",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi", "annotations": []}],
+            }
+        ] if completed else [],
+        "parallel_tool_calls": True,
+        "tool_choice": "auto",
+        "tools": [],
+        "text": {"format": {"type": "text"}},
+    }
+    if completed:
+        response["usage"] = {
+            "input_tokens": USAGE["prompt_tokens"],
+            "output_tokens": USAGE["completion_tokens"],
+            "total_tokens": USAGE["total_tokens"],
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        }
+    return response
+
+
+def _response_stream_events(response_id):
+    events = [
+        ("response.created", {"type": "response.created", "sequence_number": 0,
+                              "response": _response(response_id, status="in_progress")}),
+        ("response.output_text.delta", {"type": "response.output_text.delta", "sequence_number": 1,
+                                        "item_id": "msg_1", "output_index": 0, "content_index": 0,
+                                        "delta": "hi", "logprobs": []}),
+        ("response.completed", {"type": "response.completed", "sequence_number": 2,
+                                "response": _response(response_id)}),
+    ]
+    return "".join("event: {}\ndata: {}\n\n".format(name, json.dumps(data)) for name, data in events).encode()
+
+
 def _embedding():
     return {
         "object": "list",
@@ -76,12 +123,22 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path.endswith("/embeddings"):
             self._send("application/json", json.dumps(_embedding()).encode())
             return
+        if self.path.endswith("/responses"):
+            self._send_response(body)
+            return
         completion_id = "chatcmpl-" + uuid.uuid4().hex
         if body.get("stream"):
             include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
             self._send("text/event-stream", _stream_events(completion_id, include_usage))
             return
         self._send("application/json", json.dumps(_completion(completion_id)).encode())
+
+    def _send_response(self, body):
+        response_id = "resp_" + uuid.uuid4().hex
+        if body.get("stream"):
+            self._send("text/event-stream", _response_stream_events(response_id))
+            return
+        self._send("application/json", json.dumps(_response(response_id)).encode())
 
     def _send(self, content_type, payload):
         self.send_response(200)

@@ -87,19 +87,15 @@ class TestTraceFieldCapture:
         assert get_parent_transaction_id() == "parent-123"
 
     def test_get_transaction_name(self, monkeypatch):
-        """Test transaction name with fallback to task_type."""
-        # Test env var (highest priority)
+        """A per-call transaction name wins over the env var, which wins over task_type."""
         monkeypatch.setenv("REVENIUM_TRANSACTION_NAME", "env-transaction")
         metadata = {"transactionName": "metadata-transaction", "task_type": "task"}
-        assert get_transaction_name(metadata) == "env-transaction"
-
-        # Test metadata transactionName
-        monkeypatch.delenv("REVENIUM_TRANSACTION_NAME")
         assert get_transaction_name(metadata) == "metadata-transaction"
 
-        # Test fallback to task_type
-        metadata_no_name = {"task_type": "classification"}
-        assert get_transaction_name(metadata_no_name) == "classification"
+        assert get_transaction_name({"task_type": "classification"}) == "env-transaction"
+
+        monkeypatch.delenv("REVENIUM_TRANSACTION_NAME")
+        assert get_transaction_name({"task_type": "classification"}) == "classification"
 
     def test_get_retry_number(self, monkeypatch):
         """Test retry number capture and parsing."""
@@ -221,9 +217,10 @@ class TestTraceFieldIntegration:
         # With transaction_name in metadata (snake_case)
         assert get_transaction_name({"transaction_name": "Analyze Sentiment"}) == "Analyze Sentiment"
 
-        # Env var takes precedence
+        # A per-call name wins over the env var; the env var wins over task_type
         monkeypatch.setenv("REVENIUM_TRANSACTION_NAME", "env-transaction")
-        assert get_transaction_name({"transactionName": "metadata-transaction"}) == "env-transaction"
+        assert get_transaction_name({"transactionName": "metadata-transaction"}) == "metadata-transaction"
+        assert get_transaction_name({"task_type": "chat"}) == "env-transaction"
 
     def test_retry_number_parsing(self, monkeypatch):
         """Test retry number parsing from environment."""

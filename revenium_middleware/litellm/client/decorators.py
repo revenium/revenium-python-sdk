@@ -2,7 +2,13 @@
 Decorator-based metadata injection for Revenium LiteLLM middleware.
 
 This module provides convenient decorators for automatically injecting metadata
-into LiteLLM completion calls. Decorators work with both sync and async functions.
+into LiteLLM completion calls. Decorators work with sync and async functions, and with
+generator and async generator functions (streaming). A generator's tags are active
+while its body runs, one step at a time, and not while the caller handles each
+yielded item; an argument error surfaces at the first iteration rather than when
+the generator is created. A function that returns a generator, including a
+generator function behind another decorator such as a retry, runs when called,
+and the generator it returns carries the tags the same way.
 
 Available decorators:
     - track_agent: Set agent metadata
@@ -36,10 +42,35 @@ Example:
     ...     return response
 """
 
-import functools
+import contextlib
 import inspect
+import logging
 from typing import Any, Callable, Dict, Optional
+
+from revenium_middleware._core.context import is_blank_metadata_value
+from revenium_middleware._core.decorators import _wrap_in_call_scope
 from .context import metadata_context
+
+logger = logging.getLogger("revenium_middleware.decorators")
+
+FieldsForCall = Callable[[tuple, dict], Dict[str, Any]]
+
+_NOT_PASSED = object()
+
+
+def _tag_calls(func: Callable, fields_for_call: FieldsForCall) -> Callable:
+    """Set the fields ``fields_for_call`` resolves from each call's arguments while ``func``'s body runs.
+
+    The fields are resolved once per call; each step of a generator body gets a fresh scope.
+    A field that resolves to None is not set, so an outer decorator's value for it stays.
+    """
+    def scope_for_call(args: tuple, kwargs: dict) -> Callable[[], Any]:
+        fields = {key: value for key, value in fields_for_call(args, kwargs).items() if value is not None}
+        if not fields:
+            return contextlib.nullcontext
+        return lambda: metadata_context.set(**fields)
+
+    return _wrap_in_call_scope(func, scope_for_call)
 
 
 def track_agent(
@@ -55,7 +86,8 @@ def track_agent(
     duration of the decorated function. It supports both static agent names
     and dynamic extraction from function arguments or object attributes.
     
-    Works with both sync and async functions.
+    Works with sync and async functions, and with generator and async generator
+    functions, whose tags are active only while the body runs (see the module docstring).
     
     Args:
         agent: Static agent name to use. Mutually exclusive with name_from_arg
@@ -104,32 +136,11 @@ def track_agent(
         raise ValueError("Can only specify one of: agent, name_from_arg, name_from_attr")
     
     def decorator(func: Callable) -> Callable:
-        # Check if function is async
-        is_async = inspect.iscoroutinefunction(func)
-        
-        if is_async:
-            @functools.wraps(func)
-            async def async_wrapper(*args, **kwargs):
-                # Determine agent name
-                agent_name = _get_value(agent, name_from_arg, name_from_attr, args, kwargs, func, "agent")
+        def fields_for_call(args: tuple, kwargs: dict) -> Dict[str, Any]:
+            return {"agent": _get_value(agent, name_from_arg, name_from_attr, args, kwargs, func, "agent")}
 
-                # Set context and call function
-                with metadata_context.set(agent=agent_name):
-                    return await func(*args, **kwargs)
+        return _tag_calls(func, fields_for_call)
 
-            return async_wrapper
-        else:
-            @functools.wraps(func)
-            def sync_wrapper(*args, **kwargs):
-                # Determine agent name
-                agent_name = _get_value(agent, name_from_arg, name_from_attr, args, kwargs, func, "agent")
-
-                # Set context and call function
-                with metadata_context.set(agent=agent_name):
-                    return func(*args, **kwargs)
-
-            return sync_wrapper
-    
     return decorator
 
 
@@ -146,7 +157,8 @@ def track_task(
     duration of the decorated function. It supports both static task types
     and dynamic extraction from function arguments or object attributes.
     
-    Works with both sync and async functions.
+    Works with sync and async functions, and with generator and async generator
+    functions, whose tags are active only while the body runs (see the module docstring).
     
     Args:
         task_type: Static task type to use. Mutually exclusive with type_from_arg
@@ -195,32 +207,11 @@ def track_task(
         raise ValueError("Can only specify one of: task_type, type_from_arg, type_from_attr")
     
     def decorator(func: Callable) -> Callable:
-        # Check if function is async
-        is_async = inspect.iscoroutinefunction(func)
-        
-        if is_async:
-            @functools.wraps(func)
-            async def async_wrapper(*args, **kwargs):
-                # Determine task type
-                task_type_value = _get_value(task_type, type_from_arg, type_from_attr, args, kwargs, func, "task_type")
+        def fields_for_call(args: tuple, kwargs: dict) -> Dict[str, Any]:
+            return {"task_type": _get_value(task_type, type_from_arg, type_from_attr, args, kwargs, func, "task_type")}
 
-                # Set context and call function
-                with metadata_context.set(task_type=task_type_value):
-                    return await func(*args, **kwargs)
+        return _tag_calls(func, fields_for_call)
 
-            return async_wrapper
-        else:
-            @functools.wraps(func)
-            def sync_wrapper(*args, **kwargs):
-                # Determine task type
-                task_type_value = _get_value(task_type, type_from_arg, type_from_attr, args, kwargs, func, "task_type")
-
-                # Set context and call function
-                with metadata_context.set(task_type=task_type_value):
-                    return func(*args, **kwargs)
-
-            return sync_wrapper
-    
     return decorator
 
 
@@ -240,7 +231,8 @@ def track_job(
     decorated function so every completion inside inherits them. Supports static
     values and dynamic extraction from function arguments.
 
-    Works with both sync and async functions.
+    Works with sync and async functions, and with generator and async generator
+    functions, whose tags are active only while the body runs (see the module docstring).
 
     Args:
         job_id: Static job instance ID. Mutually exclusive with job_id_from_arg.
@@ -273,28 +265,16 @@ def track_job(
         raise ValueError("Can only specify one of: type, type_from_arg")
 
     def decorator(func: Callable) -> Callable:
-        is_async = inspect.iscoroutinefunction(func)
-
-        def _raw_arg(arg_name: str, args: tuple, kwargs: dict, field_name: str) -> Any:
-            """Resolve a dynamic argument's raw value, without stringification."""
-            # Check the call-site kwargs first (mirrors _get_value) — signature
-            # binding files keyword args under a **kwargs catch-all parameter's
-            # name, which would hide them from the bound-arguments lookup below.
-            if arg_name in kwargs:
-                return kwargs[arg_name]
-            try:
-                bound = inspect.signature(func).bind(*args, **kwargs)
-                bound.apply_defaults()
-            except TypeError:
-                bound = None
-            if bound is not None and arg_name in bound.arguments:
-                return bound.arguments[arg_name]
-            raise ValueError(f"Argument '{arg_name}' not found in function call for {field_name}")
+        def _passed_arg(arg_name: str, args: tuple, kwargs: dict, field_name: str) -> Any:
+            raw = _raw_arg(func, arg_name, args, kwargs, field_name)
+            if raw is _NOT_PASSED:
+                raise _argument_not_found(arg_name, field_name)
+            return raw
 
         def _job_metadata(args: tuple, kwargs: dict) -> Dict[str, Any]:
             resolved_job_id = job_id
             if job_id_from_arg is not None:
-                raw_job_id = _raw_arg(job_id_from_arg, args, kwargs, "job_id")
+                raw_job_id = _passed_arg(job_id_from_arg, args, kwargs, "job_id")
                 if raw_job_id is None:
                     raise ValueError(
                         f"job_id argument '{job_id_from_arg}' is None — a job id is required"
@@ -305,7 +285,7 @@ def track_job(
                 metadata["agentic_job_name"] = name
             resolved_type = type
             if type_from_arg is not None:
-                raw_type = _raw_arg(type_from_arg, args, kwargs, "job_type")
+                raw_type = _passed_arg(type_from_arg, args, kwargs, "job_type")
                 resolved_type = str(raw_type) if raw_type is not None else None
             if resolved_type is not None:
                 metadata["agentic_job_type"] = resolved_type
@@ -313,20 +293,7 @@ def track_job(
                 metadata["agentic_job_version"] = version
             return metadata
 
-        if is_async:
-            @functools.wraps(func)
-            async def async_wrapper(*args, **kwargs):
-                with metadata_context.set(**_job_metadata(args, kwargs)):
-                    return await func(*args, **kwargs)
-
-            return async_wrapper
-        else:
-            @functools.wraps(func)
-            def sync_wrapper(*args, **kwargs):
-                with metadata_context.set(**_job_metadata(args, kwargs)):
-                    return func(*args, **kwargs)
-
-            return sync_wrapper
+        return _tag_calls(func, _job_metadata)
 
     return decorator
 
@@ -339,7 +306,7 @@ def _get_value(
     kwargs: dict,
     func: Callable,
     field_name: str
-) -> str:
+) -> Optional[str]:
     """
     Generic helper to extract a value from static value, argument, or attribute.
 
@@ -353,7 +320,8 @@ def _get_value(
         field_name: Name of the field (for error messages)
 
     Returns:
-        Value as string
+        Value as string, or None when the argument or attribute is None or ""
+        (no tag, never the text "None")
 
     Raises:
         ValueError: If argument/attribute not found or invalid
@@ -361,21 +329,58 @@ def _get_value(
     if static_value is not None:
         return static_value
 
+    raw = _raw_value(arg_name, attr_name, args, kwargs, func, field_name)
+    if raw is _NOT_PASSED or is_blank_metadata_value(raw):
+        return None
+    return str(raw)
+
+
+def _argument_not_found(arg_name: str, field_name: str) -> ValueError:
+    return ValueError(f"Argument '{arg_name}' not found in function call for {field_name}")
+
+
+def _raw_arg(func: Callable, arg_name: str, args: tuple, kwargs: dict, field_name: str) -> Any:
+    """The value this call gives ``func``'s parameter ``arg_name``, with the
+    function's default applied when it is omitted.
+
+    Returns ``_NOT_PASSED`` when the call gives it nothing: a name left out of a
+    ``**kwargs`` catch-all, or a call ``func`` itself will reject with its own
+    TypeError.
+
+    Raises:
+        ValueError: ``arg_name`` is not a parameter of ``func`` and ``func`` takes no ``**kwargs``.
+    """
+    # Call-site kwargs first: binding files keyword args under a **kwargs
+    # catch-all parameter's name, which would hide them from the bound arguments.
+    if arg_name in kwargs:
+        return kwargs[arg_name]
+    signature = inspect.signature(func)
+    parameters = list(signature.parameters.values())
+    names = [parameter.name for parameter in parameters]
+    if arg_name not in names:
+        if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
+            return _NOT_PASSED
+        raise _argument_not_found(arg_name, field_name)
+    try:
+        bound = signature.bind(*args, **kwargs)
+    except TypeError:
+        index = names.index(arg_name)
+        return args[index] if index < len(args) else _NOT_PASSED
+    bound.apply_defaults()
+    return bound.arguments[arg_name]
+
+
+def _raw_value(
+    arg_name: Optional[str],
+    attr_name: Optional[str],
+    args: tuple,
+    kwargs: dict,
+    func: Callable,
+    field_name: str
+) -> Any:
+    """The argument's or attribute's value as passed, before any conversion."""
     if arg_name is not None:
-        # Try to get from kwargs first
-        if arg_name in kwargs:
-            return str(kwargs[arg_name])
-
-        # Try to get from args using function signature
-        sig = inspect.signature(func)
-        param_names = list(sig.parameters.keys())
-
-        if arg_name in param_names:
-            arg_index = param_names.index(arg_name)
-            if arg_index < len(args):
-                return str(args[arg_index])
-
-        raise ValueError(f"Argument '{arg_name}' not found in function call for {field_name}")
+        return _raw_arg(func, arg_name, args, kwargs, field_name)
 
     if attr_name is not None:
         # Get from self (first argument for methods)
@@ -386,7 +391,7 @@ def _get_value(
         if not hasattr(self_obj, attr_name):
             raise ValueError(f"Object does not have attribute '{attr_name}' for {field_name}")
 
-        return str(getattr(self_obj, attr_name))
+        return getattr(self_obj, attr_name)
 
     raise ValueError(f"No {field_name} source specified")
 
@@ -404,7 +409,8 @@ def track_trace(
     duration of the decorated function. It supports both static trace IDs
     and dynamic extraction from function arguments or object attributes.
 
-    Works with both sync and async functions.
+    Works with sync and async functions, and with generator and async generator
+    functions, whose tags are active only while the body runs (see the module docstring).
 
     Args:
         trace_id: Static trace ID to use. Mutually exclusive with id_from_arg
@@ -444,31 +450,10 @@ def track_trace(
         raise ValueError("Can only specify one of: trace_id, id_from_arg, id_from_attr")
 
     def decorator(func: Callable) -> Callable:
-        # Check if function is async
-        is_async = inspect.iscoroutinefunction(func)
+        def fields_for_call(args: tuple, kwargs: dict) -> Dict[str, Any]:
+            return {"trace_id": _get_value(trace_id, id_from_arg, id_from_attr, args, kwargs, func, "trace_id")}
 
-        if is_async:
-            @functools.wraps(func)
-            async def async_wrapper(*args, **kwargs):
-                # Determine trace ID
-                trace_id_value = _get_value(trace_id, id_from_arg, id_from_attr, args, kwargs, func, "trace_id")
-
-                # Set context and call function
-                with metadata_context.set(trace_id=trace_id_value):
-                    return await func(*args, **kwargs)
-
-            return async_wrapper
-        else:
-            @functools.wraps(func)
-            def sync_wrapper(*args, **kwargs):
-                # Determine trace ID
-                trace_id_value = _get_value(trace_id, id_from_arg, id_from_attr, args, kwargs, func, "trace_id")
-
-                # Set context and call function
-                with metadata_context.set(trace_id=trace_id_value):
-                    return func(*args, **kwargs)
-
-            return sync_wrapper
+        return _tag_calls(func, fields_for_call)
 
     return decorator
 
@@ -490,7 +475,8 @@ def track_organization(
     duration of the decorated function. It supports both static organization names
     and dynamic extraction from function arguments or object attributes.
 
-    Works with both sync and async functions.
+    Works with sync and async functions, and with generator and async generator
+    functions, whose tags are active only while the body runs (see the module docstring).
 
     Args:
         organization_name: Static organization name to use. Mutually exclusive with
@@ -538,31 +524,12 @@ def track_organization(
         raise ValueError("Can only specify one of: organization_name, name_from_arg, name_from_attr")
 
     def decorator(func: Callable) -> Callable:
-        # Check if function is async
-        is_async = inspect.iscoroutinefunction(func)
+        def fields_for_call(args: tuple, kwargs: dict) -> Dict[str, Any]:
+            return {"organization_name": _get_value(
+                effective_name, effective_from_arg, effective_from_attr, args, kwargs, func, "organization_name"
+            )}
 
-        if is_async:
-            @functools.wraps(func)
-            async def async_wrapper(*args, **kwargs):
-                # Determine organization name
-                org_name_value = _get_value(effective_name, effective_from_arg, effective_from_attr, args, kwargs, func, "organization_name")
-
-                # Set context using organization_name (not organization_id)
-                with metadata_context.set(organization_name=org_name_value):
-                    return await func(*args, **kwargs)
-
-            return async_wrapper
-        else:
-            @functools.wraps(func)
-            def sync_wrapper(*args, **kwargs):
-                # Determine organization name
-                org_name_value = _get_value(effective_name, effective_from_arg, effective_from_attr, args, kwargs, func, "organization_name")
-
-                # Set context using organization_name (not organization_id)
-                with metadata_context.set(organization_name=org_name_value):
-                    return func(*args, **kwargs)
-
-            return sync_wrapper
+        return _tag_calls(func, fields_for_call)
 
     return decorator
 
@@ -580,7 +547,8 @@ def track_subscription(
     duration of the decorated function. It supports both static subscription IDs
     and dynamic extraction from function arguments or object attributes.
 
-    Works with both sync and async functions.
+    Works with sync and async functions, and with generator and async generator
+    functions, whose tags are active only while the body runs (see the module docstring).
 
     Args:
         subscription_id: Static subscription ID to use. Mutually exclusive with
@@ -620,31 +588,12 @@ def track_subscription(
         raise ValueError("Can only specify one of: subscription_id, id_from_arg, id_from_attr")
 
     def decorator(func: Callable) -> Callable:
-        # Check if function is async
-        is_async = inspect.iscoroutinefunction(func)
+        def fields_for_call(args: tuple, kwargs: dict) -> Dict[str, Any]:
+            return {"subscription_id": _get_value(
+                subscription_id, id_from_arg, id_from_attr, args, kwargs, func, "subscription_id"
+            )}
 
-        if is_async:
-            @functools.wraps(func)
-            async def async_wrapper(*args, **kwargs):
-                # Determine subscription ID
-                sub_id_value = _get_value(subscription_id, id_from_arg, id_from_attr, args, kwargs, func, "subscription_id")
-
-                # Set context and call function
-                with metadata_context.set(subscription_id=sub_id_value):
-                    return await func(*args, **kwargs)
-
-            return async_wrapper
-        else:
-            @functools.wraps(func)
-            def sync_wrapper(*args, **kwargs):
-                # Determine subscription ID
-                sub_id_value = _get_value(subscription_id, id_from_arg, id_from_attr, args, kwargs, func, "subscription_id")
-
-                # Set context and call function
-                with metadata_context.set(subscription_id=sub_id_value):
-                    return func(*args, **kwargs)
-
-            return sync_wrapper
+        return _tag_calls(func, fields_for_call)
 
     return decorator
 
@@ -666,7 +615,8 @@ def track_product(
     duration of the decorated function. It supports both static product names
     and dynamic extraction from function arguments or object attributes.
 
-    Works with both sync and async functions.
+    Works with sync and async functions, and with generator and async generator
+    functions, whose tags are active only while the body runs (see the module docstring).
 
     Args:
         product_name: Static product name to use. Mutually exclusive with
@@ -714,31 +664,12 @@ def track_product(
         raise ValueError("Can only specify one of: product_name, name_from_arg, name_from_attr")
 
     def decorator(func: Callable) -> Callable:
-        # Check if function is async
-        is_async = inspect.iscoroutinefunction(func)
+        def fields_for_call(args: tuple, kwargs: dict) -> Dict[str, Any]:
+            return {"product_name": _get_value(
+                effective_name, effective_from_arg, effective_from_attr, args, kwargs, func, "product_name"
+            )}
 
-        if is_async:
-            @functools.wraps(func)
-            async def async_wrapper(*args, **kwargs):
-                # Determine product name
-                prod_name_value = _get_value(effective_name, effective_from_arg, effective_from_attr, args, kwargs, func, "product_name")
-
-                # Set context using product_name (not product_id)
-                with metadata_context.set(product_name=prod_name_value):
-                    return await func(*args, **kwargs)
-
-            return async_wrapper
-        else:
-            @functools.wraps(func)
-            def sync_wrapper(*args, **kwargs):
-                # Determine product name
-                prod_name_value = _get_value(effective_name, effective_from_arg, effective_from_attr, args, kwargs, func, "product_name")
-
-                # Set context using product_name (not product_id)
-                with metadata_context.set(product_name=prod_name_value):
-                    return func(*args, **kwargs)
-
-            return sync_wrapper
+        return _tag_calls(func, fields_for_call)
 
     return decorator
 
@@ -769,38 +700,24 @@ def _build_subscriber_dict(
         func: The decorated function
 
     Returns:
-        Dictionary with subscriber information
+        Dictionary with subscriber information; a part that is missing, None or "" is left out
     """
-    subscriber = {}
-
-    # Get subscriber ID
-    if subscriber_id is not None:
-        subscriber['id'] = subscriber_id
-    elif id_from_arg is not None:
+    def optional_value(static_value: Optional[str], arg_name: Optional[str], field_name: str) -> Optional[str]:
         try:
-            subscriber['id'] = _get_value(None, id_from_arg, None, args, kwargs, func, "subscriber_id")
+            return _get_value(static_value, arg_name, None, args, kwargs, func, field_name)
         except ValueError:
-            pass  # Optional field, skip if not found
+            return None  # Optional field, skip if not found
 
-    # Get subscriber email
-    if subscriber_email is not None:
-        subscriber['email'] = subscriber_email
-    elif email_from_arg is not None:
-        try:
-            subscriber['email'] = _get_value(None, email_from_arg, None, args, kwargs, func, "subscriber_email")
-        except ValueError:
-            pass  # Optional field, skip if not found
-
-    # Get credential name
-    if credential_name is not None:
-        subscriber['credential'] = {'name': credential_name}
-    elif credential_from_arg is not None:
-        try:
-            cred_name = _get_value(None, credential_from_arg, None, args, kwargs, func, "credential_name")
-            subscriber['credential'] = {'name': cred_name}
-        except ValueError:
-            pass  # Optional field, skip if not found
-
+    subscriber: Dict[str, Any] = {}
+    resolved_id = optional_value(subscriber_id, id_from_arg, "subscriber_id")
+    if resolved_id is not None:
+        subscriber['id'] = resolved_id
+    resolved_email = optional_value(subscriber_email, email_from_arg, "subscriber_email")
+    if resolved_email is not None:
+        subscriber['email'] = resolved_email
+    resolved_credential = optional_value(credential_name, credential_from_arg, "credential_name")
+    if resolved_credential is not None:
+        subscriber['credential'] = {'name': resolved_credential}
     return subscriber
 
 
@@ -819,7 +736,8 @@ def track_subscriber(
     This decorator sets the 'subscriber' field (with id, email, and credential)
     in the metadata context for the duration of the decorated function.
 
-    Works with both sync and async functions.
+    Works with sync and async functions, and with generator and async generator
+    functions, whose tags are active only while the body runs (see the module docstring).
 
     Args:
         subscriber_id: Static subscriber ID to use.
@@ -844,45 +762,15 @@ def track_subscriber(
         ...     return litellm.completion(...)
     """
     def decorator(func: Callable) -> Callable:
-        # Check if function is async
-        is_async = inspect.iscoroutinefunction(func)
+        def fields_for_call(args: tuple, kwargs: dict) -> Dict[str, Any]:
+            subscriber = _build_subscriber_dict(
+                subscriber_id, subscriber_email, credential_name,
+                id_from_arg, email_from_arg, credential_from_arg,
+                args, kwargs, func
+            )
+            return {"subscriber": subscriber} if subscriber else {}
 
-        if is_async:
-            @functools.wraps(func)
-            async def async_wrapper(*args, **kwargs):
-                # Build subscriber dict
-                subscriber = _build_subscriber_dict(
-                    subscriber_id, subscriber_email, credential_name,
-                    id_from_arg, email_from_arg, credential_from_arg,
-                    args, kwargs, func
-                )
-
-                # Set context and call function
-                if subscriber:
-                    with metadata_context.set(subscriber=subscriber):
-                        return await func(*args, **kwargs)
-                else:
-                    return await func(*args, **kwargs)
-
-            return async_wrapper
-        else:
-            @functools.wraps(func)
-            def sync_wrapper(*args, **kwargs):
-                # Build subscriber dict
-                subscriber = _build_subscriber_dict(
-                    subscriber_id, subscriber_email, credential_name,
-                    id_from_arg, email_from_arg, credential_from_arg,
-                    args, kwargs, func
-                )
-
-                # Set context and call function
-                if subscriber:
-                    with metadata_context.set(subscriber=subscriber):
-                        return func(*args, **kwargs)
-                else:
-                    return func(*args, **kwargs)
-
-            return sync_wrapper
+        return _tag_calls(func, fields_for_call)
 
     return decorator
 
@@ -900,7 +788,8 @@ def track_quality(
     for the duration of the decorated function. It supports both static quality scores
     and dynamic extraction from function arguments or object attributes.
 
-    Works with both sync and async functions.
+    Works with sync and async functions, and with generator and async generator
+    functions, whose tags are active only while the body runs (see the module docstring).
 
     Args:
         quality_score: Static quality score to use (0.0-1.0). Mutually exclusive with
@@ -940,31 +829,12 @@ def track_quality(
         raise ValueError("Can only specify one of: quality_score, score_from_arg, score_from_attr")
 
     def decorator(func: Callable) -> Callable:
-        # Check if function is async
-        is_async = inspect.iscoroutinefunction(func)
+        def fields_for_call(args: tuple, kwargs: dict) -> Dict[str, Any]:
+            return {"response_quality_score": _get_quality_score(
+                quality_score, score_from_arg, score_from_attr, args, kwargs, func
+            )}
 
-        if is_async:
-            @functools.wraps(func)
-            async def async_wrapper(*args, **kwargs):
-                # Determine quality score
-                score_value = _get_quality_score(quality_score, score_from_arg, score_from_attr, args, kwargs, func)
-
-                # Set context and call function
-                with metadata_context.set(response_quality_score=score_value):
-                    return await func(*args, **kwargs)
-
-            return async_wrapper
-        else:
-            @functools.wraps(func)
-            def sync_wrapper(*args, **kwargs):
-                # Determine quality score
-                score_value = _get_quality_score(quality_score, score_from_arg, score_from_attr, args, kwargs, func)
-
-                # Set context and call function
-                with metadata_context.set(response_quality_score=score_value):
-                    return func(*args, **kwargs)
-
-            return sync_wrapper
+        return _tag_calls(func, fields_for_call)
 
     return decorator
 
@@ -976,7 +846,7 @@ def _get_quality_score(
     args: tuple,
     kwargs: dict,
     func: Callable
-) -> float:
+) -> Optional[float]:
     """
     Extract quality score from static value, argument, or attribute.
 
@@ -989,10 +859,11 @@ def _get_quality_score(
         func: The decorated function
 
     Returns:
-        Quality score as float
+        Quality score as float, or None (no score sent) when the value is
+        missing, None, "" or not a number
 
     Raises:
-        ValueError: If argument/attribute not found or invalid
+        ValueError: If the named argument or attribute does not exist
     """
     # Use the generic _get_value function and convert to float
     value_str = _get_value(
@@ -1004,7 +875,13 @@ def _get_quality_score(
         func,
         "quality_score"
     )
-    return float(value_str)
+    if value_str is None:
+        return None
+    try:
+        return float(value_str)
+    except ValueError:
+        logger.warning("track_quality: the quality_score value is not a number; the call is recorded without a score")
+        return None
 
 
 __all__ = [

@@ -9,9 +9,14 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 # Add project root to path
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
+
+pytestmark = pytest.mark.e2e
+MISSING_KEYS = "ANTHROPIC_API_KEY and REVENIUM_METERING_API_KEY are needed for this live test"
 
 def load_env():
     """Load environment variables from .env file."""
@@ -39,8 +44,7 @@ def test_streaming_token_metering():
 
     # Verify API keys
     if not os.getenv("ANTHROPIC_API_KEY") or not os.getenv("REVENIUM_METERING_API_KEY"):
-        print("❌ API keys not set")
-        return False
+        pytest.skip(MISSING_KEYS)
 
     print("✅ API keys found")
     print()
@@ -57,66 +61,56 @@ def test_streaming_token_metering():
     print("   Testing token counting accuracy for streaming")
     print()
 
-    try:
-        with client.messages.stream(
-            model="claude-3-haiku-20240307",
-            max_tokens=100,
-            messages=[{"role": "user", "content": "Count from 1 to 5"}],
-            usage_metadata={
-                "organization_id": "e2e-test-streaming",
-                "trace_id": "test-streaming-001",
-                "task_type": "streaming-test"
-            }
-        ) as stream:
-            print("   Streaming response: ", end="", flush=True)
-            full_text = ""
-            for text in stream.text_stream:
-                full_text += text
-                print(text, end="", flush=True)
-            print()
-
-        # Get final message with usage
-        final_message = stream.get_final_message()
-
-        assert final_message.usage.input_tokens > 0, "No input tokens"
-        assert final_message.usage.output_tokens > 0, "No output tokens"
-        assert len(full_text) > 0, "No response text"
-
-        print()
-        print("✅ Streaming call successful!")
-        print(f"   Full response: {full_text}")
-        print(f"   Input tokens: {final_message.usage.input_tokens}")
-        print(f"   Output tokens: {final_message.usage.output_tokens}")
+    with client.messages.stream(
+        model="claude-haiku-4-5",
+        max_tokens=100,
+        messages=[{"role": "user", "content": "Count from 1 to 5"}],
+        usage_metadata={
+            "organization_id": "e2e-test-streaming",
+            "trace_id": "test-streaming-001",
+            "task_type": "streaming-test"
+        }
+    ) as stream:
+        print("   Streaming response: ", end="", flush=True)
+        full_text = ""
+        for text in stream.text_stream:
+            full_text += text
+            print(text, end="", flush=True)
         print()
 
-        print("=" * 80)
-        print("MANUAL VERIFICATION REQUIRED")
-        print("=" * 80)
-        print()
-        print("1. Go to Revenium dashboard")
-        print("2. Filter by organization_id: 'e2e-test-streaming'")
-        print("3. Find event with trace_id: 'test-streaming-001'")
-        print("4. Verify streaming-specific fields:")
-        print()
-        print("   CRITICAL - Streaming Fields:")
-        print(f"   ✓ isStreamed: true")
-        print(f"   ✓ inputTokenCount: {final_message.usage.input_tokens}")
-        print(f"   ✓ outputTokenCount: {final_message.usage.output_tokens}")
-        print(f"   ✓ timeToFirstToken: > 0 (should be populated)")
-        print()
-        print("5. Verify token counts match Anthropic response above")
-        print()
-        print("=" * 80)
+    # Get final message with usage
+    final_message = stream.get_final_message()
 
-        return True
+    assert final_message.usage.input_tokens > 0, "No input tokens"
+    assert final_message.usage.output_tokens > 0, "No output tokens"
+    assert len(full_text) > 0, "No response text"
 
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+    print()
+    print("✅ Streaming call successful!")
+    print(f"   Full response: {full_text}")
+    print(f"   Input tokens: {final_message.usage.input_tokens}")
+    print(f"   Output tokens: {final_message.usage.output_tokens}")
+    print()
+
+    print("=" * 80)
+    print("MANUAL VERIFICATION REQUIRED")
+    print("=" * 80)
+    print()
+    print("1. Go to Revenium dashboard")
+    print("2. Filter by organization_id: 'e2e-test-streaming'")
+    print("3. Find event with trace_id: 'test-streaming-001'")
+    print("4. Verify streaming-specific fields:")
+    print()
+    print("   CRITICAL - Streaming Fields:")
+    print(f"   ✓ isStreamed: true")
+    print(f"   ✓ inputTokenCount: {final_message.usage.input_tokens}")
+    print(f"   ✓ outputTokenCount: {final_message.usage.output_tokens}")
+    print(f"   ✓ timeToFirstToken: > 0 (should be populated)")
+    print()
+    print("5. Verify token counts match Anthropic response above")
+    print()
+    print("=" * 80)
 
 
 if __name__ == "__main__":
-    success = test_streaming_token_metering()
-    sys.exit(0 if success else 1)
+    test_streaming_token_metering()

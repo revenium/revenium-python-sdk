@@ -71,6 +71,21 @@ def base_kwargs(model="gpt-4o-mini", custom_llm_provider=None):
     return kwargs
 
 
+# Every host variable a gateway trace field can fall back to. A test that pins
+# a whole gateway record clears them, so a developer laptop or CI host cannot
+# leak its own values in.
+HOST_TRACE_VARIABLES = (
+    "REVENIUM_ENVIRONMENT", "ENVIRONMENT", "DEPLOYMENT_ENV",
+    "REVENIUM_REGION", "AWS_REGION", "AWS_DEFAULT_REGION", "AZURE_REGION",
+    "GCP_REGION", "GOOGLE_CLOUD_REGION",
+    "REVENIUM_CREDENTIAL_ALIAS", "REVENIUM_TRANSACTION_NAME", "REVENIUM_TRACE_TYPE",
+    "REVENIUM_TRACE_NAME", "REVENIUM_PARENT_TRANSACTION_ID", "REVENIUM_RETRY_NUMBER",
+    "REVENIUM_SKILL_NAME", "REVENIUM_SKILL_SOURCE", "REVENIUM_SKILL_KIND",
+    "REVENIUM_SKILL_PLUGIN_NAME", "REVENIUM_SKILL_MARKETPLACE_NAME",
+    "REVENIUM_SKILL_INVOCATION_TRIGGER", "REVENIUM_TICKET_ID",
+)
+
+
 def submitted_args(mock_submit):
     """The metering payload from the single expected submission.
 
@@ -129,9 +144,17 @@ def make_key_dict(user_email="", key_alias="", team_alias=None, metadata=None,
     )
 
 
+def after_pre_call(data):
+    """What the guardrail's pre-call leaves on every request that authenticated."""
+    from revenium_middleware.litellm.proxy.guardrail import _stamp_meter_key
+
+    _stamp_meter_key(data)
+    return data
+
+
 def guardrail_data(headers=None, model="gpt-4o-mini", stream=False, hidden_params=None,
                    metadata=None, metadata_key="metadata", custom_llm_provider=None,
-                   call_type=None):
+                   call_type=None, upstream_model=None):
     """Build the request dict a guardrail hook receives.
 
     In a guardrail hook metadata sits at data["metadata"], not at
@@ -168,7 +191,7 @@ def guardrail_data(headers=None, model="gpt-4o-mini", stream=False, hidden_param
         data[metadata_key] = header_block
     if metadata:
         data["metadata"].update(metadata)
-    if custom_llm_provider or call_type:
+    if custom_llm_provider or call_type or upstream_model:
         # Where a real proxy puts the upstream's identity for a guardrail hook:
         # not in the request dict, but on the logging object it carries. Probed
         # against a live litellm 1.102.0 proxy on the /v1/messages route, where
@@ -179,6 +202,7 @@ def guardrail_data(headers=None, model="gpt-4o-mini", stream=False, hidden_param
                 for key, value in (
                     ("custom_llm_provider", custom_llm_provider),
                     ("call_type", call_type),
+                    ("model", upstream_model),
                 )
                 if value
             }

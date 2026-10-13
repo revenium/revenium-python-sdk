@@ -1,44 +1,77 @@
-# Public resource-tree inventory for the provider SDKs that have one (BACK-3612, BACK-3593 AC7).
+# Public call-surface inventory for every SDK and framework the middleware wraps
+# (BACK-3612, BACK-3593 AC7, BACK-4027).
 #
-# Every public method reachable from the openai, anthropic, perplexity and
-# google-genai client objects (see resource_tree.py) must be either `registered`
-# (mapped to the manifest.yaml rows that execute it) or `allowed` under a group
-# whose `reason` says why it is not executed. test_resource_inventory.py fails on
-# any live method that is neither, so a provider release that adds a surface
-# fails the build until someone decides which it is.
+# Every public method reachable from the roots in resource_tree.py (the openai,
+# anthropic, perplexity, google-genai, ollama and fal clients; boto3's Bedrock
+# Runtime client; the ollama, fal_client and litellm modules; the Vertex AI model,
+# session, batch prediction, supervised tuning and context-cache classes; the
+# LangChain callback base; the griptape drivers the SDK subclasses) must be
+# either `registered` (mapped to the manifest.yaml rows that execute it) or
+# `allowed` under a group whose `reason` says why it is not executed.
+# test_resource_inventory.py fails on any live method that is neither, so a
+# provider release that adds a surface fails the build until someone decides
+# which it is.
+#
+# Raw and streaming-response forms (`.with_raw_response.`, `.with_streaming_response.`)
+# are walked too. One whose base method is `allowed` inherits that group, since
+# it reaches the same endpoint; one whose base is `registered` must be listed
+# itself, because it runs through the wrap on its own code path.
 #
 # The lists are the union over the provider versions we support (the pins in the
-# negative control and the latest releases), so an entry may be absent from the
-# installed version; only methods missing from this file fail.
+# negative control and the latest releases; Vertex AI over google-cloud-aiplatform
+# 1.71.1 and 2.x), so an entry may be absent from the installed version; only
+# methods missing from this file fail. The frameworks (langchain, griptape) have
+# no `registered` methods: the SDK meters them through the provider calls they
+# make, so their groups say which hooks and driver calls reach a wrap.
 #
-# Allowed reasons are judgements made on 2026-10-05. Group A is the list of
-# known billable gaps: moving a method out of A means adding its wrap and its
-# manifest rows.
+# Allowed reasons are judgements made on 2026-10-05 and, for the roots added by
+# BACK-4027, on 2026-10-08, and by BACK-4229, on 2026-10-10. Group A is the list of known billable gaps: moving a
+# method out of A means adding its wrap and its manifest rows.
+#
+# A group marked `disclose: true` is one the customer pays the provider for while
+# nothing reaches Revenium. README.md's "Calls the SDK does not meter" list must
+# name exactly those methods; tests/test_docs/test_readme_unmetered_calls.py checks it.
 
 version: 1
 providers:
   openai:
     registered:
+      AsyncOpenAI.audio.speech.create: [openai.audio.speech.create.async]
+      AsyncOpenAI.audio.transcriptions.create: [openai.audio.transcriptions.create.async]
+      AsyncOpenAI.audio.translations.create: [openai.audio.translations.create.async]
       AsyncOpenAI.chat.completions.create: [openai.chat.create.async, openai.chat.create.async.stream, perplexity.openai_compatible.chat.create.async, perplexity.openai_compatible.chat.create.async.stream, perplexity.openai_compatible.chat.create.async.perplexity_only]
-      AsyncOpenAI.chat.completions.parse: [openai.chat.parse.async]
+      AsyncOpenAI.chat.completions.parse: [openai.chat.parse.async, perplexity.openai_compatible.chat.parse.async, perplexity.openai_compatible.chat.parse.async.perplexity_only, perplexity.openai_compatible.chat.parse.async.openai_only]
       AsyncOpenAI.chat.completions.stream: [openai.chat.stream_helper.async]
+      AsyncOpenAI.chat.completions.with_raw_response.create: [openai.chat.raw.async.stream, perplexity.openai_compatible.chat.raw.async, perplexity.openai_compatible.chat.raw.async.stream]
+      AsyncOpenAI.chat.completions.with_streaming_response.create: [openai.chat.streaming_response.async.stream, perplexity.openai_compatible.chat.streaming_response.async, perplexity.openai_compatible.chat.streaming_response.async.stream]
       AsyncOpenAI.embeddings.create: [openai.embeddings.create.async]
       AsyncOpenAI.responses.create: [openai.responses.create.async, openai.responses.create.async.stream]
       AsyncOpenAI.responses.parse: [openai.responses.parse.async]
+      AsyncOpenAI.responses.retrieve: [openai.responses.background.retrieve.async]
       AsyncOpenAI.responses.stream: [openai.responses.stream_helper.async]
+      AsyncOpenAI.responses.with_raw_response.create: [openai.responses.raw.async.stream]
+      AsyncOpenAI.responses.with_streaming_response.create: [openai.responses.streaming_response.async.stream]
+      OpenAI.audio.speech.create: [openai.audio.speech.create.sync]
+      OpenAI.audio.speech.with_raw_response.create: [openai.audio.speech.raw.sync]
+      OpenAI.audio.transcriptions.create: [openai.audio.transcriptions.create.sync, openai.audio.transcriptions.create.sync.stream]
+      OpenAI.audio.transcriptions.with_raw_response.create: [openai.audio.transcriptions.raw.sync]
+      OpenAI.audio.translations.create: [openai.audio.translations.create.sync]
       OpenAI.chat.completions.create: [openai.chat.create.sync, openai.chat.create.sync.stream, perplexity.openai_compatible.chat.create.sync, perplexity.openai_compatible.chat.create.sync.stream, perplexity.openai_compatible.chat.create.sync.perplexity_only]
-      OpenAI.chat.completions.parse: [openai.chat.parse.sync]
+      OpenAI.chat.completions.parse: [openai.chat.parse.sync, perplexity.openai_compatible.chat.parse.sync, perplexity.openai_compatible.chat.parse.sync.perplexity_only, perplexity.openai_compatible.chat.parse.sync.openai_only]
       OpenAI.chat.completions.stream: [openai.chat.stream_helper.sync]
+      OpenAI.chat.completions.with_raw_response.create: [openai.chat.raw.sync.stream, perplexity.openai_compatible.chat.raw.sync, perplexity.openai_compatible.chat.raw.sync.stream, perplexity.openai_compatible.chat.raw.sync.perplexity_only, perplexity.openai_compatible.chat.raw.sync.stream.perplexity_only]
+      OpenAI.chat.completions.with_streaming_response.create: [openai.chat.streaming_response.sync.stream, perplexity.openai_compatible.chat.streaming_response.sync, perplexity.openai_compatible.chat.streaming_response.sync.stream]
       OpenAI.embeddings.create: [openai.embeddings.create.sync]
       OpenAI.responses.create: [openai.responses.create.sync, openai.responses.create.sync.stream]
       OpenAI.responses.parse: [openai.responses.parse.sync]
+      OpenAI.responses.retrieve: [openai.responses.background.retrieve.sync]
       OpenAI.responses.stream: [openai.responses.stream_helper.sync]
+      OpenAI.responses.with_raw_response.create: [openai.responses.raw.sync.stream]
+      OpenAI.responses.with_streaming_response.create: [openai.responses.streaming_response.sync.stream]
     allowed:
       - reason: "billable model usage the SDK does not meter: no wrap is registered. BACK-3593 listed images, audio, videos, realtime and the Gemini image and video calls as out of scope; the rest were first found by this inventory on 2026-10-05. Each enters the manifest with the ticket that adds its wrap"
+        disclose: true
         methods:
-          - "AsyncOpenAI.audio.speech.create"
-          - "AsyncOpenAI.audio.transcriptions.create"
-          - "AsyncOpenAI.audio.translations.create"
           - "AsyncOpenAI.beta.realtime.connect"
           - "AsyncOpenAI.beta.responses.compact"
           - "AsyncOpenAI.beta.responses.connect"
@@ -54,10 +87,17 @@ providers:
           - "AsyncOpenAI.beta.threads.runs.submit_tool_outputs_and_poll"
           - "AsyncOpenAI.beta.threads.runs.submit_tool_outputs_stream"
           - "AsyncOpenAI.completions.create"
+          - "AsyncOpenAI.decisions.create"
           - "AsyncOpenAI.fine_tuning.alpha.graders.run"
           - "AsyncOpenAI.images.create_variation"
           - "AsyncOpenAI.images.edit"
           - "AsyncOpenAI.images.generate"
+          - "AsyncOpenAI.live.connect"
+          - "AsyncOpenAI.live.create"
+          - "AsyncOpenAI.live.forks.connect"
+          - "AsyncOpenAI.live.sessions.accept"
+          - "AsyncOpenAI.live.sessions.fork"
+          - "AsyncOpenAI.live.sideband.connect"
           - "AsyncOpenAI.realtime.calls.accept"
           - "AsyncOpenAI.realtime.calls.create"
           - "AsyncOpenAI.realtime.connect"
@@ -69,9 +109,6 @@ providers:
           - "AsyncOpenAI.videos.edit"
           - "AsyncOpenAI.videos.extend"
           - "AsyncOpenAI.videos.remix"
-          - "OpenAI.audio.speech.create"
-          - "OpenAI.audio.transcriptions.create"
-          - "OpenAI.audio.translations.create"
           - "OpenAI.beta.realtime.connect"
           - "OpenAI.beta.responses.compact"
           - "OpenAI.beta.responses.connect"
@@ -87,10 +124,17 @@ providers:
           - "OpenAI.beta.threads.runs.submit_tool_outputs_and_poll"
           - "OpenAI.beta.threads.runs.submit_tool_outputs_stream"
           - "OpenAI.completions.create"
+          - "OpenAI.decisions.create"
           - "OpenAI.fine_tuning.alpha.graders.run"
           - "OpenAI.images.create_variation"
           - "OpenAI.images.edit"
           - "OpenAI.images.generate"
+          - "OpenAI.live.connect"
+          - "OpenAI.live.create"
+          - "OpenAI.live.forks.connect"
+          - "OpenAI.live.sessions.accept"
+          - "OpenAI.live.sessions.fork"
+          - "OpenAI.live.sideband.connect"
           - "OpenAI.realtime.calls.accept"
           - "OpenAI.realtime.calls.create"
           - "OpenAI.realtime.connect"
@@ -103,6 +147,7 @@ providers:
           - "OpenAI.videos.extend"
           - "OpenAI.videos.remix"
       - reason: "asynchronous job (batch, fine-tuning, evaluation run, async completion): billed when the job runs server-side, not on this call; needs its own ticket, as messages.batches.create records in the manifest"
+        disclose: true
         methods:
           - "AsyncOpenAI.batches.create"
           - "AsyncOpenAI.evals.runs.create"
@@ -110,11 +155,87 @@ providers:
           - "OpenAI.batches.create"
           - "OpenAI.evals.runs.create"
           - "OpenAI.fine_tuning.jobs.create"
+      - reason: "wrapped by the SDK, but no manifest row executes it: test_patch_coverage proves the wrap is live, the matrix does not check its payload; move it to registered with the row that does"
+        methods:
+          - "AsyncOpenAI.audio.speech.with_raw_response.create"
+          - "AsyncOpenAI.audio.speech.with_streaming_response.create"
+          - "AsyncOpenAI.audio.transcriptions.with_raw_response.create"
+          - "AsyncOpenAI.audio.transcriptions.with_streaming_response.create"
+          - "AsyncOpenAI.audio.translations.with_raw_response.create"
+          - "AsyncOpenAI.audio.translations.with_streaming_response.create"
+          - "AsyncOpenAI.chat.completions.with_raw_response.parse"
+          - "AsyncOpenAI.chat.completions.with_streaming_response.parse"
+          - "AsyncOpenAI.embeddings.with_raw_response.create"
+          - "AsyncOpenAI.embeddings.with_streaming_response.create"
+          - "AsyncOpenAI.responses.cancel"
+          - "AsyncOpenAI.responses.with_raw_response.parse"
+          - "AsyncOpenAI.responses.with_raw_response.retrieve"
+          - "AsyncOpenAI.responses.with_streaming_response.retrieve"
+          - "OpenAI.audio.speech.with_streaming_response.create"
+          - "OpenAI.audio.transcriptions.with_streaming_response.create"
+          - "OpenAI.audio.translations.with_raw_response.create"
+          - "OpenAI.audio.translations.with_streaming_response.create"
+          - "OpenAI.chat.completions.with_raw_response.parse"
+          - "OpenAI.chat.completions.with_streaming_response.parse"
+          - "OpenAI.embeddings.with_raw_response.create"
+          - "OpenAI.embeddings.with_streaming_response.create"
+          - "OpenAI.responses.cancel"
+          - "OpenAI.responses.with_raw_response.parse"
+          - "OpenAI.responses.with_raw_response.retrieve"
+          - "OpenAI.responses.with_streaming_response.retrieve"
       - reason: "resource management, retrieval, listing or deletion: no model usage"
         methods:
+          - "AsyncOpenAI.audio.voices.create"
           - "AsyncOpenAI.batches.cancel"
           - "AsyncOpenAI.batches.list"
           - "AsyncOpenAI.batches.retrieve"
+          - "AsyncOpenAI.beta.agents.create"
+          - "AsyncOpenAI.beta.agents.delete"
+          - "AsyncOpenAI.beta.agents.environments.create"
+          - "AsyncOpenAI.beta.agents.environments.files.create"
+          - "AsyncOpenAI.beta.agents.environments.files.list"
+          - "AsyncOpenAI.beta.agents.environments.files.prepare"
+          - "AsyncOpenAI.beta.agents.environments.files.prepare_directory"
+          - "AsyncOpenAI.beta.agents.environments.files.upload"
+          - "AsyncOpenAI.beta.agents.environments.list"
+          - "AsyncOpenAI.beta.agents.environments.retrieve"
+          - "AsyncOpenAI.beta.agents.environments.templates.create"
+          - "AsyncOpenAI.beta.agents.environments.templates.delete"
+          - "AsyncOpenAI.beta.agents.environments.templates.list"
+          - "AsyncOpenAI.beta.agents.environments.templates.retrieve"
+          - "AsyncOpenAI.beta.agents.environments.templates.update"
+          - "AsyncOpenAI.beta.agents.list"
+          - "AsyncOpenAI.beta.agents.retrieve"
+          - "AsyncOpenAI.beta.agents.sessions.artifacts.content"
+          - "AsyncOpenAI.beta.agents.sessions.artifacts.delete"
+          - "AsyncOpenAI.beta.agents.sessions.artifacts.for_result"
+          - "AsyncOpenAI.beta.agents.sessions.artifacts.list"
+          - "AsyncOpenAI.beta.agents.sessions.artifacts.retrieve"
+          - "AsyncOpenAI.beta.agents.sessions.delete"
+          - "AsyncOpenAI.beta.agents.sessions.items.list"
+          - "AsyncOpenAI.beta.agents.sessions.list"
+          - "AsyncOpenAI.beta.agents.sessions.retrieve"
+          - "AsyncOpenAI.beta.agents.sessions.subagents.items.list"
+          - "AsyncOpenAI.beta.agents.sessions.subagents.list"
+          - "AsyncOpenAI.beta.agents.sessions.subagents.retrieve"
+          - "AsyncOpenAI.beta.agents.sessions.subagents.turns.items.list"
+          - "AsyncOpenAI.beta.agents.sessions.subagents.turns.list"
+          - "AsyncOpenAI.beta.agents.sessions.subagents.turns.retrieve"
+          - "AsyncOpenAI.beta.agents.sessions.traces.list"
+          - "AsyncOpenAI.beta.agents.sessions.turns.items.list"
+          - "AsyncOpenAI.beta.agents.sessions.turns.list"
+          - "AsyncOpenAI.beta.agents.sessions.turns.retrieve"
+          - "AsyncOpenAI.beta.agents.update"
+          - "AsyncOpenAI.beta.agents.vaults.create"
+          - "AsyncOpenAI.beta.agents.vaults.credentials.create"
+          - "AsyncOpenAI.beta.agents.vaults.credentials.delete"
+          - "AsyncOpenAI.beta.agents.vaults.credentials.list"
+          - "AsyncOpenAI.beta.agents.vaults.credentials.retrieve"
+          - "AsyncOpenAI.beta.agents.vaults.credentials.update"
+          - "AsyncOpenAI.beta.agents.vaults.delete"
+          - "AsyncOpenAI.beta.agents.vaults.list"
+          - "AsyncOpenAI.beta.agents.vaults.retrieve"
+          - "AsyncOpenAI.beta.agents.vaults.update"
           - "AsyncOpenAI.beta.assistants.create"
           - "AsyncOpenAI.beta.assistants.delete"
           - "AsyncOpenAI.beta.assistants.list"
@@ -200,16 +321,20 @@ providers:
           - "AsyncOpenAI.fine_tuning.jobs.pause"
           - "AsyncOpenAI.fine_tuning.jobs.resume"
           - "AsyncOpenAI.fine_tuning.jobs.retrieve"
+          - "AsyncOpenAI.live.sessions.download_recording"
+          - "AsyncOpenAI.live.sessions.hangup"
+          - "AsyncOpenAI.live.sessions.refer"
+          - "AsyncOpenAI.live.sessions.reject"
           - "AsyncOpenAI.models.delete"
           - "AsyncOpenAI.models.list"
           - "AsyncOpenAI.models.retrieve"
           - "AsyncOpenAI.realtime.calls.hangup"
           - "AsyncOpenAI.realtime.calls.refer"
           - "AsyncOpenAI.realtime.calls.reject"
-          - "AsyncOpenAI.responses.cancel"
           - "AsyncOpenAI.responses.delete"
           - "AsyncOpenAI.responses.input_items.list"
-          - "AsyncOpenAI.responses.retrieve"
+          - "AsyncOpenAI.safety.alerts.retrieve"
+          - "AsyncOpenAI.safety.cases.retrieve"
           - "AsyncOpenAI.skills.content.retrieve"
           - "AsyncOpenAI.skills.create"
           - "AsyncOpenAI.skills.delete"
@@ -252,9 +377,65 @@ providers:
           - "AsyncOpenAI.videos.get_character"
           - "AsyncOpenAI.videos.list"
           - "AsyncOpenAI.videos.retrieve"
+          - "AsyncOpenAI.webhooks.create"
+          - "AsyncOpenAI.webhooks.delete"
+          - "AsyncOpenAI.webhooks.event_types.list"
+          - "AsyncOpenAI.webhooks.list"
+          - "AsyncOpenAI.webhooks.retrieve"
+          - "AsyncOpenAI.webhooks.rotate_secret"
+          - "AsyncOpenAI.webhooks.test"
+          - "AsyncOpenAI.webhooks.update"
+          - "OpenAI.audio.voices.create"
           - "OpenAI.batches.cancel"
           - "OpenAI.batches.list"
           - "OpenAI.batches.retrieve"
+          - "OpenAI.beta.agents.create"
+          - "OpenAI.beta.agents.delete"
+          - "OpenAI.beta.agents.environments.create"
+          - "OpenAI.beta.agents.environments.files.create"
+          - "OpenAI.beta.agents.environments.files.list"
+          - "OpenAI.beta.agents.environments.files.prepare"
+          - "OpenAI.beta.agents.environments.files.prepare_directory"
+          - "OpenAI.beta.agents.environments.files.upload"
+          - "OpenAI.beta.agents.environments.list"
+          - "OpenAI.beta.agents.environments.retrieve"
+          - "OpenAI.beta.agents.environments.templates.create"
+          - "OpenAI.beta.agents.environments.templates.delete"
+          - "OpenAI.beta.agents.environments.templates.list"
+          - "OpenAI.beta.agents.environments.templates.retrieve"
+          - "OpenAI.beta.agents.environments.templates.update"
+          - "OpenAI.beta.agents.list"
+          - "OpenAI.beta.agents.retrieve"
+          - "OpenAI.beta.agents.sessions.artifacts.content"
+          - "OpenAI.beta.agents.sessions.artifacts.delete"
+          - "OpenAI.beta.agents.sessions.artifacts.for_result"
+          - "OpenAI.beta.agents.sessions.artifacts.list"
+          - "OpenAI.beta.agents.sessions.artifacts.retrieve"
+          - "OpenAI.beta.agents.sessions.delete"
+          - "OpenAI.beta.agents.sessions.items.list"
+          - "OpenAI.beta.agents.sessions.list"
+          - "OpenAI.beta.agents.sessions.retrieve"
+          - "OpenAI.beta.agents.sessions.subagents.items.list"
+          - "OpenAI.beta.agents.sessions.subagents.list"
+          - "OpenAI.beta.agents.sessions.subagents.retrieve"
+          - "OpenAI.beta.agents.sessions.subagents.turns.items.list"
+          - "OpenAI.beta.agents.sessions.subagents.turns.list"
+          - "OpenAI.beta.agents.sessions.subagents.turns.retrieve"
+          - "OpenAI.beta.agents.sessions.traces.list"
+          - "OpenAI.beta.agents.sessions.turns.items.list"
+          - "OpenAI.beta.agents.sessions.turns.list"
+          - "OpenAI.beta.agents.sessions.turns.retrieve"
+          - "OpenAI.beta.agents.update"
+          - "OpenAI.beta.agents.vaults.create"
+          - "OpenAI.beta.agents.vaults.credentials.create"
+          - "OpenAI.beta.agents.vaults.credentials.delete"
+          - "OpenAI.beta.agents.vaults.credentials.list"
+          - "OpenAI.beta.agents.vaults.credentials.retrieve"
+          - "OpenAI.beta.agents.vaults.credentials.update"
+          - "OpenAI.beta.agents.vaults.delete"
+          - "OpenAI.beta.agents.vaults.list"
+          - "OpenAI.beta.agents.vaults.retrieve"
+          - "OpenAI.beta.agents.vaults.update"
           - "OpenAI.beta.assistants.create"
           - "OpenAI.beta.assistants.delete"
           - "OpenAI.beta.assistants.list"
@@ -340,16 +521,20 @@ providers:
           - "OpenAI.fine_tuning.jobs.pause"
           - "OpenAI.fine_tuning.jobs.resume"
           - "OpenAI.fine_tuning.jobs.retrieve"
+          - "OpenAI.live.sessions.download_recording"
+          - "OpenAI.live.sessions.hangup"
+          - "OpenAI.live.sessions.refer"
+          - "OpenAI.live.sessions.reject"
           - "OpenAI.models.delete"
           - "OpenAI.models.list"
           - "OpenAI.models.retrieve"
           - "OpenAI.realtime.calls.hangup"
           - "OpenAI.realtime.calls.refer"
           - "OpenAI.realtime.calls.reject"
-          - "OpenAI.responses.cancel"
           - "OpenAI.responses.delete"
           - "OpenAI.responses.input_items.list"
-          - "OpenAI.responses.retrieve"
+          - "OpenAI.safety.alerts.retrieve"
+          - "OpenAI.safety.cases.retrieve"
           - "OpenAI.skills.content.retrieve"
           - "OpenAI.skills.create"
           - "OpenAI.skills.delete"
@@ -392,6 +577,14 @@ providers:
           - "OpenAI.videos.get_character"
           - "OpenAI.videos.list"
           - "OpenAI.videos.retrieve"
+          - "OpenAI.webhooks.create"
+          - "OpenAI.webhooks.delete"
+          - "OpenAI.webhooks.event_types.list"
+          - "OpenAI.webhooks.list"
+          - "OpenAI.webhooks.retrieve"
+          - "OpenAI.webhooks.rotate_secret"
+          - "OpenAI.webhooks.test"
+          - "OpenAI.webhooks.update"
       - reason: "organization and administration API: no model usage"
         methods:
           - "AsyncOpenAI.admin.organization.admin_api_keys.create"
@@ -408,6 +601,11 @@ providers:
           - "AsyncOpenAI.admin.organization.certificates.update"
           - "AsyncOpenAI.admin.organization.data_retention.retrieve"
           - "AsyncOpenAI.admin.organization.data_retention.update"
+          - "AsyncOpenAI.admin.organization.external_storage.create"
+          - "AsyncOpenAI.admin.organization.external_storage.delete"
+          - "AsyncOpenAI.admin.organization.external_storage.list"
+          - "AsyncOpenAI.admin.organization.external_storage.retrieve"
+          - "AsyncOpenAI.admin.organization.external_storage.validate"
           - "AsyncOpenAI.admin.organization.groups.create"
           - "AsyncOpenAI.admin.organization.groups.delete"
           - "AsyncOpenAI.admin.organization.groups.list"
@@ -527,6 +725,11 @@ providers:
           - "OpenAI.admin.organization.certificates.update"
           - "OpenAI.admin.organization.data_retention.retrieve"
           - "OpenAI.admin.organization.data_retention.update"
+          - "OpenAI.admin.organization.external_storage.create"
+          - "OpenAI.admin.organization.external_storage.delete"
+          - "OpenAI.admin.organization.external_storage.list"
+          - "OpenAI.admin.organization.external_storage.retrieve"
+          - "OpenAI.admin.organization.external_storage.validate"
           - "OpenAI.admin.organization.groups.create"
           - "OpenAI.admin.organization.groups.delete"
           - "OpenAI.admin.organization.groups.list"
@@ -642,6 +845,7 @@ providers:
           - "AsyncOpenAI.fine_tuning.alpha.graders.validate"
           - "AsyncOpenAI.moderations.create"
           - "AsyncOpenAI.realtime.client_secrets.create"
+          - "AsyncOpenAI.realtime.translations.client_secrets.create"
           - "AsyncOpenAI.responses.input_tokens.count"
           - "AsyncOpenAI.vector_stores.file_batches.poll"
           - "AsyncOpenAI.vector_stores.files.poll"
@@ -656,6 +860,7 @@ providers:
           - "OpenAI.fine_tuning.alpha.graders.validate"
           - "OpenAI.moderations.create"
           - "OpenAI.realtime.client_secrets.create"
+          - "OpenAI.realtime.translations.client_secrets.create"
           - "OpenAI.responses.input_tokens.count"
           - "OpenAI.vector_stores.file_batches.poll"
           - "OpenAI.vector_stores.files.poll"
@@ -671,8 +876,19 @@ providers:
           - "OpenAI.beta.chat.completions.parse"
           - "OpenAI.beta.chat.completions.stream"
       - reason: "hosted agent, session or workflow: the model runs server-side across many events and this call returns no per-request usage to meter"
+        disclose: true
         methods:
+          - "AsyncOpenAI.beta.agents.sessions.create"
+          - "AsyncOpenAI.beta.agents.sessions.events.create"
+          - "AsyncOpenAI.beta.agents.sessions.events.stream"
+          - "AsyncOpenAI.beta.agents.sessions.stream"
+          - "AsyncOpenAI.beta.agents.sessions.update"
           - "AsyncOpenAI.beta.chatkit.sessions.create"
+          - "OpenAI.beta.agents.sessions.create"
+          - "OpenAI.beta.agents.sessions.events.create"
+          - "OpenAI.beta.agents.sessions.events.stream"
+          - "OpenAI.beta.agents.sessions.stream"
+          - "OpenAI.beta.agents.sessions.update"
           - "OpenAI.beta.chatkit.sessions.create"
       - reason: "generic raw-request passthrough: forwards an arbitrary HTTP call, so there is no operation to meter"
         methods:
@@ -721,6 +937,29 @@ providers:
       AsyncAnthropic.messages.parse: [anthropic.messages.parse.async]
       AsyncAnthropic.messages.stream: [anthropic.messages.stream_helper.async]
     allowed:
+      - reason: "asynchronous job (batch, fine-tuning, evaluation run, async completion): billed when the job runs server-side, not on this call; needs its own ticket, as messages.batches.create records in the manifest"
+        disclose: true
+        methods:
+          - "Anthropic.beta.messages.batches.with_raw_response.create"
+          - "Anthropic.beta.messages.batches.with_streaming_response.create"
+          - "Anthropic.messages.batches.with_raw_response.create"
+          - "Anthropic.messages.batches.with_streaming_response.create"
+          - "AsyncAnthropic.beta.messages.batches.with_raw_response.create"
+          - "AsyncAnthropic.beta.messages.batches.with_streaming_response.create"
+          - "AsyncAnthropic.messages.batches.with_raw_response.create"
+          - "AsyncAnthropic.messages.batches.with_streaming_response.create"
+      - reason: "wrapped by the SDK, but no manifest row executes it: test_patch_coverage proves the wrap is live, the matrix does not check its payload; move it to registered with the row that does"
+        methods:
+          - "Anthropic.beta.messages.with_raw_response.create"
+          - "Anthropic.beta.messages.with_raw_response.parse"
+          - "Anthropic.beta.messages.with_streaming_response.create"
+          - "Anthropic.messages.with_raw_response.create"
+          - "Anthropic.messages.with_streaming_response.create"
+          - "AsyncAnthropic.beta.messages.with_raw_response.create"
+          - "AsyncAnthropic.beta.messages.with_raw_response.parse"
+          - "AsyncAnthropic.beta.messages.with_streaming_response.create"
+          - "AsyncAnthropic.messages.with_raw_response.create"
+          - "AsyncAnthropic.messages.with_streaming_response.create"
       - reason: "resource management, retrieval, listing or deletion: no model usage"
         methods:
           - "Anthropic.beta.agents.archive"
@@ -1332,6 +1571,7 @@ providers:
           - "Anthropic.beta.messages.tool_runner"
           - "AsyncAnthropic.beta.messages.tool_runner"
       - reason: "hosted agent, session or workflow: the model runs server-side across many events and this call returns no per-request usage to meter"
+        disclose: true
         methods:
           - "Anthropic.beta.deployments.run"
           - "Anthropic.beta.dreams.create"
@@ -1370,20 +1610,27 @@ providers:
           - "Anthropic.copy"
           - "Anthropic.is_closed"
           - "Anthropic.platform_headers"
+          - "Anthropic.timeout.as_dict"
           - "Anthropic.with_middleware"
           - "Anthropic.with_options"
           - "AsyncAnthropic.close"
           - "AsyncAnthropic.copy"
           - "AsyncAnthropic.is_closed"
           - "AsyncAnthropic.platform_headers"
+          - "AsyncAnthropic.timeout.as_dict"
           - "AsyncAnthropic.with_middleware"
           - "AsyncAnthropic.with_options"
   perplexity:
     registered:
       AsyncPerplexity.chat.completions.create: [perplexity.native.chat.create.async, perplexity.native.chat.create.async.stream]
+      AsyncPerplexity.chat.completions.with_raw_response.create: [perplexity.native.chat.raw.async, perplexity.native.chat.raw.async.stream]
+      AsyncPerplexity.chat.completions.with_streaming_response.create: [perplexity.native.chat.streaming_response.async, perplexity.native.chat.streaming_response.async.stream]
       Perplexity.chat.completions.create: [perplexity.native.chat.create.sync, perplexity.native.chat.create.sync.stream]
+      Perplexity.chat.completions.with_raw_response.create: [perplexity.native.chat.raw.sync, perplexity.native.chat.raw.sync.stream]
+      Perplexity.chat.completions.with_streaming_response.create: [perplexity.native.chat.streaming_response.sync, perplexity.native.chat.streaming_response.sync.stream]
     allowed:
       - reason: "billable model usage the SDK does not meter: no wrap is registered. BACK-3593 listed images, audio, videos, realtime and the Gemini image and video calls as out of scope; the rest were first found by this inventory on 2026-10-05. Each enters the manifest with the ticket that adds its wrap"
+        disclose: true
         methods:
           - "AsyncPerplexity.contextualized_embeddings.create"
           - "AsyncPerplexity.embeddings.create"
@@ -1394,6 +1641,7 @@ providers:
           - "Perplexity.responses.create"
           - "Perplexity.search.create"
       - reason: "asynchronous job (batch, fine-tuning, evaluation run, async completion): billed when the job runs server-side, not on this call; needs its own ticket, as messages.batches.create records in the manifest"
+        disclose: true
         methods:
           - "AsyncPerplexity.async_.chat.completions.create"
           - "Perplexity.async_.chat.completions.create"
@@ -1414,6 +1662,7 @@ providers:
           - "Perplexity.responses.files.list"
           - "Perplexity.responses.retrieve"
       - reason: "hosted agent, session or workflow: the model runs server-side across many events and this call returns no per-request usage to meter"
+        disclose: true
         methods:
           - "AsyncPerplexity.browser.sessions.create"
           - "Perplexity.browser.sessions.create"
@@ -1453,14 +1702,19 @@ providers:
       Client.aio.models.generate_content: [genai.aio.models.generate_content.async]
       Client.aio.models.generate_content_stream: [genai.aio.models.generate_content_stream.async]
       Client.aio.models.generate_images: [genai.aio.models.generate_images.async]
+      Client.aio.models.generate_videos: [genai.aio.models.generate_videos.async]
+      Client.aio.operations.get: [genai.aio.models.generate_videos.async]
       Client.chats.create().send_message: [genai.chats.send_message.sync]
       Client.chats.create().send_message_stream: [genai.chats.send_message_stream.sync]
       Client.models.embed_content: [genai.models.embed_content.sync]
       Client.models.generate_content: [genai.models.generate_content.sync]
       Client.models.generate_content_stream: [genai.models.generate_content_stream.sync]
       Client.models.generate_images: [genai.models.generate_images.sync]
+      Client.models.generate_videos: [genai.models.generate_videos.sync, genai.models.generate_videos.vertex.sync]
+      Client.operations.get: [genai.models.generate_videos.sync, genai.models.generate_videos.vertex.sync]
     allowed:
       - reason: "billable model usage the SDK does not meter: no wrap is registered. BACK-3593 listed images, audio, videos, realtime and the Gemini image and video calls as out of scope; the rest were first found by this inventory on 2026-10-05. Each enters the manifest with the ticket that adds its wrap"
+        disclose: true
         methods:
           - "Client.aio.file_search_stores.import_file"
           - "Client.aio.file_search_stores.upload_to_file_search_store"
@@ -1468,7 +1722,6 @@ providers:
           - "Client.aio.live.connect"
           - "Client.aio.live.music.connect"
           - "Client.aio.models.edit_image"
-          - "Client.aio.models.generate_videos"
           - "Client.aio.models.recontext_image"
           - "Client.aio.models.segment_image"
           - "Client.aio.models.upscale_image"
@@ -1476,11 +1729,11 @@ providers:
           - "Client.file_search_stores.upload_to_file_search_store"
           - "Client.interactions.create"
           - "Client.models.edit_image"
-          - "Client.models.generate_videos"
           - "Client.models.recontext_image"
           - "Client.models.segment_image"
           - "Client.models.upscale_image"
       - reason: "asynchronous job (batch, fine-tuning, evaluation run, async completion): billed when the job runs server-side, not on this call; needs its own ticket, as messages.batches.create records in the manifest"
+        disclose: true
         methods:
           - "Client.aio.batches.create"
           - "Client.aio.batches.create_embeddings"
@@ -1488,6 +1741,13 @@ providers:
           - "Client.batches.create"
           - "Client.batches.create_embeddings"
           - "Client.tunings.tune"
+      - reason: "billable model usage the SDK does not meter: context-cache storage, billed per token per hour while the cache lives; creating a cache or extending its lifetime is billed, and reads at generation time are metered"
+        disclose: true
+        methods:
+          - "Client.aio.caches.create"
+          - "Client.aio.caches.update"
+          - "Client.caches.create"
+          - "Client.caches.update"
       - reason: "resource management, retrieval, listing or deletion: no model usage"
         methods:
           - "Client.agents.create"
@@ -1502,11 +1762,9 @@ providers:
           - "Client.aio.batches.delete"
           - "Client.aio.batches.get"
           - "Client.aio.batches.list"
-          - "Client.aio.caches.create"
           - "Client.aio.caches.delete"
           - "Client.aio.caches.get"
           - "Client.aio.caches.list"
-          - "Client.aio.caches.update"
           - "Client.aio.credentials.create"
           - "Client.aio.credentials.delete"
           - "Client.aio.credentials.get"
@@ -1541,7 +1799,6 @@ providers:
           - "Client.aio.models.get"
           - "Client.aio.models.list"
           - "Client.aio.models.update"
-          - "Client.aio.operations.get"
           - "Client.aio.triggers.create"
           - "Client.aio.triggers.delete"
           - "Client.aio.triggers.get"
@@ -1565,11 +1822,9 @@ providers:
           - "Client.batches.delete"
           - "Client.batches.get"
           - "Client.batches.list"
-          - "Client.caches.create"
           - "Client.caches.delete"
           - "Client.caches.get"
           - "Client.caches.list"
-          - "Client.caches.update"
           - "Client.credentials.create"
           - "Client.credentials.delete"
           - "Client.credentials.get"
@@ -1604,7 +1859,6 @@ providers:
           - "Client.models.get"
           - "Client.models.list"
           - "Client.models.update"
-          - "Client.operations.get"
           - "Client.triggers.create"
           - "Client.triggers.delete"
           - "Client.triggers.get"
@@ -1643,6 +1897,7 @@ providers:
           - "Client.tunings.validate_reward"
           - "Client.webhooks.ping"
       - reason: "hosted agent, session or workflow: the model runs server-side across many events and this call returns no per-request usage to meter"
+        disclose: true
         methods:
           - "Client.aio.triggers.run"
           - "Client.triggers.run"
@@ -1666,3 +1921,802 @@ providers:
         methods:
           - "Client.aio.aclose"
           - "Client.close"
+  ollama:
+    registered:
+      AsyncClient.chat: [ollama.async_client.chat.async, ollama.async_client.chat.async.stream]
+      AsyncClient.embed: [ollama.async_client.embed.async]
+      AsyncClient.embeddings: [ollama.async_client.embeddings.async]
+      AsyncClient.generate: [ollama.async_client.generate.async, ollama.async_client.generate.async.stream]
+      Client.chat: [ollama.client.chat.sync, ollama.client.chat.sync.stream]
+      Client.embed: [ollama.client.embed.sync]
+      Client.embeddings: [ollama.embeddings.sync]
+      Client.generate: [ollama.client.generate.sync, ollama.client.generate.sync.stream]
+      ollama.chat: [ollama.chat.sync, ollama.chat.sync.stream]
+      ollama.embed: [ollama.embed.sync]
+      ollama.embeddings: [ollama.embeddings.sync]
+      ollama.generate: [ollama.generate.sync]
+    allowed:
+      - reason: "billable model usage the SDK does not meter: no wrap is registered. BACK-3593 listed images, audio, videos, realtime and the Gemini image and video calls as out of scope; the rest were first found by this inventory on 2026-10-05. Each enters the manifest with the ticket that adds its wrap"
+        disclose: true
+        methods:
+          - "AsyncClient.systemone"
+          - "Client.systemone"
+          - "ollama.systemone"
+      - reason: "hosted tool call (web search, page fetch, code sandbox): no model tokens on this call; a tool cost, which @meter_tool records"
+        disclose: true
+        methods:
+          - "AsyncClient.web_fetch"
+          - "AsyncClient.web_search"
+          - "Client.web_fetch"
+          - "Client.web_search"
+          - "ollama.web_fetch"
+          - "ollama.web_search"
+      - reason: "resource management, retrieval, listing or deletion: no model usage"
+        methods:
+          - "AsyncClient.copy"
+          - "AsyncClient.create"
+          - "AsyncClient.create_blob"
+          - "AsyncClient.delete"
+          - "AsyncClient.list"
+          - "AsyncClient.ps"
+          - "AsyncClient.pull"
+          - "AsyncClient.push"
+          - "AsyncClient.show"
+          - "Client.copy"
+          - "Client.create"
+          - "Client.create_blob"
+          - "Client.delete"
+          - "Client.list"
+          - "Client.ps"
+          - "Client.pull"
+          - "Client.push"
+          - "Client.show"
+          - "ollama.copy"
+          - "ollama.create"
+          - "ollama.delete"
+          - "ollama.list"
+          - "ollama.ps"
+          - "ollama.pull"
+          - "ollama.push"
+          - "ollama.show"
+      - reason: "client plumbing on the client object itself (copying, reconfiguring, closing, header helpers): no request to the provider"
+        methods:
+          - "AsyncClient.close"
+          - "Client.close"
+  litellm:
+    registered:
+      litellm.acompletion: [litellm.acompletion.async, litellm.acompletion.async.stream_with_usage, litellm.acompletion.async.stream_without_usage]
+      litellm.acompletion_with_retries: [litellm.acompletion_with_retries.async]
+      litellm.aembedding: [litellm.aembedding.async]
+      litellm.aresponses: [litellm.aresponses.async]
+      litellm.atext_completion: [litellm.atext_completion.async]
+      litellm.batch_completion: [litellm.batch_completion.sync]
+      litellm.completion: [litellm.completion.sync, litellm.completion.sync.stream_with_usage, litellm.completion.sync.stream_without_usage]
+      litellm.completion_with_retries: [litellm.completion_with_retries.sync, litellm.completion_with_retries.sync.over_wrapped_completion]
+      litellm.embedding: [litellm.embedding.sync]
+      litellm.responses: [litellm.responses.sync]
+      litellm.text_completion: [litellm.text_completion.sync, litellm.text_completion.sync.stream_without_usage]
+    allowed:
+      - reason: "billable model usage the SDK does not meter: no wrap is registered. BACK-3593 listed images, audio, videos, realtime and the Gemini image and video calls as out of scope; the rest were first found by this inventory on 2026-10-05. Each enters the manifest with the ticket that adds its wrap"
+        disclose: true
+        methods:
+          - "litellm.aadapter_completion"
+          - "litellm.aadapter_generate_content"
+          - "litellm.acompact_responses"
+          - "litellm.acreate_run"
+          - "litellm.adapter_completion"
+          - "litellm.adecisions"
+          - "litellm.agenerate_content"
+          - "litellm.aimage_edit"
+          - "litellm.aimage_generation"
+          - "litellm.aimage_variation"
+          - "litellm.aingest"
+          - "litellm.anthropic_interface.messages.acreate"
+          - "litellm.anthropic_interface.messages.create"
+          - "litellm.anthropic_messages"
+          - "litellm.anthropic_messages_handler"
+          - "litellm.aocr"
+          - "litellm.aquery"
+          - "litellm.arealtime_calls"
+          - "litellm.arerank"
+          - "litellm.aresponses_api_with_mcp"
+          - "litellm.aresponses_with_retries"
+          - "litellm.arun_thread"
+          - "litellm.arun_thread_stream"
+          - "litellm.asearch"
+          - "litellm.aspeech"
+          - "litellm.asystemone"
+          - "litellm.atranscription"
+          - "litellm.avideo_create_character"
+          - "litellm.avideo_edit"
+          - "litellm.avideo_extension"
+          - "litellm.avideo_generation"
+          - "litellm.avideo_remix"
+          - "litellm.compact_responses"
+          - "litellm.config_completion"
+          - "litellm.create_run"
+          - "litellm.decisions"
+          - "litellm.image_edit"
+          - "litellm.image_generation"
+          - "litellm.image_variation"
+          - "litellm.ingest"
+          - "litellm.nlp_cloud_chat_completion"
+          - "litellm.ocr"
+          - "litellm.query"
+          - "litellm.replicate_chat_completion"
+          - "litellm.rerank"
+          - "litellm.responses_with_retries"
+          - "litellm.run_thread"
+          - "litellm.run_thread_stream"
+          - "litellm.search"
+          - "litellm.speech"
+          - "litellm.systemone"
+          - "litellm.transcription"
+          - "litellm.video_create_character"
+          - "litellm.video_edit"
+          - "litellm.video_extension"
+          - "litellm.video_generation"
+          - "litellm.video_remix"
+      - reason: "asynchronous job (batch, fine-tuning, evaluation run, async completion): billed when the job runs server-side, not on this call; needs its own ticket, as messages.batches.create records in the manifest"
+        disclose: true
+        methods:
+          - "litellm.acreate_batch"
+          - "litellm.acreate_fine_tuning_job"
+          - "litellm.create_batch"
+          - "litellm.create_fine_tuning_job"
+      - reason: "hosted tool call (web search, page fetch, code sandbox): no model tokens on this call; a tool cost, which @meter_tool records"
+        disclose: true
+        methods:
+          - "litellm.acode_interpreter_tool"
+          - "litellm.acreate_sandbox"
+          - "litellm.arun_code"
+      - reason: "resource management, retrieval, listing or deletion: no model usage"
+        methods:
+          - "litellm.a_add_message"
+          - "litellm.acancel_batch"
+          - "litellm.acancel_eval"
+          - "litellm.acancel_fine_tuning_job"
+          - "litellm.acancel_responses"
+          - "litellm.acancel_run"
+          - "litellm.acreate_agent"
+          - "litellm.acreate_assistants"
+          - "litellm.acreate_container"
+          - "litellm.acreate_eval"
+          - "litellm.acreate_file"
+          - "litellm.acreate_skill"
+          - "litellm.acreate_thread"
+          - "litellm.add_message"
+          - "litellm.adelete_agent"
+          - "litellm.adelete_assistant"
+          - "litellm.adelete_container"
+          - "litellm.adelete_eval"
+          - "litellm.adelete_responses"
+          - "litellm.adelete_run"
+          - "litellm.adelete_sandbox"
+          - "litellm.adelete_skill"
+          - "litellm.afile_content"
+          - "litellm.afile_delete"
+          - "litellm.afile_list"
+          - "litellm.afile_retrieve"
+          - "litellm.aget_agent"
+          - "litellm.aget_assistants"
+          - "litellm.aget_eval"
+          - "litellm.aget_messages"
+          - "litellm.aget_responses"
+          - "litellm.aget_run"
+          - "litellm.aget_skill"
+          - "litellm.aget_thread"
+          - "litellm.alist_agent_versions"
+          - "litellm.alist_agents"
+          - "litellm.alist_batches"
+          - "litellm.alist_container_files"
+          - "litellm.alist_containers"
+          - "litellm.alist_evals"
+          - "litellm.alist_fine_tuning_jobs"
+          - "litellm.alist_input_items"
+          - "litellm.alist_runs"
+          - "litellm.alist_skills"
+          - "litellm.aretrieve_batch"
+          - "litellm.aretrieve_container"
+          - "litellm.aretrieve_fine_tuning_job"
+          - "litellm.aupload_container_file"
+          - "litellm.avector_store_file_content"
+          - "litellm.avector_store_file_create"
+          - "litellm.avector_store_file_delete"
+          - "litellm.avector_store_file_list"
+          - "litellm.avector_store_file_retrieve"
+          - "litellm.avector_store_file_update"
+          - "litellm.avideo_content"
+          - "litellm.avideo_get_character"
+          - "litellm.avideo_list"
+          - "litellm.avideo_status"
+          - "litellm.cancel_batch"
+          - "litellm.cancel_eval"
+          - "litellm.cancel_fine_tuning_job"
+          - "litellm.cancel_responses"
+          - "litellm.cancel_run"
+          - "litellm.create_agent"
+          - "litellm.create_assistants"
+          - "litellm.create_container"
+          - "litellm.create_eval"
+          - "litellm.create_file"
+          - "litellm.create_skill"
+          - "litellm.create_thread"
+          - "litellm.delete_agent"
+          - "litellm.delete_assistant"
+          - "litellm.delete_container"
+          - "litellm.delete_eval"
+          - "litellm.delete_responses"
+          - "litellm.delete_run"
+          - "litellm.delete_skill"
+          - "litellm.file_content"
+          - "litellm.file_content_streaming"
+          - "litellm.file_delete"
+          - "litellm.file_list"
+          - "litellm.file_retrieve"
+          - "litellm.get_agent"
+          - "litellm.get_assistants"
+          - "litellm.get_eval"
+          - "litellm.get_messages"
+          - "litellm.get_responses"
+          - "litellm.get_run"
+          - "litellm.get_skill"
+          - "litellm.get_thread"
+          - "litellm.list_agent_versions"
+          - "litellm.list_agents"
+          - "litellm.list_batches"
+          - "litellm.list_container_files"
+          - "litellm.list_containers"
+          - "litellm.list_evals"
+          - "litellm.list_fine_tuning_jobs"
+          - "litellm.list_input_items"
+          - "litellm.list_runs"
+          - "litellm.list_skills"
+          - "litellm.retrieve_batch"
+          - "litellm.retrieve_container"
+          - "litellm.retrieve_fine_tuning_job"
+          - "litellm.upload_container_file"
+          - "litellm.vector_store_file_content"
+          - "litellm.vector_store_file_create"
+          - "litellm.vector_store_file_delete"
+          - "litellm.vector_store_file_list"
+          - "litellm.vector_store_file_retrieve"
+          - "litellm.vector_store_file_update"
+          - "litellm.video_content"
+          - "litellm.video_get_character"
+          - "litellm.video_list"
+          - "litellm.video_status"
+      - reason: "local helper, token count, moderation, ephemeral credential, polling or signature check: no billable model usage on this call"
+        methods:
+          - "litellm.acount_tokens"
+          - "litellm.acreate_realtime_client_secret"
+          - "litellm.acreate_realtime_transcription_session"
+          - "litellm.add_known_models"
+          - "litellm.add_provider_affinity_header"
+          - "litellm.add_provider_specific_params_to_optional_params"
+          - "litellm.add_system_prompt_to_messages"
+          - "litellm.add_trusted_model_credentials_to_litellm_params"
+          - "litellm.admission_input_tokens"
+          - "litellm.admitted_prompt_token_counter"
+          - "litellm.amoderation"
+          - "litellm.async_mock_completion_streaming_obj"
+          - "litellm.asyncify"
+          - "litellm.azure_ai_supports_native_responses"
+          - "litellm.bedrock_route_for_request"
+          - "litellm.calculate_request_duration"
+          - "litellm.client"
+          - "litellm.close_litellm_async_clients"
+          - "litellm.completion_cost"
+          - "litellm.convert_model_response_to_streaming"
+          - "litellm.convert_to_model_response_object"
+          - "litellm.convert_to_streaming_response"
+          - "litellm.convert_to_streaming_response_async"
+          - "litellm.cost_per_token"
+          - "litellm.create_pretrained_tokenizer"
+          - "litellm.create_tokenizer"
+          - "litellm.custom_chat_llm_router"
+          - "litellm.custom_prompt"
+          - "litellm.declared_authenticating_provider"
+          - "litellm.decode"
+          - "litellm.decode_video_id_with_provider"
+          - "litellm.delete_nested_value"
+          - "litellm.disable_cache"
+          - "litellm.drop_params_env_flag"
+          - "litellm.enable_cache"
+          - "litellm.encode"
+          - "litellm.exception_type"
+          - "litellm.filter_out_litellm_params"
+          - "litellm.flatten_form_field_values"
+          - "litellm.foundry_chat_rejects_function_tools_while_reasoning"
+          - "litellm.function_call_prompt"
+          - "litellm.get_api_base"
+          - "litellm.get_api_key_from_env"
+          - "litellm.get_audio_file_for_health_check"
+          - "litellm.get_azure_credentials"
+          - "litellm.get_completion_messages"
+          - "litellm.get_configured_request_timeout"
+          - "litellm.get_content_from_model_response"
+          - "litellm.get_coroutine_checker"
+          - "litellm.get_error_message"
+          - "litellm.get_first_chars_messages"
+          - "litellm.get_formatted_prompt"
+          - "litellm.get_litellm_gateway_api_key"
+          - "litellm.get_litellm_logging_class"
+          - "litellm.get_litellm_metadata_from_kwargs"
+          - "litellm.get_litellm_params"
+          - "litellm.get_llm_provider"
+          - "litellm.get_max_tokens"
+          - "litellm.get_model_cost_map"
+          - "litellm.get_model_info"
+          - "litellm.get_modified_max_tokens"
+          - "litellm.get_non_default_completion_params"
+          - "litellm.get_non_default_transcription_params"
+          - "litellm.get_num_retries_from_retry_policy"
+          - "litellm.get_openai_credentials"
+          - "litellm.get_optional_params"
+          - "litellm.get_optional_params_add_message"
+          - "litellm.get_optional_params_embeddings"
+          - "litellm.get_optional_params_image_gen"
+          - "litellm.get_optional_params_transcription"
+          - "litellm.get_optional_rerank_params"
+          - "litellm.get_provider_fields"
+          - "litellm.get_requester_metadata"
+          - "litellm.get_response_headers"
+          - "litellm.get_response_string"
+          - "litellm.get_secret"
+          - "litellm.get_secret_bool"
+          - "litellm.get_secret_str"
+          - "litellm.get_set_callbacks"
+          - "litellm.get_standard_openai_params"
+          - "litellm.get_supported_openai_params"
+          - "litellm.get_valid_models"
+          - "litellm.get_vertex_ai_model_route"
+          - "litellm.http2_enabled"
+          - "litellm.identify"
+          - "litellm.is_bedrock_pricing_only_model"
+          - "litellm.is_nested_path"
+          - "litellm.is_openai_finetune_model"
+          - "litellm.is_xai_batch_results_id"
+          - "litellm.map_finish_reason"
+          - "litellm.map_system_message_pt"
+          - "litellm.mark_litellm_import_complete"
+          - "litellm.mock_completion"
+          - "litellm.mock_completion_streaming_obj"
+          - "litellm.mock_embedding"
+          - "litellm.mock_image_generation"
+          - "litellm.mock_responses_api_response"
+          - "litellm.moderation"
+          - "litellm.modify_integration"
+          - "litellm.normalize_drop_params"
+          - "litellm.ollama_pt"
+          - "litellm.parse_control_options"
+          - "litellm.peek_reasoning_summary_aliases"
+          - "litellm.pre_process_non_default_params"
+          - "litellm.print_verbose"
+          - "litellm.process_response_headers"
+          - "litellm.prompt_factory"
+          - "litellm.read_config_args"
+          - "litellm.redact_message_input_output_from_logging"
+          - "litellm.register_model"
+          - "litellm.register_prompt_template"
+          - "litellm.remove_index_from_tool_calls"
+          - "litellm.reset_retry_policy"
+          - "litellm.response_cost_calculator"
+          - "litellm.responses_api_bridge_check"
+          - "litellm.run_async_function"
+          - "litellm.rust"
+          - "litellm.safe_deep_copy"
+          - "litellm.set_global_bitbucket_config"
+          - "litellm.set_global_gitlab_config"
+          - "litellm.set_global_prompt_directory"
+          - "litellm.should_run_mock_completion"
+          - "litellm.stream_chunk_builder"
+          - "litellm.stream_chunk_builder_text_completion"
+          - "litellm.stringify_json_tool_call_content"
+          - "litellm.strip_reasoning_summary_aliases_from_optional_params"
+          - "litellm.supports_audio_input"
+          - "litellm.supports_audio_output"
+          - "litellm.supports_function_calling"
+          - "litellm.supports_httpx_timeout"
+          - "litellm.supports_parallel_function_calling"
+          - "litellm.supports_reasoning"
+          - "litellm.supports_response_schema"
+          - "litellm.supports_system_messages"
+          - "litellm.supports_url_context"
+          - "litellm.supports_vision"
+          - "litellm.supports_web_search"
+          - "litellm.timeout"
+          - "litellm.token_counter"
+          - "litellm.update_cache"
+          - "litellm.update_messages_with_model_file_ids"
+          - "litellm.update_response_metadata"
+          - "litellm.validate_and_fix_openai_messages"
+          - "litellm.validate_and_fix_openai_tools"
+          - "litellm.validate_and_fix_thinking_param"
+          - "litellm.validate_chat_completion_tool_choice"
+          - "litellm.validate_environment"
+          - "litellm.validate_openai_optional_params"
+          - "litellm.validate_provider_affinity_header_name"
+          - "litellm.with_control_options"
+          - "litellm.without_bedrock_route_prefix"
+      - reason: "alias or helper that runs a registered entry point at call time, so that entry point's manifest rows cover it"
+        methods:
+          - "litellm.acreate"
+          - "litellm.ahealth_check"
+          - "litellm.async_completion_with_fallbacks"
+          - "litellm.batch_completion_models"
+          - "litellm.batch_completion_models_all_responses"
+          - "litellm.check_valid_key"
+          - "litellm.completion_with_fallbacks"
+          - "litellm.compress"
+          - "litellm.maybe_run_chat_completion_agentic_loop"
+      - reason: "generic raw-request passthrough: forwards an arbitrary HTTP call, so there is no operation to meter"
+        methods:
+          - "litellm.allm_passthrough_route"
+          - "litellm.llm_passthrough_route"
+  fal:
+    registered:
+      AsyncClient.get_handle: [fal.submit_async.status.result.async]
+      AsyncClient.result: [fal.submit_async.status.result.async]
+      AsyncClient.run: [fal.async_client.run.async]
+      AsyncClient.stream: [fal.async_client.stream.async.stream]
+      AsyncClient.submit: [fal.async_client.submit.async]
+      AsyncClient.subscribe: [fal.async_client.subscribe.async]
+      AsyncRequestHandle.get: [fal.submit_async.async, fal.async_client.submit.async]
+      SyncClient.get_handle: [fal.submit.status.result.sync]
+      SyncClient.result: [fal.submit.status.result.sync]
+      SyncClient.run: [fal.sync_client.run.sync]
+      SyncClient.stream: [fal.sync_client.stream.sync.stream]
+      SyncClient.submit: [fal.sync_client.submit.sync]
+      SyncClient.subscribe: [fal.sync_client.subscribe.sync]
+      SyncRequestHandle.get: [fal.submit.sync, fal.sync_client.submit.sync]
+      fal_client.result: [fal.submit.status.result.sync]
+      fal_client.result_async: [fal.submit_async.status.result.async]
+      fal_client.run: [fal.run.sync]
+      fal_client.run_async: [fal.run_async.async]
+      fal_client.stream: [fal.stream.sync.stream]
+      fal_client.stream_async: [fal.stream_async.async.stream]
+      fal_client.submit: [fal.submit.sync]
+      fal_client.submit_async: [fal.submit_async.async]
+      fal_client.subscribe: [fal.subscribe.sync]
+      fal_client.subscribe_async: [fal.subscribe_async.async]
+    allowed:
+      - reason: "billable model usage the SDK does not meter: no wrap is registered. BACK-3593 listed images, audio, videos, realtime and the Gemini image and video calls as out of scope; the rest were first found by this inventory on 2026-10-05. Each enters the manifest with the ticket that adds its wrap"
+        disclose: true
+        methods:
+          - "AsyncClient.realtime"
+          - "AsyncClient.ws_connect"
+          - "SyncClient.realtime"
+          - "SyncClient.ws_connect"
+          - "fal_client.realtime"
+          - "fal_client.realtime_async"
+          - "fal_client.ws_connect"
+          - "fal_client.ws_connect_async"
+      - reason: "resource management, retrieval, listing or deletion: no model usage"
+        methods:
+          - "AsyncClient.cancel"
+          - "AsyncClient.upload"
+          - "AsyncClient.upload_file"
+          - "AsyncClient.upload_image"
+          - "AsyncRequestHandle.cancel"
+          - "SyncClient.cancel"
+          - "SyncClient.upload"
+          - "SyncClient.upload_file"
+          - "SyncClient.upload_image"
+          - "SyncRequestHandle.cancel"
+          - "fal_client.cancel"
+          - "fal_client.cancel_async"
+          - "fal_client.upload"
+          - "fal_client.upload_async"
+          - "fal_client.upload_file"
+          - "fal_client.upload_file_async"
+          - "fal_client.upload_image"
+          - "fal_client.upload_image_async"
+      - reason: "local helper, token count, moderation, ephemeral credential, polling or signature check: no billable model usage on this call"
+        methods:
+          - "AsyncClient.status"
+          - "AsyncRequestHandle.from_request_id"
+          - "AsyncRequestHandle.iter_events"
+          - "AsyncRequestHandle.status"
+          - "SyncClient.status"
+          - "SyncRequestHandle.from_request_id"
+          - "SyncRequestHandle.iter_events"
+          - "SyncRequestHandle.status"
+          - "fal_client.encode"
+          - "fal_client.encode_file"
+          - "fal_client.encode_image"
+          - "fal_client.set_get_current_app"
+          - "fal_client.status"
+          - "fal_client.status_async"
+  vertex:
+    registered:
+      generative_models.ChatSession.send_message: [vertex.chat_session.send_message, vertex.chat_session.send_message.stream]
+      generative_models.ChatSession.send_message_async: [vertex.chat_session.send_message_async, vertex.chat_session.send_message_async.stream]
+      generative_models.GenerativeModel.generate_content: [vertex.generative_model.generate_content.sync, vertex.generative_model.generate_content.sync.stream]
+      generative_models.GenerativeModel.generate_content_async: [vertex.generative_model.generate_content_async, vertex.generative_model.generate_content_async.stream]
+      language_models.TextEmbeddingModel.get_embeddings: [vertex.text_embedding_model.get_embeddings.sync]
+      language_models.TextEmbeddingModel.get_embeddings_async: [vertex.text_embedding_model.get_embeddings_async]
+      preview.generative_models.ChatSession.send_message: [vertex.preview.chat_session.send_message]
+      preview.generative_models.GenerativeModel.generate_content_async: [vertex.preview.generative_model.generate_content_async]
+    allowed:
+      - reason: "billable model usage the SDK does not meter: no wrap is registered. BACK-3593 listed images, audio, videos, realtime and the Gemini image and video calls as out of scope; the rest were first found by this inventory on 2026-10-05. Each enters the manifest with the ticket that adds its wrap"
+        disclose: true
+        methods:
+          - "language_models.ChatSession.send_message"
+          - "language_models.ChatSession.send_message_async"
+          - "language_models.ChatSession.send_message_streaming"
+          - "language_models.ChatSession.send_message_streaming_async"
+          - "language_models.CodeChatSession.send_message"
+          - "language_models.CodeChatSession.send_message_async"
+          - "language_models.CodeChatSession.send_message_streaming"
+          - "language_models.CodeChatSession.send_message_streaming_async"
+          - "language_models.CodeGenerationModel.predict"
+          - "language_models.CodeGenerationModel.predict_async"
+          - "language_models.CodeGenerationModel.predict_streaming"
+          - "language_models.CodeGenerationModel.predict_streaming_async"
+          - "language_models.TextGenerationModel.predict"
+          - "language_models.TextGenerationModel.predict_async"
+          - "language_models.TextGenerationModel.predict_streaming"
+          - "language_models.TextGenerationModel.predict_streaming_async"
+          - "preview.vision_models.ImageCaptioningModel.get_captions"
+          - "preview.vision_models.ImageGenerationModel.upscale_image"
+          - "preview.vision_models.ImageQnAModel.ask_question"
+          - "preview.vision_models.ImageSegmentationModel.segment_image"
+          - "preview.vision_models.ImageTextModel.ask_question"
+          - "preview.vision_models.ImageTextModel.get_captions"
+          - "preview.vision_models.MultiModalEmbeddingModel.get_embeddings"
+          - "preview.vision_models.WatermarkVerificationModel.verify_image"
+          - "vision_models.ImageCaptioningModel.get_captions"
+          - "vision_models.ImageGenerationModel.upscale_image"
+          - "vision_models.ImageQnAModel.ask_question"
+          - "vision_models.ImageTextModel.ask_question"
+          - "vision_models.ImageTextModel.get_captions"
+          - "vision_models.MultiModalEmbeddingModel.get_embeddings"
+      - reason: "asynchronous job (batch, fine-tuning, evaluation run, async completion): billed when the job runs server-side, not on this call; needs its own ticket, as messages.batches.create records in the manifest"
+        disclose: true
+        methods:
+          - "batch_prediction.BatchPredictionJob.submit"
+          - "language_models.ChatModel.tune_model"
+          - "language_models.ChatModel.tune_model_rlhf"
+          - "language_models.CodeChatModel.tune_model"
+          - "language_models.CodeGenerationModel.batch_predict"
+          - "language_models.CodeGenerationModel.tune_model"
+          - "language_models.TextEmbeddingModel.batch_predict"
+          - "language_models.TextEmbeddingModel.deploy_tuned_model"
+          - "language_models.TextEmbeddingModel.tune_model"
+          - "language_models.TextGenerationModel.batch_predict"
+          - "language_models.TextGenerationModel.tune_model"
+          - "language_models.TextGenerationModel.tune_model_rlhf"
+          - "tuning.sft.train"
+      - reason: "billable model usage the SDK does not meter: context-cache storage, billed per token per hour while the cache lives; creating a cache or extending its lifetime is billed, and reads at generation time are metered"
+        disclose: true
+        methods:
+          - "caching.CachedContent.create"
+          - "caching.CachedContent.update"
+          - "preview.caching.CachedContent.create"
+          - "preview.caching.CachedContent.update"
+      - reason: "wrapped by the SDK, but no manifest row executes it: test_patch_coverage proves the wrap is live, the matrix does not check its payload; move it to registered with the row that does"
+        methods:
+          - "preview.generative_models.ChatSession.send_message_async"
+          - "preview.generative_models.GenerativeModel.generate_content"
+          - "preview.vision_models.ImageGenerationModel.edit_image"
+          - "preview.vision_models.ImageGenerationModel.generate_images"
+          - "vision_models.ImageGenerationModel.edit_image"
+          - "vision_models.ImageGenerationModel.generate_images"
+      - reason: "resource management, retrieval, listing or deletion: no model usage"
+        methods:
+          - "batch_prediction.BatchPredictionJob.cancel"
+          - "batch_prediction.BatchPredictionJob.delete"
+          - "batch_prediction.BatchPredictionJob.list"
+          - "batch_prediction.BatchPredictionJob.num_pending_jobs"
+          - "batch_prediction.BatchPredictionJob.refresh"
+          - "caching.CachedContent.delete"
+          - "caching.CachedContent.get"
+          - "caching.CachedContent.list"
+          - "caching.CachedContent.refresh"
+          - "language_models.ChatModel.get_tuned_model"
+          - "language_models.ChatModel.list_tuned_model_names"
+          - "language_models.CodeChatModel.get_tuned_model"
+          - "language_models.CodeChatModel.list_tuned_model_names"
+          - "language_models.CodeGenerationModel.get_tuned_model"
+          - "language_models.CodeGenerationModel.list_tuned_model_names"
+          - "language_models.TextEmbeddingModel.get_tuned_model"
+          - "language_models.TextEmbeddingModel.list_tuned_model_names"
+          - "language_models.TextGenerationModel.get_tuned_model"
+          - "language_models.TextGenerationModel.list_tuned_model_names"
+          - "preview.caching.CachedContent.delete"
+          - "preview.caching.CachedContent.get"
+          - "preview.caching.CachedContent.list"
+          - "preview.caching.CachedContent.refresh"
+      - reason: "local helper, token count, moderation, ephemeral credential, polling or signature check: no billable model usage on this call"
+        methods:
+          - "batch_prediction.BatchPredictionJob.to_dict"
+          - "caching.CachedContent.to_dict"
+          - "generative_models.GenerativeModel.compute_tokens"
+          - "generative_models.GenerativeModel.compute_tokens_async"
+          - "generative_models.GenerativeModel.count_tokens"
+          - "generative_models.GenerativeModel.count_tokens_async"
+          - "generative_models.GenerativeModel.from_cached_content"
+          - "generative_models.GenerativeModel.start_chat"
+          - "language_models.ChatModel.from_pretrained"
+          - "language_models.ChatModel.start_chat"
+          - "language_models.CodeChatModel.from_pretrained"
+          - "language_models.CodeChatModel.start_chat"
+          - "language_models.CodeGenerationModel.from_pretrained"
+          - "language_models.TextEmbeddingModel.count_tokens"
+          - "language_models.TextEmbeddingModel.from_pretrained"
+          - "language_models.TextGenerationModel.from_pretrained"
+          - "preview.caching.CachedContent.to_dict"
+          - "preview.generative_models.GenerativeModel.compute_tokens"
+          - "preview.generative_models.GenerativeModel.compute_tokens_async"
+          - "preview.generative_models.GenerativeModel.count_tokens"
+          - "preview.generative_models.GenerativeModel.count_tokens_async"
+          - "preview.generative_models.GenerativeModel.from_cached_content"
+          - "preview.generative_models.GenerativeModel.set_request_response_logging_config"
+          - "preview.generative_models.GenerativeModel.start_chat"
+          - "preview.vision_models.ImageCaptioningModel.from_pretrained"
+          - "preview.vision_models.ImageGenerationModel.from_pretrained"
+          - "preview.vision_models.ImageQnAModel.from_pretrained"
+          - "preview.vision_models.ImageSegmentationModel.from_pretrained"
+          - "preview.vision_models.ImageTextModel.from_pretrained"
+          - "preview.vision_models.MultiModalEmbeddingModel.from_pretrained"
+          - "preview.vision_models.WatermarkVerificationModel.from_pretrained"
+          - "vision_models.ImageCaptioningModel.from_pretrained"
+          - "vision_models.ImageGenerationModel.from_pretrained"
+          - "vision_models.ImageQnAModel.from_pretrained"
+          - "vision_models.ImageTextModel.from_pretrained"
+          - "vision_models.MultiModalEmbeddingModel.from_pretrained"
+  bedrock:
+    registered: {}
+    allowed:
+      - reason: "billable model usage the SDK does not meter: boto3's Bedrock Runtime client is not wrapped by default. With REVENIUM_BEDROCK_TRANSPORT on, Claude models on invoke_model, invoke_model_with_response_stream, converse and converse_stream are metered (manifest row bedrock.boto3.invoke_model.transport_unset, BACK-3611); every other model, and guardrail checks billed per text unit, never are"
+        disclose: true
+        methods:
+          - "bedrock-runtime.apply_guardrail"
+          - "bedrock-runtime.converse"
+          - "bedrock-runtime.converse_stream"
+          - "bedrock-runtime.invoke_guardrail_checks"
+          - "bedrock-runtime.invoke_model"
+          - "bedrock-runtime.invoke_model_with_response_stream"
+      - reason: "asynchronous job (batch, fine-tuning, evaluation run, async completion): billed when the job runs server-side, not on this call; needs its own ticket, as messages.batches.create records in the manifest"
+        disclose: true
+        methods:
+          - "bedrock-runtime.start_async_invoke"
+      - reason: "resource management, retrieval, listing or deletion: no model usage"
+        methods:
+          - "bedrock-runtime.get_async_invoke"
+          - "bedrock-runtime.list_async_invokes"
+      - reason: "local helper, token count, moderation, ephemeral credential, polling or signature check: no billable model usage on this call"
+        methods:
+          - "bedrock-runtime.count_tokens"
+      - reason: "client plumbing on the client object itself (copying, reconfiguring, closing, header helpers): no request to the provider"
+        methods:
+          - "bedrock-runtime.can_paginate"
+          - "bedrock-runtime.close"
+          - "bedrock-runtime.generate_presigned_url"
+          - "bedrock-runtime.get_paginator"
+          - "bedrock-runtime.get_waiter"
+  langchain:
+    registered: {}
+    allowed:
+      - reason: "LangChain callback hook implemented by UnifiedReveniumCallbackHandler; tests/test_openai/test_langchain_exactly_once.py executes the metering ones"
+        methods:
+          - "AsyncCallbackHandler.on_agent_action"
+          - "AsyncCallbackHandler.on_agent_finish"
+          - "AsyncCallbackHandler.on_chain_end"
+          - "AsyncCallbackHandler.on_chain_error"
+          - "AsyncCallbackHandler.on_chain_start"
+          - "AsyncCallbackHandler.on_chat_model_start"
+          - "AsyncCallbackHandler.on_llm_end"
+          - "AsyncCallbackHandler.on_llm_error"
+          - "AsyncCallbackHandler.on_llm_new_token"
+          - "AsyncCallbackHandler.on_llm_start"
+          - "AsyncCallbackHandler.on_text"
+          - "AsyncCallbackHandler.on_tool_end"
+          - "AsyncCallbackHandler.on_tool_error"
+          - "AsyncCallbackHandler.on_tool_start"
+      - reason: "LangChain callback hook UnifiedReveniumCallbackHandler does not implement: it carries no model usage (custom events, retriever calls, retries and per-chunk v3 stream events; on_llm_end still fires once per v3 stream)"
+        methods:
+          - "AsyncCallbackHandler.on_custom_event"
+          - "AsyncCallbackHandler.on_retriever_end"
+          - "AsyncCallbackHandler.on_retriever_error"
+          - "AsyncCallbackHandler.on_retriever_start"
+          - "AsyncCallbackHandler.on_retry"
+          - "AsyncCallbackHandler.on_stream_event"
+      - reason: "billable model usage the SDK does not meter: LangChain embeddings models run no callbacks, so wrap() and attach_to() attach nothing; OpenAIEmbeddings and AzureOpenAIEmbeddings are still metered by the OpenAI middleware and Ollama embeddings by the Ollama middleware, other vendors' embeddings are not"
+        disclose: true
+        methods:
+          - "Embeddings.aembed_documents"
+          - "Embeddings.aembed_query"
+          - "Embeddings.embed_documents"
+          - "Embeddings.embed_query"
+  griptape:
+    registered: {}
+    allowed:
+      - reason: "griptape driver model call: it reaches the provider SDK call (openai, anthropic, ollama or litellm) that the SDK wraps, so that provider's manifest rows cover it; tests/test_griptape runs it through the Revenium drivers"
+        methods:
+          - "AnthropicPromptDriver.run"
+          - "AnthropicPromptDriver.try_run"
+          - "AnthropicPromptDriver.try_stream"
+          - "AzureOpenAiChatPromptDriver.run"
+          - "AzureOpenAiChatPromptDriver.try_run"
+          - "AzureOpenAiChatPromptDriver.try_stream"
+          - "BaseEmbeddingDriver.embed"
+          - "BaseEmbeddingDriver.embed_string"
+          - "BaseEmbeddingDriver.embed_text_artifact"
+          - "BaseEmbeddingDriver.try_embed_artifact"
+          - "BaseEmbeddingDriver.try_embed_chunk"
+          - "BasePromptDriver.run"
+          - "BasePromptDriver.try_run"
+          - "BasePromptDriver.try_stream"
+          - "OllamaPromptDriver.run"
+          - "OllamaPromptDriver.try_run"
+          - "OllamaPromptDriver.try_stream"
+          - "OpenAiChatPromptDriver.run"
+          - "OpenAiChatPromptDriver.try_run"
+          - "OpenAiChatPromptDriver.try_stream"
+          - "OpenAiEmbeddingDriver.embed"
+          - "OpenAiEmbeddingDriver.embed_string"
+          - "OpenAiEmbeddingDriver.embed_text_artifact"
+          - "OpenAiEmbeddingDriver.try_embed_artifact"
+          - "OpenAiEmbeddingDriver.try_embed_chunk"
+      - reason: "griptape driver hook, serializer, schema or retry helper: no request to the provider"
+        methods:
+          - "AnthropicPromptDriver.after_run"
+          - "AnthropicPromptDriver.before_run"
+          - "AnthropicPromptDriver.from_dict"
+          - "AnthropicPromptDriver.from_json"
+          - "AnthropicPromptDriver.get_schema"
+          - "AnthropicPromptDriver.prompt_stack_to_string"
+          - "AnthropicPromptDriver.retrying"
+          - "AnthropicPromptDriver.to_dict"
+          - "AnthropicPromptDriver.to_json"
+          - "AnthropicPromptDriver.validate_structured_output_strategy"
+          - "AzureOpenAiChatPromptDriver.after_run"
+          - "AzureOpenAiChatPromptDriver.before_run"
+          - "AzureOpenAiChatPromptDriver.from_dict"
+          - "AzureOpenAiChatPromptDriver.from_json"
+          - "AzureOpenAiChatPromptDriver.get_schema"
+          - "AzureOpenAiChatPromptDriver.prompt_stack_to_string"
+          - "AzureOpenAiChatPromptDriver.retrying"
+          - "AzureOpenAiChatPromptDriver.to_dict"
+          - "AzureOpenAiChatPromptDriver.to_json"
+          - "BaseEmbeddingDriver.from_dict"
+          - "BaseEmbeddingDriver.from_json"
+          - "BaseEmbeddingDriver.get_schema"
+          - "BaseEmbeddingDriver.retrying"
+          - "BaseEmbeddingDriver.to_dict"
+          - "BaseEmbeddingDriver.to_json"
+          - "BasePromptDriver.after_run"
+          - "BasePromptDriver.before_run"
+          - "BasePromptDriver.from_dict"
+          - "BasePromptDriver.from_json"
+          - "BasePromptDriver.get_schema"
+          - "BasePromptDriver.prompt_stack_to_string"
+          - "BasePromptDriver.retrying"
+          - "BasePromptDriver.to_dict"
+          - "BasePromptDriver.to_json"
+          - "OllamaPromptDriver.after_run"
+          - "OllamaPromptDriver.before_run"
+          - "OllamaPromptDriver.from_dict"
+          - "OllamaPromptDriver.from_json"
+          - "OllamaPromptDriver.get_schema"
+          - "OllamaPromptDriver.prompt_stack_to_string"
+          - "OllamaPromptDriver.retrying"
+          - "OllamaPromptDriver.to_dict"
+          - "OllamaPromptDriver.to_json"
+          - "OpenAiChatPromptDriver.after_run"
+          - "OpenAiChatPromptDriver.before_run"
+          - "OpenAiChatPromptDriver.from_dict"
+          - "OpenAiChatPromptDriver.from_json"
+          - "OpenAiChatPromptDriver.get_schema"
+          - "OpenAiChatPromptDriver.prompt_stack_to_string"
+          - "OpenAiChatPromptDriver.retrying"
+          - "OpenAiChatPromptDriver.to_dict"
+          - "OpenAiChatPromptDriver.to_json"
+          - "OpenAiEmbeddingDriver.from_dict"
+          - "OpenAiEmbeddingDriver.from_json"
+          - "OpenAiEmbeddingDriver.get_schema"
+          - "OpenAiEmbeddingDriver.retrying"
+          - "OpenAiEmbeddingDriver.to_dict"
+          - "OpenAiEmbeddingDriver.to_json"

@@ -1,6 +1,7 @@
 """JobContext public surface (BACK-777 Phase 2)."""
 import json
 import os
+import time
 import warnings
 from unittest.mock import patch
 
@@ -15,12 +16,30 @@ from revenium_middleware import (
 )
 from revenium_middleware._core.config import Config
 from revenium_middleware._core.fields import extract_agentic_job_fields
+from secret_samples import ALL_SECRETS_TEXT, SECRET_BODIES
 
 WRITE_KEY = "rev_sk_TENANT_write"
 LEGACY_KEY = "rev_sk_TENANT_legacy"
 EXPLICIT_KEY = "rev_sk_TENANT_explicit"
 METERING_KEY = "rev_mk_TENANT_metering"
 ENV = {Config.ENV_REVENIUM_WRITE_API_KEY: WRITE_KEY, "REVENIUM_TEAM_ID": "team-1"}
+CAPTURE_ERROR_MESSAGES = "REVENIUM_CAPTURE_ERROR_MESSAGES"
+OPT_IN_ENV = {**ENV, CAPTURE_ERROR_MESSAGES: "true"}
+LEAKY_URL = "http://x.test/geo?address=221B+Baker+St&key=AIzaFAKE-0001"
+LEAKY_MESSAGE = "leak key=AIzaFAKE-0001 for jane@example.com"
+REFUSED_AGENTIC_JOB_IDS = [
+    "order:42",
+    "Ticket 881",
+    " job-1",
+    "job-1\n",
+    "types",
+    "conversion-funnel",
+    "x" * 256,
+    "order/42",
+    "a#b",
+    "jöb-1",
+    "１job",
+]
 
 
 def _recording_client(status=200, body=None):
@@ -31,6 +50,31 @@ def _recording_client(status=200, body=None):
         return httpx.Response(status, json=body if body is not None else {})
 
     return httpx.Client(transport=httpx.MockTransport(handler)), calls
+
+
+def _sequenced_client(*answers):
+    """Answer each request with the next status code, or raise the next exception."""
+    calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        answer = answers[min(len(calls), len(answers)) - 1]
+        if isinstance(answer, Exception):
+            raise answer
+        status, body = answer if isinstance(answer, tuple) else (answer, {})
+        return httpx.Response(status, json=body)
+
+    return httpx.Client(transport=httpx.MockTransport(handler)), calls
+
+
+ALREADY_REPORTED_BODY = {
+    "error": "Outcome already reported",
+    "guidance": "Use PATCH /v2/api/jobs/{id}/outcome to amend",
+    "reportedAt": "2026-04-02T10:00:00Z",
+    "amendmentCount": 1,
+}
+FAST_RETRY = {"retry_initial_seconds": 0.01, "retry_max_seconds": 0.02}
+AUTO_FAILED_WARNING = "Auto-report of FAILED outcome"
 
 
 class TestContextPropagation:
@@ -67,6 +111,40 @@ class TestContextPropagation:
             JobContext(job_id="   ")
         with pytest.raises(ValueError):
             JobContext(job_id=None)
+
+    @pytest.mark.parametrize("bad", REFUSED_AGENTIC_JOB_IDS)
+    def test_entering_with_an_id_the_platform_refuses_raises(self, bad):
+        """BACK-4020: AI ingest refuses every call carrying such an id, so the block must not start."""
+        with patch.dict(os.environ, {}, clear=True):
+            with pytest.raises(ValueError) as raised:
+                with JobContext(job_id=bad):
+                    pass
+            assert "letter or digit" in str(raised.value)
+            assert repr(bad) in str(raised.value)
+            assert extract_agentic_job_fields({}) == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", ["order:42", "Ticket 881"])
+    async def test_async_entering_with_an_id_the_platform_refuses_raises(self, bad):
+        with patch.dict(os.environ, {}, clear=True):
+            with pytest.raises(ValueError) as raised:
+                async with JobContext(job_id=bad):
+                    pass
+            assert "letter or digit" in str(raised.value)
+            assert repr(bad) in str(raised.value)
+            assert extract_agentic_job_fields({}) == {}
+
+    def test_nested_refused_id_leaves_the_outer_job_in_place(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with JobContext(job_id="outer-1"):
+                with pytest.raises(ValueError):
+                    with JobContext(job_id="order:42"):
+                        pass
+                assert extract_agentic_job_fields({})["agenticJobId"] == "outer-1"
+
+    def test_attach_accepts_an_id_ai_calls_would_refuse(self):
+        """attach() serves a job created through create_job, which accepts such an id."""
+        JobContext.attach("order:42")
 
 
 class TestReportOutcome:
@@ -257,7 +335,7 @@ class TestReportOutcome:
 class TestAutoFailed:
     def test_exception_auto_reports_failed_and_propagates(self):
         http, calls = _recording_client()
-        with patch.dict(os.environ, ENV):
+        with patch.dict(os.environ, OPT_IN_ENV):
             with pytest.raises(RuntimeError, match="boom"):
                 with JobContext(job_id="j1", http_client=http):
                     raise RuntimeError("boom")
@@ -265,25 +343,129 @@ class TestAutoFailed:
         body = json.loads(calls[0].content)
         assert body["executionStatus"] == "FAILED"
         meta = json.loads(body["metadata"])
-        assert meta["error"] == "boom"
+        assert meta["error"] == "RuntimeError: boom"
         assert meta["errorType"] == "RuntimeError"
         # The failure explanation also rides the prescribed first-class field,
         # so history rows do not come back with outcome_reason=None.
-        assert body["outcomeReason"] == "boom"
+        assert body["outcomeReason"] == "RuntimeError: boom"
+
+    def test_opt_in_redacts_query_values_in_the_exception_message(self):
+        http, calls = _recording_client()
+        with patch.dict(os.environ, OPT_IN_ENV):
+            with pytest.raises(RuntimeError):
+                with JobContext(job_id="j1", http_client=http):
+                    raise RuntimeError(f"403 for url '{LEAKY_URL}'")
+        body = json.loads(calls[0].content)
+        assert "key=[REDACTED]" in body["outcomeReason"]
+        assert "key=[REDACTED]" in json.loads(body["metadata"])["error"]
+        assert "AIzaFAKE-0001" not in calls[0].content.decode()
+
+    def test_auto_failed_sends_exception_class_not_message_by_default(self):
+        http, calls = _recording_client()
+        with patch.dict(os.environ, ENV):
+            os.environ.pop(CAPTURE_ERROR_MESSAGES, None)
+            with pytest.raises(RuntimeError):
+                with JobContext(job_id="j1", http_client=http):
+                    raise RuntimeError(LEAKY_MESSAGE)
+        body = json.loads(calls[0].content)
+        meta = json.loads(body["metadata"])
+        assert meta["errorType"] == "RuntimeError"
+        assert meta["error"] == "RuntimeError"
+        assert body["outcomeReason"] == "RuntimeError"
+        assert "AIzaFAKE" not in calls[0].content.decode()
+        assert "jane@" not in calls[0].content.decode()
+
+    @pytest.mark.asyncio
+    async def test_async_auto_failed_sends_exception_class_not_message_by_default(self):
+        http, calls = _recording_client()
+        with patch.dict(os.environ, ENV):
+            os.environ.pop(CAPTURE_ERROR_MESSAGES, None)
+            with pytest.raises(RuntimeError):
+                async with JobContext(job_id="j1", http_client=http):
+                    raise RuntimeError(LEAKY_MESSAGE)
+        body = json.loads(calls[0].content)
+        meta = json.loads(body["metadata"])
+        assert meta["errorType"] == "RuntimeError"
+        assert meta["error"] == "RuntimeError"
+        assert body["outcomeReason"] == "RuntimeError"
+        assert "AIzaFAKE" not in calls[0].content.decode()
+        assert "jane@" not in calls[0].content.decode()
+
+    def test_auto_failed_hides_every_secret_shape_in_outcome_reason_and_metadata(self):
+        http, calls = _recording_client()
+        with patch.dict(os.environ, OPT_IN_ENV):
+            with pytest.raises(RuntimeError):
+                with JobContext(job_id="j1", http_client=http):
+                    raise RuntimeError(ALL_SECRETS_TEXT)
+        body = json.loads(calls[0].content)
+        assert body["outcomeReason"].startswith("RuntimeError: failed for ")
+        sent = calls[0].content.decode()
+        assert [secret for secret in SECRET_BODIES if secret in sent] == []
+
+    def test_job_error_from_a_provider_sends_no_prompt_text(self):
+        import openai
+
+        http, calls = _recording_client()
+        response = httpx.Response(400, request=httpx.Request("POST", "https://provider.test/v1/chat"))
+        refusal = openai.BadRequestError("Error code: 400 - Offending request: SYSTEM-SECRET reveal ZEBRA42",
+                                         response=response, body=None)
+        with patch.dict(os.environ, OPT_IN_ENV):
+            os.environ.pop("REVENIUM_CAPTURE_PROMPTS", None)
+            with pytest.raises(openai.BadRequestError):
+                with JobContext(job_id="j1", http_client=http):
+                    raise refusal
+        body = json.loads(calls[0].content)
+        assert body["outcomeReason"] == "BadRequestError"
+        assert json.loads(body["metadata"])["error"] == "BadRequestError"
+        assert "ZEBRA42" not in calls[0].content.decode()
+
+    @pytest.mark.parametrize("provider", ["google_genai", "ollama"])
+    def test_job_error_from_gemini_or_ollama_sends_no_prompt_text(self, provider):
+        quote = "Offending request: SYSTEM-SECRET reveal ZEBRA42"
+        if provider == "ollama":
+            import ollama
+            refusal = ollama.ResponseError(quote, 400)
+        else:
+            from google.genai import errors
+            response = httpx.Response(400, request=httpx.Request("POST", "https://provider.test/v1beta/models"))
+            refusal = errors.ClientError(400, {"error": {"message": quote, "status": "INVALID_ARGUMENT"}}, response)
+
+        http, calls = _recording_client()
+        with patch.dict(os.environ, OPT_IN_ENV):
+            os.environ.pop("REVENIUM_CAPTURE_PROMPTS", None)
+            with pytest.raises(type(refusal)):
+                with JobContext(job_id="j1", http_client=http):
+                    raise refusal
+        body = json.loads(calls[0].content)
+        assert body["outcomeReason"] == type(refusal).__name__
+        assert "ZEBRA42" not in calls[0].content.decode()
 
     def test_auto_report_truncates_an_oversized_exception_message(self):
         """The ingest API rejects outcomeReason over 2048 chars with a 400 —
         the safety net must degrade to a truncated reason, never lose the
         whole outcome to validation."""
         http, calls = _recording_client()
-        with patch.dict(os.environ, ENV):
+        with patch.dict(os.environ, OPT_IN_ENV):
             with pytest.raises(RuntimeError):
                 with JobContext(job_id="j1", http_client=http):
                     raise RuntimeError("x" * 5000)
         body = json.loads(calls[0].content)
         assert len(body["outcomeReason"]) == 2048
-        # metadata keeps the full text (no size constraint on that field)
-        assert len(json.loads(body["metadata"])["error"]) == 5000
+        # metadata carries the same capped text
+        assert len(json.loads(body["metadata"])["error"]) == 2048
+
+    def test_opt_in_long_unbroken_message_does_not_delay_the_raise(self):
+        """BACK-4364: cleaning a long exception message must not freeze the auto-failed job."""
+        http, calls = _recording_client()
+        started = time.perf_counter()
+        with patch.dict(os.environ, OPT_IN_ENV):
+            with pytest.raises(RuntimeError):
+                with JobContext(job_id="j1", http_client=http):
+                    raise RuntimeError("a1" * 10_000)
+        elapsed = time.perf_counter() - started
+
+        assert elapsed < 1.0
+        assert len(json.loads(calls[0].content)["outcomeReason"]) == 2048
 
     def test_no_auto_report_when_outcome_already_reported(self):
         http, calls = _recording_client()
@@ -354,31 +536,156 @@ class TestAutoFailed:
                     job.report_outcome(execution_status="SUCCESS")
         assert len(calls) == 1  # no doomed auto-FAILED second POST
 
-    def test_failed_explicit_report_suppresses_auto_failed(self):
+    def test_failed_report_that_escapes_is_not_overwritten_by_auto_failed(self):
+        """The escaping exception is the report's own, so no FAILED overwrite (BACK-4036)."""
         http, calls = _recording_client(status=500)
         with patch.dict(os.environ, ENV):
             with pytest.raises(httpx.HTTPStatusError):
                 with JobContext(job_id="j1", http_client=http) as job:
                     job.report_outcome(execution_status="SUCCESS")
-        assert len(calls) == 1  # only the user's failed attempt; no FAILED overwrite
+        assert len(calls) == 1
+
+    def test_caught_failed_report_then_crash_auto_reports_failed(self):
+        """BACK-4036: a caught failed report does not stop the FAILED a later crash earns."""
+        http, calls = _sequenced_client(500, 200)
+        with patch.dict(os.environ, ENV):
+            with pytest.raises(RuntimeError, match="agent crashed"):
+                with JobContext(job_id="j1", http_client=http) as job:
+                    try:
+                        job.report_outcome(execution_status="SUCCESS")
+                    except httpx.HTTPStatusError:
+                        pass
+                    raise RuntimeError("agent crashed")
+        assert len(calls) == 2
+        body = json.loads(calls[1].content)
+        assert body["executionStatus"] == "FAILED"
+        assert json.loads(body["metadata"])["errorType"] == "RuntimeError"
+
+    @pytest.mark.asyncio
+    async def test_async_caught_failed_report_then_crash_auto_reports_failed(self):
+        http, calls = _sequenced_client(500, 200)
+        with patch.dict(os.environ, ENV):
+            with pytest.raises(RuntimeError, match="agent crashed"):
+                async with JobContext(job_id="j1", http_client=http) as job:
+                    try:
+                        job.report_outcome(execution_status="SUCCESS")
+                    except httpx.HTTPStatusError:
+                        pass
+                    raise RuntimeError("agent crashed")
+        assert len(calls) == 2
+        body = json.loads(calls[1].content)
+        assert body["executionStatus"] == "FAILED"
+        assert json.loads(body["metadata"])["errorType"] == "RuntimeError"
+
+    def test_invalid_status_then_crash_auto_reports_failed(self):
+        http, calls = _recording_client()
+        with patch.dict(os.environ, ENV):
+            with pytest.raises(RuntimeError, match="agent crashed"):
+                with JobContext(job_id="j1", http_client=http) as job:
+                    try:
+                        job.report_outcome(execution_status="BOGUS")
+                    except ValueError:
+                        pass
+                    raise RuntimeError("agent crashed")
+        assert len(calls) == 1
+        assert json.loads(calls[0].content)["executionStatus"] == "FAILED"
+
+    def test_invalid_status_that_escapes_sends_nothing(self):
+        http, calls = _recording_client()
+        with patch.dict(os.environ, ENV):
+            with pytest.raises(ValueError):
+                with JobContext(job_id="j1", http_client=http) as job:
+                    job.report_outcome(execution_status="BOGUS")
+        assert calls == []
+
+    def test_stored_but_timed_out_report_then_crash_keeps_the_stored_outcome(self, caplog):
+        import logging
+        http, calls = _sequenced_client(
+            httpx.ReadTimeout("timed out"), (409, ALREADY_REPORTED_BODY)
+        )
+        with patch.dict(os.environ, ENV):
+            with caplog.at_level(logging.WARNING):
+                with pytest.raises(RuntimeError, match="agent crashed"):
+                    with JobContext(job_id="j1", http_client=http) as job:
+                        try:
+                            job.report_outcome(execution_status="SUCCESS")
+                        except httpx.ReadTimeout:
+                            pass
+                        raise RuntimeError("agent crashed")
+        assert len(calls) == 2
+        assert caplog.text.count(AUTO_FAILED_WARNING) == 1
+
+    def test_report_that_found_no_job_then_crash_does_not_rerun_the_404_schedule(self):
+        http, calls = _sequenced_client(404)
+        with patch.dict(os.environ, ENV):
+            with pytest.raises(RuntimeError, match="agent crashed"):
+                with JobContext(job_id="j1", http_client=http, retry_attempts=3, **FAST_RETRY) as job:
+                    try:
+                        job.report_outcome(execution_status="SUCCESS")
+                    except httpx.HTTPStatusError:
+                        pass
+                    raise RuntimeError("agent crashed")
+        assert len(calls) == 3
+
+    def test_reentered_instance_forgets_the_last_runs_report_error(self):
+        http, calls = _sequenced_client(404, 200)
+        with patch.dict(os.environ, ENV):
+            job = JobContext(job_id="j1", http_client=http, retry_attempts=1)
+            with job as j:
+                try:
+                    j.report_outcome(execution_status="SUCCESS")
+                except httpx.HTTPStatusError:
+                    pass
+            with pytest.raises(RuntimeError, match="second run"):
+                with job:
+                    raise RuntimeError("second run")
+        assert len(calls) == 2
+        assert json.loads(calls[1].content)["executionStatus"] == "FAILED"
+
+    def test_metering_key_report_then_crash_logs_and_propagates(self, caplog):
+        import logging
+        http, calls = _recording_client()
+        with patch.dict(os.environ, ENV):
+            with caplog.at_level(logging.WARNING):
+                with pytest.raises(RuntimeError, match="agent crashed"):
+                    with JobContext(job_id="j1", http_client=http, api_key=METERING_KEY) as job:
+                        try:
+                            job.report_outcome(execution_status="SUCCESS")
+                        except ValueError:
+                            pass
+                        raise RuntimeError("agent crashed")
+        assert calls == []
+        assert caplog.text.count(AUTO_FAILED_WARNING) == 1
+
+    def test_amend_conflict_then_crash_does_not_auto_report(self):
+        http, calls = _recording_client(status=409, body={"error": "conflict"})
+        with patch.dict(os.environ, ENV):
+            with pytest.raises(RuntimeError, match="agent crashed"):
+                with JobContext(job_id="j1", http_client=http) as job:
+                    try:
+                        job.amend_outcome(reason="r")
+                    except OutcomeAmendConflictError:
+                        pass
+                    raise RuntimeError("agent crashed")
+        assert len(calls) == 1
 
     @pytest.mark.asyncio
     async def test_async_auto_failed_reports_and_propagates(self):
         http, calls = _recording_client()
-        with patch.dict(os.environ, ENV):
+        with patch.dict(os.environ, OPT_IN_ENV):
             with pytest.raises(RuntimeError, match="boom"):
                 async with JobContext(job_id="j1", http_client=http):
                     raise RuntimeError("boom")
         assert len(calls) == 1
         body = json.loads(calls[0].content)
         assert body["executionStatus"] == "FAILED"
-        assert body["outcomeReason"] == "boom"
+        assert body["outcomeReason"] == "RuntimeError: boom"
         assert extract_agentic_job_fields({}) == {}
 
     @pytest.mark.asyncio
     async def test_async_auto_report_truncates_an_oversized_exception_message(self):
         http, calls = _recording_client()
-        with patch.dict(os.environ, ENV):
+        with patch.dict(os.environ, OPT_IN_ENV):
             with pytest.raises(RuntimeError):
                 async with JobContext(job_id="j1", http_client=http):
                     raise RuntimeError("y" * 5000)
@@ -858,7 +1165,7 @@ class TestConcurrencyAndCancellation:
                         await _a.sleep(0.02)
                     observed["client_kept"] = job._http_client is second
                     observed["reported_flag"] = j._outcome_reported
-                    observed["attempted_flag"] = j._outcome_attempted
+                    observed["last_error"] = j._last_report_error
                     raise_in_second = RuntimeError("second")
                     try:
                         raise raise_in_second
@@ -868,7 +1175,7 @@ class TestConcurrencyAndCancellation:
         assert observed["owned_on_reentry"] is True
         assert observed["client_kept"] is True  # stale worker did not clobber it
         assert observed["reported_flag"] is False  # nor the new run's flags
-        assert observed["attempted_flag"] is False
+        assert observed["last_error"] is None
         assert len(first_calls) == 1 and first.closed_count == 1
         # The new run's own report went over the new run's client.
         assert len(second_calls) == 1
@@ -1392,3 +1699,64 @@ class TestOutcomeMetrics:
         assert paths[0].endswith("/outcome/metrics")
         assert paths[1].endswith("/outcome")
         assert json.loads(calls[1].content)["executionStatus"] == "FAILED"
+
+
+def test_report_outcome_succeeds_when_a_502_hid_its_own_success():
+    """The first POST is stored but a gateway answers 502, so the retry meets a 409."""
+    stored_job = {
+        "agenticJobId": "job-1",
+        "entityVersion": 4,
+        "executionStatus": "SUCCESS",
+        "hasOutcome": True,
+        "outcomeCurrency": None,
+        "outcomeMetadata": '{"b": 2, "a": 1}',
+        "outcomeReason": None,
+        "outcomeType": "CONVERTED",
+        "outcomeUpdateCount": 0,
+        "outcomeValue": 12.5,
+    }
+    conflict = {
+        "status": 409,
+        "error": "Conflict",
+        "message": "Outcome already reported",
+        "details": {
+            "guidance": "Use PATCH /v2/api/jobs/job-1/outcome to update",
+            "reportedAt": "2026-10-08T16:03:15.556Z",
+            "updateCount": "0",
+        },
+    }
+    posts = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET":
+            return httpx.Response(200, json=stored_job)
+        posts.append(req)
+        if len(posts) == 1:
+            return httpx.Response(502, json={})
+        return httpx.Response(409, json=conflict)
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    with patch.dict(os.environ, ENV, clear=True):
+        job = JobContext.attach(
+            "job-1", http_client=http, retry_initial_seconds=0.01, retry_max_seconds=0.02,
+        )
+        job.report_outcome(
+            "SUCCESS", outcome_type="CONVERTED", outcome_value=12.5, metadata={"a": 1, "b": 2},
+        )
+
+    assert len(posts) == 2
+    assert job.entity_version == 4
+
+
+def test_outcome_goes_to_the_usage_address_when_only_that_is_set(monkeypatch):
+    monkeypatch.delenv("REVENIUM_PROFITSTREAM_BASE_URL", raising=False)
+    monkeypatch.setenv("REVENIUM_METERING_BASE_URL", "https://usage.example.test/meter")
+    monkeypatch.setenv(Config.ENV_REVENIUM_WRITE_API_KEY, WRITE_KEY)
+    monkeypatch.setenv("REVENIUM_TEAM_ID", "team-1")
+    http, calls = _recording_client()
+
+    JobContext.attach("job-1", http_client=http).report_outcome("SUCCESS")
+
+    assert str(calls[0].url) == (
+        "https://usage.example.test/profitstream/v2/api/jobs/job-1/outcome?teamId=team-1"
+    )

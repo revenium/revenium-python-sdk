@@ -7,11 +7,15 @@ that do NOT require fal_client to be installed, enabling independent testing.
 
 import logging
 import datetime
+import math
+import re
 import uuid
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from revenium_middleware import client, get_client, run_async_in_thread, shutdown_event
+from revenium_middleware import client, run_async_in_thread, shutdown_event
 from revenium_middleware._core import submit_ai_event
+from revenium_middleware._core.log_sanitize import sanitize_for_logging
+from revenium_middleware._core.metering import current_client
 from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
 from revenium_middleware._core.fields import (
     extract_field_with_fallback as _core_extract_field_with_fallback,
@@ -22,6 +26,7 @@ from revenium_middleware._core.fields import (
     extract_service_tier_fields,
     extract_effort_field,
     extract_prompt_context_fields,
+    extract_skill_fields,
     merge_extra_body,
 )
 from .trace_fields import (
@@ -37,6 +42,9 @@ from .trace_fields import (
     get_agent_version,
     detect_media_type,
     normalize_model_name,
+    INPUT_TOKEN_KEYS,
+    OUTPUT_TOKEN_KEYS,
+    TOTAL_TOKEN_KEY,
 )
 from .config import Config, get_middleware_source
 
@@ -139,9 +147,8 @@ def extract_video_fields(result: Any, arguments: Dict[str, Any]) -> Dict[str, An
         elif "inference_time" in result:
             fields["duration_seconds"] = float(result["inference_time"])
 
-    # Duration from request arguments (requested duration)
     if arguments.get("duration"):
-        fields["requested_duration_seconds"] = float(arguments["duration"])
+        _read_requested_duration(arguments["duration"], fields)
 
     # Resolution, FPS, aspect ratio from request arguments
     if arguments.get("resolution"):
@@ -205,6 +212,85 @@ def extract_audio_fields(result: Any, arguments: Dict[str, Any]) -> Dict[str, An
     return fields
 
 
+_SECONDS_SPELLING = re.compile(r"\s*(\d+(?:\.\d+)?)\s*s?\s*", re.IGNORECASE)
+
+
+def _positive_finite(value: Any) -> Optional[float]:
+    try:
+        seconds = float(value)
+    except (ValueError, OverflowError):
+        return None
+    if not math.isfinite(seconds) or seconds <= 0:
+        return None
+    return seconds
+
+
+def requested_duration_seconds(value: Any) -> Optional[float]:
+    """Seconds from a fal clip length such as 8, "5" or "8s"; None when it is not a positive finite number."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return _positive_finite(value)
+    if isinstance(value, str):
+        match = _SECONDS_SPELLING.fullmatch(value)
+        return _positive_finite(match.group(1)) if match else None
+    return None
+
+
+def _is_auto_duration(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().lower() == "auto"
+
+
+def _read_requested_duration(value: Any, fields: Dict[str, Any]) -> None:
+    seconds = requested_duration_seconds(value)
+    if seconds is not None:
+        fields["requested_duration_seconds"] = seconds
+    elif _is_auto_duration(value):
+        logger.debug("fal duration is 'auto'; recording the video without a requested duration")
+    else:
+        logger.warning(
+            "fal duration %.40r is not a number of seconds; recording the video without a requested duration",
+            sanitize_for_logging(value),
+        )
+
+
+def _whole_token_count(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    if not math.isfinite(value) or value < 0:
+        return 0
+    return int(value)
+
+
+def _first_reported(usage: Dict[str, Any], keys) -> Any:
+    for key in keys:
+        if key in usage:
+            return usage[key]
+    return None
+
+
+def extract_completion_fields(result: Any) -> Dict[str, int]:
+    """
+    Extract the token counts a fal.ai language model result reports in ``usage``.
+
+    Returns:
+        Dict with: input_token_count, output_token_count, total_token_count
+    """
+    usage = result.get("usage") if isinstance(result, dict) else None
+    if not isinstance(usage, dict):
+        usage = {}
+
+    input_tokens = _whole_token_count(_first_reported(usage, INPUT_TOKEN_KEYS))
+    output_tokens = _whole_token_count(_first_reported(usage, OUTPUT_TOKEN_KEYS))
+    reported_total = _whole_token_count(usage.get(TOTAL_TOKEN_KEY))
+
+    return {
+        "input_token_count": input_tokens,
+        "output_token_count": output_tokens,
+        "total_token_count": reported_total if reported_total > 0 else input_tokens + output_tokens,
+    }
+
+
 # =============================================================================
 # Metering dispatcher
 # =============================================================================
@@ -245,14 +331,14 @@ def _build_common_args(
         "product_name": product_name,
         "agent": meta["agent"],
         "middleware_source": get_middleware_source(),
-        "environment": get_environment(),
-        "region": get_region(),
-        "credential_alias": get_credential_alias(),
-        "trace_type": get_trace_type(),
-        "trace_name": get_trace_name(),
-        "parent_transaction_id": get_parent_transaction_id(),
+        "environment": get_environment(usage_metadata),
+        "region": get_region(usage_metadata),
+        "credential_alias": get_credential_alias(usage_metadata),
+        "trace_type": get_trace_type(usage_metadata),
+        "trace_name": get_trace_name(usage_metadata),
+        "parent_transaction_id": get_parent_transaction_id(usage_metadata),
         "transaction_name": get_transaction_name(usage_metadata),
-        "retry_number": get_retry_number(),
+        "retry_number": get_retry_number(usage_metadata),
     }
 
 
@@ -272,9 +358,9 @@ def handle_metering(
     - image -> client.ai.create_image
     - video -> client.ai.create_video
     - audio -> client.ai.create_audio
-    - generation/other -> client.ai.create_completion
+    - chat/generation -> client.ai.create_completion
     """
-    if get_client() is None:
+    if current_client() is None:
         return  # metering disabled (no API key configured)
     response_time_dt = datetime.datetime.now(datetime.timezone.utc)
 
@@ -284,7 +370,7 @@ def handle_metering(
                 logger.warning("Skipping metering call during shutdown")
                 return
 
-            media_type = detect_media_type(application)
+            media_type = detect_media_type(application, result)
             common = _build_common_args(
                 application, request_time_dt, response_time_dt, usage_metadata, transaction_id, is_streamed
             )
@@ -363,11 +449,12 @@ def handle_metering(
                 )
                 metering_result = submit_ai_event("audio", audio_args)
             else:
+                completion_fields = extract_completion_fields(result)
                 completion_args = {
                     **common,
-                    "input_token_count": 0,
-                    "output_token_count": 1,
-                    "total_token_count": 1,
+                    "input_token_count": completion_fields["input_token_count"],
+                    "output_token_count": completion_fields["output_token_count"],
+                    "total_token_count": completion_fields["total_token_count"],
                     "cost_type": "AI",
                     "stop_reason": "END",
                     "is_streamed": is_streamed,
@@ -386,6 +473,7 @@ def handle_metering(
                 )
                 completion_args.update(extract_effort_field(usage_metadata))
                 completion_args.update(extract_prompt_context_fields(usage_metadata))
+                completion_args.update(extract_skill_fields(usage_metadata))
                 metering_result = submit_ai_event("completion", completion_args)
 
             logger.debug("Metering call result: %s", metering_result)

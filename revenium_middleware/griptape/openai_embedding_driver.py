@@ -10,6 +10,7 @@ from typing import Dict, Any, Optional
 from griptape.drivers.embedding.openai import OpenAiEmbeddingDriver
 
 from ._metadata import strip_revenium_auth_keys
+from ._retry import stop_retrying_budget_errors
 
 # Import the revenium OpenAI middleware - this automatically patches OpenAI calls
 try:
@@ -73,6 +74,7 @@ class ReveniumOpenAiEmbeddingDriver(OpenAiEmbeddingDriver):
         **kwargs
     ):
         super().__init__(**kwargs)
+        stop_retrying_budget_errors(self)
         
         self.usage_metadata = usage_metadata or {}
         

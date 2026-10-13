@@ -6,10 +6,11 @@ row's per-operation oracle. Known gaps are strict xfails keyed by their ticket.
 A row runs only in the test environment its ``env`` names (``default`` when
 absent); see ``entry_points.instrumented``. The same rows also serve as a
 timing oracle: with the metering worker busy, a payload's ``request_duration``
-must still match the call it measured.
+must not include the time the event waited for a worker.
 """
 import contextlib
 import contextvars
+import gc
 import json
 import os
 import pathlib
@@ -122,11 +123,25 @@ def _check_image(payload, usage):
     _require("input_token_count" not in payload, "image payloads carry no token fields", payload)
 
 
+def _check_video(payload, usage):
+    _require(payload["operation"] == "video", "expected a video payload", payload)
+    _require(payload.get("duration_seconds") == calls.VEO_SECONDS,
+             f"duration_seconds must equal the requested {calls.VEO_SECONDS}", payload)
+    _require("input_token_count" not in payload, "video payloads carry no token fields", payload)
+
+
+def _check_audio(payload, usage):
+    _require(payload["operation"] == "audio", "expected an audio payload", payload)
+    _require(payload.get("operation_type") == "AUDIO", "expected operation_type AUDIO", payload)
+
+
 ORACLES = {
     "completion": _check_completion,
     "embedding": _check_embedding,
     "embedding_without_usage": _check_embedding_without_usage,
     "image": _check_image,
+    "video": _check_video,
+    "audio": _check_audio,
 }
 
 
@@ -137,6 +152,9 @@ def check_oracle(row, payloads):
     model, provider = _expected(row)
     _require(payload.get("model") == model, f"model must be {model!r}", payload)
     _require(payload.get("provider") == provider, f"provider must be {provider!r}", payload)
+    if "subtype" in row:
+        _require(payload.get("operation_subtype") == row["subtype"], f"operation_subtype must be {row['subtype']!r}",
+                 payload)
     ORACLES[row["operation"]](payload, _expected_usage(row))
 
 
@@ -219,7 +237,12 @@ def test_entry_point_emits_one_payload(row, mock_revenium_client, request):
     check_oracle(row, payloads)
 
 
-LATENCY_BUDGET_MS = 100
+# The harness times the whole call, client construction and event loop included, so
+# its wall clock bounds request_duration from above and is no estimate of it: on a
+# loaded CI runner the time outside the provider call has reached 614 ms. The
+# tolerance covers the product's wall clock against the harness's monotonic clock and
+# stays far below the queue wait that a duration stamped at send time would add.
+CLOCK_TOLERANCE_MS = 100
 QUEUE_WAIT_SECONDS = 0.5
 LATENCY_ROWS = [row for row in ROWS_IN_THIS_ENVIRONMENT
                 if row["status"] == "metered" and not row.get("isolate") and not _metered_after_verified_release(row)]
@@ -286,11 +309,25 @@ def _recording_client(timings):
     return recorder
 
 
+@contextlib.contextmanager
+def _no_garbage_collection_pause():
+    """A full collection over the whole suite's heap takes 0.3 to 0.6 s on CI, longer than the latency budget.
+
+    One landing inside a timed call counts as call latency the SDK never added.
+    """
+    gc.collect()
+    gc.disable()
+    try:
+        yield
+    finally:
+        gc.enable()
+
+
 @pytest.fixture(scope="module")
 def timings_behind_a_busy_worker():
     timings = {row["id"]: RowTiming() for row in LATENCY_ROWS}
     pool = _row_stamping_pool()
-    with _busy_metering_worker(pool, _recording_client(timings)):
+    with _busy_metering_worker(pool, _recording_client(timings)), _no_garbage_collection_pause():
         for row in LATENCY_ROWS:
             timing = timings[row["id"]]
             pool.row_id = row["id"]
@@ -310,8 +347,8 @@ def test_recorded_duration_excludes_the_metering_queue_wait(row, timings_behind_
     assert timing.error is None
     assert timing.recorded_durations, "no payload was recorded for this call"
     for duration in timing.recorded_durations:
-        assert abs(duration - timing.elapsed_ms) <= LATENCY_BUDGET_MS, (
-            f"request_duration {duration} ms, call took {timing.elapsed_ms:.0f} ms")
+        assert 0 <= duration <= timing.elapsed_ms + CLOCK_TOLERANCE_MS, (
+            f"request_duration {duration} ms is longer than the {timing.elapsed_ms:.0f} ms the call took")
 
 
 def test_every_stub_runs_cleanly_without_our_middleware(differential):
@@ -333,6 +370,7 @@ class TestManifest:
             assert row["mode"] in ("sync", "async"), row["id"]
             assert isinstance(row["streamed"], bool), row["id"]
             assert row["operation"] in oracles, row["id"]
+            assert row["operation"] != "audio" or row.get("subtype"), row["id"]
             assert row["status"] in EXECUTABLE_STATUSES + ("not_executed", "unsupported"), row["id"]
             assert _environment_of(row) in ENVIRONMENTS, row["id"]
 

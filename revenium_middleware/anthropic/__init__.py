@@ -14,7 +14,6 @@ initialize() function.
 """
 
 import logging
-import os
 
 logger = logging.getLogger("revenium_middleware.anthropic.init")
 
@@ -41,6 +40,11 @@ except ImportError as e:
     usage_context = None  # type: ignore
 
 
+def _ready_to_meter():
+    from revenium_middleware._core.metering import get_client
+    return middleware is not None and get_client() is not None
+
+
 def initialize():
     """
     Explicitly initialize the Revenium middleware.
@@ -52,10 +56,10 @@ def initialize():
         bool: True if initialization succeeded, False otherwise
     """
     try:
-        # Check if required environment variables are set
-        api_key = os.getenv("REVENIUM_METERING_API_KEY")
-        if not api_key:
-            logger.debug("Metering API key not set - middleware will not meter requests")
+        if not _ready_to_meter():
+            logger.debug(
+                "No valid metering API key or Anthropic middleware not loaded - middleware will not meter requests"
+            )
             return False
 
         # The middleware is automatically activated by importing create_wrapper
@@ -76,10 +80,7 @@ def is_initialized():
         bool: True if middleware is active and ready to meter requests
     """
     try:
-        # Check if environment is properly configured
-        api_key = os.getenv("REVENIUM_METERING_API_KEY")
-
-        return bool(api_key)
+        return _ready_to_meter()
     except Exception:
         return False
 

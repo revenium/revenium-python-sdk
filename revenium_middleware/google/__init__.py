@@ -19,42 +19,15 @@ Usage:
 """
 
 import logging
-import os
 
+from revenium_middleware._core.config import env_flag_enabled
 
-# Configure logging based on REVENIUM_LOG_LEVEL environment variable
-def _configure_logging():
-    """Configure logging for the Revenium middleware."""
-    log_level_str = os.getenv("REVENIUM_LOG_LEVEL", "INFO").upper()
-
-    # Map string levels to logging constants
-    level_mapping = {
-        "DEBUG": logging.DEBUG,
-        "INFO": logging.INFO,
-        "WARNING": logging.WARNING,
-        "ERROR": logging.ERROR,
-        "CRITICAL": logging.CRITICAL,
-    }
-
-    log_level = level_mapping.get(log_level_str, logging.INFO)
-
-    logging.getLogger("revenium_middleware").setLevel(log_level)
-
-    return log_level
-
-
-# Configure logging
-_log_level = _configure_logging()
 
 # Set up logging
 logger = logging.getLogger(__name__)
 
 # Check if verbose startup logging is enabled
-_verbose_startup = os.getenv("REVENIUM_VERBOSE_STARTUP", "").lower() in (
-    "true",
-    "1",
-    "yes",
-)
+_verbose_startup = env_flag_enabled("REVENIUM_VERBOSE_STARTUP")
 
 if _verbose_startup:
     logger.info("Revenium middleware initialization starting")

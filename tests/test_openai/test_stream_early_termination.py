@@ -8,6 +8,8 @@ import asyncio
 import datetime
 import gc
 import threading
+import time
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -194,7 +196,7 @@ class FailingAsyncEventStream:
 
 
 @patch("revenium_middleware.openai.middleware.submit_ai_event", return_value=SimpleNamespace(id="evt"))
-@patch("revenium_middleware.openai.middleware.get_client", lambda: object())
+@patch("revenium_middleware.openai.middleware.current_client", lambda: object())
 @patch("revenium_middleware.openai.middleware.run_async_in_thread")
 class TestAsyncResponsesStreamCleanup:
     @staticmethod
@@ -249,3 +251,128 @@ class TestAsyncResponsesStreamCleanup:
         assert source.close_calls == 1
         assert mock_submit.call_count == 1
         assert mock_submit.call_args[0][1]["total_token_count"] == 100
+
+
+LONG_STREAM_CHUNKS = 10_000
+LONG_STREAM_USAGE = SimpleNamespace(prompt_tokens=11, completion_tokens=LONG_STREAM_CHUNKS,
+                                    total_tokens=11 + LONG_STREAM_CHUNKS)
+
+
+class _Chunk:
+    """A chat chunk that can be weakly referenced, unlike SimpleNamespace."""
+
+    def __init__(self, finish_reason=None, usage=None):
+        self.id = "chatcmpl-long"
+        self.model = "gpt-4o-mini"
+        self.system_fingerprint = None
+        self.choices = [SimpleNamespace(delta=SimpleNamespace(content="x"), finish_reason=finish_reason)]
+        self.usage = usage
+
+
+def _long_stream(refs):
+    for number in range(LONG_STREAM_CHUNKS):
+        last = number == LONG_STREAM_CHUNKS - 1
+        chunk = _Chunk("length", LONG_STREAM_USAGE) if last else _Chunk()
+        refs.append(weakref.ref(chunk))
+        yield chunk
+
+
+async def _async_long_stream(refs):
+    for chunk in _long_stream(refs):
+        yield chunk
+
+
+def _run_metering_now(coro):
+    thread = threading.Thread(target=asyncio.run, args=(coro,))
+    thread.start()
+    thread.join()
+    return thread
+
+
+@pytest.fixture
+def sent():
+    records = []
+    with patch.object(mw, "current_client", lambda: object()), \
+         patch.object(mw, "submit_ai_event", side_effect=lambda _kind, args: records.append(args)), \
+         patch.object(mw, "run_async_in_thread", side_effect=_run_metering_now):
+        yield records
+
+
+def _consume_sync(refs):
+    wrapper = mw.handle_streaming_response(_long_stream(refs), NOW, {}, None, {})
+    for _ in wrapper:
+        pass
+    return wrapper
+
+
+def _consume_async(refs):
+    async def consume():
+        wrapper = mw._wrap_async_stream(_async_long_stream(refs), NOW, {})
+        async for _ in wrapper:
+            pass
+        return wrapper
+    return asyncio.run(consume())
+
+
+class TestLongStreamRetention:
+    @pytest.mark.parametrize("consume", [_consume_sync, _consume_async], ids=["sync", "async"])
+    def test_consumed_chunks_are_released(self, consume, sent):
+        refs = []
+
+        wrapper = consume(refs)
+        gc.collect()
+
+        assert len(refs) == LONG_STREAM_CHUNKS
+        assert sum(ref() is not None for ref in refs) <= 1
+        assert wrapper is not None
+        assert len(sent) == 1
+        assert sent[0]["total_token_count"] == LONG_STREAM_USAGE.total_tokens
+        assert sent[0]["output_token_count"] == LONG_STREAM_CHUNKS
+        assert sent[0]["stop_reason"] == "TOKEN_LIMIT"
+
+
+FIRST_TOKEN_WAIT = datetime.timedelta(seconds=1)
+RAW_READ_PAUSE_SECONDS = 0.2
+
+
+def _stream_responses_sync(events):
+    for _ in mw.handle_streaming_responses(iter(events), NOW - FIRST_TOKEN_WAIT, {}):
+        pass
+    return FIRST_TOKEN_WAIT
+
+
+def _stream_responses_async(events):
+    async def consume():
+        stream = TestAsyncChatEarlyTermination.FakeAsyncStream(events)
+        async for _ in mw._wrap_async_responses_stream(stream, NOW - FIRST_TOKEN_WAIT, {}):
+            pass
+    asyncio.run(consume())
+    return FIRST_TOKEN_WAIT
+
+
+def _stream_responses_raw(events):
+    from .test_openai_sdk_entry_points import FakeOpenAI, RESPONSES_REQUEST
+
+    raw = FakeOpenAI().sync_client().responses.with_raw_response.create(**RESPONSES_REQUEST, stream=True)
+    time.sleep(RAW_READ_PAUSE_SECONDS)
+    list(raw.parse())
+    return datetime.timedelta(seconds=RAW_READ_PAUSE_SECONDS)
+
+
+class TestResponsesStreamFirstToken:
+    @pytest.mark.parametrize("stream_responses", [_stream_responses_sync, _stream_responses_async,
+                                                  _stream_responses_raw], ids=["sync", "async", "raw_response"])
+    def test_a_streamed_response_records_its_first_token_time(self, sent, stream_responses):
+        """The first output text is timed from the request, as on the chat stream (BACK-4413)."""
+        waited = stream_responses(typed_events())
+
+        assert len(sent) == 1
+        assert waited.total_seconds() * 1000 <= sent[0]["time_to_first_token"] <= sent[0]["request_duration"]
+
+    def test_a_stream_without_output_text_records_zero(self, sent):
+        events = [event for event in typed_events() if event.type != "response.output_text.delta"]
+
+        _stream_responses_sync(events)
+
+        assert len(sent) == 1
+        assert sent[0]["time_to_first_token"] == 0

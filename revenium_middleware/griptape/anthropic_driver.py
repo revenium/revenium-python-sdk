@@ -11,6 +11,7 @@ from griptape.drivers.prompt.anthropic import AnthropicPromptDriver
 from griptape.common.prompt_stack.prompt_stack import PromptStack
 
 from ._metadata import strip_revenium_auth_keys
+from ._retry import stop_retrying_budget_errors
 
 # Import the Revenium middleware for Anthropic - this auto-patches the anthropic client
 try:
@@ -51,6 +52,7 @@ class ReveniumAnthropicDriver(AnthropicPromptDriver):
         
         # Initialize parent without usage_metadata
         super().__init__(**kwargs)
+        stop_retrying_budget_errors(self)
         
         if not MIDDLEWARE_AVAILABLE:
             logger.warning(

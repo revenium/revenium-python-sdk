@@ -1,10 +1,16 @@
 import contextlib
 import datetime
+import functools
 import importlib
-import json
+import inspect
+import itertools
 import logging
 import os
+import threading
+import time
 import uuid
+import weakref
+from collections import OrderedDict
 from collections.abc import Mapping
 from contextvars import ContextVar
 from numbers import Number
@@ -12,23 +18,56 @@ from types import SimpleNamespace
 from typing import Dict, Any, NamedTuple, Optional, Tuple
 from enum import Enum
 
+import anyio
 import wrapt
+
 from revenium_middleware import client, get_client, run_async_in_thread, shutdown_event, merge_metadata
-from revenium_middleware._core.enforcement import check_enforcement
+from revenium_middleware._core.metering import current_client, recorded_under
+from revenium_middleware._core.call_context import CallContext
+from revenium_middleware._core.enforcement import check_enforcement, is_bypass_enabled, is_circuit_breaker_enabled
 from revenium_middleware._core.exceptions import BudgetExceededError  # noqa: F401 — re-exported via openai.exceptions
 from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
 from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, extract_skill_fields, extract_coding_assistant_fields, extract_service_tier_fields, extract_effort_field, extract_prompt_context_fields, merge_extra_body
-from revenium_middleware._core.config import is_selective_metering_enabled, is_capture_prompts_enabled
-from revenium_middleware._core.context import is_inside_decorated_function
-from revenium_middleware._core.patch_registry import register_patch
-from revenium_middleware._core.call_ownership import OPENAI, claim_call_for_transport, with_callback_metadata
+from revenium_middleware._core.config import is_capture_prompts_enabled, is_selective_metering_enabled
+from revenium_middleware._core.selective_metering import reported_if_unmetered
+from revenium_middleware._core.context import (
+    _agentic_job_context, is_inside_decorated_function, next_idempotency_key, overlay_metadata,
+)
+from revenium_middleware._core.parse_failures import metering_failed_parse
+from revenium_middleware._core.patch_registry import is_patched, wrap_once
+from revenium_middleware._core.call_ownership import (
+    OPENAI, PERPLEXITY, bind_model_call_for_cost, call_owned_by_outer_wrapper, claim_call_for_transport,
+    mark_model_call_served_by, peek_callback_metadata, with_callback_metadata
+)
 from revenium_middleware._core import submit_ai_event
+from revenium_middleware._core.usage_iterations import billed_iterations, submit_iteration_records
+from revenium_middleware._core.failed_calls import (
+    ERROR_STOP_REASON, CallFailure, exception_in_flight, failed_transaction_id, failure_of,
+)
+from revenium_middleware._core.langchain_settings import langchain_usage_metadata
 from revenium_middleware._core.log_sanitize import sanitize_for_logging
+from revenium_middleware._core.perplexity_cost import extract_reported_cost, read_reported_usage, reported_cost_of
+from revenium_middleware._core.perplexity_usage_metadata import take_usage_metadata
+from revenium_middleware._core.cache_tokens import (
+    billable_input_tokens,
+    extract_cache_creation_ttl_counts,
+    openai_cache_write_tokens,
+    prompt_folds_claude_cache,
+    without_openai_cache_writes,
+)
 
 # Azure OpenAI support imports
 from .provider import Provider, detect_provider, get_provider_metadata, is_azure_provider
 from .azure_model_resolver import resolve_azure_model_name
+from .raw_response import is_raw_response, tap_async_sse_body, tap_sse_body
+from openai import BaseModel as OpenAIBaseModel
+
+try:
+    from openai._legacy_response import LegacyAPIResponse
+except ImportError:
+    LegacyAPIResponse = None
 from .azure_config import get_azure_config
+from . import xai_usage
 from .exceptions import (
     ReveniumMiddlewareError, ValidationError, MeteringError,
     NetworkError, AuthenticationError, categorize_exception, handle_exception_safely
@@ -38,11 +77,10 @@ from .exceptions import (
 from .langchain._utils import is_langchain_available
 
 # Prompt capture utilities
-from .prompt_extractor import (
-    extract_prompts_from_request,
-    extract_response_content,
-    extract_streaming_response_content
+from revenium_middleware._core.prompt_extraction import (
+    ReplyCollector, extract_prompt_data_if_enabled, extract_prompts_from_request, responses_output_text,
 )
+from revenium_middleware._core.responses_status import responses_stop_reason as _responses_stop_reason
 
 logger = logging.getLogger("revenium_middleware.extension")
 
@@ -75,8 +113,9 @@ def _extract_cache_token_counts(usage: Any) -> Tuple[int, int]:
     """
     Return (cache_creation_token_count, cache_read_token_count).
 
-    OpenAI reports cached prompt/input tokens as cache reads. Anthropic-shaped
-    LangChain metadata reports read and creation counts separately.
+    OpenAI reports cached prompt/input tokens as cache reads and
+    ``cache_write_tokens`` as cache creation. Anthropic-shaped LangChain
+    metadata reports read and creation counts separately.
     """
     input_token_details = _get_value(usage, "input_token_details")
     cache_creation_token_count = _coerce_int(
@@ -86,7 +125,7 @@ def _extract_cache_token_counts(usage: Any) -> Tuple[int, int]:
         _get_value(input_token_details, "cache_read", 0)
     )
     if cache_creation_token_count or cache_read_token_count:
-        return cache_creation_token_count, cache_read_token_count
+        return cache_creation_token_count or openai_cache_write_tokens(usage), cache_read_token_count
 
     # Anthropic native usage shape: a live ChatAnthropic LLMResult exposes the
     # raw `response_metadata.usage` block with these flat keys rather than the
@@ -98,20 +137,60 @@ def _extract_cache_token_counts(usage: Any) -> Tuple[int, int]:
         _get_value(usage, "cache_read_input_tokens", 0)
     )
     if cache_creation_token_count or cache_read_token_count:
-        return cache_creation_token_count, cache_read_token_count
+        return cache_creation_token_count or openai_cache_write_tokens(usage), cache_read_token_count
 
     input_tokens_details = _get_value(usage, "input_tokens_details")
     cache_read_token_count = _coerce_int(
         _get_value(input_tokens_details, "cached_tokens", 0)
     )
-    if cache_read_token_count:
-        return 0, cache_read_token_count
+    if not cache_read_token_count:
+        prompt_details = _get_value(usage, "prompt_tokens_details")
+        cache_read_token_count = _coerce_int(
+            _get_value(prompt_details, "cached_tokens", 0)
+        )
+    return openai_cache_write_tokens(usage), cache_read_token_count
 
-    prompt_details = _get_value(usage, "prompt_tokens_details")
-    cache_read_token_count = _coerce_int(
-        _get_value(prompt_details, "cached_tokens", 0)
-    )
-    return 0, cache_read_token_count
+
+def _billable_prompt_tokens(gross_prompt_tokens, usage, model, cache_creation_token_count, cache_read_token_count):
+    """The input count to record for an OpenAI-shaped ``gross_prompt_tokens``."""
+    if prompt_folds_claude_cache(model, usage):
+        return billable_input_tokens(gross_prompt_tokens, cache_read_token_count, cache_creation_token_count, True)
+    return without_openai_cache_writes(gross_prompt_tokens, usage)
+
+
+def _billed_output_tokens(provider, prompt_tokens, completion_tokens, total_tokens, reasoning_token_count):
+    if provider != Provider.XAI:
+        return completion_tokens
+    return xai_usage.billed_output_tokens(prompt_tokens, completion_tokens, total_tokens, reasoning_token_count)
+
+
+def _parsed(response):
+    """The parsed body of a ``with_raw_response`` result, or the response itself."""
+    return response.parse() if callable(getattr(response, 'parse', None)) else response
+
+
+def _perplexity_reported_cost(response):
+    return extract_reported_cost(_parsed(response))
+
+
+def _xai_reported_cost(response):
+    return xai_usage.reported_cost(getattr(_parsed(response), 'usage', None))
+
+
+def _streamed_reported_cost(provider, usage):
+    return xai_usage.reported_cost(usage) if provider == Provider.XAI else None
+
+
+_PROVIDER_REPORTED_COSTS = {
+    "PERPLEXITY": _perplexity_reported_cost,
+    "XAI": _xai_reported_cost,
+}
+
+
+def _provider_reported_cost(provider_label, response):
+    """The provider's own charge for the call, for the providers that report one."""
+    read_cost = _PROVIDER_REPORTED_COSTS.get(provider_label)
+    return read_cost(response) if read_cost else None
 
 
 def _extract_reasoning_token_count(usage: Any) -> int:
@@ -135,56 +214,6 @@ def _extract_reasoning_token_count(usage: Any) -> int:
     return _coerce_int(
         _get_value(output_tokens_details, "reasoning_tokens", 0)
     )
-
-
-def extract_prompt_data_if_enabled(
-    request_body: Optional[Dict[str, Any]],
-    response: Any = None,
-    accumulated_content: str = None
-) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[bool]]:
-    """
-    Extract prompt data if capture is enabled.
-
-    Args:
-        request_body: Request body containing messages
-        response: API response object (for non-streaming)
-        accumulated_content: Accumulated streaming content (for streaming)
-
-    Returns:
-        Tuple of (system_prompt, input_messages, output_response, prompts_truncated)
-    """
-    if not is_capture_prompts_enabled() or not request_body:
-        return None, None, None, None
-
-    # Extract prompts from request
-    prompt_data = extract_prompts_from_request(request_body)
-    system_prompt = prompt_data.get('systemPrompt')
-    input_messages = prompt_data.get('inputMessages')
-    prompts_truncated = prompt_data.get('promptsTruncated', False)
-
-    # Extract response content
-    if accumulated_content is not None:
-        # Streaming response
-        response_data = extract_streaming_response_content(
-            accumulated_content, prompts_truncated
-        )
-    elif response is not None:
-        # Non-streaming response
-        response_data = extract_response_content(response, prompts_truncated)
-    else:
-        response_data = {'outputResponse': None, 'promptsTruncated': prompts_truncated}
-
-    output_response = response_data.get('outputResponse')
-    prompts_truncated = response_data.get('promptsTruncated', prompts_truncated)
-
-    logger.debug(
-        f"Prompt capture - system_prompt: {bool(system_prompt)}, "
-        f"input_messages: {bool(input_messages)}, "
-        f"output_response: {bool(output_response)}, "
-        f"truncated: {prompts_truncated}"
-    )
-
-    return system_prompt, input_messages, output_response, prompts_truncated
 
 
 class OperationType(str, Enum):
@@ -337,6 +366,12 @@ def extract_usage_data(response, operation_type: OperationType, request_time: st
     else:
         resolved_model_name = raw_model_name
 
+    # Extract provider-specific cache token details.
+    cache_creation_token_count, cache_read_token_count = _extract_cache_token_counts(
+        response.usage
+    )
+    reasoning_token_count = _extract_reasoning_token_count(response.usage)
+
     # Extract tokens based on operation type
     if operation_type == OperationType.EMBED:
         input_tokens = response.usage.prompt_tokens
@@ -348,28 +383,27 @@ def extract_usage_data(response, operation_type: OperationType, request_time: st
         # Responses API uses input_tokens/output_tokens, Chat uses prompt_tokens/completion_tokens
         if hasattr(response.usage, 'input_tokens'):
             # Responses API format
-            input_tokens = response.usage.input_tokens
+            gross_input_tokens = response.usage.input_tokens
             output_tokens = response.usage.output_tokens
         else:
             # Chat Completions format
-            input_tokens = response.usage.prompt_tokens
+            gross_input_tokens = response.usage.prompt_tokens
             output_tokens = response.usage.completion_tokens
+        input_tokens = _billable_prompt_tokens(
+            gross_input_tokens, response.usage, raw_model_name, cache_creation_token_count, cache_read_token_count
+        )
 
         total_tokens = response.usage.total_tokens
+        output_tokens = _billed_output_tokens(
+            provider, gross_input_tokens, output_tokens, total_tokens, reasoning_token_count
+        )
 
         # Get stop reason - Responses API may not have choices
         if hasattr(response, 'choices') and response.choices:
             openai_finish_reason = response.choices[0].finish_reason
             stop_reason = get_stop_reason(openai_finish_reason)
         else:
-            # Responses API doesn't have choices, use default
-            stop_reason = "END"
-
-    # Extract provider-specific cache token details.
-    cache_creation_token_count, cache_read_token_count = _extract_cache_token_counts(
-        response.usage
-    )
-    reasoning_token_count = _extract_reasoning_token_count(response.usage)
+            stop_reason = _responses_stop_reason(response)
 
     # Build unified usage data structure
     usage_data = {
@@ -386,6 +420,7 @@ def extract_usage_data(response, operation_type: OperationType, request_time: st
         "time_to_first_token": 0,  # Will be set by caller if applicable
         "cache_creation_token_count": cache_creation_token_count,
         "cache_read_token_count": cache_read_token_count,
+        "cache_creation_ttl_counts": extract_cache_creation_ttl_counts(response.usage),
         "reasoning_token_count": reasoning_token_count,
         "request_time": request_time,
         "response_time": response_time,
@@ -398,7 +433,7 @@ def extract_usage_data(response, operation_type: OperationType, request_time: st
     }
 
     # Debug logging for provider detection and model resolution
-    logger.debug(f"Provider detected: {provider}, metadata: {provider_metadata}")
+    logger.debug("Provider detected: %s, metadata: %s", provider, sanitize_for_logging(provider_metadata))
     logger.debug(f"Model resolution: {raw_model_name} -> {resolved_model_name}")
 
     logger.debug(
@@ -447,9 +482,23 @@ async def log_token_usage(
         cache_creation_token_count: Optional[int] = None,
         cache_read_token_count: Optional[int] = None,
         reasoning_token_count: Optional[int] = None,
+        reported_cost: Optional[Dict[str, float]] = None,
+        cache_creation_ttl_counts: Optional[Dict[str, int]] = None,
+        usage_iterations: Any = None,
+        iteration_request: Optional[Dict[str, Any]] = None,
+        error_reason: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        error_code: Optional[int] = None,
 ) -> None:
-    """Log token usage to Revenium."""
-    if get_client() is None:
+    """Log token usage to Revenium.
+
+    ``usage_iterations`` is a provider usage (or its iterations list) that may
+    hold Claude advisor or compaction passes, each of which is sent as its own
+    record after the main one; ``iteration_request`` is the request those
+    passes take their model from. ``error_reason``, ``idempotency_key`` and
+    ``error_code`` are set only on the record of a failed call.
+    """
+    if current_client() is None:
         return  # metering disabled (no API key configured)
     if shutdown_event.is_set():
         logger.warning("Skipping metering call during shutdown")
@@ -521,7 +570,7 @@ async def log_token_usage(
         completion_args["product_name"] = product_name
     if meta["agent"]:
         completion_args["agent"] = meta["agent"]
-    if meta["response_quality_score"]:
+    if meta["response_quality_score"] is not None:
         completion_args["response_quality_score"] = meta["response_quality_score"]
 
     agentic_fields = extract_agentic_job_fields(usage_metadata)
@@ -547,6 +596,8 @@ async def log_token_usage(
     # omitted entirely when unset.
     completion_args.update(extract_effort_field(usage_metadata))
     completion_args.update(extract_prompt_context_fields(usage_metadata))
+    completion_args.update(reported_cost or {})
+    completion_args.update(cache_creation_ttl_counts or {})
 
     # Add trace visualization fields only if they have values
     if environment:
@@ -581,6 +632,10 @@ async def log_token_usage(
         completion_args["output_response"] = output_response
     if prompts_truncated is not None:
         completion_args["prompts_truncated"] = prompts_truncated
+    if error_reason is not None:
+        completion_args["error_reason"] = error_reason
+    if error_code is not None:
+        completion_args["error_code"] = error_code
 
     # Log the arguments at debug level (redact sensitive prompt data)
     safe_args = {k: v for k, v in completion_args.items()
@@ -591,14 +646,21 @@ async def log_token_usage(
         safe_args['input_messages'] = '[REDACTED]'
     if 'output_response' in completion_args:
         safe_args['output_response'] = '[REDACTED]'
-    logger.debug("Calling client.ai.create_completion with args: %s", safe_args)
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("Calling client.ai.create_completion with args: %s", sanitize_for_logging(safe_args))
 
     # Debug logging for metering call
     logger.debug(f"Metering call for {operation_type.value}: {response_id}, tokens: {prompt_tokens}+{completion_tokens}={total_tokens}")
 
+    # Drawn here only when a pass is billed, so the pass records can derive their
+    # keys from it; every other call leaves the draw to submit_ai_event as before.
+    main_key = idempotency_key or (next_idempotency_key() if billed_iterations(usage_iterations) else None)
     try:
         # The client.ai.create_completion method is not async, so don't use await
-        result = submit_ai_event("completion", completion_args)
+        if main_key is None:
+            result = submit_ai_event("completion", completion_args)
+        else:
+            result = submit_ai_event("completion", completion_args, idempotency_key=main_key)
         logger.debug("Metering call result: %s", result)
         if result is not None:  # None: submit_ai_event buffered the record instead of sending it
             logger.debug("REVENIUM SUCCESS: Metering call successful: %s", result.id)
@@ -617,6 +679,7 @@ async def log_token_usage(
             logger.error(f"❌ REVENIUM FAILURE: Traceback: {traceback.format_exc()}")
         else:
             logger.debug("Metering call failed during shutdown - this is expected")
+    submit_iteration_records(submit_ai_event, completion_args, usage_iterations, iteration_request, main_key)
 
 
 def create_metering_call(
@@ -628,7 +691,13 @@ def create_metering_call(
     time_to_first_token: int = 0,
     is_streamed: bool = False,
     request_body: Optional[Dict[str, Any]] = None,
-    provider_metadata: Optional[Dict[str, str]] = None
+    provider_metadata: Optional[Dict[str, str]] = None,
+    usage_iterations: Any = None,
+    iteration_request: Optional[Dict[str, Any]] = None,
+    stop_reason: Optional[str] = None,
+    failure: Optional[CallFailure] = None,
+    request_prompts: Optional[Dict[str, Any]] = None,
+    accumulated_content: Optional[str] = None,
 ):
     """
     Unified function to create and execute metering calls for any operation
@@ -636,7 +705,17 @@ def create_metering_call(
 
     ``provider_metadata`` (``provider`` and ``model_source``) replaces the
     labels detected from ``client_instance``, for callers that know the
-    provider without holding its client.
+    provider without holding its client. ``stop_reason`` likewise replaces the
+    one read from the response, for callers that know it without an OpenAI
+    response.
+
+    ``usage_iterations`` and ``iteration_request`` are passed to
+    ``log_token_usage`` unchanged. ``failure`` marks the record of a failed
+    call: stop reason ERROR, its error reason and key, no captured prompt.
+
+    ``request_prompts`` is the captured prompt of a request that is not a chat
+    body, so ``request_body`` keeps deciding the operation subtype alone.
+    ``accumulated_content`` is a streamed call's reply text.
     """
     # Import trace field functions
     from .trace_fields import (
@@ -666,6 +745,11 @@ def create_metering_call(
 
     if provider_metadata:
         usage_data.update(provider_metadata)
+    if stop_reason:
+        usage_data["stop_reason"] = stop_reason
+    if failure is not None:
+        usage_data["stop_reason"] = ERROR_STOP_REASON
+    reported_cost = _provider_reported_cost(usage_data.get("provider"), response)
 
     # Override streaming and timing info
     usage_data["is_streamed"] = is_streamed
@@ -708,10 +792,7 @@ def create_metering_call(
         usage_metadata.get('transaction_name') or
         get_transaction_name(usage_metadata)
     )
-    retry_number = usage_metadata.get(
-        'retryNumber',
-        usage_metadata.get('retry_number', get_retry_number())
-    )
+    retry_number = get_retry_number(usage_metadata)
 
     # Detect operation type and subtype
     provider = usage_data.get("provider", "OPENAI")
@@ -734,9 +815,11 @@ def create_metering_call(
     output_response = None
     prompts_truncated = None
 
-    if operation_type == OperationType.CHAT:
+    if operation_type == OperationType.CHAT and failure is None:
         (system_prompt, input_messages, output_response, prompts_truncated) = (
-            extract_prompt_data_if_enabled(request_body, response=response)
+            extract_prompt_data_if_enabled(request_body, response=_parsed(response),
+                                           accumulated_content=accumulated_content,
+                                           request_prompts=request_prompts)
         )
 
     # Create async metering call
@@ -750,6 +833,7 @@ def create_metering_call(
             cached_tokens=usage_data["cache_creation_token_count"],
             cache_creation_token_count=usage_data["cache_creation_token_count"],
             cache_read_token_count=usage_data["cache_read_token_count"],
+            cache_creation_ttl_counts=usage_data["cache_creation_ttl_counts"],
             reasoning_token_count=usage_data["reasoning_token_count"],
             stop_reason=usage_data["stop_reason"],
             request_time=usage_data["request_time"],
@@ -779,6 +863,12 @@ def create_metering_call(
             input_messages=input_messages,
             output_response=output_response,
             prompts_truncated=prompts_truncated,
+            reported_cost=reported_cost,
+            usage_iterations=usage_iterations,
+            iteration_request=iteration_request,
+            error_reason=failure.error_reason if failure else None,
+            idempotency_key=failure.idempotency_key if failure else None,
+            error_code=failure.error_code if failure else None,
         )
 
     # Start metering thread
@@ -788,89 +878,23 @@ def create_metering_call(
 
 
 def _extract_langchain_usage_metadata():
-    """
-    Extract usage_metadata from LangChain context variables.
-
-    LangChain stores context information in thread-local variables that we can access
-    to get the usage_metadata that was passed to LangChain methods.
-
-    This is optional functionality - if LangChain is not installed, this function
-    gracefully returns an empty dict without logging errors.
-    """
-    # Only attempt LangChain integration if LangChain is available
+    """The ``usage_metadata`` passed to LangChain for this call, or ``{}``
+    when LangChain is not installed (an optional integration)."""
     if not is_langchain_available():
         return {}
-
-    try:
-        # Try to import LangChain context variables
-        from langchain_core.globals import get_llm_cache  # noqa: F401
-        from langchain_core.callbacks.manager import CallbackManagerForLLMRun  # noqa: F401
-        import contextvars  # noqa: F401
-
-        # Try to get the current context
-        # LangChain uses context variables to store run information
-        # We need to look for the current callback manager or run context
-
-        # Check if we're in a LangChain context by looking for context variables
-        # This is a best-effort approach since LangChain's internal context handling
-        # can vary between versions
-
-        # Look for common LangChain context patterns
-        import inspect
-        frame = inspect.currentframe()
-
-        # Walk up the call stack to find LangChain frames
-        while frame:
-            frame_locals = frame.f_locals
-            frame_globals = frame.f_globals
-
-            # Look for LangChain-specific variables in the call stack
-            # Check for 'config' parameter which often contains metadata
-            if 'config' in frame_locals and isinstance(frame_locals['config'], dict):
-                config = frame_locals['config']
-                if 'metadata' in config and isinstance(config['metadata'], dict):
-                    metadata = config['metadata']
-                    if 'usage_metadata' in metadata:
-                        logger.debug(f"Found usage_metadata in LangChain config: {metadata['usage_metadata']}")
-                        return metadata['usage_metadata']
-
-            # Check for 'metadata' parameter directly
-            if 'metadata' in frame_locals and isinstance(frame_locals['metadata'], dict):
-                metadata = frame_locals['metadata']
-                if 'usage_metadata' in metadata:
-                    logger.debug(f"Found usage_metadata in LangChain metadata: {metadata['usage_metadata']}")
-                    return metadata['usage_metadata']
-
-            # Check for callback manager with metadata
-            if 'callback_manager' in frame_locals:
-                cb_manager = frame_locals['callback_manager']
-                if hasattr(cb_manager, 'metadata') and isinstance(cb_manager.metadata, dict):
-                    if 'usage_metadata' in cb_manager.metadata:
-                        logger.debug(f"Found usage_metadata in callback manager: {cb_manager.metadata['usage_metadata']}")
-                        return cb_manager.metadata['usage_metadata']
-
-            frame = frame.f_back
-
-        logger.debug("No usage_metadata found in LangChain context")
-        return {}
-
-    except Exception as e:
-        # Only log at debug level for unexpected errors during metadata extraction
-        # This is optional functionality, so we don't want to spam logs
-        logger.debug(f"Error extracting LangChain usage_metadata: {e}")
-        return {}
+    return langchain_usage_metadata()
 
 
 def embeddings_create_wrapper(wrapped, instance, args, kwargs):
     logger.debug("OpenAI/Azure OpenAI embeddings.create wrapper called")
 
-    if is_selective_metering_enabled() and not is_inside_decorated_function():
-        return wrapped(*args, **kwargs)
+    if _left_unmetered():
+        return _call_unmetered(wrapped, instance, args, kwargs)
 
     request_body = kwargs.copy()
 
     # Extract API-level metadata from kwargs
-    api_metadata = kwargs.pop("usage_metadata", {}) if "usage_metadata" in kwargs else {}
+    api_metadata = _take_call_metadata(instance, kwargs) or {}
 
     # Try to extract usage_metadata from LangChain context if not found in kwargs
     if not api_metadata:
@@ -902,7 +926,7 @@ def embeddings_create_wrapper(wrapped, instance, args, kwargs):
     request_time_dt = datetime.datetime.now(datetime.timezone.utc)
 
     # Enforcement pre-call check — may raise BudgetExceededError
-    check_enforcement(usage_metadata)
+    check_enforcement(usage_metadata, model=kwargs.get("model"), provider=get_provider_metadata(provider)["provider"])
 
     logger.debug(
         "Calling wrapped embeddings function with args: %s, kwargs: %s",
@@ -913,7 +937,7 @@ def embeddings_create_wrapper(wrapped, instance, args, kwargs):
     # Call the original OpenAI function
     response = wrapped(*args, **kwargs)
 
-    logger.debug("Handling embeddings response: %s", response)
+    logger.debug("Handling embeddings response: %s", sanitize_for_logging(response))
 
     # Create metering call using unified function
     create_metering_call(
@@ -968,6 +992,94 @@ def _http_response_of(stream):
     return getattr(stream, 'response', None)
 
 
+# OpenAI sends usage in the single chunk after the finish chunk; the bounds
+# protect against n > 1 or a compatible provider that finishes early or stalls.
+_MAX_CHUNKS_READ_AFTER_FINISH = 8
+_SECONDS_TO_WAIT_FOR_USAGE_AFTER_FINISH = 2.0
+
+
+class _ResponseThatMetersOnClose(wrapt.ObjectProxy):
+    """The ``httpx.Response`` of a metered chat stream. OpenAI's ``stream()``
+    helpers close this response, never the stream, so closing it finishes
+    the stream's metering first. The stream is held weakly: an abandoned
+    stream is still recorded as soon as it is dropped."""
+
+    def __init__(self, response, stream_wrapper):
+        super().__init__(response)
+        self._self_owner = weakref.ref(stream_wrapper)
+        self._self_closed = False
+
+    def _owner_once(self):
+        if self._self_closed:
+            return None
+        self._self_closed = True
+        return self._self_owner()
+
+    def close(self):
+        try:
+            owner = self._owner_once()
+            if owner is not None:
+                owner._finish()
+        except Exception as error:
+            logger.debug("Could not finish metering a closed chat stream: %s", error)
+        finally:
+            self.__wrapped__.close()
+
+    async def aclose(self):
+        try:
+            owner = self._owner_once()
+            if owner is not None:
+                await owner._afinish()
+        except Exception as error:
+            logger.debug("Could not finish metering a closed chat stream: %s", error)
+        finally:
+            await self.__wrapped__.aclose()
+
+
+def _usage_still_to_come(stream_wrapper, still_open):
+    return still_open and stream_wrapper.finish_reason is not None and stream_wrapper.final_usage is None
+
+
+def _log_unread_usage(error):
+    logger.debug("Could not read the usage chunk of a finished chat stream: %s", type(error).__name__)
+
+
+def _read_usage_after_finish(stream_wrapper, still_open):
+    """Read on to the usage chunk that follows the finish chunk, when it is
+    still unread. Never raises."""
+    if not _usage_still_to_come(stream_wrapper, still_open):
+        return
+    deadline = time.monotonic() + _SECONDS_TO_WAIT_FOR_USAGE_AFTER_FINISH
+    try:
+        for chunk in itertools.islice(stream_wrapper.stream, _MAX_CHUNKS_READ_AFTER_FINISH):
+            stream_wrapper._observe(chunk)
+            if stream_wrapper.final_usage is not None or time.monotonic() >= deadline:
+                return
+    except Exception as error:
+        _log_unread_usage(error)
+
+
+async def _aread_usage_after_finish(stream_wrapper, still_open):
+    """The async form of ``_read_usage_after_finish``."""
+    if not _usage_still_to_come(stream_wrapper, still_open):
+        return
+    try:
+        with anyio.move_on_after(_SECONDS_TO_WAIT_FOR_USAGE_AFTER_FINISH):
+            for _ in range(_MAX_CHUNKS_READ_AFTER_FINISH):
+                stream_wrapper._observe(await stream_wrapper.stream.__anext__())
+                if stream_wrapper.final_usage is not None:
+                    return
+    except StopAsyncIteration:
+        return
+    except Exception as error:
+        _log_unread_usage(error)
+
+
+def _response_that_meters_on_close(stream, stream_wrapper):
+    response = _http_response_of(stream)
+    return None if response is None else _ResponseThatMetersOnClose(response, stream_wrapper)
+
+
 _parse_call_in_progress: ContextVar[bool] = ContextVar("revenium_openai_parse_call_in_progress", default=False)
 
 
@@ -983,10 +1095,128 @@ def _metered_by_parse():
         _parse_call_in_progress.reset(token)
 
 
-def _passes_through_unmetered():
-    if _parse_call_in_progress.get():
-        return True
-    return is_selective_metering_enabled() and not is_inside_decorated_function()
+_stream_helper_usage_metadata: ContextVar[Optional[Mapping]] = ContextVar(
+    "revenium_openai_stream_helper_usage_metadata", default=None)
+
+
+@contextlib.contextmanager
+def _tagged_by_stream_helper(usage_metadata):
+    """Hand a ``stream()`` helper's ``usage_metadata`` to the ``create()`` the
+    helper calls, without sending it to OpenAI."""
+    token = _stream_helper_usage_metadata.set(usage_metadata)
+    try:
+        yield
+    finally:
+        _stream_helper_usage_metadata.reset(token)
+
+
+def _take_call_metadata(instance, kwargs):
+    """Remove the call's own Revenium metadata from ``kwargs`` and return it.
+
+    A Perplexity-bound call also carries it inside ``extra_body``, which
+    must not reach Perplexity either."""
+    if _is_perplexity_bound(instance):
+        return take_usage_metadata(kwargs)
+    return kwargs.pop("usage_metadata", None)
+
+
+def _pop_usage_metadata(kwargs, instance=None):
+    """The call's own ``usage_metadata``, else the one its ``stream()`` helper was given.
+
+    A Perplexity-bound call merges the two field by field instead: the
+    helper's keyword wins over the call's own ``extra_body`` metadata, as the
+    keyword wins everywhere else on Perplexity."""
+    if _is_perplexity_bound(instance):
+        return {**take_usage_metadata(kwargs), **(_stream_helper_usage_metadata.get() or {})}
+    return kwargs.pop("usage_metadata", None) or _stream_helper_usage_metadata.get()
+
+
+class _TaggedSyncStreamManager(wrapt.ObjectProxy):
+    """A sync ``stream()`` helper's manager, which calls ``create()`` only when
+    its ``with`` block is entered."""
+
+    def __init__(self, manager, usage_metadata):
+        super().__init__(manager)
+        self._self_usage_metadata = usage_metadata
+
+    def __enter__(self):
+        with _tagged_by_stream_helper(self._self_usage_metadata):
+            return self.__wrapped__.__enter__()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return self.__wrapped__.__exit__(exc_type, exc_val, exc_tb)
+
+
+def _call_stream_helper(wrapped, args, kwargs):
+    usage_metadata = kwargs.pop("usage_metadata", None)
+    if not usage_metadata:
+        return wrapped(*args, **kwargs), None
+    with _tagged_by_stream_helper(usage_metadata):
+        return wrapped(*args, **kwargs), usage_metadata
+
+
+def stream_helper_wrapper(wrapped, instance, args, kwargs):
+    manager, usage_metadata = _call_stream_helper(wrapped, args, kwargs)
+    return manager if usage_metadata is None else _TaggedSyncStreamManager(manager, usage_metadata)
+
+
+def async_stream_helper_wrapper(wrapped, instance, args, kwargs):
+    # The async helpers call create() inside stream() itself.
+    manager, _ = _call_stream_helper(wrapped, args, kwargs)
+    return manager
+
+
+def _selectively_unmetered():
+    return reported_if_unmetered(is_selective_metering_enabled() and not is_inside_decorated_function())
+
+
+def _left_unmetered():
+    """Whether this call gets only its spending-cap check here, no record:
+    selective metering skips it, or an outer integration (LiteLLM) whose
+    provider call runs through this client meters it. The check stays,
+    because a LiteLLM call the proxy serves was not checked by LiteLLM's
+    wrapper; one it did check is marked so and not checked twice."""
+    return call_owned_by_outer_wrapper() or _selectively_unmetered()
+
+
+def _take_api_metadata(kwargs, instance=None):
+    """Pop the Revenium-only ``usage_metadata`` keyword, which the OpenAI SDK rejects."""
+    api_metadata = _pop_usage_metadata(kwargs, instance)
+    return dict(api_metadata) if isinstance(api_metadata, Mapping) else {}
+
+
+def _check_unmetered_call(api_metadata, model=None, provider=None):
+    """Run the spending-cap check for a call selective metering leaves
+    unmetered. No record is sent for it, so the LangChain caller's
+    attribution is read without being taken."""
+    if not is_circuit_breaker_enabled() or is_bypass_enabled():
+        return
+    if not api_metadata:
+        langchain_metadata = _extract_langchain_usage_metadata()
+        api_metadata = langchain_metadata if isinstance(langchain_metadata, Mapping) else {}
+    check_enforcement(merge_metadata(overlay_metadata(peek_callback_metadata(OPENAI), api_metadata)),
+                      model=model, provider=provider)
+
+
+def _check_unmetered_client_call(instance, kwargs, cap_provider_label):
+    _check_unmetered_call(_take_api_metadata(kwargs, instance), kwargs.get("model"), cap_provider_label(instance))
+
+
+def _call_unmetered(wrapped, instance, args, kwargs):
+    _check_unmetered_client_call(instance, kwargs, _client_cap_provider_label)
+    return wrapped(*args, **kwargs)
+
+
+def _call_responses_unmetered(wrapped, instance, args, kwargs):
+    _check_unmetered_client_call(instance, kwargs, _chat_cap_provider_label)
+    return wrapped(*args, **kwargs)
+
+
+def _tell_langchain_when_perplexity_serves(instance):
+    """A LangChain callback records a call this transport leaves unmetered,
+    and only the client knows it calls Perplexity."""
+    if _is_perplexity_bound(instance):
+        mark_model_call_served_by(OPENAI, PERPLEXITY)
 
 
 def _is_perplexity_bound(instance):
@@ -999,6 +1229,61 @@ def _is_perplexity_bound(instance):
     client_instance = getattr(instance, '_client', None)
     base_url = getattr(client_instance, 'base_url', None) if client_instance else None
     return bool(base_url) and "perplexity" in str(base_url).lower()
+
+
+_PERPLEXITY_CHAT_WRAP = "perplexity:openai.resources.chat.completions.Completions.create"
+_PERPLEXITY_ASYNC_CHAT_WRAP = "perplexity:openai.resources.chat.completions.AsyncCompletions.create"
+
+
+def _call_perplexity_bound(wrapped, instance, args, kwargs, perplexity_wrap):
+    """Leave the call to the Perplexity wrapper when it is installed. Without
+    it nothing else checks this call, so a breached cap must refuse it here.
+    A LangChain model making the call is told Perplexity serves it, and a
+    stream it makes hands it what Perplexity reports on the way through."""
+    mark_model_call_served_by(OPENAI, PERPLEXITY)
+    if not is_patched(perplexity_wrap):
+        _check_unmetered_call(take_usage_metadata(kwargs), kwargs.get("model"), _chat_cap_provider_label(instance))
+    model_call = bind_model_call_for_cost(OPENAI) if kwargs.get("stream") else ()
+    if not model_call:
+        return wrapped(*args, **kwargs)
+    observe = functools.partial(_keep_what_perplexity_reported, model_call)
+    result = wrapped(*args, **kwargs)
+    if inspect.isawaitable(result):
+        return _read_perplexity_stream_when_awaited(result, observe)
+    return _read_perplexity_stream(result, observe, tap_sse_body)
+
+
+def _keep_what_perplexity_reported(model_call, item):
+    """Leave the last charge and usage a Perplexity stream reported on the
+    LangChain run's publications, for the callback's one record.
+    langchain-openai drops the charge from a stream, and adds up the usage
+    Perplexity repeats, so far, on every chunk."""
+    try:
+        cost = reported_cost_of(item)
+        usage = getattr(item, "usage", None)
+    except Exception as error:  # a read-only reader must never fail the caller's stream
+        logger.debug("Could not read what Perplexity reported: %s", error)
+        return
+    for publication in model_call:
+        if cost is not None:
+            publication.reported_cost = cost
+        if usage:
+            publication.reported_usage = usage
+
+
+def _read_perplexity_stream(result, observe, tap_body):
+    if is_raw_response(result):
+        tap_body(result, observe, _nothing_to_finish)
+        return result
+    return read_reported_usage(result, observe)
+
+
+async def _read_perplexity_stream_when_awaited(pending, observe):
+    return _read_perplexity_stream(await pending, observe, tap_async_sse_body)
+
+
+def _nothing_to_finish():
+    pass
 
 
 def _validate_azure_configuration(client_instance):
@@ -1018,12 +1303,36 @@ def _validate_azure_configuration(client_instance):
 _PERPLEXITY_LABELS = {"provider": "PERPLEXITY", "model_source": "PERPLEXITY"}
 
 
+def _cap_provider_label(client_instance, provider_metadata=None):
+    """The provider label this call's metering record will carry, for a cap
+    filtered by provider. Only worked out when the cap check will run."""
+    if not is_circuit_breaker_enabled():
+        return None
+    if provider_metadata is None:
+        base_url = getattr(client_instance, 'base_url', None) if client_instance else None
+        provider_metadata = get_provider_metadata(detect_provider(client_instance, base_url))
+    return provider_metadata["provider"]
+
+
+def _client_cap_provider_label(instance):
+    return _cap_provider_label(getattr(instance, '_client', None))
+
+
+def _chat_provider_metadata(instance):
+    return _PERPLEXITY_LABELS if _is_perplexity_bound(instance) else None
+
+
+def _chat_cap_provider_label(instance):
+    return _cap_provider_label(getattr(instance, '_client', None), _chat_provider_metadata(instance))
+
+
 class _MeteredCall(NamedTuple):
     usage_metadata: Dict[str, Any]
     request_time_dt: datetime.datetime
     client_instance: Any
     request_body: Optional[Dict[str, Any]]
     provider_metadata: Optional[Dict[str, str]] = None
+    request_prompts: Optional[Dict[str, Any]] = None
 
 
 def _begin_chat_call(instance, kwargs) -> _MeteredCall:
@@ -1031,15 +1340,16 @@ def _begin_chat_call(instance, kwargs) -> _MeteredCall:
     and run the enforcement pre-check (which may raise ``BudgetExceededError``)
     before the provider is called. Pops ``usage_metadata`` from ``kwargs``."""
     request_body = kwargs.copy()
-    api_metadata = kwargs.pop("usage_metadata", {})
+    api_metadata = _pop_usage_metadata(kwargs, instance)
     if not api_metadata:
         api_metadata = _extract_langchain_usage_metadata()
     usage_metadata = merge_metadata(with_callback_metadata(OPENAI, api_metadata))
     client_instance = getattr(instance, '_client', None)
     _validate_azure_configuration(client_instance)
     request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-    check_enforcement(usage_metadata)
-    provider_metadata = _PERPLEXITY_LABELS if _is_perplexity_bound(instance) else None
+    provider_metadata = _chat_provider_metadata(instance)
+    check_enforcement(usage_metadata, model=kwargs.get("model"),
+                      provider=_cap_provider_label(client_instance, provider_metadata))
     return _MeteredCall(usage_metadata, request_time_dt, client_instance, request_body, provider_metadata)
 
 
@@ -1060,11 +1370,43 @@ def _meter_chat_completion(response, call: _MeteredCall):
     )
 
 
+def _failed_response(model):
+    return SimpleNamespace(id=failed_transaction_id(), model=model or "unknown", usage=_ZERO_RESPONSES_USAGE,
+                           system_fingerprint=None, choices=[])
+
+
+@contextlib.contextmanager
+def _recording_failure(call: _MeteredCall, model, is_streamed, metering_client):
+    """Send one ERROR record for a call the provider refused, under the
+    metering client current when the call started, then let the caller's
+    exception through unchanged."""
+    outer = exception_in_flight()
+    try:
+        yield
+    except Exception as error:
+        failure = failure_of(error, outer)
+        if failure is not None:
+            try:
+                with recorded_under(metering_client):
+                    create_metering_call(
+                        _failed_response(model), OperationType.CHAT, call.request_time_dt, call.usage_metadata,
+                        client_instance=call.client_instance, is_streamed=bool(is_streamed),
+                        request_body=call.request_body, provider_metadata=call.provider_metadata, failure=failure,
+                    )
+            except Exception as metering_error:
+                logger.warning("Could not record a failed OpenAI call: %s", metering_error)
+        raise
+
+
 def create_wrapper(wrapped, instance, args, kwargs):
     logger.debug("OpenAI/Azure OpenAI chat.completions.create wrapper called")
 
-    if _passes_through_unmetered() or _is_perplexity_bound(instance):
+    if _parse_call_in_progress.get():
         return wrapped(*args, **kwargs)
+    if _is_perplexity_bound(instance):
+        return _call_perplexity_bound(wrapped, instance, args, kwargs, _PERPLEXITY_CHAT_WRAP)
+    if _left_unmetered():
+        return _call_unmetered(wrapped, instance, args, kwargs)
 
     call = _begin_chat_call(instance, kwargs)
 
@@ -1079,22 +1421,46 @@ def create_wrapper(wrapped, instance, args, kwargs):
         sanitize_for_logging(kwargs),
     )
 
-    response = wrapped(*args, **kwargs)
+    metering_client = current_client()
+    with _recording_failure(call, kwargs.get("model"), stream, metering_client):
+        response = wrapped(*args, **kwargs)
 
     if stream:
         logger.debug("Handling streaming response")
-        return handle_streaming_response(
-            response,
-            call.request_time_dt,
-            call.usage_metadata,
-            client_instance=call.client_instance,
-            request_body=call.request_body,
-            caller_requested_usage=caller_requested_usage
-        )
+        with recorded_under(metering_client):
+            return handle_streaming_response(
+                response,
+                call.request_time_dt,
+                call.usage_metadata,
+                client_instance=call.client_instance,
+                request_body=call.request_body,
+                caller_requested_usage=caller_requested_usage
+            )
 
-    logger.debug("Handling non-streaming response: %s", response)
+    logger.debug("Handling non-streaming response: %s", sanitize_for_logging(response))
     _meter_chat_completion(response, call)
     return response
+
+
+def _answer_text_of(content):
+    """The answer text of a streamed delta's content: a string as is, or the
+    text parts of a list of parts (Mistral's thinking parts are not answer text)."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    texts = (_get_value(part, "text") for part in content if _get_value(part, "type") == "text")
+    return "".join(text for text in texts if isinstance(text, str))
+
+
+def _observing_chunk(process_chunk, chunk):
+    """Meter one chunk without ever breaking the caller's read: an error in
+    the middleware's own reading is logged, never raised or recorded as a
+    provider failure."""
+    try:
+        process_chunk(chunk)
+    except Exception as error:
+        logger.warning("Could not meter a chat stream chunk (%s); the stream continues", type(error).__name__)
 
 
 def _is_injected_usage_chunk(chunk, caller_requested_usage):
@@ -1125,8 +1491,10 @@ def handle_streaming_response(
     class StreamWrapper:
         def __init__(self, stream):
             self.stream = iter(stream)
-            self.response = _http_response_of(stream)
-            self.chunks = []
+            self.response = _response_that_meters_on_close(stream, self)
+            self._metering_client = current_client()
+            self._call_context = CallContext()
+            self._saw_chunk = False
             self.response_id = None
             self.model = None
             self.finish_reason = None
@@ -1142,6 +1510,8 @@ def handle_streaming_response(
             self.caller_requested_usage = caller_requested_usage
             self._closed = False
             self._usage_logged = False
+            self.failure = None
+            self._outer = exception_in_flight()
 
         def __iter__(self):
             return self
@@ -1153,21 +1523,29 @@ def handle_streaming_response(
             while True:
                 try:
                     chunk = next(self.stream)
-                    self._process_chunk(chunk)
                 except StopIteration:
                     self._finalize()
                     raise
                 except Exception as e:
                     # Ensure cleanup on any error
+                    self._record_failure(e)
                     self._finalize()
                     logger.error(f"Error in streaming response: {e}")
                     raise
 
+                self._observe(chunk)
                 if not self._injected_usage_chunk(chunk):
                     return chunk
 
+        def _observe(self, chunk):
+            _observing_chunk(self._process_chunk, chunk)
+            self._saw_chunk = True
+
         def _injected_usage_chunk(self, chunk):
             return _is_injected_usage_chunk(chunk, self.caller_requested_usage)
+
+        def _record_failure(self, error):
+            self.failure = self._call_context.run(failure_of, error, self._outer)
 
         def __enter__(self):
             """Context manager entry."""
@@ -1175,11 +1553,17 @@ def handle_streaming_response(
 
         def __exit__(self, exc_type, exc_val, exc_tb):
             """Context manager exit with cleanup."""
-            self._finalize()
+            self._finish()
 
         def close(self):
             """Close the stream, metering whatever was received so far."""
-            self._finalize()
+            self._finish()
+
+        def _finish(self):
+            try:
+                _read_usage_after_finish(self, still_open=not self._closed)
+            finally:
+                self._finalize()
 
         def __del__(self):
             # Last-resort finalize: a broken-out-of loop leaves the wrapper to
@@ -1192,7 +1576,7 @@ def handle_streaming_response(
         def _finalize(self):
             """Finalize the stream and log usage if not already done."""
             if not self._usage_logged:
-                self._log_usage()
+                self._call_context.run(self._log_usage)
                 self._usage_logged = True
             self._close_stream()
 
@@ -1208,11 +1592,10 @@ def handle_streaming_response(
                     self._closed = True
 
         def _process_chunk(self, chunk):
-            # Extract response ID and model from the chunk if available
-            if self.response_id is None and hasattr(chunk, 'id'):
-                self.response_id = chunk.id
-            if self.model is None and hasattr(chunk, 'model'):
-                self.model = chunk.model
+            # The first non-empty id and model: Azure opens a stream with a
+            # content-filter chunk whose id and model are empty.
+            self.response_id = self.response_id or getattr(chunk, 'id', None)
+            self.model = self.model or getattr(chunk, 'model', None)
             if self.system_fingerprint is None and hasattr(chunk, 'system_fingerprint'):
                 self.system_fingerprint = chunk.system_fingerprint
                 logger.debug(f"Captured system_fingerprint from stream chunk: {self.system_fingerprint}")
@@ -1220,9 +1603,9 @@ def handle_streaming_response(
                 logger.debug(f"System fingerprint already set: {self.system_fingerprint}")
 
 
-            # Check for finish reason in the chunk
-            if chunk.choices and chunk.choices[0].finish_reason:
-                self.finish_reason = chunk.choices[0].finish_reason
+            choices = getattr(chunk, 'choices', None)
+            if choices and getattr(choices[0], 'finish_reason', None):
+                self.finish_reason = choices[0].finish_reason
 
             # Check if this chunk has usage data (can be in final chunk with or without choices)
             if hasattr(chunk, 'usage') and chunk.usage:
@@ -1231,19 +1614,18 @@ def handle_streaming_response(
                 # Don't return yet - we still need to process the chunk for finish_reason etc.
 
             # Collect content for token estimation if needed
-            if chunk.choices and hasattr(chunk.choices[0], 'delta') and hasattr(chunk.choices[0].delta, 'content') and \
-                    chunk.choices[0].delta.content:
+            if choices and hasattr(choices[0], 'delta') and hasattr(choices[0].delta, 'content') and \
+                    choices[0].delta.content:
                 # Record time of first token if not already set
                 if self.first_token_time is None:
                     self.first_token_time = datetime.datetime.now(datetime.timezone.utc)
-                self.completion_text += chunk.choices[0].delta.content
+                self.completion_text += _answer_text_of(choices[0].delta.content)
 
-            # Store the chunk for later analysis
-            self.chunks.append(chunk)
+            self._saw_chunk = True
 
         def _log_usage(self):
-            # Only return if we have neither chunks nor final usage data
-            if not self.chunks and not self.final_usage:
+            # An empty stream sends no record, unless it failed before its first chunk.
+            if not self._saw_chunk and not self.final_usage and self.failure is None:
                 return
 
             # Record response time and calculate duration
@@ -1258,40 +1640,51 @@ def handle_streaming_response(
             cache_creation_token_count = 0
             cache_read_token_count = 0
             reasoning_token_count = 0
+            reported_cost = None
+            cache_creation_ttl_counts = {}
+            provider = detect_provider(self.client_instance,
+                                       getattr(self.client_instance, 'base_url', None) if self.client_instance else None)
 
             # First check if we have the final usage data from the special chunk
             if self.final_usage:
-                prompt_tokens = self.final_usage.prompt_tokens
-                completion_tokens = self.final_usage.completion_tokens
-                total_tokens = self.final_usage.total_tokens
+                cache_creation_ttl_counts = extract_cache_creation_ttl_counts(self.final_usage)
                 cache_creation_token_count, cache_read_token_count = _extract_cache_token_counts(
                     self.final_usage
                 )
+                prompt_tokens = _billable_prompt_tokens(
+                    self.final_usage.prompt_tokens, self.final_usage, self.model,
+                    cache_creation_token_count, cache_read_token_count,
+                )
+                total_tokens = self.final_usage.total_tokens
                 reasoning_token_count = _extract_reasoning_token_count(
                     self.final_usage
                 )
+                completion_tokens = _billed_output_tokens(
+                    provider, self.final_usage.prompt_tokens, self.final_usage.completion_tokens,
+                    total_tokens, reasoning_token_count,
+                )
+                reported_cost = _streamed_reported_cost(provider, self.final_usage)
                 logger.debug(
                     f"Using token usage from final chunk: prompt={prompt_tokens}, completion={completion_tokens}, total={total_tokens}")
             else:
                 # If we don't have usage data, estimate from content
                 logger.warning("No usage data found in streaming response!")
 
-            stop_reason = get_stop_reason(self.finish_reason)
+            failure = self.failure
+            stop_reason = ERROR_STOP_REASON if failure else get_stop_reason(self.finish_reason)
+            response_id = self.response_id or (failed_transaction_id() if failure else None)
 
             # Log the token usage
-            if self.response_id:
+            if response_id:
                 logger.debug(
                     "Streaming token usage - response_id: %s, prompt: %d, completion: %d, total: %d",
-                    self.response_id, prompt_tokens, completion_tokens, total_tokens
+                    response_id, prompt_tokens, completion_tokens, total_tokens
                 )
 
-                # Detect provider and resolve model name for Azure
-                provider = detect_provider(self.client_instance,
-                                         getattr(self.client_instance, 'base_url', None) if self.client_instance else None)
                 provider_metadata = get_provider_metadata(provider)
 
                 # Resolve model name for Azure deployments
-                raw_model_name = self.model or "unknown"
+                raw_model_name = self.model or (failure and (self.request_body or {}).get("model")) or "unknown"
                 if is_azure_provider(provider) and raw_model_name != "unknown":
                     base_url = getattr(self.client_instance, 'base_url', None) if self.client_instance else None
                     headers = {}  # Headers would need to be passed from wrapper context
@@ -1360,10 +1753,7 @@ def handle_streaming_response(
                     self.usage_metadata.get('transaction_name') or
                     get_transaction_name(self.usage_metadata)
                 )
-                retry_number = self.usage_metadata.get(
-                    'retryNumber',
-                    self.usage_metadata.get('retry_number', get_retry_number())
-                )
+                retry_number = get_retry_number(self.usage_metadata)
 
                 # Detect operation type and subtype
                 operation_info = detect_operation_type(
@@ -1374,20 +1764,21 @@ def handle_streaming_response(
                 # Extract prompt data if capture is enabled
                 (system_prompt, input_messages, output_response, prompts_truncated) = (
                     extract_prompt_data_if_enabled(
-                        self.request_body,
+                        None if failure else self.request_body,
                         accumulated_content=self.completion_text
                     )
                 )
 
                 async def metering_call():
                     await log_token_usage(
-                        response_id=self.response_id,
+                        response_id=response_id,
                         model=resolved_model_name,
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         total_tokens=total_tokens,
                         cached_tokens=0,
                         cache_creation_token_count=cache_creation_token_count,
+                        cache_creation_ttl_counts=cache_creation_ttl_counts,
                         cache_read_token_count=cache_read_token_count,
                         reasoning_token_count=reasoning_token_count,
                         stop_reason=stop_reason,
@@ -1420,39 +1811,236 @@ def handle_streaming_response(
                         input_messages=input_messages,
                         output_response=output_response,
                         prompts_truncated=prompts_truncated,
+                        reported_cost=reported_cost,
+                        error_reason=failure.error_reason if failure else None,
+                        idempotency_key=failure.idempotency_key if failure else None,
+                        error_code=failure.error_code if failure else None,
                     )
 
-                thread = run_async_in_thread(metering_call())
+                with recorded_under(self._metering_client):
+                    thread = run_async_in_thread(metering_call())
                 logger.debug("Streaming metering thread started: %s", thread)
 
     claim_call_for_transport(OPENAI)
+    if is_raw_response(stream):
+        meter = StreamWrapper(())
+        tap_sse_body(stream, meter._process_chunk, meter._finalize, drop_event=meter._injected_usage_chunk,
+                     on_error=meter._record_failure)
+        return stream
     return StreamWrapper(stream)
+
+
+def _captured_request_prompts(kwargs):
+    """The capture fields of a Responses request, or None with capture off.
+
+    Only these bounded strings are kept for the record, never the request
+    itself, which a waiting background job would otherwise hold in memory.
+    It runs before the call is sent, so a request it cannot read is recorded
+    without its prompt rather than failing the call.
+    """
+    if not is_capture_prompts_enabled():
+        return None
+    try:
+        return extract_prompts_from_request(dict(kwargs))
+    except Exception as e:
+        logger.warning("Prompt capture could not read this Responses request (%s); recording it without its prompt",
+                       type(e).__name__)
+        return None
 
 
 def _begin_responses_call(instance, kwargs) -> _MeteredCall:
     """Resolve the call's usage metadata and run the enforcement pre-check
     (which may raise ``BudgetExceededError``) before the provider is called."""
-    api_metadata = kwargs.pop("usage_metadata", {})
+    api_metadata = _pop_usage_metadata(kwargs, instance)
+    request_prompts = _captured_request_prompts(kwargs)
     if not api_metadata:
         api_metadata = _extract_langchain_usage_metadata()
     usage_metadata = merge_metadata(with_callback_metadata(OPENAI, api_metadata))
     request_time_dt = datetime.datetime.now(datetime.timezone.utc)
-    check_enforcement(usage_metadata)
-    return _MeteredCall(usage_metadata, request_time_dt, getattr(instance, '_client', None), None)
+    client_instance = getattr(instance, '_client', None)
+    provider_metadata = _chat_provider_metadata(instance)
+    check_enforcement(usage_metadata, model=kwargs.get("model"),
+                      provider=_cap_provider_label(client_instance, provider_metadata))
+    return _MeteredCall(usage_metadata, request_time_dt, client_instance, None, provider_metadata=provider_metadata,
+                        request_prompts=request_prompts)
+
+
+_RUNNING_RESPONSE_STATUSES = frozenset({"queued", "in_progress"})
+_FINISHED_RESPONSE_STATUSES = frozenset({"completed", "incomplete", "failed", "cancelled"})
+MAX_PENDING_BACKGROUND_RESPONSES = 1024
+
+
+class _PendingBackgroundResponse(NamedTuple):
+    usage_metadata: Dict[str, Any]
+    request_time_dt: datetime.datetime
+    request_prompts: Optional[Dict[str, Any]]
+    metering_client: Any
+
+
+def _pending_background_response(usage_metadata, request_time_dt, request_prompts, metering_client):
+    """The create-time context of a background response, its job fields resolved now.
+
+    The job is metered later by whichever call sees it finish, so its job
+    fields and Revenium key must come from create time, not the poller's.
+    """
+    usage_metadata = usage_metadata or {}
+    resolved = {**usage_metadata, **extract_agentic_job_fields(usage_metadata)}
+    return _PendingBackgroundResponse(resolved, request_time_dt, request_prompts, metering_client)
+
+
+@contextlib.contextmanager
+def _outside_the_pollers_job():
+    """Hide the polling caller's agentic job while a background job is metered.
+
+    The job's own fields were resolved at create time; the poller's job must
+    not fill in the ones it lacked.
+    """
+    token = _agentic_job_context.set(None)
+    try:
+        yield
+    finally:
+        _agentic_job_context.reset(token)
+
+
+class _PendingBackgroundResponses:
+    """Create-time context of background responses this process has not yet seen finish, keyed by response id."""
+
+    def __init__(self, capacity):
+        self._capacity = capacity
+        self._lock = threading.Lock()
+        self._pending = OrderedDict()
+        self._warned_overflow = False
+
+    def add(self, response_id, pending):
+        with self._lock:
+            self._pending[response_id] = pending
+            overflowed = len(self._pending) > self._capacity
+            while len(self._pending) > self._capacity:
+                self._pending.popitem(last=False)
+            warn = overflowed and not self._warned_overflow
+            self._warned_overflow = self._warned_overflow or overflowed
+        if warn:
+            logger.warning(
+                "More than %d OpenAI background responses are waiting to be retrieved; the oldest "
+                "will not be metered", self._capacity
+            )
+
+    def holds(self, response_id):
+        with self._lock:
+            return response_id in self._pending
+
+    def take(self, response_id):
+        with self._lock:
+            return self._pending.pop(response_id, None)
+
+
+_pending_background_responses = _PendingBackgroundResponses(MAX_PENDING_BACKGROUND_RESPONSES)
+
+
+def _read_response(response):
+    """The parsed ``Response``, or None when the caller still owns an unread body."""
+    if isinstance(response, OpenAIBaseModel):
+        return response
+    if LegacyAPIResponse is not None and isinstance(response, LegacyAPIResponse):
+        return response.parse()
+    return None
 
 
 def _meter_non_streamed_response(response, call: _MeteredCall):
+    parsed = _read_response(response)
+    if parsed is not None and getattr(parsed, "status", None) in _RUNNING_RESPONSE_STATUSES:
+        _pending_background_responses.add(
+            parsed.id,
+            _pending_background_response(call.usage_metadata, call.request_time_dt, call.request_prompts,
+                                         current_client()))
+        return
     # The Revenium backend has no separate RESPONSES operation type yet.
     _meter_owned_response(response, OperationType.CHAT, call.request_time_dt, call.usage_metadata,
                           client_instance=call.client_instance,
-                          time_to_first_token=_elapsed_ms_since(call.request_time_dt))
+                          time_to_first_token=_elapsed_ms_since(call.request_time_dt),
+                          provider_metadata=call.provider_metadata, request_prompts=call.request_prompts)
+
+
+def _meter_finished_background_response(response, response_id, instance):
+    """Meter a pending background response the first time it is seen finished.
+
+    An unread body is passed through with the job left pending, so the next
+    read that can see the response meters it.
+    """
+    parsed = _read_response(response)
+    if parsed is None or getattr(parsed, "status", None) not in _FINISHED_RESPONSE_STATUSES:
+        return
+    pending = _pending_background_responses.take(response_id)
+    if pending is None or getattr(parsed, "usage", None) is None:
+        return
+    with _outside_the_pollers_job(), recorded_under(pending.metering_client):
+        _meter_owned_response(parsed, OperationType.CHAT, pending.request_time_dt, pending.usage_metadata,
+                              client_instance=getattr(instance, '_client', None),
+                              time_to_first_token=_elapsed_ms_since(pending.request_time_dt),
+                              request_prompts=pending.request_prompts)
+
+
+def _response_id_argument(args, kwargs):
+    return args[0] if args else kwargs.get("response_id")
+
+
+def _resumed_background_stream(stream, response_id, instance, wrap_stream):
+    return wrap_stream(stream, None, None, client_instance=getattr(instance, '_client', None),
+                       background=True, resumed_id=response_id)
+
+
+def responses_retrieve_wrapper(wrapped, instance, args, kwargs):
+    response_id = _response_id_argument(args, kwargs)
+    if not _pending_background_responses.holds(response_id):
+        return wrapped(*args, **kwargs)
+    response = wrapped(*args, **kwargs)
+    if kwargs.get("stream"):
+        return _resumed_background_stream(response, response_id, instance, handle_streaming_responses)
+    _meter_finished_background_response(response, response_id, instance)
+    return response
+
+
+def async_responses_retrieve_wrapper(wrapped, instance, args, kwargs):
+    response_id = _response_id_argument(args, kwargs)
+    if not _pending_background_responses.holds(response_id):
+        return wrapped(*args, **kwargs)
+
+    async def _async_invoke():
+        response = await wrapped(*args, **kwargs)
+        if kwargs.get("stream"):
+            return _resumed_background_stream(response, response_id, instance, _wrap_async_responses_stream)
+        _meter_finished_background_response(response, response_id, instance)
+        return response
+
+    return _async_invoke()
+
+
+def responses_cancel_wrapper(wrapped, instance, args, kwargs):
+    response_id = _response_id_argument(args, kwargs)
+    response = wrapped(*args, **kwargs)
+    _meter_finished_background_response(response, response_id, instance)
+    return response
+
+
+def async_responses_cancel_wrapper(wrapped, instance, args, kwargs):
+    response_id = _response_id_argument(args, kwargs)
+
+    async def _async_invoke():
+        response = await wrapped(*args, **kwargs)
+        _meter_finished_background_response(response, response_id, instance)
+        return response
+
+    return _async_invoke()
 
 
 def responses_create_wrapper(wrapped, instance, args, kwargs):
     logger.debug("OpenAI Responses API create wrapper called")
 
-    if _passes_through_unmetered():
+    if _parse_call_in_progress.get():
         return wrapped(*args, **kwargs)
+    _tell_langchain_when_perplexity_serves(instance)
+    if _left_unmetered():
+        return _call_responses_unmetered(wrapped, instance, args, kwargs)
 
     call = _begin_responses_call(instance, kwargs)
 
@@ -1461,11 +2049,18 @@ def responses_create_wrapper(wrapped, instance, args, kwargs):
         sanitize_for_logging(args),
         sanitize_for_logging(kwargs),
     )
-    response = wrapped(*args, **kwargs)
+    metering_client = current_client()
+    with _recording_failure(call, kwargs.get("model"), kwargs.get('stream', False), metering_client):
+        response = wrapped(*args, **kwargs)
 
     if kwargs.get('stream', False):
-        return handle_streaming_responses(response, call.request_time_dt, call.usage_metadata,
-                                          client_instance=call.client_instance)
+        with recorded_under(metering_client):
+            return handle_streaming_responses(response, call.request_time_dt, call.usage_metadata,
+                                              client_instance=call.client_instance,
+                                              requested_model=kwargs.get("model"),
+                                              background=bool(kwargs.get('background')),
+                                              provider_metadata=call.provider_metadata,
+                                              request_prompts=call.request_prompts)
     _meter_non_streamed_response(response, call)
     return response
 
@@ -1473,79 +2068,73 @@ def responses_create_wrapper(wrapped, instance, args, kwargs):
 def async_responses_create_wrapper(wrapped, instance, args, kwargs):
     logger.debug("OpenAI async Responses API create wrapper called")
 
-    if _passes_through_unmetered():
+    if _parse_call_in_progress.get():
         return wrapped(*args, **kwargs)
+    _tell_langchain_when_perplexity_serves(instance)
+    if _left_unmetered():
+        return _call_responses_unmetered(wrapped, instance, args, kwargs)
 
     call = _begin_responses_call(instance, kwargs)
+    metering_client = current_client()
 
     async def _async_invoke():
-        response = await wrapped(*args, **kwargs)
+        with _recording_failure(call, kwargs.get("model"), kwargs.get('stream', False), metering_client):
+            response = await wrapped(*args, **kwargs)
 
         if kwargs.get('stream', False):
-            return _wrap_async_responses_stream(response, call.request_time_dt, call.usage_metadata,
-                                                client_instance=call.client_instance)
+            with recorded_under(metering_client):
+                return _wrap_async_responses_stream(response, call.request_time_dt, call.usage_metadata,
+                                                    client_instance=call.client_instance,
+                                                    requested_model=kwargs.get("model"),
+                                                    background=bool(kwargs.get('background')),
+                                                    provider_metadata=call.provider_metadata,
+                                                    request_prompts=call.request_prompts)
         _meter_non_streamed_response(response, call)
         return response
 
     return _async_invoke()
 
 
-def _parse_failures_without_a_response():
-    """What ``parse()`` raises after OpenAI answered, and billed, the call
-    without attaching the response it failed to parse."""
-    import pydantic
-    from openai import ContentFilterFinishReasonError
-    return ContentFilterFinishReasonError, pydantic.ValidationError, json.JSONDecodeError
+async def _await_unmetered_parse(wrapped, args, kwargs):
+    with _metered_by_parse():
+        return await wrapped(*args, **kwargs)
 
 
-def _meter_failed_parse(error, call, meter_response):
-    from openai import LengthFinishReasonError
-    if isinstance(error, LengthFinishReasonError):
-        meter_response(error.completion, call)
-    elif isinstance(error, _parse_failures_without_a_response()):
-        logger.warning(
-            "OpenAI answered and billed this parse() call, but it raised %s before returning "
-            "the response, so the call's usage was not recorded", type(error).__name__
-        )
+def _never_defers(_instance):
+    return False
 
 
-@contextlib.contextmanager
-def _metering_failed_parse(call, meter_response):
-    """Meter a ``parse()`` that raised after the provider answered, then let
-    the caller's exception through unchanged."""
-    try:
-        yield
-    except Exception as error:
-        try:
-            _meter_failed_parse(error, call, meter_response)
-        except Exception as metering_error:
-            logger.warning("Could not meter a failed parse() call: %s", metering_error)
-        raise
-
-
-def _parse_wrappers(begin_call, meter_response):
+def _parse_wrappers(begin_call, meter_response, cap_provider_label, defers=_never_defers):
     """The sync and async wraps for a structured-output ``parse()`` method.
 
     ``parse()`` posts its request itself rather than calling the wrapped
     ``create()``, and has no streamed form (structured streaming goes through
-    ``stream()``), so each call is metered here from its parsed response.
+    ``stream()``), so each call is metered here from its parsed response,
+    unless ``defers(instance)`` leaves it to another integration's wrap.
     """
     def parse_wrapper(wrapped, instance, args, kwargs):
-        if _passes_through_unmetered():
+        if _parse_call_in_progress.get() or defers(instance):
             return wrapped(*args, **kwargs)
+        if _left_unmetered():
+            _check_unmetered_client_call(instance, kwargs, cap_provider_label)
+            with _metered_by_parse():
+                return wrapped(*args, **kwargs)
         call = begin_call(instance, kwargs)
-        with _metered_by_parse(), _metering_failed_parse(call, meter_response):
+        with _metered_by_parse(), metering_failed_parse(call, meter_response):
             response = wrapped(*args, **kwargs)
         meter_response(response, call)
         return response
 
     def async_parse_wrapper(wrapped, instance, args, kwargs):
-        if _passes_through_unmetered():
+        if _parse_call_in_progress.get() or defers(instance):
             return wrapped(*args, **kwargs)
+        if _left_unmetered():
+            _check_unmetered_client_call(instance, kwargs, cap_provider_label)
+            return _await_unmetered_parse(wrapped, args, kwargs)
         call = begin_call(instance, kwargs)
 
         async def _async_invoke():
-            with _metered_by_parse(), _metering_failed_parse(call, meter_response):
+            with _metered_by_parse(), metering_failed_parse(call, meter_response):
                 response = await wrapped(*args, **kwargs)
             meter_response(response, call)
             return response
@@ -1555,15 +2144,52 @@ def _parse_wrappers(begin_call, meter_response):
     return parse_wrapper, async_parse_wrapper
 
 
-# Unlike create(), a Perplexity-bound parse() is metered here, labelled
-# PERPLEXITY: the Perplexity middleware does not wrap parse().
-chat_parse_wrapper, async_chat_parse_wrapper = _parse_wrappers(_begin_chat_call, _meter_chat_completion)
+PERPLEXITY_CHAT_PARSE_PATCH = "perplexity:openai.resources.chat.completions.Completions.parse"
+
+
+def _perplexity_meters_parse(instance):
+    return _is_perplexity_bound(instance) and is_patched(PERPLEXITY_CHAT_PARSE_PATCH)
+
+
+# A Perplexity-bound parse() is left to the Perplexity middleware when it is
+# loaded, and metered here, labelled PERPLEXITY, otherwise. The predicate is
+# looked up per call so tests can pin either configuration.
+chat_parse_wrapper, async_chat_parse_wrapper = _parse_wrappers(
+    _begin_chat_call, _meter_chat_completion, _chat_cap_provider_label,
+    defers=lambda instance: _perplexity_meters_parse(instance),
+)
 responses_parse_wrapper, async_responses_parse_wrapper = _parse_wrappers(
-    _begin_responses_call, _meter_non_streamed_response
+    _begin_responses_call, _meter_non_streamed_response, _chat_cap_provider_label
 )
 
 
 _ZERO_RESPONSES_USAGE = SimpleNamespace(input_tokens=0, output_tokens=0, total_tokens=0)
+
+
+class _ResponsesReply:
+    """The reply text of a Responses event stream.
+
+    The text of the final response wins over the deltas, so a stream resumed
+    part way through still gives the whole reply, and never twice.
+    """
+
+    def __init__(self):
+        self._deltas = ReplyCollector()
+        self._final = ReplyCollector()
+
+    def observe(self, event):
+        delta = getattr(event, 'delta', None)
+        if getattr(event, 'type', None) == 'response.output_text.delta' and isinstance(delta, str):
+            self._deltas.add(delta)
+        response = getattr(event, 'response', None)
+        final = responses_output_text(response) if response is not None else ""
+        if final:
+            self._final = ReplyCollector()
+            self._final.add(final)
+            self._deltas = ReplyCollector()
+
+    def text(self):
+        return self._final.text() or self._deltas.text()
 
 
 class _ResponsesStreamMeter:
@@ -1575,50 +2201,122 @@ class _ResponsesStreamMeter:
     ``response.incomplete`` or ``response.failed`` event adds the usage.
     """
 
-    def __init__(self, request_time_dt, usage_metadata, client_instance):
+    def __init__(self, request_time_dt, usage_metadata, client_instance, requested_model=None,
+                 background=False, resumed_id=None, provider_metadata=None, request_prompts=None):
         self._request_time_dt = request_time_dt
+        self._request_prompts = request_prompts
+        self._reply = _ResponsesReply() if is_capture_prompts_enabled() else None
         self._usage_metadata = usage_metadata
         self._client_instance = client_instance
-        self.response_id = None
+        self._provider_metadata = provider_metadata
+        self._requested_model = requested_model
+        self.failure = None
+        self._outer = exception_in_flight()
+        self._metering_client = current_client()
+        self._call_context = CallContext()
+        self._background = background
+        self._resumed = resumed_id is not None
+        self._registered = self._resumed
+        self._finished_job = None
+        self.response_id = resumed_id
         self.model = None
         self.usage = None
+        self.status = None
+        self.incomplete_details = None
         self._saw_event = False
         self._metered = False
+        self._first_output_dt = None
 
     def observe(self, event):
         self._saw_event = True
+        if self._first_output_dt is None and getattr(event, 'type', None) == 'response.output_text.delta':
+            self._first_output_dt = datetime.datetime.now(datetime.timezone.utc)
+        if self._reply is not None:
+            self._reply.observe(event)
         response = getattr(event, 'response', None)
         if response is None:
             return
         self.response_id = getattr(response, 'id', None) or self.response_id
         self.model = getattr(response, 'model', None) or self.model
         self.usage = getattr(response, 'usage', None) or self.usage
+        self.status = getattr(response, 'status', None) or self.status
+        self.incomplete_details = getattr(response, 'incomplete_details', None) or self.incomplete_details
+        if self._background:
+            self._track_background_job()
+
+    def _track_background_job(self):
+        # Runs on the caller's thread as events arrive, so meter(), which can
+        # run from a finalizer, never touches the pending registry.
+        if self.response_id is None:
+            return
+        if not self._registered:
+            self._registered = True
+            _pending_background_responses.add(self.response_id, self._call_context.run(
+                _pending_background_response, self._usage_metadata, self._request_time_dt, self._request_prompts,
+                self._metering_client))
+        if self._finished_job is None and self.status in _FINISHED_RESPONSE_STATUSES:
+            self._finished_job = _pending_background_responses.take(self.response_id)
+
+    def record_failure(self, error):
+        self.failure = self._call_context.run(failure_of, error, self._outer)
 
     def meter(self):
-        if self._metered or not self._saw_event:
+        if self._metered or (not self._saw_event and self.failure is None):
             return
         self._metered = True
 
-        if self.usage is None:
+        if self._background:
+            # A background job cut off mid-stream is metered later, by the
+            # retrieve or resumed stream that sees it finish.
+            if self._finished_job is None or self.usage is None:
+                return
+            self._request_time_dt = self._finished_job.request_time_dt
+            self._usage_metadata = self._finished_job.usage_metadata
+            self._metering_client = self._finished_job.metering_client
+            self._request_prompts = self._finished_job.request_prompts
+
+        if self.usage is None and self.failure is None:
             logger.warning("No usage data found in streaming Responses API response!")
-        if self.response_id is None:
+        if self.response_id is None and self.failure is None:
             return
 
+        self._call_context.run(self._send_under_its_own_job)
+
+    def _send_under_its_own_job(self):
+        with _outside_the_pollers_job() if self._background else contextlib.nullcontext():
+            self._send()
+
+    def _send(self):
         # An interrupted stream is metered with zero token counts rather than
         # dropped, as the chat stream wrappers do.
-        create_metering_call(
-            SimpleNamespace(
-                id=self.response_id,
-                model=self.model or "unknown",
-                usage=self.usage or _ZERO_RESPONSES_USAGE,
-                system_fingerprint=None,
-            ),
-            OperationType.CHAT,
-            self._request_time_dt,
-            self._usage_metadata,
-            client_instance=self._client_instance,
-            is_streamed=True,
-        )
+        with recorded_under(self._metering_client):
+            create_metering_call(
+                SimpleNamespace(
+                    id=self.response_id or failed_transaction_id(),
+                    model=self.model or (self.failure and self._requested_model) or "unknown",
+                    usage=self.usage or _ZERO_RESPONSES_USAGE,
+                    system_fingerprint=None,
+                    status=self.status,
+                    incomplete_details=self.incomplete_details,
+                ),
+                OperationType.CHAT,
+                self._request_time_dt,
+                self._usage_metadata,
+                client_instance=self._client_instance,
+                is_streamed=True,
+                time_to_first_token=self._time_to_first_token(),
+                provider_metadata=self._provider_metadata,
+                failure=self.failure,
+                request_prompts=self._request_prompts,
+                accumulated_content=self._reply.text() if self._reply is not None else None,
+            )
+        self._reply = None
+
+    def _time_to_first_token(self):
+        # A resumed stream's request time is the original create's, swapped in by meter().
+        if self._first_output_dt is None or self._resumed:
+            return 0
+        return int((self._first_output_dt - self._request_time_dt).total_seconds() * 1000)
 
 
 class _MeteredResponsesStream:
@@ -1641,6 +2339,7 @@ class _MeteredResponsesStream:
             self._finalize()
             raise
         except Exception as e:
+            self._meter.record_failure(e)
             self._finalize()
             logger.error(f"Error in streaming Responses API response: {e}")
             raise
@@ -1696,6 +2395,7 @@ class _AsyncMeteredResponsesStream:
             await self._afinalize()
             raise
         except Exception as e:
+            self._meter.record_failure(e)
             await self._afinalize()
             logger.error(f"Error in async streaming Responses API response: {e}")
             raise
@@ -1736,18 +2436,28 @@ class _AsyncMeteredResponsesStream:
 
 
 def handle_streaming_responses(stream, request_time_dt, usage_metadata,
-                               client_instance: Optional[Any] = None):
+                               client_instance: Optional[Any] = None, requested_model: Optional[str] = None,
+                               background=False, resumed_id=None, provider_metadata=None, request_prompts=None):
     """Wrap a sync Responses API event stream so it is metered once consumed or closed."""
-    meter = _ResponsesStreamMeter(request_time_dt, usage_metadata, client_instance)
+    meter = _ResponsesStreamMeter(request_time_dt, usage_metadata, client_instance, requested_model,
+                                  background, resumed_id, provider_metadata, request_prompts=request_prompts)
     claim_call_for_transport(OPENAI)
+    if is_raw_response(stream):
+        tap_sse_body(stream, meter.observe, meter.meter, on_error=meter.record_failure)
+        return stream
     return _MeteredResponsesStream(stream, meter)
 
 
 def _wrap_async_responses_stream(stream, request_time_dt, usage_metadata,
-                                 client_instance: Optional[Any] = None):
+                                 client_instance: Optional[Any] = None, requested_model: Optional[str] = None,
+                                 background=False, resumed_id=None, provider_metadata=None, request_prompts=None):
     """Wrap an async Responses API event stream so it is metered once consumed or closed."""
-    meter = _ResponsesStreamMeter(request_time_dt, usage_metadata, client_instance)
+    meter = _ResponsesStreamMeter(request_time_dt, usage_metadata, client_instance, requested_model,
+                                  background, resumed_id, provider_metadata, request_prompts=request_prompts)
     claim_call_for_transport(OPENAI)
+    if is_raw_response(stream):
+        tap_async_sse_body(stream, meter.observe, meter.meter, on_error=meter.record_failure)
+        return stream
     return _AsyncMeteredResponsesStream(stream, meter)
 
 
@@ -1756,15 +2466,20 @@ def _wrap_async_stream(stream, request_time_dt, usage_metadata, client_instance=
     class AsyncStreamWrapper:
         def __init__(self, stream):
             self.stream = stream
-            self.response = _http_response_of(stream)
-            self.chunks = []
+            self.response = _response_that_meters_on_close(stream, self)
+            self._metering_client = current_client()
+            self._call_context = CallContext()
+            self._saw_chunk = False
             self.response_id = None
             self.model = None
             self.finish_reason = None
             self.final_usage = None
             self.first_token_time = None
+            self._reply = ReplyCollector() if is_capture_prompts_enabled() else None
             self.caller_requested_usage = caller_requested_usage
             self._finalized = False
+            self.failure = None
+            self._outer = exception_in_flight()
 
         def __aiter__(self):
             return self
@@ -1776,35 +2491,62 @@ def _wrap_async_stream(stream, request_time_dt, usage_metadata, client_instance=
                 except StopAsyncIteration:
                     self._finalize()
                     raise
+                except Exception as e:
+                    self._record_failure(e)
+                    self._finalize()
+                    raise
 
-                if self.response_id is None and hasattr(chunk, 'id'):
-                    self.response_id = chunk.id
-                if self.model is None and hasattr(chunk, 'model'):
-                    self.model = chunk.model
-                if chunk.choices and chunk.choices[0].finish_reason:
-                    self.finish_reason = chunk.choices[0].finish_reason
-                if hasattr(chunk, 'usage') and chunk.usage:
-                    self.final_usage = chunk.usage
-                if self.first_token_time is None and chunk.choices and hasattr(chunk.choices[0], 'delta') and getattr(chunk.choices[0].delta, 'content', None):
-                    self.first_token_time = datetime.datetime.now(datetime.timezone.utc)
-                self.chunks.append(chunk)
-
+                self._observe(chunk)
                 if not self._injected_usage_chunk(chunk):
                     return chunk
 
+        def _observe(self, chunk):
+            _observing_chunk(self._process_chunk, chunk)
+            self._saw_chunk = True
+
+        def _process_chunk(self, chunk):
+            # The first non-empty id and model: Azure opens a stream with a
+            # content-filter chunk whose id and model are empty.
+            self.response_id = self.response_id or getattr(chunk, 'id', None)
+            self.model = self.model or getattr(chunk, 'model', None)
+            choices = getattr(chunk, 'choices', None)
+            if choices and getattr(choices[0], 'finish_reason', None):
+                self.finish_reason = choices[0].finish_reason
+            if hasattr(chunk, 'usage') and chunk.usage:
+                self.final_usage = chunk.usage
+            content = getattr(getattr(choices[0], 'delta', None), 'content', None) if choices else None
+            if self.first_token_time is None and content:
+                self.first_token_time = datetime.datetime.now(datetime.timezone.utc)
+            if self._reply is not None and content:
+                self._reply.add(_answer_text_of(content))
+            self._saw_chunk = True
+
         def _injected_usage_chunk(self, chunk):
             return _is_injected_usage_chunk(chunk, self.caller_requested_usage)
+
+        def _record_failure(self, error):
+            self.failure = self._call_context.run(failure_of, error, self._outer)
 
         async def __aenter__(self):
             return self
 
         async def __aexit__(self, exc_type, exc_val, exc_tb):
-            self._finalize()
+            await self._afinish()
 
         async def aclose(self):
             try:
+                await self._afinish()
+            finally:
                 if hasattr(self.stream, 'aclose'):
                     await self.stream.aclose()
+
+        def _finish(self):
+            # A sync close of the async response cannot read on; meter what arrived.
+            self._finalize()
+
+        async def _afinish(self):
+            try:
+                await _aread_usage_after_finish(self, still_open=not self._finalized)
             finally:
                 self._finalize()
 
@@ -1821,8 +2563,10 @@ def _wrap_async_stream(stream, request_time_dt, usage_metadata, client_instance=
             if self._finalized:
                 return
             self._finalized = True
+            self._call_context.run(self._meter)
 
-            if not self.chunks and not self.final_usage:
+        def _meter(self):
+            if not self._saw_chunk and not self.final_usage and self.failure is None:
                 return
 
             if self.final_usage is None:
@@ -1837,33 +2581,47 @@ def _wrap_async_stream(stream, request_time_dt, usage_metadata, client_instance=
             time_to_first_token = int((self.first_token_time - request_time_dt).total_seconds() * 1000) if self.first_token_time else 0
 
             try:
-                create_metering_call(
-                    type('Response', (), {
-                        'id': self.response_id,
-                        'model': self.model or 'unknown',
-                        'usage': self.final_usage,
-                        'system_fingerprint': None,
-                    })(),
-                    OperationType.CHAT,
-                    request_time_dt,
-                    usage_metadata,
-                    client_instance=client_instance,
-                    is_streamed=True,
-                    time_to_first_token=time_to_first_token,
-                    request_body=request_body
-                )
+                with recorded_under(self._metering_client):
+                    create_metering_call(
+                        type('Response', (), {
+                            'id': self.response_id or (failed_transaction_id() if self.failure else None),
+                            'model': self.model or (self.failure and (request_body or {}).get('model')) or 'unknown',
+                            'usage': self.final_usage,
+                            'system_fingerprint': None,
+                            'choices': [SimpleNamespace(finish_reason=self.finish_reason)],
+                        })(),
+                        OperationType.CHAT,
+                        request_time_dt,
+                        usage_metadata,
+                        client_instance=client_instance,
+                        is_streamed=True,
+                        time_to_first_token=time_to_first_token,
+                        request_body=request_body,
+                        failure=self.failure,
+                        accumulated_content=self._reply.text() if self._reply is not None else None,
+                    )
+                self._reply = None
             except Exception as e:
                 logger.error("Async stream metering error: %s", e)
 
     claim_call_for_transport(OPENAI)
+    if is_raw_response(stream):
+        meter = AsyncStreamWrapper(None)
+        tap_async_sse_body(stream, meter._process_chunk, meter._finalize, drop_event=meter._injected_usage_chunk,
+                           on_error=meter._record_failure)
+        return stream
     return AsyncStreamWrapper(stream)
 
 
 def async_create_wrapper(wrapped, instance, args, kwargs):
     logger.debug("OpenAI/Azure OpenAI async chat.completions.create wrapper called")
 
-    if _passes_through_unmetered() or _is_perplexity_bound(instance):
+    if _parse_call_in_progress.get():
         return wrapped(*args, **kwargs)
+    if _is_perplexity_bound(instance):
+        return _call_perplexity_bound(wrapped, instance, args, kwargs, _PERPLEXITY_ASYNC_CHAT_WRAP)
+    if _left_unmetered():
+        return _call_unmetered(wrapped, instance, args, kwargs)
 
     call = _begin_chat_call(instance, kwargs)
 
@@ -1872,18 +2630,22 @@ def async_create_wrapper(wrapped, instance, args, kwargs):
     if stream:
         kwargs, caller_requested_usage = _with_forced_usage_reporting(kwargs)
 
+    metering_client = current_client()
+
     async def _async_invoke():
-        response = await wrapped(*args, **kwargs)
+        with _recording_failure(call, kwargs.get("model"), stream, metering_client):
+            response = await wrapped(*args, **kwargs)
 
         if stream:
-            return _wrap_async_stream(
-                response,
-                call.request_time_dt,
-                call.usage_metadata,
-                client_instance=call.client_instance,
-                request_body=call.request_body,
-                caller_requested_usage=caller_requested_usage
-            )
+            with recorded_under(metering_client):
+                return _wrap_async_stream(
+                    response,
+                    call.request_time_dt,
+                    call.usage_metadata,
+                    client_instance=call.client_instance,
+                    request_body=call.request_body,
+                    caller_requested_usage=caller_requested_usage
+                )
 
         _meter_chat_completion(response, call)
         return response
@@ -1894,12 +2656,12 @@ def async_create_wrapper(wrapped, instance, args, kwargs):
 def async_embeddings_create_wrapper(wrapped, instance, args, kwargs):
     logger.debug("OpenAI/Azure OpenAI async embeddings.create wrapper called")
 
-    if is_selective_metering_enabled() and not is_inside_decorated_function():
-        return wrapped(*args, **kwargs)
+    if _left_unmetered():
+        return _call_unmetered(wrapped, instance, args, kwargs)
 
     request_body = kwargs.copy()
 
-    api_metadata = kwargs.pop("usage_metadata", {}) if "usage_metadata" in kwargs else {}
+    api_metadata = _take_call_metadata(instance, kwargs) or {}
 
     if not api_metadata:
         api_metadata = _extract_langchain_usage_metadata()
@@ -1923,7 +2685,7 @@ def async_embeddings_create_wrapper(wrapped, instance, args, kwargs):
     request_time_dt = datetime.datetime.now(datetime.timezone.utc)
 
     # Enforcement pre-call check — may raise BudgetExceededError
-    check_enforcement(usage_metadata)
+    check_enforcement(usage_metadata, model=kwargs.get("model"), provider=get_provider_metadata(provider)["provider"])
 
     async def _async_invoke():
         response = await wrapped(*args, **kwargs)
@@ -1952,59 +2714,64 @@ def _openai_defines(module_path, attribute_path):
     return True
 
 
-if register_patch('openai.resources.chat.completions.Completions.create'):
-    wrapt.wrap_function_wrapper(
-        'openai.resources.chat.completions', 'Completions.create', create_wrapper
-    )
+wrap_once('openai.resources.chat.completions.Completions.create',
+          'openai.resources.chat.completions', 'Completions.create', create_wrapper)
 
-if register_patch('openai.resources.chat.completions.AsyncCompletions.create'):
-    wrapt.wrap_function_wrapper(
-        'openai.resources.chat.completions', 'AsyncCompletions.create', async_create_wrapper
-    )
+wrap_once('openai.resources.chat.completions.AsyncCompletions.create',
+          'openai.resources.chat.completions', 'AsyncCompletions.create', async_create_wrapper)
 
-if register_patch('openai.resources.embeddings.Embeddings.create'):
-    wrapt.wrap_function_wrapper(
-        'openai.resources.embeddings', 'Embeddings.create', embeddings_create_wrapper
-    )
+wrap_once('openai.resources.embeddings.Embeddings.create',
+          'openai.resources.embeddings', 'Embeddings.create', embeddings_create_wrapper)
 
-if register_patch('openai.resources.embeddings.AsyncEmbeddings.create'):
-    wrapt.wrap_function_wrapper(
-        'openai.resources.embeddings', 'AsyncEmbeddings.create', async_embeddings_create_wrapper
-    )
+wrap_once('openai.resources.embeddings.AsyncEmbeddings.create',
+          'openai.resources.embeddings', 'AsyncEmbeddings.create', async_embeddings_create_wrapper)
 
-if register_patch('openai.resources.responses.Responses.create'):
-    wrapt.wrap_function_wrapper(
-        'openai.resources.responses', 'Responses.create', responses_create_wrapper
-    )
+wrap_once('openai.resources.responses.Responses.create',
+          'openai.resources.responses', 'Responses.create', responses_create_wrapper)
 
-if register_patch('openai.resources.responses.AsyncResponses.create'):
-    wrapt.wrap_function_wrapper(
-        'openai.resources.responses', 'AsyncResponses.create', async_responses_create_wrapper
-    )
+wrap_once('openai.resources.responses.AsyncResponses.create',
+          'openai.resources.responses', 'AsyncResponses.create', async_responses_create_wrapper)
 
 # parse() reached chat completions and Responses in later openai releases than
 # the declared ``openai>=1.0.0`` floor; wrapping a missing attribute would fail
 # the whole middleware import.
-if _openai_defines('openai.resources.chat.completions', 'Completions.parse') and \
-        register_patch('openai.resources.chat.completions.Completions.parse'):
-    wrapt.wrap_function_wrapper(
-        'openai.resources.chat.completions', 'Completions.parse', chat_parse_wrapper
-    )
+if _openai_defines('openai.resources.chat.completions', 'Completions.parse'):
+    wrap_once('openai.resources.chat.completions.Completions.parse',
+              'openai.resources.chat.completions', 'Completions.parse', chat_parse_wrapper)
 
-if _openai_defines('openai.resources.chat.completions', 'AsyncCompletions.parse') and \
-        register_patch('openai.resources.chat.completions.AsyncCompletions.parse'):
-    wrapt.wrap_function_wrapper(
-        'openai.resources.chat.completions', 'AsyncCompletions.parse', async_chat_parse_wrapper
-    )
+if _openai_defines('openai.resources.chat.completions', 'AsyncCompletions.parse'):
+    wrap_once('openai.resources.chat.completions.AsyncCompletions.parse',
+              'openai.resources.chat.completions', 'AsyncCompletions.parse', async_chat_parse_wrapper)
 
-if _openai_defines('openai.resources.responses', 'Responses.parse') and \
-        register_patch('openai.resources.responses.Responses.parse'):
-    wrapt.wrap_function_wrapper(
-        'openai.resources.responses', 'Responses.parse', responses_parse_wrapper
-    )
+for _module_path, _class_name, _wrapper in (
+    ('openai.resources.chat.completions', 'Completions', stream_helper_wrapper),
+    ('openai.resources.chat.completions', 'AsyncCompletions', async_stream_helper_wrapper),
+    ('openai.resources.responses', 'Responses', stream_helper_wrapper),
+    ('openai.resources.responses', 'AsyncResponses', async_stream_helper_wrapper),
+):
+    if _openai_defines(_module_path, f'{_class_name}.stream'):
+        wrap_once(f'{_module_path}.{_class_name}.stream', _module_path, f'{_class_name}.stream', _wrapper)
 
-if _openai_defines('openai.resources.responses', 'AsyncResponses.parse') and \
-        register_patch('openai.resources.responses.AsyncResponses.parse'):
-    wrapt.wrap_function_wrapper(
-        'openai.resources.responses', 'AsyncResponses.parse', async_responses_parse_wrapper
-    )
+for _class_name, _method, _wrapper in (
+    ('Responses', 'retrieve', responses_retrieve_wrapper),
+    ('AsyncResponses', 'retrieve', async_responses_retrieve_wrapper),
+    ('Responses', 'cancel', responses_cancel_wrapper),
+    ('AsyncResponses', 'cancel', async_responses_cancel_wrapper),
+):
+    if _openai_defines('openai.resources.responses', f'{_class_name}.{_method}'):
+        wrap_once(f'openai.resources.responses.{_class_name}.{_method}',
+                  'openai.resources.responses', f'{_class_name}.{_method}', _wrapper)
+
+if _openai_defines('openai.resources.responses', 'Responses.parse'):
+    wrap_once('openai.resources.responses.Responses.parse',
+              'openai.resources.responses', 'Responses.parse', responses_parse_wrapper)
+
+if _openai_defines('openai.resources.responses', 'AsyncResponses.parse'):
+    wrap_once('openai.resources.responses.AsyncResponses.parse',
+              'openai.resources.responses', 'AsyncResponses.parse', async_responses_parse_wrapper)
+
+from .audio import AUDIO_WRAPPERS  # noqa: E402  (audio.py builds on the helpers defined above)
+
+for _module_path, _attribute_path, _audio_wrapper in AUDIO_WRAPPERS:
+    if _openai_defines(_module_path, _attribute_path):
+        wrap_once(f'{_module_path}.{_attribute_path}', _module_path, _attribute_path, _audio_wrapper)

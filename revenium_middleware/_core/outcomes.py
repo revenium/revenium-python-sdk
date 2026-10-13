@@ -7,12 +7,16 @@ outcome POSTs is deliberate: metric ingestion creates the Job asynchronously,
 so a fresh outcome can race ahead until Kafka catches up.
 """
 
+import functools
+import json
 import logging
+import operator
 import re
 import time
 import urllib.parse
 from collections import abc
-from typing import Any, Collection, Dict, List, Mapping, Optional, Sequence, Union
+from decimal import Decimal, InvalidOperation
+from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence, Union
 
 import httpx
 
@@ -37,14 +41,23 @@ _METERING_KEY_PREFIX = "rev_mk_"
 # wrapping the array in a key the server does not declare would just be a 400.
 JsonBody = Union[Dict[str, Any], List[Any]]
 
-# Retried by default: 429 plus the gateway 5xx a proxy answers when it never
-# reached the origin. Safe for the calls that carry it, all of which either
-# create-or-affirm one named thing (the job) or set one terminal outcome, so a
-# repeat is the same write.
+ConflictConfirmation = Callable[[], Optional[httpx.Response]]
+
+# Retried by default: 429 plus the gateway 5xx. A gateway 5xx does not prove the
+# origin never saw the request, and a repeated outcome report is not the same
+# write: the backend refuses a second one. So a 409 that follows a gateway 5xx
+# in the same call is checked against the stored job before it is raised.
 _DEFAULT_RETRY_STATUSES = frozenset({429, 502, 503, 504})
 
-# For a write that is NOT a repeat of itself — the append-only facts endpoint,
-# where a second delivery is a second fact. Only 429 proves the request was
+_ORIGIN_MAY_HAVE_COMMITTED_STATUSES = frozenset({502, 503, 504})
+
+# For a write that carries its own Idempotency-Key. The API answers 409 while
+# the first delivery of that key is still in progress, so asking again is safe.
+IDEMPOTENCY_KEYED_RETRY_STATUSES = _DEFAULT_RETRY_STATUSES | {409}
+
+# For a write that is NOT a repeat of itself: the facts endpoint, where a
+# second delivery of a key already recorded is a correction (refused without
+# a reason, superseding the fact with one). Only 429 proves the request was
 # rejected before the origin processed it; 502/503/504 are ambiguous, since the
 # origin can have committed before the proxy gave up. ``amend_outcome_request``
 # holds the same line in its own loop for the same reason.
@@ -58,8 +71,8 @@ _AMEND_CONFLICT_RECOVERY = (
     "Read the conflict's current_entity_version, re-check the outcome you "
     "intend to write (get_outcome_history shows what the other writer "
     "changed), then re-issue the amendment with expected_entity_version set to "
-    "that version. When current_entity_version is None, read the job outside "
-    "this SDK (GET /v2/api/jobs/{agenticJobId}) to obtain it. The SDK never "
+    "that version. When current_entity_version is None, read it from "
+    "get_job(job_id)[\"entityVersion\"]. The SDK never "
     "auto-retries an amendment: PATCH-amend is not idempotent, so a blind "
     "retry can append a duplicate history row."
 )
@@ -231,6 +244,8 @@ def _request_with_retry(
     retry_attempts: int = DEFAULT_RETRY_ATTEMPTS,
     retry_initial_seconds: float = DEFAULT_RETRY_INITIAL_SECONDS,
     retry_max_seconds: float = DEFAULT_RETRY_MAX_SECONDS,
+    extra_headers: Optional[Mapping[str, str]] = None,
+    confirm_conflict: Optional[ConflictConfirmation] = None,
 ) -> Optional[httpx.Response]:
     """Issue ``method`` with bounded retry. Returns the response on success.
 
@@ -247,17 +262,28 @@ def _request_with_retry(
     (job creation); ``raise_typed_on_409`` parses the structured body and
     raises ``OutcomeAlreadyReportedError`` when it carries amendment guidance,
     falling back to warn-and-return for unparseable bodies (older backends).
+
+    ``extra_headers`` are sent on every attempt, over the standard headers.
+
+    ``confirm_conflict`` applies to ``raise_typed_on_409`` only, and only when
+    an earlier attempt of this same call answered 502, 503 or 504: the origin
+    may have stored that attempt, which makes the 409 the answer to the SDK's
+    own retry. It returns the response to hand back as the success, or ``None``
+    to raise as usual. A 409 on the first attempt, or after a 404 or 429, never
+    calls it.
     """
     attempts = max(1, retry_attempts)
     retryable = set(_DEFAULT_RETRY_STATUSES if retry_statuses is None else retry_statuses)
     if retry_on_404:
         retryable.add(404)
+    headers = {**build_headers(api_key), **(extra_headers or {})}
+    earlier_statuses: List[int] = []
     response: Optional[httpx.Response] = None
     for attempt in range(attempts):
         response = http_client.request(
             method,
             url,
-            headers=build_headers(api_key),
+            headers=headers,
             params=params,
             json=body,
             timeout=30.0,
@@ -268,8 +294,8 @@ def _request_with_retry(
             if accept_409:
                 return response
             if raise_typed_on_409:
-                _handle_conflict(response)
-                return response
+                return _settle_typed_conflict(response, earlier_statuses, confirm_conflict)
+        earlier_statuses.append(response.status_code)
         if response.status_code in retryable and attempt < attempts - 1:
             delay = _retry_delay(response, attempt, retry_initial_seconds, retry_max_seconds)
             time.sleep(delay)
@@ -292,6 +318,8 @@ def post_with_retry(
     retry_attempts: int = DEFAULT_RETRY_ATTEMPTS,
     retry_initial_seconds: float = DEFAULT_RETRY_INITIAL_SECONDS,
     retry_max_seconds: float = DEFAULT_RETRY_MAX_SECONDS,
+    extra_headers: Optional[Mapping[str, str]] = None,
+    confirm_conflict: Optional[ConflictConfirmation] = None,
 ) -> Optional[httpx.Response]:
     """POST with bounded retry. Returns the response on success/accepted-409.
 
@@ -312,7 +340,29 @@ def post_with_retry(
         retry_attempts=retry_attempts,
         retry_initial_seconds=retry_initial_seconds,
         retry_max_seconds=retry_max_seconds,
+        extra_headers=extra_headers,
+        confirm_conflict=confirm_conflict,
     )
+
+
+def _settle_typed_conflict(
+    conflict: httpx.Response,
+    earlier_statuses: Sequence[int],
+    confirm_conflict: Optional[ConflictConfirmation],
+) -> httpx.Response:
+    """The response to return for a typed 409, or the typed exception.
+
+    The conflict is this call's own earlier attempt only when a gateway hid
+    that attempt's answer and ``confirm_conflict`` finds it stored.
+    """
+    if confirm_conflict is not None and _ORIGIN_MAY_HAVE_COMMITTED_STATUSES.intersection(
+        earlier_statuses
+    ):
+        confirmed = confirm_conflict()
+        if confirmed is not None:
+            return confirmed
+    _handle_conflict(conflict)
+    return conflict
 
 
 def _conflict_field(data: Dict[str, Any], *names: str) -> Any:
@@ -450,13 +500,13 @@ def _conflict_entity_version(response: httpx.Response) -> Optional[int]:
     """The version the backend actually holds, read off an amendment 409.
 
     This is what makes the conflict recoverable: history rows carry a
-    ``sequence`` and not a version, and this SDK wraps no job read, so without
-    it a caller has nowhere to get the version their retry needs.
+    ``sequence`` and not a version, so without it a caller needs a second
+    round trip (``get_job``) to get the version their retry needs.
 
     A structured field wins when a backend offers one; today the value exists
     only inside the human-readable message, so that text is parsed as a
     fallback. Returns ``None`` when neither yields a version — the conflict is
-    still raised, the caller just has to read the job themselves.
+    still raised, and the caller reads the version with ``get_job``.
     """
     try:
         data = response.json()
@@ -519,6 +569,13 @@ def report_outcome_request(
     amendment PATCH accepts as ``expectedEntityVersion`` to detect a lost
     update. Returning the response (rather than nothing) is what lets a caller
     do that without a second read of the job.
+
+    When a gateway answers 502, 503 or 504 and the retry is then refused as
+    already reported, the job is read once and the report counts as delivered
+    if the stored outcome is the one sent, unamended; the job read is then the
+    response returned. An identical outcome stored by another writer in that
+    gap is reported as success too. ``reportedBy``, ``outcomeReportedAt`` and
+    ``metrics`` are not on the job resource, so they are not verified.
     """
     safe_id = urllib.parse.quote(agentic_job_id, safe="")
     url = (
@@ -537,6 +594,127 @@ def report_outcome_request(
         retry_attempts=retry_attempts,
         retry_initial_seconds=retry_initial_seconds,
         retry_max_seconds=retry_max_seconds,
+        confirm_conflict=functools.partial(
+            _read_job_storing_this_report,
+            http_client,
+            profitstream_base_url,
+            agentic_job_id,
+            payload,
+            team_id=team_id,
+            api_key=api_key,
+        ),
+    )
+
+
+def _read_job_storing_this_report(
+    http_client: httpx.Client,
+    profitstream_base_url: str,
+    agentic_job_id: str,
+    payload: Mapping[str, Any],
+    *,
+    team_id: str,
+    api_key: str,
+) -> Optional[httpx.Response]:
+    """The job read, when the job stores exactly the outcome ``payload`` reported.
+
+    ``None`` for everything else, including a read that fails in any way: the
+    caller then raises the already-reported error it would have raised anyway.
+    One attempt and no sleep, because this runs right after a gateway error and
+    inside the caller's own retry budget.
+    """
+    safe_id = urllib.parse.quote(agentic_job_id, safe="")
+    url = f"{profitstream_base_url.rstrip('/')}/profitstream/v2/api/jobs/{safe_id}"
+    try:
+        response = http_client.request(
+            "GET",
+            url,
+            headers=build_headers(api_key),
+            params={"teamId": team_id} if team_id else None,
+            timeout=30.0,
+        )
+        stored = 200 <= response.status_code < 300 and _job_stores_this_report_unamended(
+            response.json(), payload
+        )
+    except Exception:  # noqa: BLE001 - an unreadable job confirms nothing
+        return None
+    return response if stored else None
+
+
+def _same_outcome_value(sent: Any, stored: Any) -> bool:
+    if isinstance(sent, bool) or isinstance(stored, bool):
+        return False
+    try:
+        return Decimal(str(sent)) == Decimal(str(stored))
+    except InvalidOperation:
+        return False
+
+
+def _same_json_value(sent: Any, stored: Any) -> bool:
+    if isinstance(sent, bool) or isinstance(stored, bool):
+        return isinstance(sent, bool) and isinstance(stored, bool) and sent == stored
+    if isinstance(sent, dict) and isinstance(stored, dict):
+        return sent.keys() == stored.keys() and all(
+            _same_json_value(value, stored[key]) for key, value in sent.items()
+        )
+    if isinstance(sent, list) and isinstance(stored, list):
+        return len(sent) == len(stored) and all(
+            _same_json_value(a, b) for a, b in zip(sent, stored)
+        )
+    return sent == stored
+
+
+def _same_metadata(sent: Any, stored: Any) -> bool:
+    try:
+        return _same_json_value(json.loads(sent), json.loads(stored))
+    except (TypeError, ValueError):
+        return sent == stored
+
+
+# (payload key, job resource field, equality) for the fields that must match in
+# both directions: a value sent equals the stored one, and a field not sent is
+# null on the job.
+_REPORTED_FIELD_CHECKS = (
+    ("outcomeType", "outcomeType", operator.eq),
+    ("outcomeValue", "outcomeValue", _same_outcome_value),
+    ("outcomeReason", "outcomeReason", operator.eq),
+    ("metadata", "outcomeMetadata", _same_metadata),
+)
+
+_UNVERIFIED_REPORT_KEYS = frozenset({"metrics", "outcomeReportedAt", "reportedBy"})
+
+_CONFIRMABLE_REPORT_KEYS = (
+    frozenset({"executionStatus", "outcomeCurrency"})
+    | frozenset(payload_key for payload_key, _, _ in _REPORTED_FIELD_CHECKS)
+    | _UNVERIFIED_REPORT_KEYS
+)
+
+
+def _stored_field_matches(sent: Any, stored: Any, same: Callable[[Any, Any], bool]) -> bool:
+    if sent is None:
+        return stored is None
+    return stored is not None and same(sent, stored)
+
+
+def _job_stores_this_report_unamended(job: Any, payload: Mapping[str, Any]) -> bool:
+    """Whether ``job`` holds the outcome ``payload`` reported and nothing since.
+
+    Refuses on any doubt. A payload key outside the known set cannot be
+    compared, so it refuses; a field this call did not send must be null on the
+    job, so a bare report is never matched to another writer's richer outcome.
+    ``outcomeCurrency`` is compared only when sent, since the server may fill it.
+    """
+    if not isinstance(job, dict) or set(payload) - _CONFIRMABLE_REPORT_KEYS:
+        return False
+    if job.get("hasOutcome") is not True or _conflict_count(job.get("outcomeUpdateCount")) != 0:
+        return False
+    if job.get("executionStatus") != payload.get("executionStatus"):
+        return False
+    sent_currency = payload.get("outcomeCurrency")
+    if sent_currency is not None and job.get("outcomeCurrency") != sent_currency:
+        return False
+    return all(
+        _stored_field_matches(payload.get(payload_key), job.get(job_field), same)
+        for payload_key, job_field, same in _REPORTED_FIELD_CHECKS
     )
 
 
@@ -552,7 +730,7 @@ def append_outcome_metrics_request(
     retry_initial_seconds: float = DEFAULT_RETRY_INITIAL_SECONDS,
     retry_max_seconds: float = DEFAULT_RETRY_MAX_SECONDS,
 ) -> Optional[httpx.Response]:
-    """POST declared per-job metric facts to an existing job (append-only).
+    """POST declared per-job metric facts to an existing job (one active fact per key).
 
     ``entries`` is sent as the request body itself — a bare JSON array of
     OutcomeMetricEntry objects, which is what this endpoint declares — with each
@@ -568,9 +746,11 @@ def append_outcome_metrics_request(
 
     Only 429 is retried, and nothing else — not the gateway 5xx the other
     outcome POSTs retry, and not the 404 the outcome POST retries through the
-    Job's asynchronous creation. This endpoint is append-only: a second delivery
-    of the same entries is a second fact, or a 409 against the active-fact
-    constraint reported for a write that already succeeded. 429 is the one
+    Job's asynchronous creation. A job keeps one active fact per key: a second
+    delivery of the same entries is a correction of facts already recorded,
+    refused with a 400 when an entry carries no ``reason`` and superseding the
+    earlier fact when it does, or a 409 against the active-fact constraint
+    reported for a write that already succeeded. 429 is the one
     status that proves the request was rejected before the origin processed it,
     so it is the one that can be repeated safely; a 502/503/504 is ambiguous and
     surfaces to the caller, who can check the recorded facts before deciding to
@@ -638,9 +818,9 @@ def amend_outcome_request(
     off the conflict body — so the loop is re-check the outcome you intend to
     write (``get_outcome_history`` shows what the other writer changed), then
     re-issue the amendment with that version as ``expectedEntityVersion``. When
-    the conflict body carries no version, it takes a job read outside this SDK
-    (``GET /v2/api/jobs/{agenticJobId}``), since history rows carry a
-    ``sequence`` and not an entity version. The SDK never auto-retries an
+    the conflict body carries no version, it takes
+    ``get_job(job_id)["entityVersion"]`` to obtain one, since history rows carry
+    a ``sequence`` and not an entity version. The SDK never auto-retries an
     amendment (see below), so the raised message names that loop too.
 
     Only 429 is auto-retried: the amendment definitely was not processed.

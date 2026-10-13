@@ -5,12 +5,30 @@ This module provides pytest markers and fixtures to ensure tests run
 properly with appropriate mocking and state management.
 """
 
+import os
+import sys
+import threading
+import traceback
+
 import pytest
 from unittest.mock import patch, MagicMock
+
+try:
+    import freezegun
+except ImportError:
+    freezegun = None
+
+# freezegun reads every attribute of every loaded module when a freeze starts.
+# cohere builds its pydantic types lazily on attribute access, so that read
+# imports them mid-freeze, they fail against FakeDatetime, and the failed start
+# leaves the clock frozen for the rest of the run.
+if freezegun is not None:
+    freezegun.configure(extend_ignore_list=["cohere"])
 
 
 def pytest_configure(config):
     """Configure pytest with custom markers."""
+    config.uncaptured_stderr = os.fdopen(os.dup(sys.stderr.fileno()), "w")
     config.addinivalue_line(
         "markers",
         "unit: Unit tests (fast, no external dependencies)"
@@ -19,6 +37,48 @@ def pytest_configure(config):
         "markers",
         "e2e: End-to-end integration tests (require real API keys)"
     )
+
+
+def pytest_unconfigure(config):
+    config.uncaptured_stderr.close()
+
+
+SECONDS_BETWEEN_STACK_REPORT_AND_FAULTHANDLER_EXIT = 60
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    """Print every thread's stack, the main thread first, shortly before faulthandler ends a hung run.
+
+    faulthandler stops after 100 threads and lists the newest first, so in a
+    suite holding more than that it never reaches the main thread, which is the
+    one that hung.
+    """
+    hang_seconds = 0.0
+    if item.config.pluginmanager.has_plugin("faulthandler"):
+        hang_seconds = float(item.config.getini("faulthandler_timeout") or 0)
+    if hang_seconds <= SECONDS_BETWEEN_STACK_REPORT_AND_FAULTHANDLER_EXIT:
+        yield
+        return
+    timer = threading.Timer(hang_seconds - SECONDS_BETWEEN_STACK_REPORT_AND_FAULTHANDLER_EXIT,
+                            _report_every_thread, args=(item.nodeid, item.config))
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+
+
+def _report_every_thread(nodeid, config):
+    main = threading.main_thread().ident
+    frames = sorted(sys._current_frames().items(), key=lambda entry: entry[0] != main)
+    names = {thread.ident: thread.name for thread in threading.enumerate()}
+    report = [f"\n{nodeid} is still running; {len(frames)} threads, main thread first:"]
+    for ident, frame in frames:
+        report.append(f"--- {names.get(ident, ident)}\n{''.join(traceback.format_stack(frame))}")
+    config.uncaptured_stderr.write("\n".join(report) + "\n")
+    config.uncaptured_stderr.flush()
 
 
 def pytest_collection_modifyitems(config, items):
@@ -49,6 +109,9 @@ def mock_revenium_client():
     mock_response.json.return_value = {'status': 'success'}
 
     mock_client = MagicMock()
+    # Strings, as on a real client: spending caps read their rules with them.
+    mock_client.api_key = "hak_test_dummy_key_for_ci_testing_only"
+    mock_client.base_url = "https://api.test.revenium.ai/meter/"
     mock_client.ai.create_completion.return_value = mock_response
     mock_client.ai.create_image.return_value = mock_response
     mock_client.ai.create_video.return_value = mock_response
@@ -111,6 +174,9 @@ def _reap_enforcement_poller(monkeypatch):
         enforcement._poll_thread = None
         enforcement._stop_event.clear()
         enforcement._poll_wakeup.clear()
+        # Whose rules the cache holds is per test: a test that seeds the cache
+        # by hand must not have it dropped as another team's.
+        enforcement._cache_owner = None
 
     reap()
     yield

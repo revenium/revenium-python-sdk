@@ -14,18 +14,20 @@ explicit ``api_key`` > ``REVENIUM_WRITE_API_KEY`` >
 ``REVENIUM_METERING_API_KEY``, failing fast on a metering key (``rev_mk_``).
 """
 
+import functools
 import json
 import logging
-import os
 import threading
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import httpx
 
 # 3.8 support: asyncio.to_thread only exists on Python 3.9+, so use the backport.
 from ._metering._utils._sync import _asyncio_to_thread
-from ._core.config import Config, resolve_write_api_key
+from ._core.config import get_profitstream_base_url, resolve_write_api_key
 from ._core.context import _agentic_job_context, set_agentic_job_fields
+from ._core.error_text import reportable_exception_text
+from ._core.fields import AGENTIC_JOB_ID_RULE, is_valid_agentic_job_id
 from ._core.exceptions import (
     OutcomeAlreadyReportedError,
     OutcomeAmendConflictError,
@@ -51,8 +53,29 @@ logger = logging.getLogger(__name__)
 _OUTCOME_REASON_MAX_LEN = 2048
 
 
+def _failure_report_fields(exc: BaseException) -> Tuple[Dict[str, str], str]:
+    """The auto-FAILED outcome's metadata and reason, shared by the sync and async exit paths."""
+    error_text = reportable_exception_text(exc, _OUTCOME_REASON_MAX_LEN)
+    return {"error": error_text, "errorType": type(exc).__name__}, error_text
+
+
 _VALID_EXECUTION_STATUSES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
-_DEFAULT_PROFITSTREAM_BASE_URL = "https://api.revenium.io"
+
+
+def _remembers_report_error(method):
+    """Record on the instance the exception an explicit outcome call raised."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except Exception as error:
+            self._last_report_error = error
+            raise
+    return wrapper
+
+
+def _found_no_job(error: Optional[BaseException]) -> bool:
+    return isinstance(error, httpx.HTTPStatusError) and error.response.status_code == 404
 
 
 def _coerce_expected_entity_version(version: Optional[Any]) -> Optional[int]:
@@ -85,9 +108,14 @@ class JobContext:
                                outcome_type="CONVERTED", outcome_value=500.0)
 
     On an unhandled exception inside the block, the context auto-reports
-    ``execution_status="FAILED"`` (error message and class in metadata) —
-    unless an outcome was already reported — and ALWAYS re-raises the
-    original exception. Works as a sync or async context manager. This
+    ``execution_status="FAILED"`` (error message and class in metadata) and
+    ALWAYS re-raises the original exception. It skips the FAILED when a
+    ``report_outcome`` or ``amend_outcome`` call succeeded, the platform
+    answered that the job already has an outcome, the exception escaping the
+    block is the one your own ``report_outcome``/``amend_outcome`` raised, or
+    that call found no such job (404). So a report you caught that failed,
+    followed by a crash, still gets FAILED. Works as a sync or async context
+    manager. This
     auto-report blocks context exit; tune how long it may retry via the
     ``retry_attempts``/``retry_initial_seconds``/``retry_max_seconds`` knobs,
     which apply to every outcome HTTP call this instance makes. ``attach()``
@@ -100,6 +128,10 @@ class JobContext:
     One instance is single-use-at-a-time: concurrent or nested jobs need
     separate ``JobContext`` instances, and a second concurrent ``__enter__``
     on an already-active instance raises ``RuntimeError``.
+
+    Entering raises ``ValueError`` for a ``job_id`` Revenium refuses on AI
+    calls (see ``AGENTIC_JOB_ID_RULE``); ``attach()`` still accepts one, for a
+    job created through ``create_job``.
     """
 
     def __init__(
@@ -125,11 +157,7 @@ class JobContext:
         self.version = version
         self._team_id = team_id or ""
         self._api_key = api_key
-        self._base_url = (
-            profitstream_base_url
-            or os.getenv(Config.ENV_REVENIUM_PROFITSTREAM_BASE_URL)
-            or _DEFAULT_PROFITSTREAM_BASE_URL
-        )
+        self._base_url = get_profitstream_base_url(profitstream_base_url)
         self._http_client = http_client
         # The async auto-report hands the client (and its ownership) to a worker
         # thread, so both are per-run state. Record the original intent once and
@@ -150,7 +178,7 @@ class JobContext:
         self._enter_lock = threading.Lock()
         self._token = None
         self._outcome_reported = False
-        self._outcome_attempted = False
+        self._last_report_error: Optional[BaseException] = None
         self._resolved_team_id: Optional[str] = None
         # Optimistic-lock token from the last report/amend response; see
         # ``entity_version``. ``None`` means "no version known", which is
@@ -210,6 +238,10 @@ class JobContext:
     # ------------------------------------------------------------------ context management
 
     def __enter__(self) -> "JobContext":
+        if not is_valid_agentic_job_id(self.job_id):
+            raise ValueError(
+                f"job_id {self.job_id!r} is not an id Revenium accepts on AI calls: {AGENTIC_JOB_ID_RULE}"
+            )
         # Lifecycle invariant: the instance is "active" from the moment __enter__
         # takes this lock until exit cleanup releases the token under it again.
         # ``_token``, ``_http_client``, ``_owns_http_client`` and the outcome flags
@@ -224,7 +256,7 @@ class JobContext:
                     "instance for nested or concurrent jobs"
                 )
             self._outcome_reported = False
-            self._outcome_attempted = False
+            self._last_report_error = None
             self._resolved_team_id = None
             # A new run is a new outcome: a version carried over from the last
             # one would lock this run's amendment against a stale value.
@@ -242,7 +274,8 @@ class JobContext:
             exc is not None
             and isinstance(exc, Exception)
             and not self._outcome_reported
-            and not self._outcome_attempted
+            and exc is not self._last_report_error
+            and not _found_no_job(self._last_report_error)
         )
 
     def _reset_token(self) -> None:
@@ -319,6 +352,7 @@ class JobContext:
 
     # ------------------------------------------------------------------ outcome reporting
 
+    @_remembers_report_error
     def report_outcome(
         self,
         execution_status: str,
@@ -347,7 +381,10 @@ class JobContext:
         left to the server rather than misattributed here. A metric must already
         be declared as PER_JOB on the job type's economics contract (BACK-3078)
         or the server rejects the whole request, and ``quality_rate`` is
-        range-checked to 0..1 server-side. Facts are append-only; use
+        range-checked to 0..1 server-side. A job keeps one active fact per
+        key: a fact with a key the job already has supersedes the earlier one
+        (deactivated, not deleted) and is refused without a ``reason``, and the
+        same key twice in one request is refused. Use
         ``append_outcome_metrics`` to add more after the outcome is reported.
 
         Records the job's ``entityVersion`` from the response on this instance
@@ -355,6 +392,13 @@ class JobContext:
         instance can detect a lost update. A backend that returns no version
         leaves it unset — that amendment is simply unlocked, as before — and
         everything else works unchanged.
+
+        After a gateway error (502, 503 or 504) the retry can be refused as
+        already reported although the first attempt was stored. The job is then
+        read once, and when its stored outcome is the one sent here, unamended,
+        the call succeeds with that job's ``entityVersion``. An identical
+        outcome stored by another writer in that gap counts as success too;
+        ``reported_by`` and ``metrics`` are not part of the check.
 
         Raises:
             ValueError: invalid ``execution_status``, ``outcome_value`` without
@@ -364,9 +408,6 @@ class JobContext:
             OutcomeAlreadyReportedError: the job already has an outcome
                 (backend 409 with amendment guidance).
         """
-        # Any explicit attempt means the user owns the outcome; auto-FAILED
-        # must not second-guess it — set before validation on purpose.
-        self._outcome_attempted = True
         if execution_status not in _VALID_EXECUTION_STATUSES:
             raise ValueError(
                 f"execution_status must be one of {sorted(_VALID_EXECUTION_STATUSES)}, "
@@ -410,6 +451,7 @@ class JobContext:
         self._record_entity_version(response)
         self._outcome_reported = True
 
+    @_remembers_report_error
     def amend_outcome(
         self,
         reason: Optional[str] = None,
@@ -453,9 +495,8 @@ class JobContext:
         what the other writer changed), then re-issue this call — passing that
         version explicitly, or simply through this same handle. When
         ``current_entity_version`` is ``None`` the conflict body carried no
-        version, and it takes a job read outside this SDK
-        (``GET /v2/api/jobs/{agenticJobId}``) to obtain one; history rows carry a
-        ``sequence``, not an entity version. The SDK never auto-retries an
+        version, and it takes ``get_job(job_id)["entityVersion"]`` to obtain
+        one; history rows carry a ``sequence``, not an entity version. The SDK never auto-retries an
         amendment — PATCH-amend is not idempotent, so a blind retry can append a
         duplicate history row.
 
@@ -469,9 +510,10 @@ class JobContext:
         ``metrics`` appends declared per-job metric facts as part of this
         amendment, with the same entry shape and the same server-side rules as
         ``report_outcome``: the metric must be declared PER_JOB on the job
-        type's economics contract (BACK-3078), ``quality_rate`` is range-checked
-        to 0..1 server-side, and the facts are append-only — amending never
-        replaces a fact recorded earlier.
+        type's economics contract (BACK-3078) and ``quality_rate`` is
+        range-checked to 0..1 server-side. A fact with a key the job already has
+        supersedes it (deactivated, not deleted); the amendment's reason is used
+        when an entry has none.
 
         Raises:
             ValueError: blank ``reason``, invalid ``execution_status``, a
@@ -482,9 +524,6 @@ class JobContext:
                 ``expected_entity_version`` (backend 409) — refetch, take the
                 current version, and retry with it; the SDK does not auto-retry.
         """
-        # Any explicit attempt means the user owns the outcome; auto-FAILED
-        # must not second-guess it — set before validation on purpose.
-        self._outcome_attempted = True
         if reason is not None and (not isinstance(reason, str) or not reason.strip()):
             # Omitting the key is the deliberate way to let the backend fill in
             # an automated reason; a blank string is a caller bug, and a session
@@ -542,6 +581,8 @@ class JobContext:
             # caller who decides the amendment still applies can retry through
             # this same handle instead of threading the value back by hand.
             self._entity_version = conflict.current_entity_version
+            # The conflict proves an outcome exists: never auto-FAILED on exit.
+            self._outcome_reported = True
             raise
         # A successful amendment proves an outcome exists — never auto-FAILED on exit.
         self._outcome_reported = True
@@ -565,9 +606,12 @@ class JobContext:
         The metric has to be declared as PER_JOB on the job type's economics
         contract first (BACK-3078); a fact for an undeclared key is rejected
         with a 400, as is a ``quality_rate`` outside 0..1, which the server
-        range-checks. The endpoint is append-only and the SDK does not dedupe:
-        the server owns fact identity, and dropping a repeated measurement
-        client-side would lose real data.
+        range-checks. A job keeps one active fact per key: appending a key the
+        job already has supersedes the earlier fact (deactivated, not deleted)
+        and is refused with a 400 unless the entry carries a ``reason``, and the
+        same key twice in one request is refused. The SDK does not dedupe: the
+        server owns fact identity, and dropping a repeated measurement
+        client-side would lose a correction.
 
         Appending facts is not reporting an outcome, so this call leaves the
         outcome state of the context alone — a block that then raises still
@@ -710,10 +754,11 @@ class JobContext:
             # a blocking outcome POST, and never risk replacing the original.
             return
         try:
+            metadata, outcome_reason = _failure_report_fields(exc)
             self.report_outcome(
                 execution_status="FAILED",
-                metadata={"error": str(exc), "errorType": exc.__class__.__name__},
-                outcome_reason=str(exc)[:_OUTCOME_REASON_MAX_LEN],
+                metadata=metadata,
+                outcome_reason=outcome_reason,
             )
         except Exception as report_exc:  # noqa: BLE001 — must never mask the user's exception
             logger.warning(
@@ -752,12 +797,11 @@ class JobContext:
         # Already-resolved team wins; otherwise the worker resolves it, off the
         # event loop, because that lookup can itself be a blocking request.
         team_id = self._resolved_team_id or self._team_id
+        metadata, outcome_reason = _failure_report_fields(exc)
         payload = {
             "executionStatus": "FAILED",
-            "metadata": json.dumps(
-                {"error": str(exc), "errorType": exc.__class__.__name__}
-            ),
-            "outcomeReason": str(exc)[:_OUTCOME_REASON_MAX_LEN],
+            "metadata": json.dumps(metadata),
+            "outcomeReason": outcome_reason,
         }
 
         def _report() -> None:

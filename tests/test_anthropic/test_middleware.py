@@ -1,6 +1,8 @@
 import asyncio
 import datetime
 import logging
+import threading
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -408,3 +410,322 @@ class TestExtractOrganizationAndProductNames:
             assert org_name == "TestOrg"
             assert prod_name == "TestProduct"
             assert "deprecated" not in caplog.text.lower()
+
+
+def _run_metering_on_this_thread(coro_func, *args, **kwargs):
+    """Run the metering coroutine on the caller's thread so a per-thread cache would be reused."""
+    asyncio.run(coro_func(*args, **kwargs))
+    return MagicMock()
+
+
+def _anthropic_message(model="claude-sonnet-4-6"):
+    return SimpleNamespace(
+        id="msg_key_after_import",
+        model=model,
+        stop_reason="end_turn",
+        usage=SimpleNamespace(input_tokens=10, output_tokens=5, cache_creation_input_tokens=0,
+                              cache_read_input_tokens=0),
+    )
+
+
+def _fake_metering_client():
+    fake = MagicMock()
+    fake.ai.create_completion.return_value = MagicMock(status_code=201)
+    return fake
+
+
+class TestKeySetAfterImport:
+    """BACK-4014: Anthropic calls are metered once the key reaches the environment after import."""
+
+    MODEL = "claude-sonnet-4-6"
+
+    @pytest.fixture(autouse=True)
+    def key_set_after_import(self, monkeypatch):
+        import revenium_middleware
+        from revenium_middleware import _core
+        from revenium_middleware._core import metering, metering_submission
+        from revenium_middleware.anthropic import middleware
+
+        monkeypatch.delenv("REVENIUM_METERING_API_KEY", raising=False)
+        monkeypatch.delenv("REVENIUM_METERING_BASE_URL", raising=False)
+        for module in (metering, metering_submission, _core, revenium_middleware):
+            monkeypatch.setattr(module, "client", None, raising=False)
+        monkeypatch.setattr(metering, "_last_failed_key", None)
+        monkeypatch.setattr(middleware, "_thread_local", threading.local(), raising=False)
+        shutdown_event.clear()
+
+        self.first = _fake_metering_client()
+        monkeypatch.setattr(metering, "_build_metering_client", lambda key, url: self.first)
+        monkeypatch.setenv("REVENIUM_METERING_API_KEY", "hak_set_after_import")
+        self.monkeypatch = monkeypatch
+        self.metering = metering
+        yield
+        shutdown_event.clear()
+
+    def _create(self):
+        request = {
+            "messages": [{"role": "user", "content": "Hello"}],
+            "model": self.MODEL,
+            "usage_metadata": {"trace_id": "trace-key-after-import"},
+        }
+        create_wrapper(MagicMock(return_value=_anthropic_message(self.MODEL)), None, (), request)
+
+    @patch("revenium_middleware.anthropic.middleware._safe_run_async_in_thread",
+           side_effect=_run_metering_on_this_thread)
+    def test_messages_create_is_metered_when_key_is_set_after_import(self, _runner):
+        self._create()
+
+        assert self.first.ai.create_completion.call_count == 1
+        assert self.first.ai.create_completion.call_args.kwargs["model"] == self.MODEL
+
+    @patch("revenium_middleware.anthropic.middleware._safe_run_async_in_thread",
+           side_effect=_run_metering_on_this_thread)
+    def test_bedrock_call_is_metered_when_key_is_set_after_import(self, _runner):
+        from revenium_middleware.anthropic.middleware import _create_bedrock_metering_call
+
+        response = SimpleNamespace(
+            id="bedrock-key-after-import",
+            model="anthropic.claude-3-haiku-20240307-v1:0",
+            usage=SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15),
+        )
+        _create_bedrock_metering_call(
+            response, {"trace_id": "trace-bedrock-key-after-import"},
+            "2026-10-08T00:00:00Z", "2026-10-08T00:00:01Z", 1000.0,
+            {"model": response.model, "messages": [{"role": "user", "content": "Hello"}]},
+        )
+
+        assert self.first.ai.create_completion.call_count == 1
+        assert self.first.ai.create_completion.call_args.kwargs["model"] == response.model
+
+    @patch("revenium_middleware.anthropic.middleware._safe_run_async_in_thread",
+           side_effect=_run_metering_on_this_thread)
+    def test_messages_create_uses_the_new_client_after_initialize_metering_on_the_same_thread(self, _runner):
+        self._create()
+        second = _fake_metering_client()
+        self.monkeypatch.setattr(self.metering, "_build_metering_client", lambda key, url: second)
+        assert self.metering.initialize_metering(api_key="hak_second_dummy") is True
+
+        self._create()
+
+        assert self.first.ai.create_completion.call_count == 1
+        assert second.ai.create_completion.call_count == 1
+
+
+_PASS_THROUGH_WRAPPERS = (
+    "create_wrapper",
+    "async_create_wrapper",
+    "stream_wrapper",
+    "async_stream_wrapper",
+    "_parse_wrapper",
+    "_beta_create_wrapper",
+    "_beta_async_create_wrapper",
+    "_beta_stream_wrapper",
+)
+_COROUTINE_WRAPPERS = {"async_create_wrapper", "_beta_async_create_wrapper"}
+
+
+def _call_through(wrapper, wrapped, awaited, kwargs):
+    """Drive a wrapper that returns a coroutine the way the SDK caller would: by awaiting it."""
+    if not awaited:
+        return wrapper(wrapped, None, (), kwargs)
+
+    async def provider(*args, **provider_kwargs):
+        return wrapped(*args, **provider_kwargs)
+
+    return asyncio.run(wrapper(provider, None, (), kwargs))
+
+
+@pytest.mark.parametrize("usage_metadata", [{"organizationName": "AcmeCorp"}, None], ids=["metadata", "none"])
+@pytest.mark.parametrize("name", _PASS_THROUGH_WRAPPERS)
+def test_selective_pass_through_drops_usage_metadata(name, usage_metadata, monkeypatch):
+    """Selective metering on, outside @revenium_meter: the call is not
+    metered, and the Revenium-only keyword never reaches the Anthropic SDK,
+    whose signature rejects it (BACK-3991)."""
+    from revenium_middleware.anthropic import middleware as anthropic_middleware
+
+    monkeypatch.setenv("REVENIUM_SELECTIVE_METERING", "true")
+    seen = []
+
+    def wrapped(*_args, **kwargs):
+        seen.append(kwargs)
+        return "provider response"
+
+    wrapper = _middleware_fn(getattr(anthropic_middleware, name))
+    kwargs = {"model": "claude-sonnet-4-6", "max_tokens": 5, "usage_metadata": usage_metadata}
+
+    assert _call_through(wrapper, wrapped, name in _COROUTINE_WRAPPERS, kwargs) == "provider response"
+    assert seen == [{"model": "claude-sonnet-4-6", "max_tokens": 5}]
+
+
+def _message_without_cache_counts():
+    message = _anthropic_message()
+    message.usage.cache_creation_input_tokens = None
+    message.usage.cache_read_input_tokens = None
+    return message
+
+
+def _meter_message_without_cache_counts(mw):
+    mw._meter_message(_message_without_cache_counts(), {}, {"model": "claude-sonnet-4-6"},
+                      "2026-10-11T00:00:00Z", datetime.datetime.now(datetime.timezone.utc), "ANTHROPIC")
+
+
+def _meter_message_stream_without_cache_counts(mw):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    mw._meter_message_stream(_message_without_cache_counts(), {}, {"model": "claude-sonnet-4-6"},
+                             "2026-10-11T00:00:00Z", now, now, "ANTHROPIC")
+
+
+@pytest.mark.parametrize("meter", [_meter_message_without_cache_counts, _meter_message_stream_without_cache_counts],
+                         ids=["_meter_message", "_meter_message_stream"])
+def test_debug_line_with_no_cache_counts_logs_cleanly(meter, caplog):
+    """A response that reports no cache counts logs its debug token line
+    without a logging error (BACK-4452 N16)."""
+    from revenium_middleware.anthropic import middleware as mw
+
+    caplog.set_level(logging.DEBUG, logger="revenium_middleware")
+    with patch.object(mw, "_get_thread_safe_client", return_value=MagicMock()), \
+            patch.object(mw, "_safe_run_async_in_thread", MagicMock()):
+        meter(mw)
+
+    assert any("cache_read_input_tokens: None" in record.getMessage() for record in caplog.records)
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+@pytest.fixture
+def no_metering_key(monkeypatch):
+    """No key in the environment and no metering client built yet."""
+    import revenium_middleware
+    from revenium_middleware import _core
+    from revenium_middleware._core import metering, metering_submission
+    from revenium_middleware.anthropic import middleware
+
+    monkeypatch.delenv("REVENIUM_METERING_API_KEY", raising=False)
+    monkeypatch.delenv("REVENIUM_METERING_BASE_URL", raising=False)
+    for module in (metering, metering_submission, _core, revenium_middleware):
+        monkeypatch.setattr(module, "client", None, raising=False)
+    monkeypatch.setattr(metering, "_last_failed_key", None)
+    monkeypatch.setattr(middleware, "_thread_local", threading.local(), raising=False)
+    monkeypatch.setattr(metering, "_new_client", lambda key, url: _fake_metering_client())
+    shutdown_event.clear()
+    yield metering
+    shutdown_event.clear()
+
+
+class TestAnthropicHealthCheck:
+    """anthropic.is_initialized() and initialize() report whether calls will
+    be metered, wherever the key came from (BACK-4452 N13)."""
+
+    @staticmethod
+    def _health():
+        from revenium_middleware import anthropic as anthropic_integration
+        return anthropic_integration.is_initialized(), anthropic_integration.initialize()
+
+    def test_is_initialized_sees_a_key_set_in_code(self, no_metering_key):
+        assert no_metering_key.initialize_metering(api_key="hak_dummy_health_check") is True
+
+        assert self._health() == (True, True)
+
+    def test_is_initialized_is_false_with_no_key_anywhere(self, no_metering_key):
+        assert self._health() == (False, False)
+
+    def test_is_initialized_is_false_for_a_blank_environment_key(self, no_metering_key, monkeypatch):
+        monkeypatch.setenv("REVENIUM_METERING_API_KEY", "   ")
+
+        assert self._health() == (False, False)
+
+    def test_is_initialized_is_false_after_the_key_set_in_code_is_cleared(self, no_metering_key):
+        assert no_metering_key.initialize_metering(api_key="hak_dummy_health_check") is True
+        assert no_metering_key.initialize_metering(api_key="") is False
+
+        assert self._health() == (False, False)
+
+    def test_is_initialized_is_false_for_a_malformed_environment_key(self, no_metering_key, monkeypatch):
+        monkeypatch.setenv("REVENIUM_METERING_API_KEY", "sk-not-revenium")
+
+        assert self._health() == (False, False)
+
+
+def _meter_raw_stream_with_usage(mw):
+    from revenium_middleware.anthropic.stream_create import StreamUsageState
+    state = StreamUsageState()
+    state.saw_message_start = True
+    state.message_id = "msg_no_key_raw_stream"
+    state.model = "claude-sonnet-4-6"
+    state.input_tokens = 10
+    state.output_tokens = 5
+    mw._meter_raw_stream(state, {}, {"model": "claude-sonnet-4-6"}, "2026-10-11T00:00:00Z",
+                         datetime.datetime.now(datetime.timezone.utc), "ANTHROPIC")
+
+
+def _meter_message_with_usage(mw):
+    mw._meter_message(_anthropic_message(), {}, {"model": "claude-sonnet-4-6"},
+                      "2026-10-11T00:00:00Z", datetime.datetime.now(datetime.timezone.utc), "ANTHROPIC")
+
+
+def _meter_message_stream_with_usage(mw):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    mw._meter_message_stream(_anthropic_message(), {}, {"model": "claude-sonnet-4-6"},
+                             "2026-10-11T00:00:00Z", now, now, "ANTHROPIC")
+
+
+def _create_bedrock_metering_call_with_usage(mw):
+    response = SimpleNamespace(id="bedrock-no-key", model="anthropic.claude-3-haiku-20240307-v1:0",
+                               usage=SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15))
+    mw._create_bedrock_metering_call(response, {}, "2026-10-11T00:00:00Z", "2026-10-11T00:00:01Z", 1000.0,
+                                     {"model": response.model, "messages": [{"role": "user", "content": "Hello"}]})
+
+
+def _bedrock_stream_send_metering_data(mw):
+    from revenium_middleware.anthropic.bedrock_adapter import BedrockStreamWrapper
+    wrapper = BedrockStreamWrapper(model="claude-3-haiku-20240307", payload={}, region="us-east-1",
+                                   messages=[{"role": "user", "content": "Hello"}])
+    wrapper.final_message = SimpleNamespace(id="bedrock-stream-no-key", model="claude-3-haiku-20240307",
+                                            usage=SimpleNamespace(input_tokens=10, output_tokens=5))
+    wrapper._call_context.run(wrapper._send_metering_data, 1.0)
+
+
+class TestNoKeyStaysQuiet:
+    """With no metering key, Anthropic calls return before building a record
+    and log nothing per call, like the other providers (BACK-4452 N14)."""
+
+    @pytest.fixture(autouse=True)
+    def quiet_setup(self, no_metering_key, caplog):
+        from revenium_middleware.anthropic import middleware as mw
+        caplog.set_level(logging.DEBUG, logger="revenium_middleware")
+        self.caplog = caplog
+        self.mw = mw
+        with patch.object(mw, "_safe_run_async_in_thread", MagicMock()) as runner:
+            self.runner = runner
+            yield
+
+    def _warnings(self):
+        return [r for r in self.caplog.records if r.levelno >= logging.WARNING]
+
+    def test_messages_create_with_no_key_builds_no_record_and_logs_nothing(self):
+        message = _anthropic_message()
+        request = {"messages": [{"role": "user", "content": "Hello"}], "model": "claude-sonnet-4-6"}
+
+        for _ in range(3):
+            assert create_wrapper(MagicMock(return_value=message), None, (), dict(request)) is message
+
+        assert self.runner.call_count == 0
+        assert self._warnings() == []
+
+    @pytest.mark.parametrize("meter", [
+        _meter_message_with_usage,
+        _meter_message_stream_with_usage,
+        _meter_raw_stream_with_usage,
+        _create_bedrock_metering_call_with_usage,
+        _bedrock_stream_send_metering_data,
+    ], ids=["_meter_message", "_meter_message_stream", "_meter_raw_stream",
+            "_create_bedrock_metering_call", "BedrockStreamWrapper._send_metering_data"])
+    def test_every_anthropic_meter_path_returns_before_building_the_record(self, meter):
+        with patch.object(self.mw, "extract_prompt_data_if_enabled",
+                             return_value=(None, None, None, False)) as prompt_capture, \
+                patch("revenium_middleware.anthropic.trace_fields.detect_vision_content") as vision_detection:
+            meter(self.mw)
+
+        assert self.runner.call_count == 0
+        assert prompt_capture.call_count == 0
+        assert vision_detection.call_count == 0
+        assert self._warnings() == []

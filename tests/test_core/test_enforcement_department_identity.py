@@ -22,6 +22,7 @@ the event's address once; this suite pins the SDK to the same two steps, and to
 the unchanged behaviour of a payload that carries no balance map at all.
 """
 import json
+from pathlib import Path
 
 import pytest
 
@@ -489,7 +490,7 @@ class TestBalanceMapSurvivesTheDiskSnapshot:
         ``balances`` key at all; the blocks in it must still be honoured."""
         rules = [org_unit_rule()]
         enforcement._persist_cache_to_disk(rules, {DEPT_EMAIL: ORG_UNIT_RULE_ID})
-        path = department_snapshot_dir / enforcement._ORG_UNIT_BLOCKS_CACHE_FILENAME
+        path = Path(enforcement._org_unit_blocks_cache_file_path())
         envelope = json.loads(path.read_text(encoding="utf-8"))
         del envelope["balances"]
         path.write_text(json.dumps(envelope), encoding="utf-8")
@@ -507,7 +508,7 @@ class TestBalanceMapSurvivesTheDiskSnapshot:
         enforcement._persist_cache_to_disk(
             [org_unit_rule()], {DEPT_EMAIL: ORG_UNIT_RULE_ID}, {DEPT_EMAIL: OWN_BALANCE},
         )
-        rules_path = department_snapshot_dir / enforcement._RULES_CACHE_FILENAME
+        rules_path = Path(enforcement._cache_file_path())
         rules_path.write_text(json.dumps([org_unit_rule(ruleId=1)]), encoding="utf-8")
 
         enforcement._load_cache_from_disk()
@@ -520,7 +521,7 @@ class TestBalanceMapSurvivesTheDiskSnapshot:
     ):
         rules = [org_unit_rule()]
         enforcement._persist_cache_to_disk(rules, {DEPT_EMAIL: ORG_UNIT_RULE_ID})
-        path = department_snapshot_dir / enforcement._ORG_UNIT_BLOCKS_CACHE_FILENAME
+        path = Path(enforcement._org_unit_blocks_cache_file_path())
         envelope = json.loads(path.read_text(encoding="utf-8"))
         envelope["balances"] = {DEPT_EMAIL: "nope", OTHER_EMAIL: "42"}
         path.write_text(json.dumps(envelope), encoding="utf-8")
@@ -536,7 +537,7 @@ class TestBalanceMapSurvivesTheDiskSnapshot:
         envelope written by an older SDK can carry un-normalized keys."""
         rules = [org_unit_rule()]
         enforcement._persist_cache_to_disk(rules, {DEPT_EMAIL: ORG_UNIT_RULE_ID})
-        path = department_snapshot_dir / enforcement._ORG_UNIT_BLOCKS_CACHE_FILENAME
+        path = Path(enforcement._org_unit_blocks_cache_file_path())
         envelope = json.loads(path.read_text(encoding="utf-8"))
         envelope["blocks"] = {" Dept-User@Example.Test ": ORG_UNIT_RULE_ID}
         envelope["balances"] = {"DEPT-USER@EXAMPLE.TEST": OWN_BALANCE}

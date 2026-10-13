@@ -385,3 +385,21 @@ def test_the_contract_fixture_records_what_the_server_requires():
             "periodStart", "periodEnd", "dimensionKey", "dimensionValue", "key", "value",
         ],
     }
+
+
+def test_economics_calls_go_to_the_usage_address_when_only_that_is_set(monkeypatch):
+    monkeypatch.delenv("REVENIUM_PROFITSTREAM_BASE_URL", raising=False)
+    monkeypatch.setenv("REVENIUM_METERING_BASE_URL", "https://usage.example.test/meter")
+    monkeypatch.setenv(Config.ENV_REVENIUM_WRITE_API_KEY, WRITE_KEY)
+    monkeypatch.setenv("REVENIUM_TEAM_ID", "team-1")
+    urls = []
+
+    def handler(request):
+        urls.append(str(request.url))
+        return httpx.Response(200, json={"ok": True})
+
+    get_job_type_economics("claim", http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    assert urls == [
+        "https://usage.example.test/profitstream/v2/api/jobs/types/claim/economics?teamId=team-1"
+    ]

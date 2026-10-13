@@ -60,8 +60,8 @@ def detect_operation_type(
     provider_lower = provider_str.lower()
     request_body = request_body or {}
 
-    # OpenAI and Azure OpenAI
-    if provider_lower in ('openai', 'azure_openai', 'azure'):
+    # OpenAI, Azure OpenAI and OpenAI-compatible providers (xAI)
+    if provider_lower in ('openai', 'azure_openai', 'azure', 'xai'):
         # Chat completions
         is_chat = (
             'chat/completions' in endpoint or

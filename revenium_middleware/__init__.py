@@ -117,12 +117,31 @@ class ReadableFormatter(logging.Formatter):
 
 # Set up logger
 logger = logging.getLogger("revenium_middleware")
-log_level = os.environ.get("REVENIUM_LOG_LEVEL", "INFO").upper()
-try:
-    logger.setLevel(getattr(logging, log_level))
-except AttributeError:
-    logger.setLevel(logging.INFO)
+
+_LOG_LEVELS = {
+    "CRITICAL": logging.CRITICAL,
+    "FATAL": logging.FATAL,
+    "ERROR": logging.ERROR,
+    "WARNING": logging.WARNING,
+    "WARN": logging.WARN,
+    "INFO": logging.INFO,
+    "DEBUG": logging.DEBUG,
+    "NOTSET": logging.NOTSET,
+}
+
+
+def _level_from_environment() -> int:
+    """The package log level REVENIUM_DEBUG and REVENIUM_LOG_LEVEL ask for; the one place they are parsed."""
+    if os.environ.get("REVENIUM_DEBUG", "").strip().lower() in ("true", "1", "yes"):
+        return logging.DEBUG
+    log_level = os.environ.get("REVENIUM_LOG_LEVEL", "INFO").strip().upper()
+    if log_level in _LOG_LEVELS:
+        return _LOG_LEVELS[log_level]
     logger.warning(f"Invalid log level: {log_level}, defaulting to INFO")
+    return logging.INFO
+
+
+logger.setLevel(_level_from_environment())
 
 
 def _application_logs_nothing(record: logging.LogRecord) -> bool:
@@ -146,9 +165,11 @@ logger.propagate = True
 # Existing imports like `from revenium_middleware import client` keep working.
 from ._core import (  # noqa: E402
     client,
+    flush_metering,
     get_buffer_stats,
     get_client,
     initialize_metering,
+    metering_key,
     run_async_in_thread,
     shutdown_event,
     revenium_meter,
@@ -165,6 +186,7 @@ from ._core import (  # noqa: E402
     idempotency_key,
     get_idempotency_key,
     set_idempotency_key,
+    carry_context,
     is_selective_metering_enabled,
 )
 
@@ -186,7 +208,10 @@ from .agentic_outcomes import AgenticOutcomeClient, AgenticOutcomeSettings  # no
 
 # Public job-context surface (BACK-777)
 from .job_context import JobContext  # noqa: E402
-from .job_history import JobOutcomeAmendment, get_outcome_history  # noqa: E402
+from .job_history import (  # noqa: E402
+    JobOutcomeAmendment, get_conversion_funnel, get_job, get_job_roi,
+    get_job_transactions, get_job_types, get_outcome_history, list_jobs,
+)
 from .job_type_economics import (  # noqa: E402
     Baseline, BaselineProvenance, JobTypeEconomics, JobTypeMetricDirection,
     JobTypeMonetizationBasis, JobTypeMonetizationCategory,
@@ -195,18 +220,22 @@ from .job_type_economics import (  # noqa: E402
     report_period_facts, upsert_job_type_economics,
 )
 from ._core.exceptions import (  # noqa: E402
+    BudgetExceededError,
     OutcomeAlreadyReportedError,
     OutcomeAmendConflictError,
     OutcomeNotReportedError,
     OutcomeReportingError,
+    ReveniumCostLimitExceeded,
 )
 
 __all__ = [
     # Metering exports
     "client",
+    "flush_metering",
     "get_buffer_stats",
     "get_client",
     "initialize_metering",
+    "metering_key",
     "run_async_in_thread",
     "shutdown_event",
     # Decorator exports
@@ -225,8 +254,12 @@ __all__ = [
     "idempotency_key",
     "get_idempotency_key",
     "set_idempotency_key",
+    "carry_context",
     # Config exports
     "is_selective_metering_enabled",
+    # Spending-cap refusal, raised by every provider middleware
+    "BudgetExceededError",
+    "ReveniumCostLimitExceeded",
     # Metering error visibility exports (BACK-778)
     "MeteringErrorEvent",
     "MeteringStatus",
@@ -248,6 +281,13 @@ __all__ = [
     # Outcome amendment / history exports (BACK-777 Phase 3)
     "get_outcome_history",
     "JobOutcomeAmendment",
+    # Job reads (BACK-4033)
+    "list_jobs",
+    "get_job",
+    "get_job_types",
+    "get_job_roi",
+    "get_job_transactions",
+    "get_conversion_funnel",
     "OutcomeNotReportedError",
     "OutcomeAmendConflictError",
     "PeriodFactEntry",

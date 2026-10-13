@@ -5,8 +5,9 @@ This module handles detection of Azure OpenAI vs standard OpenAI based on:
 1. Environment variables (AZURE_OPENAI_ENDPOINT)
 2. Base URL substring matching ("azure")
 3. Client instance type detection
+4. Base URL hostname for OpenAI-compatible providers (xAI)
 
-The detection is lazy-loaded and only impacts Azure users.
+The detection is lazy-loaded.
 """
 
 import os
@@ -14,6 +15,7 @@ import logging
 import threading
 from enum import Enum, auto
 from typing import Optional, Any
+from urllib.parse import urlparse
 
 logger = logging.getLogger("revenium_middleware.extension")
 
@@ -23,6 +25,21 @@ class Provider(Enum):
     OPENAI = auto()
     AZURE_OPENAI = auto()
     OLLAMA = auto()  # Existing provider support
+    XAI = auto()
+
+
+_OPENAI_COMPATIBLE_HOSTS = (("x.ai", Provider.XAI),)
+
+
+def _provider_from_host(url: Optional[Any]) -> Optional[Provider]:
+    try:
+        host = (urlparse(str(url)).hostname or "").rstrip(".")
+    except ValueError:
+        return None
+    for domain, provider in _OPENAI_COMPATIBLE_HOSTS:
+        if host == domain or host.endswith("." + domain):
+            return provider
+    return None
 
 
 def detect_provider(client: Optional[Any] = None, base_url: Optional[str] = None) -> Provider:
@@ -32,8 +49,9 @@ def detect_provider(client: Optional[Any] = None, base_url: Optional[str] = None
     Detection priority:
     1. Client instance type (AzureOpenAI) - most reliable
     2. Base URL substring matching ("azure")
-    3. Environment variables (AZURE_OPENAI_ENDPOINT) - only if client suggests Azure
-    4. Default to OpenAI
+    3. Base URL hostname for OpenAI-compatible providers (xAI)
+    4. Environment variables (AZURE_OPENAI_ENDPOINT) - only if client suggests Azure
+    5. Default to OpenAI
 
     Args:
         client: OpenAI client instance (may be AzureOpenAI)
@@ -73,6 +91,13 @@ def detect_provider(client: Optional[Any] = None, base_url: Optional[str] = None
             logger.debug(f"OLLAMA provider detected via client.base_url: {client.base_url}")
             return Provider.OLLAMA
 
+    client_base_url = getattr(client, 'base_url', None) if client else None
+    for url in (base_url, client_base_url):
+        host_provider = _provider_from_host(url) if url else None
+        if host_provider:
+            logger.debug(f"{host_provider.name} provider detected via base_url host: {url}")
+            return host_provider
+
     # 5. Check environment variables only if we have some indication this might be Azure
     # (This prevents false positives when both Azure and OpenAI configs are present)
     if client and hasattr(client, '__class__') and "Azure" in str(type(client)):
@@ -105,6 +130,11 @@ def get_provider_metadata(provider: Provider) -> dict:
         return {
             "provider": "OLLAMA", 
             "model_source": "OLLAMA"
+        }
+    elif provider == Provider.XAI:
+        return {
+            "provider": "XAI",
+            "model_source": "XAI"
         }
     else:  # OPENAI
         return {

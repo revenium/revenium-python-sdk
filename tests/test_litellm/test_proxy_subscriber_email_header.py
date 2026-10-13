@@ -38,6 +38,7 @@ from revenium_middleware.litellm.proxy.guardrail import ReveniumGuardrail  # noq
 from .proxy_hook_harness import (  # noqa: E402
     GuardrailResponse,
     SubscriptableResponse,
+    after_pre_call,
     base_kwargs,
     drive_metering,
     guardrail_data,
@@ -126,7 +127,7 @@ async def guardrail_failure(headers, route_key, request_metadata=None):
     with patch.object(gmod, "submit_ai_event") as submit, \
             patch.object(gmod, "run_async_in_thread", side_effect=drive_metering):
         await ReveniumGuardrail(guardrail_name="revenium").async_post_call_failure_hook(
-            request_data=guardrail_request(headers, route_key, request_metadata),
+            request_data=after_pre_call(guardrail_request(headers, route_key, request_metadata)),
             original_exception=Exception("provider exploded"),
             user_api_key_dict=owner_key(),
         )

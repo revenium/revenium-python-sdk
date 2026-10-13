@@ -10,14 +10,30 @@ from revenium_middleware._core.fields import (
     extract_field_with_fallback,
     extract_media_lineage_fields,
     extract_org_and_product,
+    extract_prompt_context_fields,
     extract_with_aliases,
     merge_extra_body,
+    _warn_refused_agentic_job_id,
 )
 from revenium_middleware._core.context import (
     get_agentic_job_fields,
     set_agentic_job_fields,
     _agentic_job_context,
 )
+
+REFUSED_AGENTIC_JOB_IDS = [
+    "order:42",
+    "Ticket 881",
+    " job-1",
+    "job-1\n",
+    "types",
+    "conversion-funnel",
+    "x" * 256,
+    "order/42",
+    "a#b",
+    "jöb-1",
+    "１job",
+]
 
 
 class TestExtractFieldWithFallback:
@@ -259,6 +275,12 @@ class TestExtractAgenticJobFields:
 
 
 class TestMergeExtraBody:
+    @pytest.fixture(autouse=True)
+    def _forget_warned_job_ids(self):
+        _warn_refused_agentic_job_id.cache_clear()
+        yield
+        _warn_refused_agentic_job_id.cache_clear()
+
     def test_returns_none_when_both_empty(self):
         assert merge_extra_body(None, {}) is None
         assert merge_extra_body({}, {}) is None
@@ -288,6 +310,43 @@ class TestMergeExtraBody:
         merge_extra_body(existing, {"new_key": "new_val"})
         assert "new_key" not in existing
 
+    @pytest.mark.parametrize("bad", REFUSED_AGENTIC_JOB_IDS)
+    def test_drops_an_agentic_job_id_the_platform_refuses(self, bad):
+        """BACK-4020: AI ingest refuses the whole call for such an id, so only the id goes."""
+        assert merge_extra_body(None, {"agenticJobId": bad, "agenticJobName": "n"}) == {"agenticJobName": "n"}
+        assert merge_extra_body(None, {"agenticJobId": bad}) is None
+
+    @pytest.mark.parametrize("agentic_fields", [{}, {"agenticJobName": "n"}])
+    def test_drops_a_refused_id_from_a_caller_extra_body_without_mutating_it(self, agentic_fields):
+        existing = {"agenticJobId": "order:42", "k": "v"}
+        expected = {"k": "v", **agentic_fields}
+        assert merge_extra_body(existing, agentic_fields) == expected
+        assert existing == {"agenticJobId": "order:42", "k": "v"}
+
+    def test_valid_fallback_lands_when_the_caller_id_is_refused(self):
+        assert merge_extra_body({"agenticJobId": "order:42"}, {"agenticJobId": "job-1"}) == {"agenticJobId": "job-1"}
+
+    @pytest.mark.parametrize(
+        "good",
+        ["job-1", "A", "j.o.b_2-x", "types2", "Types", "types.x", "conversion-funnel-a", "x" * 255],
+    )
+    def test_valid_agentic_job_ids_pass_verbatim(self, good):
+        assert merge_extra_body(None, {"agenticJobId": good}) == {"agenticJobId": good}
+
+    def test_non_string_job_id_is_left_untouched(self):
+        assert merge_extra_body(None, {"agenticJobId": 42}) == {"agenticJobId": 42}
+
+    def test_refused_id_is_warned_once_per_id(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="revenium_middleware._core.fields"):
+            merge_extra_body(None, {"agenticJobId": "warn-once:1"})
+            merge_extra_body(None, {"agenticJobId": "warn-once:1"})
+            merge_extra_body(None, {"agenticJobId": "warn#once"})
+        warnings_logged = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings_logged) == 2
+        assert "'warn-once:1'" in warnings_logged[0].getMessage()
+        assert "'warn#once'" in warnings_logged[1].getMessage()
+        assert all("letter or digit" in r.getMessage() for r in warnings_logged)
+
 
 class TestAgenticJobFieldResolution:
     """Per-field precedence: explicit metadata > contextvar > env var (BACK-777 Part 1)."""
@@ -304,6 +363,11 @@ class TestAgenticJobFieldResolution:
         with patch.dict(os.environ, {"REVENIUM_AGENTIC_JOB_ID": "env-job"}):
             result = extract_agentic_job_fields({"agentic_job_id": "meta-job"})
         assert result["agenticJobId"] == "meta-job"
+
+    def test_refused_env_job_id_never_reaches_extra_body(self):
+        with patch.dict(os.environ, {"REVENIUM_AGENTIC_JOB_ID": "order:42"}):
+            merged = merge_extra_body(None, extract_agentic_job_fields({}))
+        assert "agenticJobId" not in (merged or {})
 
     def test_camel_case_metadata_wins_too(self):
         self._token = set_agentic_job_fields(job_id="ctx-job")
@@ -366,6 +430,29 @@ class TestAgenticJobFieldResolution:
         import pytest
         with pytest.raises(ValueError):
             set_agentic_job_fields()
+
+    @pytest.mark.parametrize("wire_name, alias, env_name", [
+        ("agenticJobId", "agentic_job_id", "REVENIUM_AGENTIC_JOB_ID"),
+        ("agenticJobName", "agentic_job_name", "REVENIUM_AGENTIC_JOB_NAME"),
+        ("agenticJobType", "agentic_job_type", "REVENIUM_AGENTIC_JOB_TYPE"),
+        ("agenticJobVersion", "agentic_job_version", "REVENIUM_AGENTIC_JOB_VERSION"),
+    ])
+    def test_a_blank_per_call_job_field_falls_back_to_the_environment(self, wire_name, alias, env_name):
+        with patch.dict(os.environ, {env_name: "env-value"}):
+            result = extract_agentic_job_fields({alias: ""})
+        assert result == {wire_name: "env-value"}
+
+    def test_a_blank_per_call_job_id_falls_back_to_the_job_context(self):
+        self._token = set_agentic_job_fields(job_id="ctx-job")
+        with patch.dict(os.environ, {"REVENIUM_AGENTIC_JOB_ID": "env-job"}):
+            result = extract_agentic_job_fields({"agentic_job_id": ""})
+        assert result["agenticJobId"] == "ctx-job"
+
+    def test_a_non_blank_per_call_value_still_wins(self):
+        self._token = set_agentic_job_fields(job_id="ctx-job")
+        with patch.dict(os.environ, {"REVENIUM_AGENTIC_JOB_ID": "env-job"}):
+            result = extract_agentic_job_fields({"agentic_job_id": "meta-job"})
+        assert result["agenticJobId"] == "meta-job"
 
 
 class TestExtractSkillFields:
@@ -432,6 +519,25 @@ class TestExtractSkillFields:
     def test_empty_dict_when_no_skill_fields(self):
         with patch.dict(os.environ, {}, clear=True):
             assert self._extract({}) == {}
+
+    @pytest.mark.parametrize("field", sorted(_ALL_SNAKE))
+    @pytest.mark.parametrize("camel", [False, True], ids=["snake", "camel"])
+    def test_a_blank_per_call_value_falls_back_to_the_environment(self, field, camel):
+        head, *rest = field.split("_")
+        alias = head + "".join(part.title() for part in rest) if camel else field
+        with patch.dict(os.environ, {"REVENIUM_" + field.upper(): "env-value"}, clear=True):
+            assert self._extract({alias: ""}) == {field: "env-value"}
+
+    def test_a_blank_snake_alias_does_not_hide_the_camel_alias(self):
+        with patch.dict(os.environ, {}, clear=True):
+            assert self._extract({"skill_name": "", "skillName": "x"}) == {"skill_name": "x"}
+
+    def test_a_blank_camel_only_alias_falls_back_to_the_environment(self):
+        with patch.dict(os.environ, {"REVENIUM_SKILL_NAME": "env-skill"}, clear=True):
+            assert self._extract({"skillName": ""}) == {"skill_name": "env-skill"}
+
+    def test_a_zero_prompt_length_is_still_a_value(self):
+        assert extract_prompt_context_fields({"prompt_length": 0}) == {"prompt_length": 0}
 
 
 class TestExtractMediaLineageFields:

@@ -22,6 +22,7 @@ from revenium_middleware._core.trace_fields import (
     get_agent_version,
     get_ticket_id,
     validate_agent_version,
+    validate_ticket_id,
 )
 from revenium_middleware._core.context import (
     clear_injected_metadata,
@@ -173,6 +174,19 @@ class TestNonStringAgentVersionIsDropped:
 
     def test_a_valid_version_still_resolves(self):
         assert get_agent_version({"agent_version": "1.4.2"}) == "1.4.2"
+
+
+class TestNonStringTicketIdIsDropped:
+    """A malformed ticket id loses the ticket, never the metering event."""
+
+    @pytest.mark.parametrize("value", [123, 12.5, True, [1, 2], {"a": 1}])
+    def test_non_strings_are_dropped_not_coerced(self, value):
+        assert validate_ticket_id(value) is None
+        assert get_ticket_id({"ticket_id": value}) is None
+
+    def test_a_valid_ticket_id_still_resolves(self):
+        assert validate_ticket_id("JIRA-1") == "JIRA-1"
+        assert get_ticket_id({"ticketId": "JIRA-1"}) == "JIRA-1"
 
 
 class TestScopedVersusDirectMetadataPrecedence:

@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
-from revenium_middleware._core.config import resolve_write_api_key
+from revenium_middleware._core.config import Config, resolve_write_api_key
 
 
 @dataclass(frozen=True)
@@ -152,7 +152,7 @@ def reload_from_env() -> None:
     API_KEY = os.environ.get("REVENIUM_API_KEY", "")
     if API_KEY and not os.environ.get("REVENIUM_METERING_API_KEY"):
         os.environ["REVENIUM_METERING_API_KEY"] = API_KEY
-    BASE_URL = os.environ.get("REVENIUM_API_BASE_URL", "https://api.revenium.io")
+    BASE_URL = os.environ.get("REVENIUM_API_BASE_URL", Config.DEFAULT_BASE_URL)
     METER_BASE_URL = os.environ.get("REVENIUM_METER_BASE_URL", BASE_URL)
     PROFITSTREAM_BASE_URL = os.environ.get("REVENIUM_PROFITSTREAM_BASE_URL", BASE_URL)
     TEAM_ID = os.environ.get("REVENIUM_TEAM_ID", "")
@@ -231,7 +231,7 @@ def _split_cost(total: float, input_share: float = 0.60) -> tuple[float, float]:
 def send_completion(*, model: str, provider: str, prompt_tokens: int, response_tokens: int,
                     cost_usd: float, duration_ms: int, subscriber: dict[str, Any],
                     trace_id: str, task_type: str, agentic_job_id: str, agentic_job_name: str,
-                    agent: str, agent_name: str, organization_name: str, product_name: str,
+                    agent: str, organization_name: str, product_name: str,
                     squad_name: str, squad_id: str, transaction_prefix: str, trace_type: str,
                     agentic_job_type: str, request_time: str | None,
                     parent_transaction_id: str | None, prompt_fields: dict[str, Any],
@@ -249,12 +249,12 @@ def send_completion(*, model: str, provider: str, prompt_tokens: int, response_t
         "totalTokenCount": prompt_tokens + response_tokens, "cacheReadTokenCount": 0,
         "cacheCreationTokenCount": 0, "reasoningTokenCount": 0,
         "inputTokenCost": in_cost, "outputTokenCost": out_cost,
-        "totalCost": cost_usd, "currency": "USD", "requestDuration": duration_ms,
+        "totalCost": cost_usd, "requestDuration": duration_ms,
         "timeToFirstToken": ttft_ms, "requestTime": timestamp,
         "completionStartTime": _add_ms_iso(timestamp, ttft_ms),
         "responseTime": _add_ms_iso(timestamp, duration_ms), "subscriber": subscriber,
         "taskType": task_type, "transactionName": f"{transaction_prefix}-{task_type}",
-        "agent": agent, "agentName": agent_name, "organizationName": organization_name,
+        "agent": agent, "organizationName": organization_name,
         "productName": product_name, "squadName": squad_name, "squadId": squad_id,
         "agenticJobId": agentic_job_id, "agenticJobName": agentic_job_name,
         "agenticJobType": agentic_job_type, "agenticJobVersion": "1.0.0",
@@ -379,7 +379,7 @@ def _run_one_job(spec: ExampleSpec, item: JobPlan, job_base: datetime,
             model=step.model, provider=step.provider, prompt_tokens=pt,
             response_tokens=rt, cost_usd=cost, duration_ms=dur,
             subscriber=subscriber, trace_id=trace_id, task_type=task_type,
-            agentic_job_id=job_id, agentic_job_name=job_name, agent=step_agent, agent_name=step_agent,
+            agentic_job_id=job_id, agentic_job_name=job_name, agent=step_agent,
             organization_name=org_name, product_name=spec.product_name, squad_name=squad_name,
             squad_id=spec.squad_id, transaction_prefix=spec.transaction_prefix, trace_type=spec.trace_type,
             agentic_job_type=spec.agentic_job_type, parent_transaction_id=parent_tx_id,

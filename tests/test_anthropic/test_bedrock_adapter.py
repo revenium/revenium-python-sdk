@@ -147,7 +147,7 @@ class TestBedrockInvoke:
         
         # Test the function
         payload = {"messages": [{"role": "user", "content": "Hello"}]}
-        text, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens = bedrock_invoke("claude-3-sonnet-20240229", payload)
+        text, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, _ = bedrock_invoke("claude-3-sonnet-20240229", payload)
 
         # Verify results
         assert text == "Hello, world!"
@@ -187,7 +187,7 @@ class TestBedrockInvoke:
         mock_client.invoke_model.return_value = mock_response
         
         payload = {"messages": [{"role": "user", "content": "Hello"}]}
-        text, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens = bedrock_invoke("claude-3-haiku-20240307", payload)
+        text, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, _ = bedrock_invoke("claude-3-haiku-20240307", payload)
 
         assert text == "Hello, world!"  # Concatenated text blocks only
         assert input_tokens == 15
@@ -231,7 +231,7 @@ class TestBedrockInvoke:
         mock_client.invoke_model.return_value = mock_response
 
         payload = {"messages": [{"role": "user", "content": "Hello"}]}
-        text, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens = bedrock_invoke(
+        text, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, _ = bedrock_invoke(
             "claude-3-sonnet-20240229", payload
         )
 
@@ -259,7 +259,7 @@ class TestBedrockInvoke:
         mock_client.invoke_model.return_value = mock_response
 
         payload = {"messages": [{"role": "user", "content": "Hello"}]}
-        text, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens = bedrock_invoke(
+        text, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, _ = bedrock_invoke(
             "claude-3-sonnet-20240229", payload
         )
 
@@ -726,3 +726,159 @@ class TestBedrockStreamWrapper:
         assert final_message.usage.cache_read_input_tokens == 0
         assert final_message.model == "claude-3-haiku-20240307"
         assert final_message.content[0]["text"] == "Test response"
+
+
+ONE_HOUR_SPLIT = {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 4696}
+
+
+def _run_metering_inline(coro_func, *args, **kwargs):
+    import asyncio
+
+    asyncio.run(coro_func(*args, **kwargs))
+    return MagicMock()
+
+
+def _one_hour_stream_events():
+    """Bedrock carries the split on message_start only; message_delta repeats the flat counts."""
+    events = [
+        {"type": "message_start",
+         "message": {"usage": {"input_tokens": 13, "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 4696,
+                               "cache_creation": dict(ONE_HOUR_SPLIT), "output_tokens": 1}}},
+        {"type": "content_block_delta", "delta": {"text": "ok"}},
+        {"type": "message_delta",
+         "usage": {"input_tokens": 13, "cache_read_input_tokens": 0,
+                   "cache_creation_input_tokens": 4696, "output_tokens": 4},
+         "delta": {"stop_reason": "end_turn"}},
+        {"type": "message_stop"},
+    ]
+    return [{"chunk": {"bytes": json.dumps(e).encode("utf-8")}} for e in events]
+
+
+class TestFastPathOneHourCacheWrite:
+    """The AnthropicBedrock fast path records a one-hour write as one-hour (BACK-3992)."""
+
+    @patch('revenium_middleware.anthropic.middleware._get_thread_safe_client', return_value=MagicMock())
+    @patch('revenium_middleware.anthropic.middleware._safe_run_async_in_thread', side_effect=_run_metering_inline)
+    @patch('revenium_middleware.anthropic.middleware.submit_ai_event')
+    @patch('revenium_middleware.anthropic.bedrock_adapter.get_bedrock_client')
+    def test_fast_path_forwards_the_one_hour_split(self, mock_get_client, mock_submit, _run, _client):
+        import datetime
+        from revenium_middleware.anthropic.middleware import _handle_bedrock_request
+
+        body = {
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 13, "output_tokens": 4, "cache_read_input_tokens": 0,
+                      "cache_creation_input_tokens": 4696, "cache_creation": dict(ONE_HOUR_SPLIT)},
+        }
+        mock_response = {"body": MagicMock()}
+        mock_response["body"].read.return_value = json.dumps(body).encode()
+        mock_get_client.return_value.invoke_model.return_value = mock_response
+        request_time_dt = datetime.datetime.now(datetime.timezone.utc)
+
+        _handle_bedrock_request(
+            (), {"model": "claude-haiku-4-5", "messages": [{"role": "user", "content": "Say ok"}],
+                 "max_tokens": 5},
+            {}, request_time_dt, request_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+
+        mock_submit.assert_called_once()
+        payload = mock_submit.call_args[0][1]
+        assert payload["input_token_count"] == 13
+        assert payload["cache_creation_token_count"] == 4696
+        assert payload["cache_creation1h_token_count"] == 4696
+        assert payload["cache_creation5m_token_count"] == 0
+
+    @patch('revenium_middleware.anthropic.middleware._get_thread_safe_client', return_value=MagicMock())
+    @patch('revenium_middleware.anthropic.middleware._safe_run_async_in_thread', side_effect=_run_metering_inline)
+    @patch('revenium_middleware._core.submit_ai_event')
+    @patch('revenium_middleware.anthropic.bedrock_adapter.get_bedrock_client')
+    def test_fast_path_stream_forwards_the_one_hour_split(self, mock_get_client, mock_submit, _run, _client):
+        import datetime
+
+        mock_get_client.return_value.invoke_model_with_response_stream.return_value = {
+            "body": iter(_one_hour_stream_events())
+        }
+        wrapper = BedrockStreamWrapper(
+            model="claude-haiku-4-5",
+            payload={},
+            region="us-east-1",
+            usage_metadata={},
+            request_time_dt=datetime.datetime.now(datetime.timezone.utc),
+        )
+
+        with wrapper:
+            assert list(wrapper.text_stream) == ["ok"]
+
+        mock_submit.assert_called_once()
+        payload = mock_submit.call_args[0][1]
+        assert payload["input_token_count"] == 13
+        assert payload["cache_creation_token_count"] == 4696
+        assert payload["cache_creation1h_token_count"] == 4696
+        assert payload["cache_creation5m_token_count"] == 0
+
+
+class TestBedrockStreamKeepsItsPinnedClient:
+    """A Bedrock stream started with a key is still metered when the process
+    client is cleared before it ends: the no-key check reads the client
+    pinned at stream start, not the one current at the end (BACK-4452 N14)."""
+
+    def test_stream_started_with_a_key_is_metered_after_the_key_is_cleared(self, monkeypatch):
+        import datetime
+        from types import SimpleNamespace
+        import revenium_middleware
+        from revenium_middleware import _core
+        from revenium_middleware._core import metering, metering_submission
+        from revenium_middleware.anthropic import middleware as mw
+
+        monkeypatch.delenv("REVENIUM_METERING_API_KEY", raising=False)
+        monkeypatch.setattr(metering, "_last_failed_key", None)
+        modules = (metering, metering_submission, _core, revenium_middleware)
+        for module in modules:
+            monkeypatch.setattr(module, "client", MagicMock(), raising=False)
+
+        wrapper = BedrockStreamWrapper(
+            model="claude-3-haiku-20240307",
+            payload={},
+            region="us-east-1",
+            request_time_dt=datetime.datetime.now(datetime.timezone.utc),
+        )
+        wrapper.final_message = SimpleNamespace(id="bedrock-pinned", model="claude-3-haiku-20240307",
+                                                usage=SimpleNamespace(input_tokens=10, output_tokens=5))
+        for module in modules:
+            monkeypatch.setattr(module, "client", None, raising=False)
+
+        with patch.object(mw, "_safe_run_async_in_thread") as runner:
+            wrapper._call_context.run(wrapper._send_metering_data, 1.0)
+
+        assert runner.call_count == 1
+
+
+class TestBedrockStreamTicketId:
+    """The streamed Bedrock record carries the ticket id, as the non-streamed one does."""
+
+    @patch('revenium_middleware.anthropic.middleware._get_thread_safe_client', return_value=MagicMock())
+    @patch('revenium_middleware.anthropic.middleware._safe_run_async_in_thread', side_effect=_run_metering_inline)
+    @patch('revenium_middleware._core.submit_ai_event')
+    @patch('revenium_middleware.anthropic.bedrock_adapter.get_bedrock_client')
+    def test_stream_record_falls_back_to_the_host_ticket_id(
+            self, mock_get_client, mock_submit, _run, _client, monkeypatch):
+        import datetime
+
+        monkeypatch.setenv("REVENIUM_TICKET_ID", "JIRA-456")
+        mock_get_client.return_value.invoke_model_with_response_stream.return_value = {
+            "body": iter(_one_hour_stream_events())
+        }
+        wrapper = BedrockStreamWrapper(
+            model="claude-haiku-4-5",
+            payload={},
+            region="us-east-1",
+            usage_metadata={},
+            request_time_dt=datetime.datetime.now(datetime.timezone.utc),
+        )
+
+        with wrapper:
+            assert list(wrapper.text_stream) == ["ok"]
+
+        mock_submit.assert_called_once()
+        assert mock_submit.call_args[0][1].get("ticket_id") == "JIRA-456"

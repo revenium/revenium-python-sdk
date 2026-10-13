@@ -6,10 +6,14 @@ backoff wait recorded rather than taken. The helpers live here so the two files
 cannot drift apart -- an earlier copy of ``SequencedGet`` had silently lost the
 branch that raises connection errors.
 """
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 import httpx
 import pytest
 
-from revenium_middleware._core import enforcement
+from revenium_middleware._core import enforcement, tool_event_transport
 
 URL = "https://api.test/v2/api/ai/enforcement-rules/team-1"
 
@@ -116,6 +120,20 @@ def reset_department_warning_dedupe():
     enforcement._begin_cache_generation()
 
 
+@pytest.fixture(autouse=True)
+def reset_non_blocking_rule_warnings():
+    """Forget which warn-only breaches have been logged, around every test.
+
+    Mutated in place and deliberately kept across cache generations, so
+    neither ``monkeypatch`` nor the generation bump above resets it.
+    """
+    enforcement._warned_non_blocking_rules.clear()
+    enforcement._noted_unevaluable_filters.clear()
+    yield
+    enforcement._warned_non_blocking_rules.clear()
+    enforcement._noted_unevaluable_filters.clear()
+
+
 @pytest.fixture()
 def fetch_env(monkeypatch):
     """A fetchable enforcement config with every wait recorded, never taken."""
@@ -176,6 +194,7 @@ def department_snapshot_dir(monkeypatch, tmp_path):
     files the enforcement cache writes into it.
     """
     monkeypatch.setenv("REVENIUM_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("REVENIUM_TEAM_ID", "team-snapshot")
     monkeypatch.setattr(enforcement, "_disk_load_attempted", False)
     monkeypatch.setattr(enforcement, "_cached_rules", [])
     monkeypatch.setattr(enforcement, "_cached_org_unit_blocks", {})
@@ -184,3 +203,172 @@ def department_snapshot_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(enforcement, "_cache_timestamp", 0.0)
     monkeypatch.setattr(enforcement, "_cache_initialized", False)
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def fresh_tool_event_client():
+    """Start and end every test with no cached tool-event client.
+
+    The client is module state, so a stub installed or a real client built by
+    one test would otherwise carry its connections into whichever test ran
+    next.
+    """
+    tool_event_transport._client = None
+    yield
+    client = tool_event_transport._client
+    tool_event_transport._client = None
+    if isinstance(client, httpx.Client):
+        client.close()
+
+
+class KeepAliveMeter:
+    """A local HTTP/1.1 metering endpoint that records the client port of every request.
+
+    It answers with a Content-Length body and keeps the connection open, so a
+    sender that pools connections reuses one and the recorded ports show how
+    many connections the sender opened.
+    """
+
+    def __init__(self):
+        ports = self.ports = []
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                ports.append(self.client_address[1])
+                reply = b'{"resourceType":"metered-event"}'
+                self.send_response(201)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(reply)))
+                self.end_headers()
+                self.wfile.write(reply)
+
+            def log_message(self, *args):
+                pass
+
+        class Server(ThreadingHTTPServer):
+            daemon_threads = True
+            # Every metering worker may connect at once; the default backlog
+            # of 5 resets the rest before they are accepted.
+            request_queue_size = 128
+
+        self._server = Server(("127.0.0.1", 0), Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self.base_url = f"http://127.0.0.1:{self._server.server_address[1]}"
+        self.url = f"{self.base_url}/meter/v2/tool/events"
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._server.shutdown()
+        self._server.server_close()
+
+    def wait_for_requests(self, count, timeout=10.0):
+        deadline = time.monotonic() + timeout
+        while len(self.ports) < count and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return len(self.ports) >= count
+
+
+@pytest.fixture()
+def keep_alive_meter():
+    meter = KeepAliveMeter()
+    meter.start()
+    yield meter
+    meter.stop()
+
+
+class RecordingMeter:
+    """A local metering address that records every request and answers with a fixed status.
+
+    ``answer_with`` makes it answer requests under ``/meter/`` with another
+    status and headers (a redirect, say); every other path gets 201, so a
+    client that followed a same-host redirect leaves a second request behind.
+    ``delay`` holds every answer back that many seconds, after the request is
+    recorded, so a sender that timed out still leaves its request behind.
+    """
+
+    def __init__(self):
+        requests = self.requests = []
+        meter = self
+        self.status = 201
+        self.headers = {}
+        self.delay = 0.0
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def _record_and_answer(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                requests.append({"method": self.command, "path": self.path, "headers": dict(self.headers)})
+                status, extra = (meter.status, meter.headers) if self.path.startswith("/meter/") else (201, {})
+                time.sleep(meter.delay)
+                reply = b'{"resourceType":"metered-event"}'
+                try:
+                    self.send_response(status)
+                    for name, value in extra.items():
+                        self.send_header(name, value)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(reply)))
+                    self.end_headers()
+                    self.wfile.write(reply)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            do_POST = do_GET = _record_and_answer
+
+            def log_message(self, *args):
+                pass
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self.port = self._server.server_address[1]
+        self.base_url = f"http://127.0.0.1:{self.port}"
+        self.meter_url = f"{self.base_url}/meter/"
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def answer_with(self, status, headers=None):
+        self.status = status
+        self.headers = headers or {}
+
+    def stop(self):
+        self._server.shutdown()
+        self._server.server_close()
+
+
+@pytest.fixture()
+def recording_meters():
+    """Two recording metering addresses, A and B; both stop when the test ends."""
+    meters = (RecordingMeter(), RecordingMeter())
+    yield meters
+    for meter in meters:
+        meter.stop()
+
+
+@pytest.fixture()
+def isolated_metering(monkeypatch):
+    """Real metering clients against local stubs, with no process-wide delivery state leaking in or out.
+
+    Yields a private store-and-forward buffer. Client retries are off, so a
+    failed send fails at once instead of sleeping through backoff.
+    """
+    from collections import OrderedDict
+
+    from revenium_middleware._core import delivery_circuit, metering, metering_buffer
+    from revenium_middleware._core.metering_status import reset_metering_status
+
+    delivery_circuit.reset()
+    reset_metering_status()
+    buffer = metering_buffer.MeteringBuffer(flush_interval=3600)
+    monkeypatch.setattr(metering_buffer, "_buffer", buffer)
+    monkeypatch.setattr(metering, "_scoped_clients", OrderedDict())
+    monkeypatch.setenv(metering.MAX_RETRIES_ENV, "0")
+    yield buffer
+    for client in metering._scoped_clients.values():
+        client.close()
+    reset_metering_status()
+    delivery_circuit.reset()

@@ -136,7 +136,7 @@ The following data is captured and sent to Revenium when REVENIUM_CAPTURE_PROMPT
 
 Configuration:
 - REVENIUM_CAPTURE_PROMPTS: Enable/disable prompt capture (default: false)
-- REVENIUM_MAX_PROMPT_LENGTH: Maximum length for each field (default: 10000)
+- REVENIUM_MAX_PROMPT_SIZE: Maximum length for each field (default: 50000)
 
 Prompts exceeding the maximum length are truncated with a [TRUNCATED] marker.
 

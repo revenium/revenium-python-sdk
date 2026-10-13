@@ -7,14 +7,19 @@ is answered by ``httpx.MockTransport``; metering is recorded at
 ``submit_ai_event`` and dispatched synchronously.
 """
 import asyncio
+import itertools
 import json
+import re
 import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
 
 import httpx
 import ollama
 import pytest
 import wrapt
+from freezegun import freeze_time
 
 from revenium_middleware._core.call_ownership import OLLAMA, transport_claim_mark
 from revenium_middleware.ollama import middleware as mw
@@ -73,7 +78,7 @@ def records():
         captured.append(payload)
         return MagicMock(id="recorded")
 
-    with patch.object(mw, "get_client", return_value=MagicMock()), \
+    with patch.object(mw, "current_client", return_value=MagicMock()), \
             patch.object(mw, "submit_ai_event", side_effect=record), \
             patch.object(mw, "run_async_in_thread", side_effect=_run_now):
         yield captured
@@ -240,7 +245,7 @@ class TestTransportClaim:
 
     def test_nothing_is_claimed_or_sent_when_metering_is_disabled(self, client, records):
         mark = transport_claim_mark()
-        with patch.object(mw, "get_client", return_value=None):
+        with patch.object(mw, "current_client", return_value=None):
             client.chat(**CALLS["chat"])
         assert records == []
         assert transport_claim_mark() == mark
@@ -441,3 +446,120 @@ class TestSelectiveMeteringSkip:
         prompt_stack.add_user_message("hi")
         assert driver.run(prompt_stack).to_text() == "hi"
         assert records == []
+
+
+BURST = 10_000
+OLLAMA_ID = re.compile(r"^ollama-[0-9a-f]{32}$")
+
+
+@pytest.fixture
+def sequential_uuids(monkeypatch):
+    """uuid4 returns UUID(int=1), UUID(int=2), ... so a test can tell the id came from it."""
+    counter = itertools.count(1)
+    lock = threading.Lock()
+
+    def next_uuid():
+        with lock:
+            return uuid.UUID(int=next(counter))
+
+    monkeypatch.setattr(uuid, "uuid4", next_uuid)
+
+
+class TestTransactionIds:
+    def test_same_instant_calls_get_distinct_transaction_ids(self, sequential_uuids):
+        def start(_):
+            return mw.start_call("chat", (), dict(CALLS["chat"]), None).transaction_id
+
+        with freeze_time("2026-10-08 12:00:00"), ThreadPoolExecutor(max_workers=16) as pool:
+            ids = list(pool.map(start, range(BURST)))
+
+        assert len(set(ids)) == BURST
+        assert all(OLLAMA_ID.match(transaction_id) for transaction_id in ids)
+        assert set(ids) == {f"ollama-{uuid.UUID(int=i).hex}" for i in range(1, BURST + 1)}
+
+    def test_two_calls_at_one_instant_record_two_transaction_ids(self, client, records):
+        with freeze_time("2026-10-08 12:00:00"):
+            client.chat(**CALLS["chat"])
+            client.chat(**CALLS["chat"])
+
+        ids = [record["transaction_id"] for record in records]
+        assert len(set(ids)) == 2
+        assert all(OLLAMA_ID.match(transaction_id) for transaction_id in ids)
+
+
+def _refuses(request):
+    return httpx.Response(500, json={"error": "model runner has unexpectedly stopped"})
+
+
+@pytest.fixture
+def sent_events():
+    captured = []
+
+    def record(operation, payload, idempotency_key=None):
+        captured.append({**payload, "idempotency_key": idempotency_key})
+        return MagicMock(id="recorded")
+
+    with patch.object(mw, "current_client", return_value=MagicMock()), \
+            patch.object(mw, "submit_ai_event", side_effect=record), \
+            patch.object(mw, "run_async_in_thread", side_effect=_run_now):
+        yield captured
+
+
+def _refused_sync(endpoint, streamed):
+    client = ollama.Client(host=SELF_HOSTED, transport=httpx.MockTransport(_refuses))
+    _consume(getattr(client, endpoint)(**CALLS[endpoint], **({"stream": True} if streamed else {})))
+
+
+def _refused_async(endpoint, streamed):
+    client = ollama.AsyncClient(host=SELF_HOSTED, transport=httpx.MockTransport(_refuses))
+    asyncio.run(_aconsume(getattr(client, endpoint)(**CALLS[endpoint], **({"stream": True} if streamed else {}))))
+
+
+@pytest.mark.parametrize("streamed", [False, True], ids=["create", "stream"])
+@pytest.mark.parametrize("call", [_refused_sync, _refused_async], ids=["sync", "async"])
+@pytest.mark.parametrize("endpoint", ["chat", "generate"])
+def test_a_refused_call_sends_one_error_record(sent_events, endpoint, call, streamed):
+    """A call the Ollama server refuses is recorded once, as an ERROR, and the caller still gets its error
+    (BACK-4335)."""
+    with pytest.raises(ollama.ResponseError):
+        call(endpoint, streamed)
+
+    assert len(sent_events) == 1, sent_events
+    sent = sent_events[0]
+    assert sent["provider"] == "OLLAMA"
+    assert sent["model"] == MODEL
+    assert sent["operation_type"] == EXPECTED[endpoint][0]
+    assert sent["stop_reason"] == "ERROR"
+    assert "ResponseError (HTTP 500)" in sent["error_reason"]
+    assert sent.get("error_code") == 500
+    assert (sent["input_token_count"], sent["output_token_count"], sent["total_token_count"]) == (0, 0, 0)
+    assert sent["is_streamed"] is streamed
+    assert sent["idempotency_key"] is not None
+
+
+@pytest.mark.parametrize("call", [_refused_sync, _refused_async], ids=["sync", "async"])
+def test_a_refused_embed_sends_no_record(sent_events, call):
+    """Embeddings are the documented exception: a refused one is not recorded yet."""
+    with pytest.raises(ollama.ResponseError):
+        call("embed", False)
+
+    assert sent_events == []
+
+
+@pytest.mark.parametrize("call", [_refused_sync, _refused_async], ids=["sync", "async"])
+def test_a_refused_call_sends_no_error_text_without_prompt_capture(monkeypatch, sent_events, call):
+    """Ollama's message is the server's answer, which can quote the request (BACK-4359)."""
+    monkeypatch.setenv("REVENIUM_CAPTURE_ERROR_MESSAGES", "true")
+    monkeypatch.delenv("REVENIUM_CAPTURE_PROMPTS", raising=False)
+    with pytest.raises(ollama.ResponseError):
+        call("chat", False)
+
+    assert [sent["error_reason"] for sent in sent_events] == ["ResponseError (HTTP 500)"]
+
+
+def test_a_stream_broken_off_sends_no_error_text_without_prompt_capture(monkeypatch):
+    monkeypatch.setenv("REVENIUM_CAPTURE_ERROR_MESSAGES", "true")
+    monkeypatch.delenv("REVENIUM_CAPTURE_PROMPTS", raising=False)
+    failure = mw._failure_of(ollama.ResponseError("Offending request: SYSTEM-SECRET reveal ZEBRA42"), None)
+
+    assert failure.error_reason == "ResponseError"

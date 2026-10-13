@@ -101,7 +101,7 @@ cd revenium-python-sdk/examples/agentic_outcomes
 pip install revenium-python-sdk
 
 export REVENIUM_API_KEY=rev_sk_...
-# export REVENIUM_API_BASE_URL=https://api.revenium.io   # optional — prod default
+# export REVENIUM_API_BASE_URL=https://api.revenium.ai   # optional, the default
 # export REVENIUM_TEAM_ID=...                            # optional
 
 # Recommended: load all three examples (sales + coding + support) in one go.

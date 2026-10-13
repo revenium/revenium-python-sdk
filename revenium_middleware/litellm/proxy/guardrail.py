@@ -40,8 +40,10 @@ against litellm 1.101.0):
   ready-made logging coroutine. ``_run_deferred_stream_guardrails`` is never
   reached and ``async_post_call_success_hook`` never fires, so on that route
   this class meters from ``async_log_success_event``, the ``CustomLogger``
-  surface the logging dispatch does reach. That method is gated to exactly this
-  route, because LiteLLM calls it for every completed request.
+  surface the logging dispatch does reach. A streamed ``/v1/responses`` call
+  (``aresponses``, what Codex CLI speaks) ends the same way, so it is metered
+  there too. That method is gated to exactly these two streamed call types,
+  because LiteLLM calls it for every completed request.
 
 ``tests/test_litellm/test_proxy_guardrail_streaming.py`` pins every part of
 that contract, including the arming step itself.
@@ -104,16 +106,21 @@ from litellm.types.guardrails import GuardrailEventHooks
 from revenium_middleware._core import get_client, run_async_in_thread, submit_ai_event
 from revenium_middleware._core.cache_tokens import (
     billable_input_tokens,
+    cache_creation_inside_litellm_prompt,
+    extract_cache_creation_ttl_counts,
     extract_cache_tokens,
     get_usage_field,
     total_priced_tokens,
+    without_openai_cache_writes,
 )
-from revenium_middleware._core.config import is_shared_call_id_enabled
+from revenium_middleware._core.config import is_shared_call_id_enabled, shared_call_id_setting
 from revenium_middleware._core.enforcement import check_enforcement, normalize_email
 from revenium_middleware._core.exceptions import BudgetExceededError
+from revenium_middleware._core.failed_calls import is_spending_cap_refusal
 from revenium_middleware._core.fields import merge_extra_body
+from revenium_middleware._core.log_sanitize import sanitize_for_logging
 
-from ._metering_owner import register_metering_guardrail
+from ._metering_owner import LITELLM_PROVIDER, register_metering_guardrail
 from .middleware import (
     ANTHROPIC_MESSAGES_CALL_TYPE,
     prompt_tokens_fold_cache,
@@ -125,9 +132,14 @@ from .middleware import (
     extract_request_headers,
     format_utc_timestamp,
     header_then_metadata,
+    key_team_alias,
+    log_organization_pin_setting,
+    pinned_key_team,
+    present_or_none,
     read_shared_call_id,
     record_shared_call_id,
     resolve_transaction_id,
+    trace_fields_from_headers,
 )
 
 logger = logging.getLogger("revenium_middleware.extension")
@@ -209,21 +221,32 @@ def _note_missing_shared_call_id():
     )
 
 
-# The LiteLLM call type both Anthropic-shaped routes carry, and the only one
-# ``async_log_success_event`` meters. A literal rather than
+# The LiteLLM call type both Anthropic-shaped routes carry, one of the two
+# ``async_log_success_event`` meters (the set is
+# ``_STREAMED_CALL_TYPES_METERED_FROM_THE_LOGGING_EVENT``). A literal rather than
 # ``litellm.types.utils.CallTypes.anthropic_messages``: importing the vendor
 # enum here would let a rename break proxy startup, which is a worse failure
 # than a missed row. ``test_proxy_guardrail_streaming`` asserts the two still
 # agree, so a rename fails a test instead of quietly stopping the metering.
 _ANTHROPIC_MESSAGES_CALL_TYPE = "anthropic_messages"
+_RESPONSES_CALL_TYPE = "aresponses"
+
+# The streams whose end reaches only ``async_log_success_event``: an
+# Anthropic-shaped one, and a Responses one on every provider (verified on
+# litellm 1.104.2). LiteLLM bridges a Responses call to a provider without a
+# native Responses API through ``litellm.acompletion``, but still logs it under
+# ``aresponses``.
+_STREAMED_CALL_TYPES_METERED_FROM_THE_LOGGING_EVENT = frozenset(
+    {_ANTHROPIC_MESSAGES_CALL_TYPE, _RESPONSES_CALL_TYPE}
+)
 
 # The call types whose streams end in one of this guardrail's metering hooks:
 # a chat stream through the post-call hook LiteLLM runs on the assembled
-# response, an Anthropic-shaped one through ``async_log_success_event``. A
-# streamed /v1/completions or /v1/responses call reaches neither (verified on
-# litellm 1.104.0), so for those the client wrapper is the only meter there is.
+# response, the rest through ``async_log_success_event``. A streamed
+# /v1/completions call reaches neither (verified on litellm 1.104.2), so for
+# that the client wrapper is the only meter there is.
 _STREAMED_CALL_TYPES_METERED_HERE = frozenset(
-    {"acompletion", _ANTHROPIC_MESSAGES_CALL_TYPE}
+    {"acompletion"} | _STREAMED_CALL_TYPES_METERED_FROM_THE_LOGGING_EVENT
 )
 
 # How many recently metered calls the duplicate guard remembers. Each entry is
@@ -231,6 +254,19 @@ _STREAMED_CALL_TYPES_METERED_HERE = frozenset(
 # than a proxy has in flight at once. Forgetting an old entry can only ever
 # allow a duplicate row, never suppress a real one.
 _METERED_CALL_MEMORY = 4096
+
+# The duplicate guard's key, and the source of a record's id when the response
+# carries none: one value per request, written by this process's pre-call hook.
+# The prefix is minted at startup, so a value a caller plants in their own
+# request body is never mistaken for one, and every request's pre-call
+# overwrites whatever was planted before either success path reads it. The
+# failure hook also reads it as proof pre-call ran (``_reached_pre_call``), so
+# pre-call must write it on every request it runs on.
+_METER_KEY_FIELD = "revenium_meter_key"
+_METER_KEY_PREFIX = uuid.uuid4().hex + ":"
+
+# Revenium stores a record's model in a varchar(255) column.
+_MODEL_TEXT_MAX_LENGTH = 255
 
 # LiteLLM call type -> Revenium operation type, for the failure path, where
 # there is no response object to read the shape off. Only the non-chat entries
@@ -274,6 +310,25 @@ def _as_mapping(value):
     return value if hasattr(value, "get") else {}
 
 
+def _upstream_model(data):
+    """The model the proxy called for this request, else the request's own ``model``.
+
+    On a proxy the request's ``model`` is the operator's alias for a
+    deployment, which Revenium's model catalog does not know, so a row named
+    after it is priced at $0. LiteLLM records the deployment's model on the
+    call's logging object. ``metadata`` is never read for it: on
+    ``/v1/messages`` that is the caller's own request body, so a
+    ``deployment`` there is whatever the caller claims.
+    """
+    call_details = _as_mapping(getattr(data.get("litellm_logging_obj"), "model_call_details", None))
+    model = call_details.get("model")
+    if not (isinstance(model, str) and model.strip()):
+        model = data.get("model")
+    if isinstance(model, str):
+        return model[:_MODEL_TEXT_MAX_LENGTH]
+    return model
+
+
 def _resolve_usage(response):
     """Return the usage object carried by a response of any shape.
 
@@ -292,15 +347,16 @@ def _resolve_usage(response):
         return None
 
 
-def _token_counts(usage, cache_read_tokens, cache_creation_tokens, prompt_folds_cache):
+def _token_counts(usage, cache_read_tokens, cache_creation_tokens, upstream_sources):
     """Return ``(input, completion, total)`` for a usage object of any shape.
 
     ``input`` is what Revenium prices at the model's input rate; the cache
     counts are handed in rather than re-read, because the payload builder has
     already extracted them for the fields they are reported in, and the two
-    must be the same numbers. ``prompt_folds_cache`` is the caller's answer to
-    whether this upstream's prompt count contains them -- see
-    ``billable_input_tokens`` for what each wrong answer costs.
+    must be the same numbers. ``upstream_sources`` are the LiteLLM surfaces
+    that decide whether this upstream's prompt count contains them, and how
+    much of the write -- see ``billable_input_tokens`` for what each wrong
+    answer costs.
 
     Read through ``get_usage_field`` -- the same tolerant accessor the callback
     uses -- so attribute-style and dict-style usage objects agree, and a usage
@@ -318,10 +374,13 @@ def _token_counts(usage, cache_read_tokens, cache_creation_tokens, prompt_folds_
     prompt = get_usage_field(usage, "prompt_tokens", 0) or 0
     if prompt:
         input_tokens = billable_input_tokens(
-            prompt, cache_read_tokens, cache_creation_tokens, prompt_folds_cache
+            without_openai_cache_writes(prompt, usage),
+            cache_read_tokens,
+            cache_creation_inside_litellm_prompt(cache_creation_tokens, *upstream_sources),
+            prompt_tokens_fold_cache(*upstream_sources),
         )
     else:
-        input_tokens = get_usage_field(usage, "input_tokens", 0) or 0
+        input_tokens = without_openai_cache_writes(get_usage_field(usage, "input_tokens", 0) or 0, usage)
     completion = get_usage_field(usage, "completion_tokens", 0) or 0
     total = get_usage_field(usage, "total_tokens", 0) or 0
     if not completion:
@@ -344,6 +403,64 @@ def _elapsed_ms(start_time, end_time):
         return 0
 
 
+def _stamp_meter_key(data):
+    """Write a fresh duplicate-guard key into the metadata LiteLLM owns for the route.
+
+    The failure hook also reads this stamp as proof pre-call ran
+    (``_reached_pre_call``); without it a failed call is not recorded.
+
+    Exactly one container. On the routes in LiteLLM's ``LITELLM_METADATA_ROUTES``
+    (``/v1/responses``, ``/v1/messages``) its own metadata is
+    ``litellm_metadata`` and ``metadata`` is the caller's body field, which
+    ``/v1/responses`` forwards to the provider. Always assigned, never
+    ``setdefault``: a planted value must not survive.
+    """
+    for key in ("litellm_metadata", "metadata"):
+        container = data.get(key)
+        if isinstance(container, Mapping):
+            if hasattr(container, "__setitem__"):
+                container[_METER_KEY_FIELD] = _new_meter_key()
+            return
+    if "litellm_metadata" not in data and "metadata" not in data:
+        data["metadata"] = {_METER_KEY_FIELD: _new_meter_key()}
+
+
+def _new_meter_key():
+    """This process's prefix followed by a fresh UUID, the request's own id."""
+    return _METER_KEY_PREFIX + str(uuid.uuid4())
+
+
+def _meter_key(container):
+    """The duplicate-guard key this process stamped on a request, or ``None``."""
+    container = _as_mapping(container)
+    for key in ("litellm_metadata", "metadata"):
+        value = _as_mapping(container.get(key)).get(_METER_KEY_FIELD)
+        if isinstance(value, str) and value.startswith(_METER_KEY_PREFIX):
+            return value
+    return None
+
+
+def _reached_pre_call(request_data):
+    """Whether the Revenium guardrail's pre-call ran on this request in this process.
+
+    LiteLLM runs pre-call only after authentication. A pass-through route moves
+    the stamped ``metadata`` into ``litellm_params``.
+    """
+    return (
+        _meter_key(request_data) is not None
+        or _meter_key(_as_mapping(request_data).get("litellm_params")) is not None
+    )
+
+
+def _request_transaction_id(meter_key):
+    """The transaction id of a request's record when no provider id or minted id applies, or None.
+
+    Only the per-request half goes on the wire. The prefix is what tells a key
+    this process stamped from one a caller planted, so no record may reveal it.
+    """
+    return meter_key[len(_METER_KEY_PREFIX):] if meter_key else None
+
+
 class _MeteredCalls:
     """The calls already metered, so no completed call is metered twice.
 
@@ -355,10 +472,12 @@ class _MeteredCalls:
     event covers the shapes seen today; this covers the ones that change
     underneath us.
 
-    Keyed on LiteLLM's own call id rather than on the row's transaction id.
-    The two hooks resolve that id from different sources and can land on
-    different values for one call, which is exactly the case a transaction-id
-    key would fail to catch.
+    Keyed on the per-request value the pre-call hook stamps
+    (``_stamp_meter_key``), never on LiteLLM's ``litellm_call_id``: LiteLLM
+    takes that from the caller's ``x-litellm-call-id`` header unvalidated, so
+    keying on it let any caller repeat one id and have every later call go
+    unrecorded. Nor on the row's transaction id: the two hooks resolve that
+    from different sources and can land on different values for one call.
     """
 
     def __init__(self, capacity=_METERED_CALL_MEMORY):
@@ -403,7 +522,7 @@ def _litellm_call_id(*sources):
     return None
 
 
-def _meter_identity(response, hidden_params, data=None, shared_call_id=None):
+def _meter_identity(response, shared_call_id=None, request_transaction_id=None):
     """Return ``(transaction_id, operation_type)`` for a response of any shape.
 
     ``EmbeddingResponse`` and friends have no ``.id`` -- reading it unguarded is
@@ -413,24 +532,26 @@ def _meter_identity(response, hidden_params, data=None, shared_call_id=None):
     rather than a constant -- see ``resolve_transaction_id`` for why a shared
     sentinel is worse than no id at all.
 
+    LiteLLM's ``litellm_call_id`` is never a link: LiteLLM takes it from the
+    caller's ``x-litellm-call-id`` header unvalidated, and Revenium keeps one
+    record per organization and transaction id, so a caller repeating one
+    header would have every later id-less call merged into the first record.
+
     Args:
         shared_call_id: The id this process minted for this request, when the
             shared call id is on. It outranks the provider's own response id
             because that id never reaches Claude Code, so a row keyed on it can
             never collide with the telemetry row the customer is billed twice
-            for. ``None`` restores the chain exactly as it is with the flag off.
+            for.
+        request_transaction_id: The request's own id from the key the pre-call
+            hook stamped (``_request_transaction_id``), used when the response
+            carries no id of its own. The logging event reads the same key, so
+            when the response has no provider id the two paths file one call
+            under one id.
     """
     return (
         resolve_transaction_id(
-            shared_call_id,
-            getattr(response, "id", None),
-            # Three places carry LiteLLM's correlation id, and the request
-            # metadata is not where LiteLLM puts it -- check the response's own
-            # hidden params and the request body too, or the fallback to a real
-            # id never fires and every row gets an unrelated UUID.
-            _litellm_call_id(
-                hidden_params, getattr(response, "_hidden_params", None), data
-            ),
+            shared_call_id, getattr(response, "id", None), request_transaction_id
         ),
         _OPERATION_TYPES.get(type(response).__name__, "CHAT"),
     )
@@ -603,18 +724,46 @@ def _build_subscriber(headers, metadata, user_api_key_dict, key_metadata):
     return subscriber
 
 
-def _organization_name(headers, metadata, user_api_key_dict, key_metadata):
+_REQUEST_BODY_VALUE_TYPES = (Mapping, str, bytes, list, int, float)
+
+
+def _key_team_alias(user_api_key_dict, data):
+    """The calling key's team alias, read only where LiteLLM itself wrote it.
+
+    The ``UserAPIKeyAuth`` object decides whenever a hook has one. Without it
+    (the logging path) the alias comes from the logging kwargs'
+    ``litellm_params`` first, because LiteLLM spreads request params into the
+    kwargs' top level, where ``metadata`` can be the caller's body. The logging
+    path takes its ``user_api_key_auth`` from that ``metadata``, so a value a
+    JSON body can carry is never treated as the auth object.
+    """
+    if user_api_key_dict is not None and not isinstance(user_api_key_dict, _REQUEST_BODY_VALUE_TYPES):
+        return present_or_none(getattr(user_api_key_dict, "team_alias", None))
+    litellm_params = _as_mapping(data).get("litellm_params")
+    if hasattr(litellm_params, "get"):
+        return key_team_alias(litellm_params)
+    return key_team_alias(data)
+
+
+def _organization_name(data, headers, metadata, user_api_key_dict, key_metadata):
     """Organization attribution, headers first then key/team identity.
+
+    When the operator pins the organization to the key's team
+    (``REVENIUM_LITELLM_PIN_ORGANIZATION_TO_KEY_TEAM``) a key with a team alias
+    decides it before any header is read.
 
     The header half is ``middleware._extract_organization_name`` -- the same
     implementation the callback uses, including its deprecation warning for
     ``x-revenium-organization-id`` -- rather than a second copy of it.
     """
+    pinned = pinned_key_team(_key_team_alias(user_api_key_dict, data))
+    if pinned is not None:
+        return pinned
     organization_name = _extract_organization_name(headers, metadata)
     if organization_name is None:
-        organization_name = getattr(user_api_key_dict, "team_alias", None)
+        organization_name = present_or_none(getattr(user_api_key_dict, "team_alias", None))
     if organization_name is None:
-        organization_name = key_metadata.get("revenium_organization_name")
+        organization_name = present_or_none(key_metadata.get("revenium_organization_name"))
     return organization_name
 
 
@@ -659,13 +808,16 @@ def _enforcement_metadata(data, headers, metadata, user_api_key_dict):
     usage_metadata = {
         "model": data.get("model"),
         "organization_name": _organization_name(
-            headers, metadata, user_api_key_dict, key_metadata
+            data, headers, metadata, user_api_key_dict, key_metadata
         ),
         "product_name": _extract_product_name(headers),
         "task_type": headers.get("x-revenium-task-type"),
         "agent": headers.get("x-revenium-agent"),
         "subscriber_credential": credential,
     }
+    credential_alias = trace_fields_from_headers(headers).get("credential_alias")
+    if credential_alias:
+        usage_metadata["credential_alias"] = credential_alias
     if subscriber:
         usage_metadata["subscriber"] = subscriber
     return usage_metadata
@@ -696,6 +848,23 @@ def _budget_exception(error, model):
                 ],
             }
         },
+    )
+
+
+def _is_own_cap_refusal(error):
+    """Whether ``error`` is the 429 this guardrail raised for a spending cap.
+
+    The exception chain is the first signal. The 429's body is the second, for
+    a LiteLLM release that hands the failure hook a new exception without it.
+    """
+    if is_spending_cap_refusal(error):
+        return True
+    detail = error.detail if isinstance(error, HTTPException) else None
+    body = detail.get("error") if isinstance(detail, dict) else None
+    return (
+        isinstance(body, dict)
+        and body.get("type") == "budget_exceeded"
+        and body.get("guardrail") == "revenium"
     )
 
 
@@ -754,12 +923,18 @@ class ReveniumGuardrail(CustomGuardrail):
             ``/v1/messages`` request and return it as the ``request-id``
             response header, so Claude Code's own usage record and this proxy's
             describe one call rather than two. On by default; ``false`` opts
-            out and keeps LiteLLM's own response id. It covers the
+            out: each ``/v1/messages`` record then carries a per-request id the
+            proxy assigns, never Anthropic's ``msg_`` id. It covers the
             proxy's ``/v1/messages`` route only, so Claude Code has to be
             pointed at the proxy root (``ANTHROPIC_BASE_URL=<proxy>``). LiteLLM's
             Anthropic pass-through at ``<proxy>/anthropic/v1/messages`` mints
             nothing, warns about nothing, and leaves the call counted twice.
             See the README's "Counting a Claude Code call once" section.
+        ``REVENIUM_LITELLM_PIN_ORGANIZATION_TO_KEY_TEAM`` -- off by default.
+            When on, the calling virtual key's team alias decides the
+            organization for the budget check and the record, and the
+            ``x-revenium-organization-name`` / ``-id`` headers apply only to
+            keys with no team alias.
     """
 
     def __init__(self, **kwargs):
@@ -771,6 +946,7 @@ class ReveniumGuardrail(CustomGuardrail):
         """
         super().__init__(**kwargs)
         self._metered_calls = _MeteredCalls()
+        log_organization_pin_setting()
         default_on = bool(getattr(self, "default_on", False))
         hooks = _event_hooks(getattr(self, "event_hook", None))
         if hooks is _UNKNOWN_HOOKS:
@@ -802,12 +978,20 @@ class ReveniumGuardrail(CustomGuardrail):
         # __init__. It is checked first, and it resolves to inactive for the
         # same reason it resolves metering ownership to false: under a per-tag
         # Mode the pre-call hook fires for some requests and not others.
+        pre_call_runs_every_request = hooks is not _UNKNOWN_HOOKS and (
+            hooks is None or _PRE_CALL_EVENT in hooks
+        )
         shared_call_id_flag = is_shared_call_id_enabled()
         self._shared_id_active = bool(
             shared_call_id_flag
             and _headers_hook_available()
-            and hooks is not _UNKNOWN_HOOKS
-            and (hooks is None or _PRE_CALL_EVENT in hooks)
+            and pre_call_runs_every_request
+        )
+        # A meter key is only proof when the pre-call hook overwrote it on this
+        # very request; where that hook may not run, a found key is whatever
+        # the caller planted, and claiming nothing records the call instead.
+        self._meter_key_trusted = bool(
+            pre_call_runs_every_request and self._meters_every_request
         )
         if shared_call_id_flag:
             try:
@@ -833,6 +1017,13 @@ class ReveniumGuardrail(CustomGuardrail):
                     _headers_hook_available(),
                     getattr(self, "event_hook", None),
                 )
+        else:
+            logger.info(
+                "ReveniumGuardrail: REVENIUM_LITELLM_SHARED_CALL_ID is off "
+                "(value=%.40r); calls Claude Code also reports are stored "
+                "twice. Unset it or set it to true to turn it on.",
+                sanitize_for_logging((shared_call_id_setting() or "").strip()),
+            )
         if default_on and hooks is _UNKNOWN_HOOKS:
             logger.info(
                 "ReveniumGuardrail: mode=%r selects hooks per request, so this "
@@ -842,6 +1033,7 @@ class ReveniumGuardrail(CustomGuardrail):
                 "Remove the callback, or configure mode as a plain list.",
                 getattr(self, "event_hook", None),
             )
+        self._warn_when_failed_calls_go_unrecorded(hooks)
         if self._meters_every_request:
             # Claiming ownership only under this configuration is deliberate:
             # a guardrail applied per request could otherwise silence the
@@ -864,6 +1056,25 @@ class ReveniumGuardrail(CustomGuardrail):
             getattr(self, "default_on", False),
             self._meters_every_request,
         )
+
+    def _warn_when_failed_calls_go_unrecorded(self, hooks):
+        """Say at startup when no request will carry the pre-call stamp the failure hook needs."""
+        scan_raw_request = bool(getattr(self, "scan_raw_request", False))
+        post_call_without_pre_call = (
+            hooks is not None
+            and hooks is not _UNKNOWN_HOOKS
+            and _POST_CALL_EVENT in hooks
+            and _PRE_CALL_EVENT not in hooks
+        )
+        if post_call_without_pre_call or scan_raw_request:
+            logger.warning(
+                "ReveniumGuardrail: failed calls are not recorded unless the "
+                "Revenium guardrail's pre_call hook runs on the request itself "
+                "(mode=%r, scan_raw_request=%s). Add \"pre_call\" to mode and leave "
+                "scan_raw_request off to record them.",
+                getattr(self, "event_hook", None),
+                scan_raw_request,
+            )
 
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
         """Enforce the caller's budget before the proxied call.
@@ -896,6 +1107,19 @@ class ReveniumGuardrail(CustomGuardrail):
         logger.debug(
             "ReveniumGuardrail.async_pre_call_hook fired (call_type=%s)", call_type
         )
+        # Before the mint and before enforcement, in a try of its own, for the
+        # reasons given on the mint below. Always: the failure hook reads it as
+        # proof the request authenticated; the duplicate guard only where trusted.
+        try:
+            _stamp_meter_key(data)
+        except Exception as error:
+            logger.warning(
+                "ReveniumGuardrail: could not stamp the duplicate-guard key "
+                "(%s: %s) -- the call proceeds; it is metered unguarded on "
+                "success and a failure is not recorded",
+                type(error).__name__,
+                error,
+            )
         # Minted before enforcement, so a call blocked with a 429 still carries
         # an id and the ordering never makes the mint conditional on the budget
         # decision. In a try of its own, separate from the enforcement block
@@ -931,7 +1155,9 @@ class ReveniumGuardrail(CustomGuardrail):
             usage_metadata = _enforcement_metadata(
                 data, headers, metadata, user_api_key_dict
             )
-            check_enforcement(usage_metadata)
+            # The request's model is the operator's alias for a deployment;
+            # the model metered is known only after routing.
+            check_enforcement(usage_metadata, model=None, provider=LITELLM_PROVIDER)
         except BudgetExceededError as error:
             logger.warning(
                 "ReveniumGuardrail: rule '%s' breached (%s/%s) -- blocking",
@@ -939,7 +1165,7 @@ class ReveniumGuardrail(CustomGuardrail):
                 error.current_value,
                 error.threshold,
             )
-            raise _budget_exception(error, data.get("model"))
+            raise _budget_exception(error, data.get("model")) from error
         except Exception as error:
             logger.warning(
                 "ReveniumGuardrail: budget check failed (%s: %s) -- failing open",
@@ -1085,13 +1311,9 @@ class ReveniumGuardrail(CustomGuardrail):
             duration_ms = hidden_params.get("_response_ms") or 0
             mediation_latency = hidden_params.get("litellm_overhead_time_ms") or 0
 
-            # Identity first, claim second. The minted id, when the flag is
-            # on and one arrived, is the id both success paths resolve for the
-            # same call, so it is the only key on which the duplicate guard can
-            # recognise a call the logging event already metered. Without one
-            # the key falls back to LiteLLM's own call id, which is what
-            # BACK-3199 shipped: never the stored transaction id, because the
-            # two hooks reach different values for it on the same call.
+            # Identity first, claim second. The claim is keyed on the meter key
+            # the pre-call hook stamped, which both success paths read for one
+            # call and no caller can choose; see _MeteredCalls.
             shared_call_id = read_shared_call_id(data, self._shared_id_active)
             if (
                 self._shared_id_active
@@ -1100,12 +1322,8 @@ class ReveniumGuardrail(CustomGuardrail):
             ):
                 _note_missing_shared_call_id()
 
-            if not self._metered_calls.claim(
-                shared_call_id
-                or _litellm_call_id(
-                    hidden_params, getattr(response, "_hidden_params", None), data
-                )
-            ):
+            meter_key = self._trusted_meter_key(data)
+            if not self._metered_calls.claim(meter_key):
                 logger.debug(
                     "ReveniumGuardrail: this call was already metered from the "
                     "logging event -- not metering it a second time"
@@ -1113,7 +1331,7 @@ class ReveniumGuardrail(CustomGuardrail):
                 return
 
             transaction_id, operation_type = _meter_identity(
-                response, hidden_params, data, shared_call_id
+                response, shared_call_id, _request_transaction_id(meter_key)
             )
 
             end_time = datetime.datetime.now(datetime.timezone.utc)
@@ -1143,7 +1361,7 @@ class ReveniumGuardrail(CustomGuardrail):
                 # hidden_params) is the caller's own request body on
                 # /v1/messages, and a caller must not be able to name the
                 # upstream that decides the billed input count.
-                prompt_folds_cache=prompt_tokens_fold_cache(
+                upstream_sources=(
                     getattr(response, "_hidden_params", None),
                     data.get("litellm_params"),
                     getattr(data.get("litellm_logging_obj"), "model_call_details", None),
@@ -1162,8 +1380,25 @@ class ReveniumGuardrail(CustomGuardrail):
                 error,
             )
 
+    def _trusted_meter_key(self, container):
+        """The duplicate-guard key for this request, or ``None`` to record it unguarded."""
+        return _meter_key(container) if self._meter_key_trusted else None
+
+    def _meters_logged_request(self, litellm_params):
+        """Whether this guardrail meters the request a logging event reports.
+
+        The same ownership ``meters_request`` answers for the client wrapper,
+        read from the logging path's ``litellm_params``, which carries the
+        request's ``metadata`` and ``litellm_metadata`` where LiteLLM's guardrail
+        check looks for a key's opt-out.
+        """
+        return self._meters_every_request and (
+            self.should_run_guardrail(data=litellm_params, event_type=GuardrailEventHooks.post_call)
+            is True
+        )
+
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
-        """Meter a streamed Anthropic-route call, which no other hook sees.
+        """Meter a streamed Anthropic-route or Responses call, which no other hook sees.
 
         ``/v1/messages`` with ``stream: true`` is the one route where LiteLLM
         never calls ``async_post_call_success_hook``: the vendor arms
@@ -1171,7 +1406,13 @@ class ReveniumGuardrail(CustomGuardrail):
         ``anthropic_messages`` iterator, which enqueues a logging coroutine and
         never reaches ``_run_deferred_stream_guardrails``. See this module's
         docstring. That route is what Claude Code speaks, so without this method
-        a customer's whole Claude Code spend goes unmetered.
+        a customer's whole Claude Code spend goes unmetered. A streamed
+        ``/v1/responses`` call (Codex CLI) ends the same way.
+
+        A Responses stream is metered here only when this guardrail meters the
+        request (``meters_request``): otherwise the client wrapper meters one
+        LiteLLM bridges through ``litellm.acompletion``, and a row here would be
+        its second.
 
         LiteLLM calls this for **every** completed request, so the route gate is
         load-bearing: without it, every call already metered by the post-call
@@ -1194,16 +1435,19 @@ class ReveniumGuardrail(CustomGuardrail):
             end_time: When the stream completed.
         """
         try:
+            call_type = kwargs.get("call_type")
             if (
-                kwargs.get("call_type") != _ANTHROPIC_MESSAGES_CALL_TYPE
+                call_type not in _STREAMED_CALL_TYPES_METERED_FROM_THE_LOGGING_EVENT
                 or not kwargs.get("stream")
             ):
                 return
-            logger.debug(
-                "ReveniumGuardrail.async_log_success_event fired for a streamed "
-                "Anthropic call"
-            )
             litellm_params = _as_mapping(kwargs.get("litellm_params"))
+            if call_type == _RESPONSES_CALL_TYPE and not self._meters_logged_request(litellm_params):
+                return
+            logger.debug(
+                "ReveniumGuardrail.async_log_success_event fired for a streamed %s call",
+                call_type,
+            )
             metadata = _as_mapping(litellm_params.get("metadata"))
             # NOT metadata["headers"]: this is the one route on which LiteLLM
             # fills litellm_metadata and leaves metadata as the caller's own
@@ -1215,20 +1459,15 @@ class ReveniumGuardrail(CustomGuardrail):
             if not hidden_params:
                 hidden_params = _as_mapping(getattr(response_obj, "_hidden_params", None))
 
-            # Identity first, claim second, exactly as the post-call hook does.
-            # The minted id is the value both success paths resolve for one
-            # call, so it is the only key on which either can recognise the
-            # other's claim; without one the key falls back to LiteLLM's own
-            # call id, which is what this method shipped with.
+            # Identity first, claim second, on the same meter key the post-call
+            # hook claims, so either recognises the other's claim.
             shared_call_id = read_shared_call_id(litellm_params, self._shared_id_active)
+            meter_key = self._trusted_meter_key(litellm_params)
             transaction_id = self._stream_transaction_id(
-                kwargs, litellm_params, metadata, hidden_params, shared_call_id
+                shared_call_id, _request_transaction_id(meter_key)
             )
 
-            if not self._metered_calls.claim(
-                shared_call_id
-                or _litellm_call_id(kwargs, litellm_params, metadata, hidden_params)
-            ):
+            if not self._metered_calls.claim(meter_key):
                 logger.debug(
                     "ReveniumGuardrail: this call was already metered from the "
                     "post-call hook -- not metering it a second time"
@@ -1261,7 +1500,7 @@ class ReveniumGuardrail(CustomGuardrail):
                 request_duration=duration_ms,
                 mediation_latency=hidden_params.get("litellm_overhead_time_ms") or 0,
                 stop_reason="END",
-                prompt_folds_cache=prompt_tokens_fold_cache(
+                upstream_sources=(
                     getattr(response_obj, "_hidden_params", None),
                     kwargs,
                     litellm_params,
@@ -1278,9 +1517,7 @@ class ReveniumGuardrail(CustomGuardrail):
                 error,
             )
 
-    def _stream_transaction_id(
-        self, kwargs, litellm_params, metadata, hidden_params, shared_call_id=None
-    ):
+    def _stream_transaction_id(self, shared_call_id, request_transaction_id):
         """The transaction id for a streamed Anthropic row.
 
         This is ``async_post_call_success_hook``'s identity chain with its
@@ -1289,8 +1526,8 @@ class ReveniumGuardrail(CustomGuardrail):
         Anthropic stream and its ``.id`` is the provider's ``msg_`` id, so
         metering on it would give the streamed row a different identity shape
         from the non-streamed row on the same route -- that one is handed a raw
-        dict with no ``.id`` to read and already falls through to LiteLLM's
-        correlation id.
+        dict with no ``.id`` to read and falls through to the request's own id.
+        Both rows on the route therefore carry the request's own id.
 
         The first link is the same as the post-call hook's and outranks
         everything: the id this proxy minted for the request and handed back as
@@ -1301,13 +1538,13 @@ class ReveniumGuardrail(CustomGuardrail):
 
         Args:
             shared_call_id: The minted id, or ``None`` when the flag is off or
-                nothing this process minted is on the request. ``None`` restores
-                the chain exactly as it was before the shared call id existed.
+                nothing this process minted is on the request.
+            request_transaction_id: The request's own id from the stamped meter
+                key, or ``None`` when no trusted key is on the request, which
+                leaves a fresh UUID per row. Never LiteLLM's ``litellm_call_id``,
+                which the caller chooses (see ``_meter_identity``).
         """
-        return resolve_transaction_id(
-            shared_call_id,
-            _litellm_call_id(kwargs, litellm_params, metadata, hidden_params),
-        )
+        return resolve_transaction_id(shared_call_id, request_transaction_id)
 
     async def async_post_call_failure_hook(
         self,
@@ -1318,6 +1555,13 @@ class ReveniumGuardrail(CustomGuardrail):
     ):
         """Meter a failed proxied call with ``stop_reason="ERROR"``.
 
+        A request LiteLLM refused before the Revenium guardrail's pre-call ran
+        on it (a wrong, missing, expired or blocked key, or any other refusal
+        during authentication) sends no record.
+
+        A call this guardrail's spending cap refused never reached a provider,
+        so, as with the client integrations, it sends no record.
+
         Args:
             request_data: The request body dict.
             original_exception: The exception that failed the call.
@@ -1325,7 +1569,16 @@ class ReveniumGuardrail(CustomGuardrail):
             traceback_str: Optional traceback text from LiteLLM.
         """
         try:
+            if not _reached_pre_call(request_data):
+                logger.debug(
+                    "ReveniumGuardrail: failed request never reached the pre-call "
+                    "hook; no failed-call record"
+                )
+                return
             logger.debug("ReveniumGuardrail.async_post_call_failure_hook fired")
+            if _is_own_cap_refusal(original_exception):
+                logger.debug("ReveniumGuardrail: a spending cap refused the call; no failed-call record")
+                return
             metadata = _as_mapping(request_data.get("metadata"))
             # NOT metadata["headers"]: on /v1/messages LiteLLM fills
             # litellm_metadata instead. See extract_request_headers.
@@ -1355,7 +1608,8 @@ class ReveniumGuardrail(CustomGuardrail):
                 # suffix the failure took the success's identity and the paid
                 # row was dropped as a duplicate at zero cost. No success
                 # identity can contain the marker: those are a provider response
-                # id, a litellm_call_id or a bare UUID.
+                # id or a bare UUID. Correlation by prefix therefore holds only
+                # where the success carries the provider's id.
                 transaction_id="{0}:err:{1}".format(
                     resolve_transaction_id(
                         getattr(original_exception, "id", None),
@@ -1375,7 +1629,7 @@ class ReveniumGuardrail(CustomGuardrail):
                 request_duration=0,
                 mediation_latency=hidden_params.get("litellm_overhead_time_ms") or 0,
                 stop_reason="ERROR",
-                prompt_folds_cache=prompt_tokens_fold_cache(
+                upstream_sources=(
                     getattr(original_exception, "_hidden_params", None),
                     request_data.get("litellm_params"),
                     getattr(
@@ -1409,7 +1663,7 @@ class ReveniumGuardrail(CustomGuardrail):
         request_duration,
         mediation_latency,
         stop_reason,
-        prompt_folds_cache,
+        upstream_sources,
         is_streamed=None,
     ):
         """Build the completion metering payload shared by all three hooks.
@@ -1421,11 +1675,12 @@ class ReveniumGuardrail(CustomGuardrail):
                 alone lost the stream flag for every response that carried it
                 only on itself, silently metering a streamed call as
                 non-streamed.
-            prompt_folds_cache: Whether this upstream's ``prompt_tokens``
-                contains the cache tokens the row also reports in their own
-                fields. Resolved per hook from what LiteLLM handed it, because
-                no two hooks see the same surfaces, and wrong in either
-                direction costs money -- see ``billable_input_tokens``.
+            upstream_sources: The LiteLLM-populated surfaces, in lookup order,
+                that say whether this upstream's ``prompt_tokens`` contains the
+                cache tokens the row also reports in their own fields. Chosen
+                per hook from what LiteLLM handed it, because no two hooks see
+                the same surfaces, and a wrong answer in either direction costs
+                money -- see ``billable_input_tokens``.
             is_streamed: Whether this row is a stream, when the caller already
                 knows. Left unset, it is read out of the hidden params, which
                 is the only source the post-call hooks have.
@@ -1441,7 +1696,7 @@ class ReveniumGuardrail(CustomGuardrail):
         key_metadata = _key_metadata(metadata, user_api_key_dict)
         cache_read_tokens, cache_creation_tokens = extract_cache_tokens(usage)
         input_tokens, completion_tokens, total_tokens = _token_counts(
-            usage, cache_read_tokens, cache_creation_tokens, prompt_folds_cache
+            usage, cache_read_tokens, cache_creation_tokens, upstream_sources
         )
         if is_streamed is None:
             is_streamed = bool(
@@ -1460,16 +1715,17 @@ class ReveniumGuardrail(CustomGuardrail):
 
         completion_args = {
             "cache_creation_token_count": cache_creation_tokens,
+            **extract_cache_creation_ttl_counts(usage),
             "cache_read_token_count": cache_read_tokens,
             "input_token_cost": None,
             "output_token_cost": None,
             "total_cost": None,
             "output_token_count": completion_tokens,
             "cost_type": "AI",
-            "model": data.get("model"),
+            "model": _upstream_model(data),
             "input_token_count": input_tokens,
-            "provider": "LITELLM",
-            "model_source": "LITELLM",
+            "provider": LITELLM_PROVIDER,
+            "model_source": LITELLM_PROVIDER,
             "reasoning_token_count": 0,
             "request_time": format_utc_timestamp(request_time),
             "response_time": response_time_str,
@@ -1489,7 +1745,7 @@ class ReveniumGuardrail(CustomGuardrail):
             "task_type": headers.get("x-revenium-task-type"),
             "subscriber": subscriber if subscriber else None,
             "organization_name": _organization_name(
-                headers, metadata, user_api_key_dict, key_metadata
+                data, headers, metadata, user_api_key_dict, key_metadata
             ),
             "subscription_id": headers.get("x-revenium-subscription-id"),
             "product_name": _extract_product_name(headers),
@@ -1506,6 +1762,7 @@ class ReveniumGuardrail(CustomGuardrail):
             "is_streamed": bool(is_streamed),
             "operation_type": operation_type,
             "mediation_latency": mediation_latency,
+            **trace_fields_from_headers(headers),
             "middleware_source": "GUARDRAIL",
         }
         extra_body = merge_extra_body(None, _job_fields(headers, key_metadata))
@@ -1521,7 +1778,8 @@ class ReveniumGuardrail(CustomGuardrail):
         rather than raised.
         """
         completion_args, extra_body = built_args
-        logger.debug("ReveniumGuardrail: metering (%s) with args: %s", label, completion_args)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("ReveniumGuardrail: metering (%s) with args: %s", label, sanitize_for_logging(completion_args))
 
         async def metering_call():
             try:

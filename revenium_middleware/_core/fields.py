@@ -1,11 +1,13 @@
+import functools
 import logging
 import os
+import re
 import threading
 import warnings
 from typing import Any, Callable, Dict, Mapping, Optional, Set, Tuple
 
 from .config import Config
-from .context import get_agentic_job_fields
+from .context import get_agentic_job_fields, is_blank_metadata_value
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +17,29 @@ logger = logging.getLogger(__name__)
 # concurrent threads can't both observe "not seen" and emit duplicate startup warnings.
 _WARNED_DEPRECATED_FIELDS: Set[Tuple[str, str]] = set()
 _WARNED_DEPRECATED_LOCK = threading.Lock()
+
+# Mirror of the server's JobValidation.AGENTIC_JOB_ID_PATTERN (hypercurrent
+# :commons). AI ingest and the tool-events controller both refuse the WHOLE
+# call for an id violating this pattern, and metering is fire-and-forget, so
+# that call and its cost would vanish silently. Unlike the other attribution
+# fields (which the middleware forwards verbatim and the server accepts
+# verbatim), this one is gated client-side: dropping the field loses
+# attribution for one call; sending it loses the call.
+AGENTIC_JOB_ID_RE = re.compile(r"^(?!types$|conversion-funnel$)[a-zA-Z0-9][a-zA-Z0-9._-]{0,254}$")
+AGENTIC_JOB_ID_RULE = (
+    "a job id must start with an ASCII letter or digit, contain only ASCII letters, digits, "
+    "'.', '_' and '-', be at most 255 characters, and not be 'types' or 'conversion-funnel'"
+)
+_AGENTIC_JOB_ID_KEY = "agenticJobId"
+
+
+def is_valid_agentic_job_id(job_id: Any) -> bool:
+    # fullmatch, not match: Python's ``$`` accepts a trailing newline and
+    # ``.match()`` never requires the whole string to be consumed, so
+    # ``"job-1\n"`` would pass a ``.match()`` gate and still be refused by the
+    # server, whose Java ``matches()`` demands full consumption.
+    return isinstance(job_id, str) and AGENTIC_JOB_ID_RE.fullmatch(job_id) is not None
+
 
 AGENTIC_JOB_FIELD_MAP = {
     "agenticJobId": ("agentic_job_id", "agenticJobId"),
@@ -80,10 +105,11 @@ MEDIA_LINEAGE_FIELD_MAP = {
 # accepted usage_metadata aliases in precedence order. The reasoning effort
 # level is caller-supplied only -- like the coding assistant attribution there
 # is deliberately no env-var fallback, because the level is a property of one
-# request, not of the process. The value is passed through verbatim: no
-# allow-list, no lowercasing, no coercion onto a known level. The backend owns
-# validation (at most 16 characters matching ^[A-Za-z0-9_-]+$), so a vendor's
-# next level reaches Revenium instead of being dropped client-side.
+# request, not of the process. The value is extracted verbatim: no allow-list,
+# no lowercasing, no coercion onto a known level, so a vendor's next level
+# reaches Revenium. Only a value outside the metering API's rule (at most 16
+# characters matching ^[A-Za-z0-9_-]+$) is left off at send time, by
+# wire_guards, so it cannot cost the whole record.
 EFFORT_FIELD_MAP = {
     "effort": ("effort",),
 }
@@ -93,6 +119,7 @@ EFFORT_FIELD_MAP = {
 # per-request facts only the caller knows, so there is no env-var fallback, and
 # the values pass through verbatim because the backend owns their vocabulary.
 PROMPT_CONTEXT_FIELD_MAP = {
+    "client_surface": ("client_surface", "clientSurface"),
     "prompt_id": ("prompt_id", "promptId"),
     "prompt_length": ("prompt_length", "promptLength"),
     "query_source": ("query_source", "querySource"),
@@ -229,15 +256,14 @@ def _resolve_field_map(
     Each field is read from ``source`` under its aliases in precedence order
     (snake_case before camelCase); when every alias misses, the optional
     ``fallback(name)`` supplies the value (contextvar or env lookup, per
-    family). Absent fields are omitted entirely (never emitted as None).
+    family). A blank alias (None or "") counts as a miss, so it neither hides
+    a later alias nor the fallback. Absent fields are omitted entirely (never
+    emitted as None).
     """
     result = {}
     for name, aliases in field_map.items():
-        value = None
-        for alias in aliases:
-            value = source.get(alias)
-            if value is not None:
-                break
+        value = next((source.get(alias) for alias in aliases
+                      if not is_blank_metadata_value(source.get(alias))), None)
         if value is None and fallback is not None:
             value = fallback(name)
         if value is not None:
@@ -317,8 +343,9 @@ def extract_effort_field(source: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
 
     The value is forwarded verbatim. There is no client-side allow-list and no
     normalization: an unrecognised but well-formed level (a vendor's next tier)
-    is passed through, and a value the backend rejects fails visibly on the
-    metering call rather than being silently dropped here.
+    is passed through. A value outside the metering API's rule is left off the
+    record with a WARNING when it is sent (``wire_guards``), so the call is
+    still recorded.
     """
     if not source:
         return {}
@@ -326,7 +353,7 @@ def extract_effort_field(source: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
 
 
 def extract_prompt_context_fields(source: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
-    """Resolve prompt, speed-mode and subagent attribution from caller metadata.
+    """Resolve client-surface, prompt, speed-mode and subagent attribution from caller metadata.
 
     Each field resolves from its snake_case key then its camelCase alias and is
     returned under the snake_case keyword ``create_completion`` expects. Absent
@@ -380,10 +407,31 @@ def extract_media_lineage_fields(source: Optional[Mapping[str, Any]]) -> Dict[st
     return _resolve_field_map(source, MEDIA_LINEAGE_FIELD_MAP)
 
 
+@functools.lru_cache(maxsize=256)
+def _warn_refused_agentic_job_id(job_id: str) -> None:
+    logger.warning("Dropping agenticJobId %r from this call: %s", job_id, AGENTIC_JOB_ID_RULE)
+
+
+def _without_refused_agentic_job_id(fields: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """A copy of ``fields`` minus an ``agenticJobId`` string the server refuses.
+
+    A non-str id is left alone: the server coerces it and it works today.
+    """
+    kept = dict(fields) if fields else {}
+    job_id = kept.get(_AGENTIC_JOB_ID_KEY)
+    if isinstance(job_id, str) and not is_valid_agentic_job_id(job_id):
+        _warn_refused_agentic_job_id(job_id)
+        del kept[_AGENTIC_JOB_ID_KEY]
+    return kept
+
+
 def merge_extra_body(existing: Optional[Dict[str, Any]], agentic_fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if not agentic_fields:
-        return existing if existing else None
-    merged = dict(existing) if existing else {}
-    for k, v in agentic_fields.items():
+    """Merge agentic job fields under a caller ``extra_body`` (the caller's keys win).
+
+    Each source loses a refused ``agenticJobId`` before the merge, so a valid
+    id from the other source still lands. Never mutates ``existing``.
+    """
+    merged = _without_refused_agentic_job_id(existing)
+    for k, v in _without_refused_agentic_job_id(agentic_fields).items():
         merged.setdefault(k, v)
-    return merged
+    return merged or None

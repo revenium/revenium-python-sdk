@@ -1,4 +1,4 @@
-"""Prompt, speed-mode and subagent attribution through the fal entry point (BACK-3388).
+"""Prompt, speed-mode, subagent (BACK-3388) and client-surface (BACK-3905) attribution through fal.
 
 fal routes all four /v2/ai paths from one entry point, so it is where a
 completion-only field leaking onto audio, image or video would surface as a
@@ -13,6 +13,7 @@ import pytest
 from revenium_middleware.fal._metering import handle_metering
 
 METADATA = {
+    "clientSurface": "claude-code-desktop",
     "promptId": "prompt-42",
     "prompt_length": 1834,
     "querySource": "repl_main_thread",
@@ -21,6 +22,7 @@ METADATA = {
 }
 
 WIRE = {
+    "clientSurface": "claude-code-desktop",
     "promptId": "prompt-42",
     "promptLength": 1834,
     "querySource": "repl_main_thread",
@@ -80,6 +82,6 @@ def test_completion_omits_the_fields_when_unset():
 def test_media_paths_ship_without_forwarding_the_fields(application, fixture_name, request):
     body = _meter_with_real_client(application, request.getfixturevalue(fixture_name), METADATA)
     assert body["transactionId"] == "fal-prompt-context-test"
-    for wire_name in ("promptId", "promptLength", "querySource", "subagentType"):
+    for wire_name in ("clientSurface", "promptId", "promptLength", "querySource", "subagentType"):
         assert wire_name not in body, wire_name
     assert body.get("speed") != "fast"

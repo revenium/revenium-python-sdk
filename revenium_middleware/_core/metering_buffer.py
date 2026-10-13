@@ -17,7 +17,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import functools
 import logging
+import os
 import queue
 import threading
 import time
@@ -48,6 +50,10 @@ MIN_REPLAY_TIMEOUT_SECONDS = 0.001
 # Replays in flight at once while a backlog drains: at a 300 ms round trip
 # that replays about 50 records a second next to the live traffic.
 REPLAY_CONCURRENCY = 16
+# Replays in flight at once in the exit flush, where no live traffic competes:
+# the 32 connections the delivery workers use clear 500 held records in about
+# 4 seconds at a 250 ms round trip, inside the default 5 second budget.
+EXIT_REPLAY_CONCURRENCY = 32
 
 # 409 is deliberately absent (diverging from the vendored client's blanket
 # retry): the backend's idempotency_key_mismatch 409 is permanent and would
@@ -317,8 +323,17 @@ def _event_loop_running_here() -> bool:
     return True
 
 
+def _is_redirect(status_code: int) -> bool:
+    return 300 <= status_code < 400
+
+
 def _status_is_retryable(status_code: int, headers: Any) -> bool:
-    """Mirror the vendored HTTP client's _should_retry status semantics."""
+    """Mirror the vendored HTTP client's _should_retry status semantics, except that a redirect is never retried."""
+    if _is_redirect(status_code):
+        # The same address answers the same way: holding the record would
+        # keep it, captured prompts included, for a day and open the circuit
+        # for good records.
+        return False
     should_retry_header = ""
     if headers is not None:
         should_retry_header = headers.get("x-should-retry", "")
@@ -338,7 +353,7 @@ def is_retryable_failure(exc: BaseException) -> bool:
 
     Transient failures (connection/timeout errors, 408/409/429, 5xx, or an
     explicit ``x-should-retry: true``) qualify. Permanent failures -- other
-    4xx such as 401/403/404/422 -- must never be buffered.
+    4xx such as 401/403/404/422, and every redirect -- must never be buffered.
     """
     # Vendored metering-client exceptions (AI events).
     from revenium_middleware._metering._exceptions import (
@@ -363,53 +378,120 @@ def is_retryable_failure(exc: BaseException) -> bool:
     return False
 
 
-def _replay_ai_event(payload: Dict[str, Any], timeout_seconds: float) -> None:
-    """Re-submit a buffered AI event through the metering client."""
+def _address_without_credentials(url: httpx.URL) -> str:
+    port = f":{url.port}" if url.port is not None else ""
+    return f"{url.scheme}://{url.host}{port}{url.path}"
+
+
+def _redirect_target(response: httpx.Response) -> str:
+    location = response.headers.get("location")
+    if not location:
+        return "with no Location header"
+    try:
+        return f"pointing to {_address_without_credentials(response.request.url.join(location))}"
+    except Exception:  # noqa: BLE001 - an unreadable Location must not hide the warning
+        return "pointing to an address that is not a valid URL"
+
+
+def warn_if_redirected(exc: BaseException) -> bool:
+    """Log one WARNING and return True when a metering request failed because it was answered with a redirect.
+
+    The metering clients never follow a redirect, so the record was not
+    delivered. Only the scheme, host, port and path of each address are
+    logged: never a query string, credentials, headers or the response body.
+    """
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if not isinstance(status_code, int) or not _is_redirect(status_code):
+        return False
+    try:
+        asked = _address_without_credentials(response.request.url)
+    except Exception:  # noqa: BLE001 - a response built without its request still deserves the warning
+        asked = "the Revenium address"
+    logger.warning(
+        "Revenium metering request to %s was answered with a %d redirect %s; the SDK does not follow redirects, "
+        "so the record was not sent anywhere else and was dropped. Set the Revenium address to the final address.",
+        asked,
+        status_code,
+        _redirect_target(response),
+    )
+    return True
+
+
+class _ReplayClients:
+    """Clients for AI records held under another key than the current client's, one per Revenium address.
+
+    Shared for one flush and closed when it ends: building a client costs
+    milliseconds of CPU in TLS setup, which a client per held record multiplied.
+    """
+
+    def __init__(self) -> None:
+        self._clients: Dict[str, Any] = {}
+        self._lock = threading.Lock()
+        # Apart from _lock, so that closing the clients at the end of a flush
+        # does not wait for a build that its deadline left running.
+        self._build_lock = threading.Lock()
+
+    def get(self, api_key: str, base_url: str) -> Any:
+        """Return the client for ``base_url``; its own key is whichever record built it, so set the key per request."""
+        from revenium_middleware._core.metering import _new_client
+
+        with self._build_lock:
+            with self._lock:
+                client = self._clients.get(base_url)
+            if client is None:
+                client = _new_client(api_key, base_url)
+                with self._lock:
+                    self._clients[base_url] = client
+            return client
+
+    def close_all(self) -> None:
+        with self._lock:
+            clients, self._clients = list(self._clients.values()), {}
+        for client in clients:
+            try:
+                client.close()
+            except Exception as exc:  # noqa: BLE001 - must not keep the flush lock held
+                logger.debug("Closing a replay client failed: %s", exc)
+
+
+def _replay_ai_event(payload: Dict[str, Any], timeout_seconds: float, replay_clients: _ReplayClients) -> None:
+    """Re-submit a buffered AI event under the key and endpoint it was recorded with."""
     from revenium_middleware._core.metering import get_client
 
-    client = get_client()
-    if client is None:
-        # Backend credentials unavailable right now: treat as transient so
-        # the event stays buffered for the next flush cycle.
-        raise httpx.ConnectError("metering client not configured")
+    api_key, base_url = payload.get("api_key"), payload.get("base_url")
+    if not api_key or not base_url:
+        raise ValueError("buffered AI event has no frozen credentials")
 
+    current = get_client()
+    if current is not None and (current.api_key, str(current.base_url)) == (api_key, base_url):
+        _send_ai_replay(current, payload, timeout_seconds)
+        return
+    _send_ai_replay(replay_clients.get(api_key, base_url), payload, timeout_seconds)
+
+
+def _send_ai_replay(client: Any, payload: Dict[str, Any], timeout_seconds: float) -> None:
     # The buffer's own replay cycle is the retry loop; client-side retries
     # would multiply the per-call timeout and overrun a flush deadline.
-    method = getattr(client.with_options(max_retries=0).ai, f"create_{payload['operation']}")
+    sender = client.with_options(api_key=payload["api_key"], max_retries=0)
+    method = getattr(sender.ai, f"create_{payload['operation']}")
     kwargs = dict(payload["args"])
     # Replay owns the timeout: the flush budget must win over any frozen
     # caller-supplied value (which applied to the original call, not replay).
-    kwargs["timeout"] = timeout_seconds
+    kwargs["timeout"] = _time_left_for_call(timeout_seconds)
     method(**kwargs)
 
 
 def _replay_tool_event(payload: Dict[str, Any], timeout_seconds: float) -> None:
-    """Re-POST a buffered tool event with its original payload."""
-    # Replay after an outage should honor credential rotation, matching the
-    # AI path (which resolves the current client at replay time). Fall back
-    # to the endpoint frozen at dispatch when nothing is configured now.
-    from revenium_middleware._metering.decorator import _resolve_endpoint
+    """Re-POST a buffered tool event to the endpoint, and under the key, it was dispatched with."""
+    from revenium_middleware._core.tool_event_transport import post_tool_event
 
-    url, key = _resolve_endpoint()
-    if url is None or key is None:
-        url, key = payload["url"], payload["key"]
-
-    with httpx.Client(timeout=timeout_seconds) as client:
-        response = client.post(
-            url,
-            headers={
-                "x-api-key": key,
-                "Content-Type": "application/json",
-                "Idempotency-Key": payload["event_payload"]["transactionId"],
-            },
-            json=payload["event_payload"],
-        )
-        response.raise_for_status()
+    post_tool_event(payload, timeout_seconds)
 
 
-def _default_replay(event: BufferedEvent, timeout_seconds: float) -> None:
+def _default_replay(event: BufferedEvent, timeout_seconds: float, replay_clients: _ReplayClients) -> None:
     if event.kind == AI_KIND:
-        _replay_ai_event(event.payload, timeout_seconds)
+        _replay_ai_event(event.payload, timeout_seconds, replay_clients)
     elif event.kind == TOOL_KIND:
         _replay_tool_event(event.payload, timeout_seconds)
     else:  # unknown kinds are a programming error; treat as permanent
@@ -422,53 +504,113 @@ class _ReplayOutcome(NamedTuple):
     discarded: int
     retry: List[BufferedEvent]
     status: List[Optional[Tuple[BaseException, str]]]
+    unreachable_kinds: Set[str]
+
+
+class _NotAttempted(Exception):
+    """The flush deadline passed before this event's replay could start."""
+
+
+def _time_for_one_call(timeout_seconds: float, deadline: Optional[float]) -> Optional[float]:
+    """``timeout_seconds``, capped by what is left before ``deadline`` (``time.monotonic()``); None once it passed."""
+    if deadline is None:
+        return timeout_seconds
+    left = deadline - time.monotonic()
+    if left <= 0:
+        return None
+    return max(MIN_REPLAY_TIMEOUT_SECONDS, min(timeout_seconds, left))
+
+
+# The deadline of the flush whose replay runs on this thread: building the
+# replay's client can wait on another replay's build, which uses up its time.
+_replay_deadline: "contextvars.ContextVar[Optional[float]]" = contextvars.ContextVar(
+    "revenium_replay_deadline", default=None
+)
+
+
+def _time_left_for_call(timeout_seconds: float) -> float:
+    """``timeout_seconds``, capped by what is left of this replay's flush; raises ``_NotAttempted`` once it passed."""
+    timeout = _time_for_one_call(timeout_seconds, _replay_deadline.get())
+    if timeout is None:
+        raise _NotAttempted()
+    return timeout
+
+
+def _join_by(threads: List[threading.Thread], deadline: Optional[float]) -> None:
+    for thread in threads:
+        thread.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
 
 
 def _replay_concurrently(
-    replay_fn: Callable[[BufferedEvent, float], None], batch: List[BufferedEvent], timeout_seconds: float
-) -> List[Optional[Exception]]:
-    """Replay ``batch`` with one thread per event after the first, which runs here; each event's error or None."""
-    errors: List[Optional[Exception]] = [None] * len(batch)
+    replay_fn: Callable[[BufferedEvent, float], None],
+    batch: List[BufferedEvent],
+    timeout_seconds: float,
+    deadline: Optional[float] = None,
+) -> Tuple[List[Optional[Exception]], bool]:
+    """Replay ``batch`` with one thread per event, or here for a batch of one; each event's error or None,
+    and whether a thread could not start.
+
+    From the first thread that cannot start (Python 3.12.0 to 3.12.2 inside
+    atexit), the rest of the batch replays here, one at a time, each call
+    capped by what is left before ``deadline``; events it leaves untried fail
+    with ``_NotAttempted``, as do those of threads still replaying at the
+    deadline, which are not waited for.
+    """
+    errors: List[Optional[Exception]] = [_NotAttempted() for _ in batch]
 
     def replay(index: int) -> None:
+        timeout = _time_for_one_call(timeout_seconds, deadline)
+        if timeout is None:
+            return
+        token = _replay_deadline.set(deadline)
         try:
-            replay_fn(batch[index], timeout_seconds)
+            replay_fn(batch[index], timeout)
         except Exception as exc:  # noqa: BLE001 - classified by the flush that waits on the batch
             errors[index] = exc
+        else:
+            errors[index] = None
+        finally:
+            _replay_deadline.reset(token)
 
     threads = []
-    for index in range(1, len(batch)):
+    inline_from = len(batch) if len(batch) > 1 else 0
+    for index in range(inline_from):
         thread = threading.Thread(target=replay, args=(index,), name="MeteringReplay", daemon=True)
         try:
             thread.start()
         except RuntimeError:
-            replay(index)
-            continue
+            inline_from = index
+            break
         threads.append(thread)
-    replay(0)
-    for thread in threads:
-        thread.join()
-    return errors
+    for index in range(inline_from, len(batch)):
+        replay(index)
+    _join_by(threads, deadline)
+    return list(errors), len(batch) > 1 and len(threads) < len(batch)
 
 
 def _sort_outcomes(batch: List[BufferedEvent], errors: List[Optional[Exception]]) -> _ReplayOutcome:
     sent = ai_sent = discarded = 0
     retry: List[BufferedEvent] = []
     status: List[Optional[Tuple[BaseException, str]]] = []
+    unreachable_kinds: Set[str] = set()
     for event, error in zip(batch, errors):
         if error is None:
             sent += 1
             ai_sent += event.kind == AI_KIND
             status.append(None)
+        elif isinstance(error, _NotAttempted):
+            retry.append(event)
         elif is_retryable_failure(error):
             logger.debug("Buffer flush stopped replaying %s events; their endpoint is still unreachable: %s",
                          event.kind, error)
             retry.append(event)
+            unreachable_kinds.add(event.kind)
         else:
             discarded += 1
             status.append((error, event.kind))
-            logger.debug("Discarded buffered event after permanent failure: %s", error)
-    return _ReplayOutcome(sent, ai_sent, discarded, retry, status)
+            if not warn_if_redirected(error):
+                logger.debug("Discarded buffered event after permanent failure: %s", error)
+    return _ReplayOutcome(sent, ai_sent, discarded, retry, status, unreachable_kinds)
 
 
 class _BatchLimits(NamedTuple):
@@ -502,10 +644,14 @@ class MeteringBuffer:
         now_fn: Callable[[], float] = time.time,
         replay_concurrency: Optional[int] = None,
         replay_timeout_seconds: Optional[float] = None,
+        exit_replay_concurrency: Optional[int] = None,
     ):
         """Without ``replay_concurrency``, replay ``REPLAY_CONCURRENCY`` events at once with the default replay, else 1.
 
-        ``replay_timeout_seconds`` caps one replay attempt; by default, ``REVENIUM_METERING_TIMEOUT_SECONDS``.
+        ``exit_replay_concurrency`` is the width of a flush with a deadline;
+        by default ``EXIT_REPLAY_CONCURRENCY`` with the default replay, else
+        ``replay_concurrency``. ``replay_timeout_seconds`` caps one replay
+        attempt; by default, ``REVENIUM_METERING_TIMEOUT_SECONDS``.
         """
         if replay_timeout_seconds is None:
             from revenium_middleware._core.metering import metering_client_timeout
@@ -515,10 +661,16 @@ class MeteringBuffer:
         self._max_size = max_size
         self._flush_interval = flush_interval
         self._max_age_seconds = max_age_seconds
-        self._replay_fn = replay_fn or _default_replay
+        self._replay_clients = _ReplayClients()
+        self._replay_fn = replay_fn or functools.partial(_default_replay, replay_clients=self._replay_clients)
         if replay_concurrency is None:
             replay_concurrency = REPLAY_CONCURRENCY if replay_fn is None else 1
         self._replay_concurrency = replay_concurrency
+        if exit_replay_concurrency is None:
+            exit_replay_concurrency = (
+                max(replay_concurrency, EXIT_REPLAY_CONCURRENCY) if replay_fn is None else replay_concurrency
+            )
+        self._exit_replay_concurrency = exit_replay_concurrency
         self._now_fn = now_fn
 
         self._events: Deque[BufferedEvent] = deque()
@@ -575,12 +727,15 @@ class MeteringBuffer:
         order when the flush ends, while the other kind's events behind them
         are still replayed. Stops when every kind has failed, on the deadline,
         or when the buffer is drained. Permanent failures and expired events
-        are discarded. Without a deadline, up to ``replay_concurrency`` events
-        are replayed at once, no more than one of them an AI event while the
-        delivery circuit is open; with a deadline (the exit drain), one at a
-        time. Serialized: concurrent flushes queue up, and one with a deadline
-        stops waiting for the flush in progress when the deadline passes,
-        replaying nothing.
+        are discarded. Up to ``replay_concurrency`` events are replayed at
+        once, or ``exit_replay_concurrency`` with a deadline (the exit drain,
+        ``flush_metering()``), no more than one of them an AI event while the
+        delivery circuit is open, and one at a time once a replay thread
+        could not start. Serialized: concurrent flushes queue up, and one with
+        a deadline stops waiting for the flush in progress when the deadline
+        passes, replaying nothing; a flush without a deadline stops after its
+        current batch once the exit drain has started, and does not start
+        replaying after that, so that drain replays the rest at its own width.
         """
         sent = expired = discarded = 0
         started = time.monotonic()
@@ -609,26 +764,36 @@ class MeteringBuffer:
         with self._lock:
             late_overflow = self._register_build([])
         unreachable_kinds: Set[str] = set()
+        deadline = None if deadline_seconds is None else started + deadline_seconds
+        threads_refused = False
         try:
-            while deadline_seconds is None or time.monotonic() - started < deadline_seconds:
+            while self._may_replay_more(deadline_seconds, started):
                 batch, expired_events = self._take_replay_batch(
-                    self._batch_limits(deadline_seconds), unreachable_kinds, late_overflow
+                    self._batch_limits(deadline_seconds, threads_refused), unreachable_kinds, late_overflow
                 )
                 deferred_outcomes.extend(self._expire(expired_events))
                 expired += len(expired_events)
                 if not batch:
                     break
 
-                errors = _replay_concurrently(self._replay_fn, batch, self._replay_timeout(deadline_seconds, started))
+                errors, refused = _replay_concurrently(
+                    self._replay_fn, batch, self._replay_timeout(deadline_seconds, started), deadline
+                )
+                threads_refused = threads_refused or refused
                 outcome = _sort_outcomes(batch, errors)
                 self._settle_replays(outcome)
                 sent += outcome.sent
                 discarded += outcome.discarded
                 deferred_outcomes.extend(outcome.status)
-                unreachable_kinds.update(event.kind for event in outcome.retry)
+                unreachable_kinds.update(outcome.unreachable_kinds)
         finally:
-            self._unpark()
-            self._flush_lock.release()
+            try:
+                self._unpark()
+            finally:
+                try:
+                    self._replay_clients.close_all()
+                finally:
+                    self._flush_lock.release()
 
         for status in deferred_outcomes:
             if status is None:
@@ -650,12 +815,21 @@ class MeteringBuffer:
             )
         return {"sent": sent, "expired": expired, "discarded": discarded, "remaining": remaining}
 
-    def _batch_limits(self, deadline_seconds: Optional[float]) -> _BatchLimits:
-        if deadline_seconds is not None:
-            return _BatchLimits(size=1, ai=1)
-        if get_circuit().is_open():
-            return _BatchLimits(size=self._replay_concurrency, ai=1)
-        return _BatchLimits(size=self._replay_concurrency, ai=self._replay_concurrency)
+    @staticmethod
+    def _may_replay_more(deadline_seconds: Optional[float], started: float) -> bool:
+        """Until the deadline; without one, until the exit drain starts, which then replays the rest at its width."""
+        if deadline_seconds is None:
+            return not _exit_drain_started()
+        return time.monotonic() - started < deadline_seconds
+
+    def _batch_limits(self, deadline_seconds: Optional[float], threads_refused: bool) -> _BatchLimits:
+        if threads_refused:
+            size = 1
+        elif deadline_seconds is None:
+            size = self._replay_concurrency
+        else:
+            size = self._exit_replay_concurrency
+        return _BatchLimits(size=size, ai=1 if get_circuit().is_open() else size)
 
     def _replay_timeout(self, deadline_seconds: Optional[float], started: float) -> float:
         """Cap each replay call so a single slow network call cannot blow through the flush deadline.
@@ -729,7 +903,7 @@ class MeteringBuffer:
         # records that failed in it go back to the front and are retried.
         if outcome.ai_sent:
             get_circuit().record_success()
-        elif any(event.kind == AI_KIND for event in outcome.retry):
+        elif AI_KIND in outcome.unreachable_kinds:
             get_circuit().record_failure()
 
     def _unpark(self) -> None:
@@ -983,13 +1157,11 @@ class MeteringBuffer:
             self._thread = thread
 
     def _run(self) -> None:
-        from revenium_middleware._core.metering import shutdown_event
-
         while True:
             self._replay_requested.wait(self._flush_interval)
             self._replay_requested.clear()
             # Final drain happens in handle_exit(), which owns the shutdown budget.
-            if shutdown_event.is_set():
+            if _exit_drain_started():
                 return
             try:
                 self.flush()
@@ -998,9 +1170,31 @@ class MeteringBuffer:
             self.report_evictions()
 
 
+def _exit_drain_started() -> bool:
+    from revenium_middleware._core.metering import shutdown_event
+
+    return shutdown_event.is_set()
+
+
 _buffer: Optional[MeteringBuffer] = None
 # Reentrant for the same reason as the buffer's own locks.
 _buffer_init_lock = threading.RLock()
+# A forked child keeps its parents' buffers so the overflowed coroutines they
+# hold, which the parent sends, are never collected unawaited in the child.
+_buffers_left_by_parent: List[MeteringBuffer] = []
+
+
+def _forget_parent_buffer() -> None:
+    """Give a forked child an empty buffer of its own; the parent's held events are the parent's to send."""
+    global _buffer, _buffer_init_lock
+    if _buffer is not None:
+        _buffers_left_by_parent.append(_buffer)
+    _buffer = None
+    _buffer_init_lock = threading.RLock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forget_parent_buffer)
 
 
 def _is_usable_flush_interval(seconds: float) -> bool:

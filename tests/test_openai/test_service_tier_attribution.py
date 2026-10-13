@@ -28,7 +28,7 @@ def _log(usage_metadata):
     )
 
 
-@patch("revenium_middleware.openai.middleware.get_client", lambda: object())
+@patch("revenium_middleware.openai.middleware.current_client", lambda: object())
 @patch("revenium_middleware.openai.middleware.submit_ai_event")
 def test_usage_metadata_tier_fields_forwarded_as_typed_kwargs(mock_submit):
     mock_submit.return_value = SimpleNamespace(id="completion-service-tier-test")
@@ -53,7 +53,7 @@ def test_usage_metadata_tier_fields_forwarded_as_typed_kwargs(mock_submit):
     assert "pricingTier" not in extra_body
 
 
-@patch("revenium_middleware.openai.middleware.get_client", lambda: object())
+@patch("revenium_middleware.openai.middleware.current_client", lambda: object())
 @patch("revenium_middleware.openai.middleware.submit_ai_event")
 def test_unset_tier_fields_omitted_from_payload(mock_submit):
     mock_submit.return_value = SimpleNamespace(id="completion-service-tier-test")

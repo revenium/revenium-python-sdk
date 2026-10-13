@@ -450,3 +450,84 @@ class TestMessagesStream:
         assert payload["cache_creation_token_count"] == 300
         assert "cache_creation5m_token_count" not in payload
         assert "cache_creation1h_token_count" not in payload
+
+
+def litellm_usage(cache_creation):
+    """Usage as LiteLLM converts an Anthropic response, built by LiteLLM itself.
+
+    LiteLLM moves the split under ``prompt_tokens_details.cache_creation_token_details``
+    and folds the cache tokens into ``prompt_tokens``, so the native read of
+    ``usage.cache_creation`` finds nothing there.
+    """
+    transformation = pytest.importorskip("litellm.llms.anthropic.chat.transformation")
+    total = sum(cache_creation.values())
+    return transformation.AnthropicConfig().calculate_usage(
+        {
+            "input_tokens": 16,
+            "output_tokens": 6,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": total,
+            "cache_creation": cache_creation,
+        },
+        None,
+    )
+
+
+def test_extraction_reads_litellms_nested_split():
+    converted = litellm_usage({"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 3000})
+
+    assert extract_cache_creation_ttl_counts(converted) == {
+        "cache_creation5m_token_count": 0,
+        "cache_creation1h_token_count": 3000,
+    }
+
+
+def test_extraction_reads_a_mixed_nested_split():
+    converted = litellm_usage({"ephemeral_5m_input_tokens": 1000, "ephemeral_1h_input_tokens": 2000})
+
+    assert extract_cache_creation_ttl_counts(converted) == {
+        "cache_creation5m_token_count": 1000,
+        "cache_creation1h_token_count": 2000,
+    }
+
+
+def test_extraction_forwards_a_partial_split_as_given():
+    # No sum check on Anthropic or LiteLLM buckets: the backend charges any
+    # remainder of the aggregate at the five-minute rate.
+    partial = {
+        "prompt_tokens": 3016,
+        "prompt_tokens_details": {
+            "cache_creation_tokens": 3000,
+            "cache_creation_token_details": {"ephemeral_1h_input_tokens": 1000},
+        },
+    }
+
+    assert extract_cache_creation_ttl_counts(partial) == {"cache_creation1h_token_count": 1000}
+
+
+def test_converse_cache_details_map_to_both_buckets():
+    converse_usage = {
+        "inputTokens": 13,
+        "outputTokens": 4,
+        "cacheReadInputTokens": 0,
+        "cacheWriteInputTokens": 3000,
+        "cacheDetails": [{"ttl": "1h", "inputTokens": 2000}, {"ttl": "5m", "inputTokens": 1000}],
+    }
+
+    assert extract_cache_creation_ttl_counts(converse_usage) == {
+        "cache_creation5m_token_count": 1000,
+        "cache_creation1h_token_count": 2000,
+    }
+
+
+def test_converse_cache_details_that_do_not_sum_are_dropped():
+    # LiteLLM's own Converse parser keeps a split only when it accounts for the
+    # whole write; a partial one would understate the write's cost.
+    converse_usage = {
+        "inputTokens": 13,
+        "outputTokens": 4,
+        "cacheWriteInputTokens": 3000,
+        "cacheDetails": [{"ttl": "1h", "inputTokens": 1000}],
+    }
+
+    assert extract_cache_creation_ttl_counts(converse_usage) == {}

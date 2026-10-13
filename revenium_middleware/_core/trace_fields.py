@@ -46,40 +46,53 @@ AGENT_VERSION_MAX_LENGTH = 64
 TRACE_TYPE_PATTERN = re.compile(r'^[a-zA-Z0-9_-]+$')
 
 
-def get_environment() -> Optional[str]:
+def _per_call(usage_metadata: Optional[Dict[str, Any]], *aliases: str) -> Any:
+    """The first set value of ``aliases`` in the call's metadata, or None."""
+    if not usage_metadata:
+        return None
+    for alias in aliases:
+        value = usage_metadata.get(alias)
+        if value:
+            return value
+    return None
+
+
+def get_environment(usage_metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """
-    Get deployment environment from environment variables.
+    Get deployment environment, the call's own value first.
 
     Checks in order:
-    1. REVENIUM_ENVIRONMENT
-    2. ENVIRONMENT
-    3. DEPLOYMENT_ENV
+    1. environment from usage_metadata
+    2. REVENIUM_ENVIRONMENT
+    3. ENVIRONMENT
+    4. DEPLOYMENT_ENV
 
     Returns:
         Environment name (e.g., 'production', 'staging') or None
     """
     return (
+        _per_call(usage_metadata, 'environment') or
         os.getenv(ENV_REVENIUM_ENVIRONMENT) or
         os.getenv(ENV_ENVIRONMENT) or
         os.getenv(ENV_DEPLOYMENT_ENV)
     )
 
 
-def get_region() -> Optional[str]:
+def get_region(usage_metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """
-    Get cloud region from environment variables.
+    Get cloud region, the call's own value first.
 
     Checks in order:
-    1. REVENIUM_REGION
-    2. AWS_REGION or AWS_DEFAULT_REGION
-    3. AZURE_REGION
-    4. GCP_REGION or GOOGLE_CLOUD_REGION
+    1. region from usage_metadata
+    2. REVENIUM_REGION
+    3. AWS_REGION or AWS_DEFAULT_REGION
+    4. AZURE_REGION
+    5. GCP_REGION or GOOGLE_CLOUD_REGION
 
     Returns:
         Region name (e.g., 'us-east-1', 'eastus') or None
     """
-    # Try Revenium-specific env var first
-    region = os.getenv(ENV_REVENIUM_REGION)
+    region = _per_call(usage_metadata, 'region') or os.getenv(ENV_REVENIUM_REGION)
     if region:
         return region
 
@@ -101,50 +114,59 @@ def get_region() -> Optional[str]:
     return None
 
 
-def get_credential_alias() -> Optional[str]:
+def get_credential_alias(usage_metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """
-    Get credential alias from environment variables.
+    Get credential alias, the call's own value first, then the environment.
 
     Returns:
         Credential alias (e.g., 'prod-api-key', 'staging-key') or None
     """
-    return os.getenv(ENV_REVENIUM_CREDENTIAL_ALIAS)
+    return (
+        _per_call(usage_metadata, 'credentialAlias', 'credential_alias') or
+        os.getenv(ENV_REVENIUM_CREDENTIAL_ALIAS)
+    )
 
 
-def get_trace_type() -> Optional[str]:
+def get_trace_type(usage_metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """
-    Get and validate trace type from environment variables.
+    Get and validate trace type, the call's own value first, then the environment.
+
+    An invalid per-call value is omitted rather than replaced by the
+    environment's.
 
     Returns:
         Validated trace type or None if invalid/not set
     """
-    trace_type = os.getenv(ENV_REVENIUM_TRACE_TYPE)
+    trace_type = _per_call(usage_metadata, 'traceType', 'trace_type') or os.getenv(ENV_REVENIUM_TRACE_TYPE)
     if trace_type:
         return validate_trace_type(trace_type)
     return None
 
 
-def get_trace_name() -> Optional[str]:
+def get_trace_name(usage_metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """
-    Get and validate trace name from environment variables.
+    Get and validate trace name, the call's own value first, then the environment.
 
     Returns:
         Validated trace name (truncated if needed) or None if not set
     """
-    trace_name = os.getenv(ENV_REVENIUM_TRACE_NAME)
+    trace_name = _per_call(usage_metadata, 'traceName', 'trace_name') or os.getenv(ENV_REVENIUM_TRACE_NAME)
     if trace_name:
         return validate_trace_name(trace_name)
     return None
 
 
-def get_parent_transaction_id() -> Optional[str]:
+def get_parent_transaction_id(usage_metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """
-    Get parent transaction ID from environment variables.
+    Get parent transaction ID, the call's own value first, then the environment.
 
     Returns:
         Parent transaction ID or None
     """
-    return os.getenv(ENV_REVENIUM_PARENT_TRANSACTION_ID)
+    return (
+        _per_call(usage_metadata, 'parentTransactionId', 'parent_transaction_id') or
+        os.getenv(ENV_REVENIUM_PARENT_TRANSACTION_ID)
+    )
 
 
 def get_transaction_name(usage_metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
@@ -152,8 +174,8 @@ def get_transaction_name(usage_metadata: Optional[Dict[str, Any]] = None) -> Opt
     Get transaction name with fallback to task_type.
 
     Checks in order:
-    1. REVENIUM_TRANSACTION_NAME env var
-    2. transactionName from usage_metadata
+    1. transactionName / transaction_name from usage_metadata
+    2. REVENIUM_TRANSACTION_NAME env var
     3. task_type from usage_metadata (fallback)
 
     Args:
@@ -162,29 +184,11 @@ def get_transaction_name(usage_metadata: Optional[Dict[str, Any]] = None) -> Opt
     Returns:
         Transaction name or None
     """
-    # First priority: env var
-    transaction_name = os.getenv(ENV_REVENIUM_TRANSACTION_NAME)
-    if transaction_name:
-        return transaction_name
-
-    # Second priority: usage_metadata
-    if usage_metadata:
-        transaction_name = (
-            usage_metadata.get('transactionName') or
-            usage_metadata.get('transaction_name')
-        )
-        if transaction_name:
-            return transaction_name
-
-        # Third priority: fallback to task_type
-        task_type = (
-            usage_metadata.get('task_type') or
-            usage_metadata.get('taskType')
-        )
-        if task_type:
-            return task_type
-
-    return None
+    return (
+        _per_call(usage_metadata, 'transactionName', 'transaction_name') or
+        os.getenv(ENV_REVENIUM_TRANSACTION_NAME) or
+        _per_call(usage_metadata, 'task_type', 'taskType')
+    )
 
 
 def get_ticket_id(usage_metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
@@ -242,13 +246,32 @@ def get_agent_version(
     return None
 
 
-def get_retry_number() -> int:
+def _per_call_retry_number(usage_metadata: Optional[Dict[str, Any]]) -> Optional[int]:
+    if not usage_metadata:
+        return None
+    value = usage_metadata.get('retryNumber')
+    if value is None:
+        value = usage_metadata.get('retry_number')
+    if value is None:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.isdecimal():
+        return int(value)
+    logger.warning("Invalid retry number in usage_metadata, using REVENIUM_RETRY_NUMBER")
+    return None
+
+
+def get_retry_number(usage_metadata: Optional[Dict[str, Any]] = None) -> int:
     """
-    Get retry number from environment variables.
+    Get retry number, the call's own value first, then the environment.
 
     Returns:
         Retry number (0 for first attempt, 1+ for retries)
     """
+    per_call = _per_call_retry_number(usage_metadata)
+    if per_call is not None:
+        return per_call
     try:
         return int(os.getenv(ENV_REVENIUM_RETRY_NUMBER, '0'))
     except ValueError:
@@ -256,6 +279,12 @@ def get_retry_number() -> int:
             "Invalid REVENIUM_RETRY_NUMBER value, defaulting to 0"
         )
         return 0
+
+
+def _warn_not_a_string(name: str, value: Any) -> None:
+    logger.warning(
+        f"{name} must be a string, got {type(value).__name__}. Field will be omitted."
+    )
 
 
 def validate_trace_type(trace_type: str) -> Optional[str]:
@@ -273,6 +302,9 @@ def validate_trace_type(trace_type: str) -> Optional[str]:
         Valid trace type or None if invalid
     """
     if not trace_type:
+        return None
+    if not isinstance(trace_type, str):
+        _warn_not_a_string("traceType", trace_type)
         return None
 
     # Check length
@@ -312,6 +344,9 @@ def validate_trace_name(trace_name: str) -> Optional[str]:
     """
     if not trace_name:
         return None
+    if not isinstance(trace_name, str):
+        _warn_not_a_string("traceName", trace_name)
+        return None
 
     # Check length and truncate if needed
     if len(trace_name) > TRACE_NAME_MAX_LENGTH:
@@ -326,20 +361,32 @@ def validate_trace_name(trace_name: str) -> Optional[str]:
     return trace_name
 
 
-def validate_ticket_id(ticket_id: str) -> Optional[str]:
+def validate_ticket_id(ticket_id: Any) -> Optional[str]:
     """
     Validate ticket ID length and truncate if needed.
 
     Rules:
+    - Non-string values are dropped, never coerced (as validate_agent_version)
     - Maximum 256 characters
     - Truncates with warning if too long
 
     Args:
-        ticket_id: Ticket ID to validate
+        ticket_id: Caller-supplied ticket ID, straight from ``usage_metadata``
 
     Returns:
-        Valid ticket ID (truncated if needed) or None if empty
+        Valid ticket ID (truncated if needed) or None if empty or non-string
     """
+    if ticket_id is None:
+        return None
+
+    if not isinstance(ticket_id, str):
+        logger.debug(
+            "Ignoring non-string ticketId of type %s; "
+            "ticket attribution dropped for this event.",
+            type(ticket_id).__name__,
+        )
+        return None
+
     if not ticket_id:
         return None
 

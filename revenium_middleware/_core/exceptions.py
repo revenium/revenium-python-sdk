@@ -25,6 +25,7 @@ class BudgetExceededError(Exception):
         threshold: Optional[float] = None,
         resets_at: Optional[str] = None,
         rule_id: Optional[Union[str, int]] = None,
+        deny_message: Optional[str] = None,
     ):
         super().__init__(message)
         self.message = message
@@ -33,6 +34,7 @@ class BudgetExceededError(Exception):
         self.threshold = threshold
         self.resets_at = resets_at
         self.rule_id = rule_id
+        self.deny_message = deny_message
 
 
 # Deprecated alias preserved for backward compatibility. The exception was
@@ -90,9 +92,8 @@ class OutcomeAmendConflictError(OutcomeReportingError):
     the outcome you intend to write (``get_outcome_history`` shows what the
     other writer changed), then re-issue the amendment with
     ``expected_entity_version`` set to it. It is ``None`` when the body carries
-    no version, in which case the version has to come from a job read outside
-    this SDK (``GET /v2/api/jobs/{agenticJobId}``) — history rows carry a
-    ``sequence``, not an entity version. The SDK does not auto-retry:
+    no version, in which case it takes ``get_job(job_id)["entityVersion"]`` to
+    obtain one; history rows carry a ``sequence``, not an entity version. The SDK does not auto-retry:
     PATCH-amend is not idempotent, so a blind retry can append a duplicate
     history row.
     """

@@ -225,9 +225,7 @@ class AICreateImageParams(TypedDict, total=False):
     model_source: Annotated[str, PropertyInfo(alias="modelSource")]
     """The source of the AI model used"""
 
-    # Sent on every metered call although it is not in the published spec:
-    # _core/trace_fields.py::get_credential_alias() supplies the value on
-    # live traffic; removal pending confirmation from the metering API owners.
+    # SDK-side input only: resources/ai.py sends it as subscriber.credential.name, never under this name.
     credential_alias: Annotated[str, PropertyInfo(alias="credentialAlias")]
     """Human-readable name for the API key being used"""
 

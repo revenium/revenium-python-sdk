@@ -19,7 +19,11 @@ import threading
 
 from typing import Dict, Any, Optional, Tuple, Generator, Iterator, Union, List
 
+from revenium_middleware.anthropic.bedrock_model_names import anthropic_model_name, bedrock_reported_model_id  # noqa: F401
 from revenium_middleware.anthropic.bedrock_transport import suppress_transport_metering
+from revenium_middleware._core.log_sanitize import sanitize_for_logging
+from revenium_middleware._core.call_context import CallContext
+from revenium_middleware._core.metering import current_client, recorded_under
 
 logger = logging.getLogger("revenium_middleware.extension")
 
@@ -264,7 +268,7 @@ def _extract_token_counts(usage: Any, metrics: Optional[Any] = None) -> Tuple[Op
     return input_tokens, output_tokens
 
 
-def bedrock_invoke(model: str, payload: dict, region: Optional[str] = None) -> Tuple[str, int, int, int, int]:
+def bedrock_invoke(model: str, payload: dict, region: Optional[str] = None) -> Tuple[str, int, int, int, int, Any]:
     """
     Invoke Bedrock model with Anthropic-compatible parameters.
 
@@ -274,7 +278,8 @@ def bedrock_invoke(model: str, payload: dict, region: Optional[str] = None) -> T
         region: AWS region (defaults to AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1)
 
     Returns:
-        Tuple of (text_content, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens)
+        Tuple of (text_content, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+        cache_creation), the last being the response's per-TTL cache-write split or None
 
     Raises:
         BedrockValidationError: For invalid input parameters
@@ -330,7 +335,7 @@ def bedrock_invoke(model: str, payload: dict, region: Optional[str] = None) -> T
         cache_read_tokens = cache_read_tokens if cache_read_tokens is not None else 0
 
         logger.debug(f"Bedrock invoke successful: {input_tokens} input tokens, {output_tokens} output tokens")
-        return text, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens
+        return text, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, usage.get("cache_creation")
 
     except BedrockValidationError:
         # Re-raise validation errors as-is
@@ -359,6 +364,7 @@ class BedrockStreamIterator:
         self.output_tokens = 0
         self.cache_creation_tokens = 0
         self.cache_read_tokens = 0
+        self.cache_creation = None
         self._stream = None
         self._started = False
 
@@ -431,7 +437,8 @@ class BedrockStreamIterator:
                 if not isinstance(chunk_data, dict):
                     continue
 
-                logger.debug(f"Bedrock stream chunk: {chunk_data}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug("Bedrock stream chunk: %s", sanitize_for_logging(chunk_data))
 
                 chunk_type = chunk_data.get("type")
                 usage = _as_dict(chunk_data.get("usage"))
@@ -485,6 +492,8 @@ class BedrockStreamIterator:
             self.cache_creation_tokens = cache_creation_tokens
         if cache_read_tokens is not None:
             self.cache_read_tokens = cache_read_tokens
+        if usage.get("cache_creation"):
+            self.cache_creation = usage["cache_creation"]
 
 
 def bedrock_invoke_stream(model: str, payload: dict, region: Optional[str] = None) -> BedrockStreamIterator:
@@ -571,7 +580,8 @@ def create_bedrock_payload(messages: Union[list, List[Dict[str, Any]]], **kwargs
 
 def create_anthropic_response(text: str, input_tokens: int, output_tokens: int,
                             model: str, request_id: Optional[str] = None,
-                            cache_creation_tokens: int = 0, cache_read_tokens: int = 0):
+                            cache_creation_tokens: int = 0, cache_read_tokens: int = 0,
+                            cache_creation: Any = None):
     """
     Create an Anthropic-compatible response object.
 
@@ -583,6 +593,8 @@ def create_anthropic_response(text: str, input_tokens: int, output_tokens: int,
         request_id: Optional request ID
         cache_creation_tokens: Number of cache creation input tokens (default 0)
         cache_read_tokens: Number of cache read input tokens (default 0)
+        cache_creation: The response's per-TTL cache-write split, Anthropic's
+            ``usage.cache_creation`` (default None, as Anthropic reports no split)
 
     Returns:
         Object that mimics Anthropic's Message response structure with both
@@ -632,25 +644,29 @@ def create_anthropic_response(text: str, input_tokens: int, output_tokens: int,
             self.text = text
 
     class Usage(HybridAccessMixin):
-        def __init__(self, input_tokens, output_tokens, cache_creation_tokens=0, cache_read_tokens=0):
+        def __init__(self, input_tokens, output_tokens, cache_creation_tokens=0, cache_read_tokens=0,
+                     cache_creation=None):
             self.input_tokens = input_tokens
             self.output_tokens = output_tokens
             self.total_tokens = input_tokens + output_tokens
             self.cache_creation_input_tokens = cache_creation_tokens
             self.cache_read_input_tokens = cache_read_tokens
+            self.cache_creation = cache_creation
 
     class Message(HybridAccessMixin):
-        def __init__(self, text, input_tokens, output_tokens, model, request_id, cache_creation_tokens=0, cache_read_tokens=0):
+        def __init__(self, text, input_tokens, output_tokens, model, request_id, cache_creation_tokens=0,
+                     cache_read_tokens=0, cache_creation=None):
             self.id = request_id or _generate_safe_id("msg_bedrock", text)
             self.type = "message"
             self.role = "assistant"
             self.model = model
             self.content = [TextBlock(text)]
-            self.usage = Usage(input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens)
+            self.usage = Usage(input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, cache_creation)
             self.stop_reason = "end_turn"
             self.stop_sequence = None
 
-    return Message(text, input_tokens, output_tokens, model, request_id, cache_creation_tokens, cache_read_tokens)
+    return Message(text, input_tokens, output_tokens, model, request_id, cache_creation_tokens, cache_read_tokens,
+                   cache_creation)
 
 
 class BedrockStreamWrapper:
@@ -670,6 +686,8 @@ class BedrockStreamWrapper:
         self.usage_metadata = usage_metadata or {}
         self.request_time_dt = request_time_dt or datetime.datetime.now(datetime.timezone.utc)
         self.request_time = request_time or self.request_time_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.metering_client = current_client()
+        self._call_context = CallContext()
 
         # Stream state
         self.stream_iterator = None
@@ -700,7 +718,7 @@ class BedrockStreamWrapper:
                 self._create_final_message()
 
             # Send metering data
-            self._send_metering_data(request_duration)
+            self._call_context.run(self._send_metering_data, request_duration)
 
         except Exception as e:
             logger.warning(f"Error processing final message from Bedrock stream: {str(e)}")
@@ -772,7 +790,8 @@ class BedrockStreamWrapper:
             model=self.model,
             request_id=self.response_id,
             cache_creation_tokens=self.cache_creation_tokens,
-            cache_read_tokens=self.cache_read_tokens
+            cache_read_tokens=self.cache_read_tokens,
+            cache_creation=getattr(self.stream_iterator, 'cache_creation', None),
         )
 
     def _send_metering_data(self, request_duration: float):
@@ -786,10 +805,17 @@ class BedrockStreamWrapper:
             from .trace_fields import detect_vision_content
             from revenium_middleware._core.subscriber import extract_subscriber_from_metadata
             from revenium_middleware._core import trace_fields as core_trace_fields
-            from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, extract_effort_field, extract_prompt_context_fields, merge_extra_body
+            from revenium_middleware._core.cache_tokens import extract_cache_creation_ttl_counts
+            from revenium_middleware._core.fields import extract_org_and_product, extract_common_metadata, extract_agentic_job_fields, extract_effort_field, extract_prompt_context_fields, extract_skill_fields, merge_extra_body
+            from .prompt_extractor import captured_prompt_fields
 
             if shutdown_event.is_set():
                 logger.warning("Skipping metering call during shutdown")
+                return
+
+            with recorded_under(self.metering_client):
+                no_client = _get_thread_safe_client() is None
+            if no_client:
                 return
 
             if not self.final_message:
@@ -815,6 +841,7 @@ class BedrockStreamWrapper:
             if has_vision_content:
                 extra_body['hasVisionContent'] = True
             extra_body = merge_extra_body(extra_body, extract_agentic_job_fields(self.usage_metadata or {}))
+            prompt_fields = captured_prompt_fields(self.payload, accumulated_content=self.accumulated_text)
 
             async def metering_call():
                 try:
@@ -822,12 +849,6 @@ class BedrockStreamWrapper:
                         logger.warning("Skipping metering call during shutdown")
                         return
                     logger.debug("Metering call to Revenium for Bedrock stream completion %s", self.response_id)
-
-                    # Get thread-safe client
-                    client = _get_thread_safe_client()
-                    if not client:
-                        logger.warning("No thread-safe client available for Bedrock stream metering")
-                        return
 
                     # Build subscriber object from usage metadata
                     subscriber = extract_subscriber_from_metadata(self.usage_metadata)
@@ -839,6 +860,7 @@ class BedrockStreamWrapper:
 
                     result = submit_ai_event("completion", {
                         "cache_creation_token_count": self.cache_creation_tokens,
+                        **extract_cache_creation_ttl_counts(self.final_message.usage),
                         "cache_read_token_count": self.cache_read_tokens,
                         "input_token_cost": None,
                         "output_token_cost": None,
@@ -870,6 +892,16 @@ class BedrockStreamWrapper:
                         "operation_type": "CHAT",
                         "response_quality_score": meta["response_quality_score"],
                         "middleware_source": "PYTHON",
+                        "environment": core_trace_fields.get_environment(self.usage_metadata),
+                        "region": core_trace_fields.get_region(self.usage_metadata),
+                        "credential_alias": core_trace_fields.get_credential_alias(self.usage_metadata),
+                        "trace_type": core_trace_fields.get_trace_type(self.usage_metadata),
+                        "trace_name": core_trace_fields.get_trace_name(self.usage_metadata),
+                        "ticket_id": core_trace_fields.get_ticket_id(self.usage_metadata),
+                        "parent_transaction_id": core_trace_fields.get_parent_transaction_id(self.usage_metadata),
+                        "transaction_name": core_trace_fields.get_transaction_name(self.usage_metadata),
+                        "retry_number": core_trace_fields.get_retry_number(self.usage_metadata),
+                        **extract_skill_fields(self.usage_metadata),
                         # Reasoning effort is caller-supplied and forwarded
                         # verbatim. Spread the sparse resolver result rather
                         # than reading a key off it: create_completion only
@@ -881,6 +913,7 @@ class BedrockStreamWrapper:
                         # Same sparse rule for the agent version: absent means
                         # omitted, never "agentVersion": null.
                         **({"agent_version": agent_version} if agent_version is not None else {}),
+                        **prompt_fields,
                         "extra_body": extra_body if extra_body else None,
                     })
                     logger.debug("Metering call result for Bedrock stream: %s", result)
@@ -890,7 +923,8 @@ class BedrockStreamWrapper:
                         import traceback
                         logger.warning(f"Traceback: {traceback.format_exc()}")
 
-            thread = _safe_run_async_in_thread(metering_call)
+            with recorded_under(self.metering_client):
+                thread = _safe_run_async_in_thread(metering_call)
             logger.debug("Metering thread started for Bedrock stream: %s", thread)
 
         except Exception as e:

@@ -38,7 +38,9 @@ LiteLLM upgrade that changed either dispatch fails here -- which is the failure
 mode that otherwise shows up as silently missing revenue.
 """
 
+import copy
 import datetime
+import uuid
 
 import pytest
 
@@ -368,28 +370,38 @@ class TestStreamedAnthropicRouteIsMetered:
         assert args["model"] == ANTHROPIC_MODEL
 
     @pytest.mark.asyncio
-    async def test_the_metered_id_is_litellms_call_id_not_the_anthropic_message_id(
-        self, guardrail, submit
+    async def test_the_metered_id_is_neither_the_anthropic_message_id_nor_the_callers_call_id(
+        self, monkeypatch, submit
     ):
-        """Both rows on this route must carry the same kind of id.
+        """Both rows on this route carry the request's own id.
 
         The non-streamed row on ``/v1/messages`` has no ``.id`` to read off its
-        raw Anthropic body and already falls through to LiteLLM's call id.
-        Metering the streamed row on the assembled response's ``.id`` would give
-        the two rows different identity shapes for the same route.
+        raw Anthropic body and falls through to the request's own id. Metering
+        the streamed row on the assembled response's ``.id`` would give the two
+        rows different identity shapes for the same route, and metering it on
+        LiteLLM's call id would let a caller who repeats ``x-litellm-call-id``
+        merge every call into one record.
         """
-        kwargs = logging_kwargs(
-            "anthropic_messages", stream=True, litellm_call_id="litellm-anthropic-stream"
+        monkeypatch.setenv(FLAG, "false")
+        instance = ReveniumGuardrail(
+            guardrail_name="revenium", event_hook=["pre_call", "post_call"], default_on=True
         )
+        data = guardrail_data(
+            stream=True, model=ANTHROPIC_MODEL, metadata_key="litellm_metadata"
+        )
+        stamped = await run_pre_call(instance, data, call_type="anthropic_messages")
+        kwargs = logging_kwargs_from(data, litellm_call_id="litellm-anthropic-stream")
         response = GuardrailResponse(
             response_id="msg_01AnthropicStream", usage=AssembledUsage()
         )
 
-        await guardrail.async_log_success_event(kwargs, response, NOW, LATER)
+        await instance.async_log_success_event(kwargs, response, NOW, LATER)
 
-        args = submitted_args(submit)
-        assert args["transaction_id"] == "litellm-anthropic-stream"
-        assert args["transaction_id"] != "msg_01AnthropicStream"
+        transaction_id = submitted_args(submit)["transaction_id"]
+        assert transaction_id == request_id_of(stamped)
+        assert transaction_id != "msg_01AnthropicStream"
+        assert transaction_id != "litellm-anthropic-stream"
+        uuid.UUID(transaction_id)
 
     @pytest.mark.asyncio
     async def test_metering_failure_never_escapes_the_logging_event(
@@ -406,8 +418,82 @@ class TestStreamedAnthropicRouteIsMetered:
         )
 
 
+RESPONSES_MODEL = "gpt-4o-mini"
+
+
+class TestStreamedResponsesCallIsMetered:
+    """``/v1/responses`` with ``stream: true``, which Codex CLI speaks.
+
+    On a model with a native Responses API the stream reaches no other hook of
+    this guardrail and LiteLLM's client entry points are not called, so the
+    logging event is the only meter there is.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_responses_call_is_metered_from_the_logging_event(
+        self, guardrail, submit
+    ):
+        kwargs = logging_kwargs("aresponses", stream=True, model=RESPONSES_MODEL)
+
+        await guardrail.async_log_success_event(
+            kwargs, GuardrailResponse(usage=AssembledUsage()), NOW, LATER
+        )
+
+        args = submitted_args(submit)
+        assert args["input_token_count"] == AssembledUsage.prompt_tokens
+        assert args["output_token_count"] == AssembledUsage.completion_tokens
+        assert args["is_streamed"] is True
+        assert args["middleware_source"] == "GUARDRAIL"
+        assert args["model"] == RESPONSES_MODEL
+
+    @pytest.mark.asyncio
+    async def test_a_guardrail_that_does_not_own_metering_leaves_it_to_the_client_wrapper(
+        self, submit
+    ):
+        """Without ownership the client wrapper meters a bridged stream, so a row here would be its second."""
+        not_owning = ReveniumGuardrail(
+            guardrail_name="revenium", event_hook=["pre_call", "post_call"], default_on=False
+        )
+
+        await not_owning.async_log_success_event(
+            logging_kwargs("aresponses", stream=True),
+            GuardrailResponse(usage=AssembledUsage()),
+            NOW,
+            LATER,
+        )
+
+        assert submit.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_a_key_opted_out_of_the_guardrail_is_left_to_the_client_wrapper(
+        self, guardrail, submit
+    ):
+        kwargs = logging_kwargs("aresponses", stream=True)
+        kwargs["litellm_params"]["metadata"]["user_api_key_metadata"] = {
+            "opted_out_global_guardrails": ["revenium"]
+        }
+
+        await guardrail.async_log_success_event(
+            kwargs, GuardrailResponse(usage=AssembledUsage()), NOW, LATER
+        )
+
+        assert submit.call_count == 0
+
+
 class TestTheLoggingEventMetersNothingElse:
     """The route gate, which is load-bearing: this hook fires on every call."""
+
+    @pytest.mark.asyncio
+    async def test_a_non_streamed_responses_call_is_left_to_the_post_call_hook(
+        self, guardrail, submit
+    ):
+        await guardrail.async_log_success_event(
+            logging_kwargs("aresponses", stream=False),
+            GuardrailResponse(usage=AssembledUsage()),
+            NOW,
+            LATER,
+        )
+        assert submit.call_count == 0
 
     @pytest.mark.asyncio
     async def test_a_non_streamed_anthropic_call_is_left_to_the_post_call_hook(
@@ -437,19 +523,27 @@ class TestTheLoggingEventMetersNothingElse:
 class TestOneRowPerCallAcrossBothHooks:
     """Whichever hook meters a call first, the other must not meter it again."""
 
+    @pytest.fixture(autouse=True)
+    def _shared_call_id_off(self, monkeypatch):
+        """These rows carry the request's own id; the minted id has its own class below."""
+        monkeypatch.setenv(FLAG, "false")
+
     @staticmethod
-    def _one_call(litellm_call_id="litellm-shared-call-id", call_type="anthropic_messages"):
-        """The two shapes one completed call reaches our two hooks in."""
-        kwargs = logging_kwargs(call_type, stream=True, litellm_call_id=litellm_call_id)
+    async def _one_call(instance, litellm_call_id="litellm-shared-call-id", call_type="anthropic_messages"):
+        """The two shapes one completed call reaches our two hooks in, after its pre-call."""
         data = guardrail_data(stream=True, model=ANTHROPIC_MODEL)
         data["litellm_call_id"] = litellm_call_id
+        await instance.async_pre_call_hook(
+            user_api_key_dict=make_key_dict(), cache=MagicMock(), data=data, call_type=call_type
+        )
+        kwargs = logging_kwargs_from(data, litellm_call_id=litellm_call_id, call_type=call_type)
         return kwargs, data
 
     @pytest.mark.asyncio
     async def test_the_post_call_hook_does_not_re_meter_a_logged_stream(
         self, guardrail, submit
     ):
-        kwargs, data = self._one_call()
+        kwargs, data = await self._one_call(guardrail)
         response = GuardrailResponse(usage=AssembledUsage())
 
         await guardrail.async_log_success_event(kwargs, response, NOW, LATER)
@@ -457,7 +551,7 @@ class TestOneRowPerCallAcrossBothHooks:
             data=data, user_api_key_dict=make_key_dict(), response=response
         )
 
-        assert submitted_args(submit)["transaction_id"] == "litellm-shared-call-id"
+        assert submitted_args(submit)["transaction_id"] != "litellm-shared-call-id"
 
     @pytest.mark.asyncio
     async def test_the_logging_event_does_not_re_meter_a_post_called_stream(
@@ -469,7 +563,7 @@ class TestOneRowPerCallAcrossBothHooks:
         dispatches success logging, so this is the order that matters if a
         provider's ``anthropic_messages`` stream ever arrives as a wrapper.
         """
-        kwargs, data = self._one_call()
+        kwargs, data = await self._one_call(guardrail)
         response = GuardrailResponse(usage=AssembledUsage())
 
         await guardrail.async_post_call_success_hook(
@@ -483,7 +577,7 @@ class TestOneRowPerCallAcrossBothHooks:
     async def test_two_different_calls_still_produce_two_rows(self, guardrail, submit):
         """The guard remembers calls, not routes: distinct calls are distinct rows."""
         for call_id in ("litellm-call-a", "litellm-call-b"):
-            kwargs, _ = self._one_call(litellm_call_id=call_id)
+            kwargs, _ = await self._one_call(guardrail, litellm_call_id=call_id)
             await guardrail.async_log_success_event(
                 kwargs, GuardrailResponse(usage=AssembledUsage()), NOW, LATER
             )
@@ -495,7 +589,7 @@ class TestOneRowPerCallAcrossBothHooks:
         self, registered, submit
     ):
         """The route the guard must not disturb: one row, from the post-call hook."""
-        kwargs, data = self._one_call(call_type="acompletion")
+        kwargs, data = await self._one_call(registered, call_type="acompletion")
         response = GuardrailResponse(response_id="chatcmpl-stream", usage=AssembledUsage())
 
         await run_deferred_stream(
@@ -516,7 +610,7 @@ class TestOneRowPerCallAcrossBothHooks:
         success for the attempt that worked. Both rows are wanted, so the guard
         covers the success paths only.
         """
-        kwargs, data = self._one_call()
+        kwargs, data = await self._one_call(guardrail)
 
         await guardrail.async_log_success_event(
             kwargs, GuardrailResponse(usage=AssembledUsage()), NOW, LATER
@@ -728,15 +822,15 @@ class TestTheStreamedRowTakesTheMintedId:
         assert args["transaction_id"] != "msg_01AnthropicStream"
 
     @pytest.mark.asyncio
-    async def test_the_streamed_row_falls_back_to_litellms_call_id_with_the_flag_off(
+    async def test_the_streamed_row_takes_a_per_request_id_with_the_flag_off(
         self, submit
     ):
-        """Flag off is the shipped default, and it must behave as it did."""
+        """With the flag off, the row carries the request's own id, never the caller's."""
         instance = self._new_guardrail()
         data = guardrail_data(
             stream=True, model=ANTHROPIC_MODEL, metadata_key="litellm_metadata"
         )
-        await self._mint(instance, data)
+        stamped = await run_pre_call(instance, data, call_type="anthropic_messages")
         assert "revenium_call_id" not in data["litellm_metadata"]
 
         kwargs = logging_kwargs_from(data, litellm_call_id="litellm-anthropic-stream")
@@ -749,7 +843,11 @@ class TestTheStreamedRowTakesTheMintedId:
             LATER,
         )
 
-        assert submitted_args(submit)["transaction_id"] == "litellm-anthropic-stream"
+        transaction_id = submitted_args(submit)["transaction_id"]
+        assert transaction_id == request_id_of(stamped)
+        assert transaction_id != "litellm-anthropic-stream"
+        assert transaction_id != "msg_01AnthropicStream"
+        uuid.UUID(transaction_id)
 
     @pytest.mark.asyncio
     async def test_the_streamed_path_reads_the_header_key_this_route_fills(
@@ -901,3 +999,608 @@ class TestTheStreamedRowTakesTheMintedId:
         assert submit.call_count == 2
         ids = [call[0][1]["transaction_id"] for call in submit.call_args_list]
         assert ids[0] != ids[1]
+
+
+PIN_SETTING = "REVENIUM_LITELLM_PIN_ORGANIZATION_TO_KEY_TEAM"
+
+
+class TestStreamedRecordPinnedToTheKeyTeam:
+    """The streamed logging path reads the key's team only where LiteLLM wrote it (BACK-4363)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("call_type, model", [
+        ("anthropic_messages", ANTHROPIC_MODEL),
+        ("aresponses", RESPONSES_MODEL),
+    ], ids=["messages", "responses"])
+    async def test_a_streamed_record_names_the_pinned_key_team(
+        self, guardrail, submit, monkeypatch, call_type, model
+    ):
+        monkeypatch.setenv(PIN_SETTING, "true")
+        data = guardrail_data(
+            headers={"x-revenium-organization-name": "SomeoneElse"},
+            stream=True,
+            model=model,
+            metadata_key="litellm_metadata",
+        )
+        data["litellm_metadata"]["user_api_key_team_alias"] = "AcmeTeam"
+        kwargs = logging_kwargs_from(data, call_type=call_type, model=model)
+        kwargs["litellm_params"]["metadata"].update(
+            {"user_id": "claude-code-user", "user_api_key_team_alias": "Planted"}
+        )
+
+        await guardrail.async_log_success_event(
+            kwargs, GuardrailResponse(usage=AssembledUsage()), NOW, LATER
+        )
+
+        assert submit.call_count == 1
+        assert submitted_args(submit)["organization_name"] == "AcmeTeam"
+
+    @pytest.mark.asyncio
+    async def test_a_team_alias_in_the_top_level_logging_metadata_does_not_beat_litellm_params(
+        self, guardrail, submit, monkeypatch
+    ):
+        """LiteLLM spreads request params into the logging kwargs, so a top-level
+        ``metadata`` there can be the caller's body; ``litellm_params`` is LiteLLM's."""
+        monkeypatch.setenv(PIN_SETTING, "true")
+        data = guardrail_data(
+            headers={"x-revenium-organization-name": "SomeoneElse"},
+            stream=True,
+            model=ANTHROPIC_MODEL,
+            metadata_key="litellm_metadata",
+        )
+        data["litellm_metadata"]["user_api_key_team_alias"] = "AcmeTeam"
+        kwargs = logging_kwargs_from(data)
+        kwargs["metadata"] = {"user_id": "claude-code-user", "user_api_key_team_alias": "Planted"}
+
+        await guardrail.async_log_success_event(
+            kwargs, GuardrailResponse(usage=AssembledUsage()), NOW, LATER
+        )
+
+        assert submit.call_count == 1
+        assert submitted_args(submit)["organization_name"] == "AcmeTeam"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("planted_auth", [
+        "x",
+        {},
+        {"team_alias": "Planted"},
+        ["AcmeTeam"],
+    ], ids=["string", "empty-object", "object-with-team", "list"])
+    async def test_a_user_api_key_auth_planted_in_the_body_does_not_hide_the_key_team(
+        self, guardrail, submit, monkeypatch, planted_auth
+    ):
+        """On ``/v1/messages`` ``metadata`` is the caller's body, so a
+        ``user_api_key_auth`` there is not LiteLLM's auth object."""
+        monkeypatch.setenv(PIN_SETTING, "true")
+        data = guardrail_data(
+            headers={"x-revenium-organization-name": "SomeoneElse"},
+            stream=True,
+            model=ANTHROPIC_MODEL,
+            metadata_key="litellm_metadata",
+        )
+        data["litellm_metadata"]["user_api_key_team_alias"] = "AcmeTeam"
+        kwargs = logging_kwargs_from(data)
+        kwargs["litellm_params"]["metadata"].update(
+            {"user_id": "claude-code-user", "user_api_key_auth": planted_auth}
+        )
+
+        await guardrail.async_log_success_event(
+            kwargs, GuardrailResponse(usage=AssembledUsage()), NOW, LATER
+        )
+
+        assert submit.call_count == 1
+        assert submitted_args(submit)["organization_name"] == "AcmeTeam"
+
+
+# --- A caller-chosen call id never suppresses a record ----------------------
+#
+# LiteLLM sets ``litellm_call_id`` from the inbound ``x-litellm-call-id`` header
+# unvalidated, so it is a value any caller with a gateway key picks. The
+# duplicate guard used to key on it: every later request carrying the same
+# header, from that caller or any other, was answered and paid for upstream but
+# sent no usage record and never counted toward a cap (BACK-4371).
+
+CALLER_CALL_ID = "11111111-2222-4333-8444-555555555555"
+METADATA_CONTAINERS = ("litellm_metadata", "metadata")
+
+
+def _mapping_containers(data):
+    return {
+        key: data[key] for key in METADATA_CONTAINERS if isinstance(data.get(key), dict)
+    }
+
+
+async def run_pre_call(instance, data, call_type="acompletion", key_dict=None):
+    """Run the real pre-call hook and return what it added to the request metadata.
+
+    The return value is whatever the SDK stamped for this request, read off the
+    containers rather than by name, so a test can replay it in another request
+    exactly as a caller who obtained it would.
+    """
+    before = {key: set(container) for key, container in _mapping_containers(data).items()}
+    await instance.async_pre_call_hook(
+        user_api_key_dict=key_dict or make_key_dict(),
+        cache=MagicMock(),
+        data=data,
+        call_type=call_type,
+    )
+    written = {}
+    for key, container in _mapping_containers(data).items():
+        for name, value in container.items():
+            if name not in before.get(key, set()):
+                written[name] = value
+    return written
+
+
+def plant_in_both_containers(data, planted):
+    """Seed ``planted`` into both metadata containers of a request body."""
+    data.setdefault("litellm_metadata", {}).update(planted)
+    data["metadata"].update(planted)
+
+
+def responses_logging_kwargs(data, litellm_call_id=CALLER_CALL_ID):
+    """The logging kwargs of a streamed ``/v1/responses`` call.
+
+    LiteLLM's Responses entry point hands the logging object the request's
+    ``litellm_metadata`` as ``litellm_params["metadata"]`` (litellm
+    ``responses/main.py``), not the two containers ``logging_kwargs_from``
+    copies across.
+    """
+    return {
+        "model": RESPONSES_MODEL,
+        "call_type": "aresponses",
+        "stream": True,
+        "litellm_call_id": litellm_call_id,
+        "litellm_params": {"metadata": data["litellm_metadata"]},
+    }
+
+
+class TestACallerChosenCallIdNeverSuppressesARecord:
+    """Every answered call is recorded whatever ``x-litellm-call-id`` it carries."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_metering_owner(self):
+        from revenium_middleware.litellm.proxy import _metering_owner
+
+        _metering_owner.reset_metering_owner()
+        yield
+        _metering_owner.reset_metering_owner()
+
+    @staticmethod
+    def _chat_request(headers=None):
+        data = guardrail_data(headers=headers)
+        data["litellm_call_id"] = CALLER_CALL_ID
+        return data
+
+    @staticmethod
+    async def _post_call(instance, data, index):
+        await instance.async_post_call_success_hook(
+            data=data,
+            user_api_key_dict=make_key_dict(),
+            response=GuardrailResponse(
+                response_id="chatcmpl-%d" % index, usage=AssembledUsage()
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_six_chat_calls_with_one_caller_call_id_send_six_records(
+        self, guardrail, submit
+    ):
+        for index in range(6):
+            data = self._chat_request()
+            await run_pre_call(guardrail, data)
+            await self._post_call(guardrail, data, index)
+
+        assert submit.call_count == 6
+
+    @pytest.mark.asyncio
+    async def test_four_streamed_chat_calls_with_one_caller_call_id_send_four_records(
+        self, registered, submit
+    ):
+        for index in range(4):
+            data = guardrail_data(stream=True)
+            data["litellm_call_id"] = CALLER_CALL_ID
+            await run_pre_call(registered, data)
+            response = GuardrailResponse(
+                response_id="chatcmpl-stream-%d" % index, usage=AssembledUsage()
+            )
+            await run_deferred_stream(captured_data=data, assembled_response=response)
+            await registered.async_log_success_event(
+                logging_kwargs_from(
+                    data,
+                    litellm_call_id=CALLER_CALL_ID,
+                    call_type="acompletion",
+                    model="gpt-4o-mini",
+                ),
+                response,
+                NOW,
+                LATER,
+            )
+
+        assert submit.call_count == 4
+
+    @pytest.mark.asyncio
+    async def test_a_call_id_another_caller_sent_gets_its_own_record(
+        self, guardrail, submit
+    ):
+        for index, subscriber in enumerate(("alice", "bob")):
+            data = self._chat_request(headers={"x-revenium-subscriber-id": subscriber})
+            await run_pre_call(guardrail, data)
+            await self._post_call(guardrail, data, index)
+
+        assert submit.call_count == 2
+        assert submit.call_args_list[1][0][1]["subscriber"]["id"] == "bob"
+
+    @pytest.mark.asyncio
+    async def test_without_pre_call_in_mode_every_call_is_recorded(
+        self, guardrail, submit
+    ):
+        """Nothing stamps a request in this mode, so nothing found on one is trusted.
+
+        Each request carries a key the SDK really stamped for another request,
+        in both containers: a guardrail that trusted it here would let the
+        caller who planted it suppress every record after the first.
+        """
+        planted = await run_pre_call(guardrail, self._chat_request())
+        post_call_only = ReveniumGuardrail(
+            guardrail_name="revenium", event_hook=["post_call"], default_on=True
+        )
+        for index in range(3):
+            data = self._chat_request()
+            plant_in_both_containers(data, planted)
+            await self._post_call(post_call_only, data, index)
+
+        assert submit.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_a_meter_key_replayed_in_the_request_body_cannot_suppress_a_record(
+        self, guardrail, submit
+    ):
+        first = self._chat_request()
+        stamped = await run_pre_call(guardrail, first)
+        await self._post_call(guardrail, first, 0)
+
+        replay = self._chat_request()
+        plant_in_both_containers(replay, stamped)
+        await run_pre_call(guardrail, replay)
+        await self._post_call(guardrail, replay, 1)
+
+        assert submit.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_four_streamed_responses_calls_with_one_caller_call_id_send_four_records(
+        self, guardrail, submit
+    ):
+        """``/v1/responses`` with ``stream: true`` is metered from the logging event."""
+        for _ in range(4):
+            data = guardrail_data(
+                stream=True, model=RESPONSES_MODEL, metadata_key="litellm_metadata"
+            )
+            data["litellm_call_id"] = CALLER_CALL_ID
+            await run_pre_call(guardrail, data, call_type="aresponses")
+            await guardrail.async_log_success_event(
+                responses_logging_kwargs(data),
+                GuardrailResponse(usage=AssembledUsage()),
+                NOW,
+                LATER,
+            )
+
+        assert submit.call_count == 4
+
+    @pytest.mark.asyncio
+    async def test_streamed_messages_calls_with_one_caller_call_id_and_the_flag_off_send_one_record_each(
+        self, monkeypatch, submit
+    ):
+        """With no minted shared id, the caller's id is all that told these calls apart."""
+        monkeypatch.setenv(FLAG, "false")
+        instance = ReveniumGuardrail(
+            guardrail_name="revenium", event_hook=["pre_call", "post_call"], default_on=True
+        )
+        for _ in range(3):
+            data = guardrail_data(
+                stream=True, model=ANTHROPIC_MODEL, metadata_key="litellm_metadata"
+            )
+            data["litellm_call_id"] = CALLER_CALL_ID
+            await run_pre_call(instance, data, call_type="anthropic_messages")
+            await instance.async_log_success_event(
+                logging_kwargs_from(data, litellm_call_id=CALLER_CALL_ID),
+                GuardrailResponse(usage=AssembledUsage()),
+                NOW,
+                LATER,
+            )
+
+        assert submit.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_a_responses_pre_call_leaves_the_callers_metadata_unchanged(
+        self, guardrail
+    ):
+        """On ``/v1/responses`` ``metadata`` is the caller's own body field.
+
+        LiteLLM forwards it to the provider, which caps it at 16 pairs and
+        returns it on the stored response, so nothing of ours may be written
+        there.
+        """
+        data = guardrail_data(
+            stream=True,
+            model=RESPONSES_MODEL,
+            metadata_key="litellm_metadata",
+            metadata={"order": "42"},
+        )
+        callers_metadata = copy.deepcopy(data["metadata"])
+
+        await run_pre_call(guardrail, data, call_type="aresponses")
+
+        assert data["metadata"] == callers_metadata
+
+    @pytest.mark.parametrize("logging_event_first", [True, False])
+    @pytest.mark.asyncio
+    async def test_one_call_through_both_paths_with_a_caller_call_id_is_recorded_once(
+        self, monkeypatch, submit, logging_event_first
+    ):
+        """The guard still does its job: one call reaching both hooks is one record.
+
+        The response carries its own id, which only the post-call hook reads,
+        so a guard keyed on the stored transaction id would see two calls here.
+        """
+        monkeypatch.setenv(FLAG, "false")
+        instance = ReveniumGuardrail(
+            guardrail_name="revenium", event_hook=["pre_call", "post_call"], default_on=True
+        )
+        data = guardrail_data(
+            stream=True, model=ANTHROPIC_MODEL, metadata_key="litellm_metadata"
+        )
+        data["litellm_call_id"] = CALLER_CALL_ID
+        await run_pre_call(instance, data, call_type="anthropic_messages")
+        response = GuardrailResponse(response_id="msg_distinct", usage=AssembledUsage())
+
+        async def logging_event():
+            await instance.async_log_success_event(
+                logging_kwargs_from(data, litellm_call_id=CALLER_CALL_ID),
+                response,
+                NOW,
+                LATER,
+            )
+
+        async def post_call():
+            await instance.async_post_call_success_hook(
+                data=data, user_api_key_dict=make_key_dict(), response=response
+            )
+
+        hooks = (logging_event, post_call) if logging_event_first else (post_call, logging_event)
+        for hook in hooks:
+            await hook()
+
+        assert submit.call_count == 1
+
+
+# --- A caller-chosen call id never merges records ---------------------------
+#
+# Sending a record is not enough: Revenium keeps one record per organization
+# and transaction id. A record filed under the caller's ``x-litellm-call-id``
+# is merged with every other call that repeated the header, so spend stops
+# growing and a cap never fills (BACK-4376). A record whose response carries
+# no provider id must take an id the caller cannot choose.
+
+EMBEDDING_MODEL = "text-embedding-3-small"
+
+
+def records_revenium_keeps(submit):
+    """Revenium stores one record per (organization, transaction id)."""
+    return {
+        (call[0][1]["organization_name"], call[0][1]["transaction_id"])
+        for call in submit.call_args_list
+    }
+
+
+def sent_transaction_ids(submit):
+    return [call[0][1]["transaction_id"] for call in submit.call_args_list]
+
+
+def request_id_of(stamped):
+    """The id a request's record carries: its stamped meter key without this process's prefix."""
+    return stamped[guardrail_module._METER_KEY_FIELD][len(guardrail_module._METER_KEY_PREFIX):]
+
+
+def assert_no_id_is_the_callers_or_reveals_the_prefix(ids):
+    process_prefix = guardrail_module._METER_KEY_PREFIX.rstrip(":")
+    assert CALLER_CALL_ID not in ids
+    for transaction_id in ids:
+        assert process_prefix not in transaction_id
+
+
+def embedding_response():
+    """An ``EmbeddingResponse``, which has no ``.id`` for the record to take."""
+    from litellm.types.utils import EmbeddingResponse, Usage as LiteLLMUsage
+
+    return EmbeddingResponse(
+        model=EMBEDDING_MODEL,
+        data=[{"embedding": [0.1, 0.2], "index": 0, "object": "embedding"}],
+        usage=LiteLLMUsage(prompt_tokens=7, completion_tokens=0, total_tokens=7),
+    )
+
+
+def flag_off_guardrail(monkeypatch):
+    """A trusted guardrail with the shared call id off, read when it is built."""
+    monkeypatch.setenv(FLAG, "false")
+    return ReveniumGuardrail(
+        guardrail_name="revenium", event_hook=["pre_call", "post_call"], default_on=True
+    )
+
+
+class TestACallerChosenCallIdNeverMergesRecords:
+    """Every answered call is its own record whatever ``x-litellm-call-id`` it carries."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_metering_owner(self):
+        from revenium_middleware.litellm.proxy import _metering_owner
+
+        _metering_owner.reset_metering_owner()
+        yield
+        _metering_owner.reset_metering_owner()
+
+    @staticmethod
+    async def _streamed_messages_request(instance):
+        data = guardrail_data(
+            stream=True, model=ANTHROPIC_MODEL, metadata_key="litellm_metadata"
+        )
+        data["litellm_call_id"] = CALLER_CALL_ID
+        stamped = await run_pre_call(instance, data, call_type="anthropic_messages")
+        return data, stamped
+
+    @pytest.mark.asyncio
+    async def test_four_streamed_responses_calls_with_one_caller_call_id_are_four_records(
+        self, guardrail, submit
+    ):
+        expected = []
+        for _ in range(4):
+            data = guardrail_data(
+                stream=True, model=RESPONSES_MODEL, metadata_key="litellm_metadata"
+            )
+            data["litellm_call_id"] = CALLER_CALL_ID
+            stamped = await run_pre_call(guardrail, data, call_type="aresponses")
+            expected.append(request_id_of(stamped))
+            await guardrail.async_log_success_event(
+                responses_logging_kwargs(data),
+                GuardrailResponse(usage=AssembledUsage()),
+                NOW,
+                LATER,
+            )
+
+        assert len(records_revenium_keeps(submit)) == 4
+        assert sent_transaction_ids(submit) == expected
+        assert_no_id_is_the_callers_or_reveals_the_prefix(sent_transaction_ids(submit))
+
+    @pytest.mark.parametrize("streamed", [True, False], ids=["streamed", "not_streamed"])
+    @pytest.mark.asyncio
+    async def test_three_messages_calls_with_one_caller_call_id_and_the_flag_off_are_three_records(
+        self, monkeypatch, submit, streamed
+    ):
+        instance = flag_off_guardrail(monkeypatch)
+        expected = []
+        for _ in range(3):
+            data = guardrail_data(
+                stream=streamed, model=ANTHROPIC_MODEL, metadata_key="litellm_metadata"
+            )
+            data["litellm_call_id"] = CALLER_CALL_ID
+            stamped = await run_pre_call(instance, data, call_type="anthropic_messages")
+            expected.append(request_id_of(stamped))
+            if streamed:
+                await instance.async_log_success_event(
+                    logging_kwargs_from(data, litellm_call_id=CALLER_CALL_ID),
+                    GuardrailResponse(
+                        response_id="msg_01AnthropicStream", usage=AssembledUsage()
+                    ),
+                    NOW,
+                    LATER,
+                )
+            else:
+                # The raw body this route hands the hook: a dict, so no ``.id``.
+                await instance.async_post_call_success_hook(
+                    data=data,
+                    user_api_key_dict=make_key_dict(),
+                    response=copy.deepcopy(ANTHROPIC_NON_STREAMED_BODY),
+                )
+
+        assert len(records_revenium_keeps(submit)) == 3
+        assert sent_transaction_ids(submit) == expected
+        assert_no_id_is_the_callers_or_reveals_the_prefix(sent_transaction_ids(submit))
+
+    @pytest.mark.asyncio
+    async def test_three_embeddings_calls_with_one_caller_call_id_are_three_records(
+        self, guardrail, submit
+    ):
+        expected = []
+        for _ in range(3):
+            data = guardrail_data(model=EMBEDDING_MODEL)
+            data["litellm_call_id"] = CALLER_CALL_ID
+            stamped = await run_pre_call(guardrail, data, call_type="aembedding")
+            expected.append(request_id_of(stamped))
+            await guardrail.async_post_call_success_hook(
+                data=data, user_api_key_dict=make_key_dict(), response=embedding_response()
+            )
+
+        assert len(records_revenium_keeps(submit)) == 3
+        assert sent_transaction_ids(submit) == expected
+        assert_no_id_is_the_callers_or_reveals_the_prefix(sent_transaction_ids(submit))
+
+    @pytest.mark.asyncio
+    async def test_without_pre_call_in_mode_idless_calls_with_one_caller_call_id_are_separate_records(
+        self, submit
+    ):
+        """Nothing is stamped in this mode, so there is no per-request id to pin, only distinctness."""
+        post_call_only = ReveniumGuardrail(
+            guardrail_name="revenium", event_hook=["post_call"], default_on=True
+        )
+        for _ in range(3):
+            data = guardrail_data(model=EMBEDDING_MODEL)
+            data["litellm_call_id"] = CALLER_CALL_ID
+            await post_call_only.async_post_call_success_hook(
+                data=data, user_api_key_dict=make_key_dict(), response=embedding_response()
+            )
+
+        assert len(records_revenium_keeps(submit)) == 3
+        assert_no_id_is_the_callers_or_reveals_the_prefix(sent_transaction_ids(submit))
+
+    @pytest.mark.parametrize(
+        "logging_event_first", [True, False], ids=["logging_first", "post_call_first"]
+    )
+    @pytest.mark.asyncio
+    async def test_two_calls_with_one_caller_call_id_each_reported_through_both_paths_are_two_records(
+        self, monkeypatch, submit, logging_event_first
+    ):
+        instance = flag_off_guardrail(monkeypatch)
+        expected = []
+        for _ in range(2):
+            data, stamped = await self._streamed_messages_request(instance)
+            expected.append(request_id_of(stamped))
+            response = GuardrailResponse(response_id=None, usage=AssembledUsage())
+
+            async def logging_event():
+                await instance.async_log_success_event(
+                    logging_kwargs_from(data, litellm_call_id=CALLER_CALL_ID),
+                    response,
+                    NOW,
+                    LATER,
+                )
+
+            async def post_call():
+                await instance.async_post_call_success_hook(
+                    data=data, user_api_key_dict=make_key_dict(), response=response
+                )
+
+            hooks = (logging_event, post_call) if logging_event_first else (post_call, logging_event)
+            for hook in hooks:
+                await hook()
+
+        assert submit.call_count == 2
+        assert len(records_revenium_keeps(submit)) == 2
+        assert sent_transaction_ids(submit) == expected
+        assert_no_id_is_the_callers_or_reveals_the_prefix(sent_transaction_ids(submit))
+
+    @pytest.mark.asyncio
+    async def test_both_paths_file_one_call_under_one_transaction_id(
+        self, monkeypatch, submit
+    ):
+        """With no provider id, Revenium's own duplicate check backs up the in-process claim.
+
+        The claim memory here forgets every call at once, so both paths send.
+        Both must name the same request id, or Revenium would keep two records
+        for one call.
+        """
+        instance = flag_off_guardrail(monkeypatch)
+        instance._metered_calls = guardrail_module._MeteredCalls(capacity=0)
+        data, stamped = await self._streamed_messages_request(instance)
+        response = GuardrailResponse(response_id=None, usage=AssembledUsage())
+
+        await instance.async_log_success_event(
+            logging_kwargs_from(data, litellm_call_id=CALLER_CALL_ID), response, NOW, LATER
+        )
+        await instance.async_post_call_success_hook(
+            data=data, user_api_key_dict=make_key_dict(), response=response
+        )
+
+        assert submit.call_count == 2
+        assert sent_transaction_ids(submit) == [request_id_of(stamped)] * 2
+        assert len(records_revenium_keeps(submit)) == 1
+        assert_no_id_is_the_callers_or_reveals_the_prefix(sent_transaction_ids(submit))

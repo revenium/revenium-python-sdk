@@ -31,7 +31,7 @@ def _log(usage_metadata):
 
 
 def _payload(usage_metadata):
-    with patch("revenium_middleware.openai.middleware.get_client", lambda: object()), \
+    with patch("revenium_middleware.openai.middleware.current_client", lambda: object()), \
             patch("revenium_middleware.openai.middleware.submit_ai_event") as mock_submit:
         mock_submit.return_value = SimpleNamespace(id="completion-effort-test")
         asyncio.run(_log(usage_metadata))
@@ -93,3 +93,30 @@ def test_unset_prompt_context_fields_omitted_from_the_wire():
     body = _wire_body({"trace_id": "no-prompt-context"})
     for wire_name in ("promptId", "promptLength", "querySource", "speed", "subagentType"):
         assert wire_name not in body, wire_name
+
+
+def test_client_surface_reaches_the_wire():
+    """BACK-3905: the client surface rides the prompt-context path with no provider edit."""
+    assert _wire_body({"clientSurface": "claude-code-desktop"})["clientSurface"] == "claude-code-desktop"
+
+
+def test_unset_client_surface_omitted_from_the_wire():
+    assert "clientSurface" not in _wire_body({"trace_id": "no-client-surface"})
+
+
+def test_queued_openai_record_is_sent_under_its_key_after_metering_is_disabled():
+    import contextvars
+    from revenium_middleware._core import metering
+    from revenium_middleware._metering import ReveniumMetering
+
+    client_a = ReveniumMetering(api_key="hak_org_a_dummy")
+    mock_post = MagicMock(return_value=type("R", (), {"id": "evt-1"})())
+    ctx = contextvars.copy_context()
+    ctx.run(metering._enqueued_client.set, client_a)
+
+    with patch.object(client_a.ai, "_post", mock_post), \
+            patch("revenium_middleware._core.metering.client", None), \
+            patch.dict("os.environ", {"REVENIUM_METERING_API_KEY": ""}):
+        ctx.run(asyncio.run, _log({"trace_id": "queued-before-disable"}))
+
+    assert mock_post.called, "record queued under key A was dropped after metering was disabled"

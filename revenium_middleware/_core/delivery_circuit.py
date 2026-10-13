@@ -10,6 +10,7 @@ the first one that succeeds closes the circuit again.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from typing import Callable
@@ -91,3 +92,12 @@ def reset() -> None:
     """Start over with a closed circuit."""
     global _circuit
     _circuit = DeliveryCircuit()
+
+
+def _forget_parent_lock() -> None:
+    """Keep the circuit's state in a forked child, but not a lock a parent thread held at the fork."""
+    _circuit._lock = threading.RLock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forget_parent_lock)

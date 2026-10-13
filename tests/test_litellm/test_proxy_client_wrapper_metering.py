@@ -18,7 +18,7 @@ The client wrapper still meters every call the guardrail does not:
 * direct ``litellm.completion`` / ``acompletion`` calls in the same process,
   which carry no ``proxy_server_request``;
 * proxied streams whose end reaches none of the guardrail's metering hooks
-  (``/v1/completions`` and the bridged ``/v1/responses``, on litellm 1.104.0).
+  (``/v1/completions``, on litellm 1.104.2).
 
 Standing aside must not cost the guardrail its token counts. It meters a stream
 from the response LiteLLM assembles, which carries the provider's counts only if
@@ -30,8 +30,11 @@ usage only when the request asks for it.
 
 import asyncio
 import json
+import threading
 import time
+import warnings
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -43,22 +46,30 @@ import litellm  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from litellm.proxy import proxy_server  # noqa: E402
 
+import revenium_middleware.openai  # noqa: E402,F401  patches the OpenAI SDK under LiteLLM's openai/ route
 from revenium_middleware._core import metering_pool  # noqa: E402
 from revenium_middleware.litellm.client import middleware as client_middleware  # noqa: E402
 from revenium_middleware.litellm.proxy import _metering_owner  # noqa: E402
 from revenium_middleware.litellm.proxy.guardrail import ReveniumGuardrail  # noqa: E402
+from revenium_middleware.litellm.proxy.middleware import MiddlewareHandler  # noqa: E402
 
 from .fake_openai_upstream import EMBEDDING_USAGE, USAGE, api_base, start_upstream  # noqa: E402
 
-# hosted_vllm rather than openai: LiteLLM reaches it over its own HTTP client
-# instead of the openai SDK, which the SDK's OpenAI middleware patches when
-# another test module has loaded it. It also keeps /v1/messages on the
-# chat-completions bridge, which calls litellm.acompletion, where an OpenAI
-# model would go to the Responses API that the client wrapper does not patch.
+# hosted_vllm rather than openai: it keeps /v1/messages on the chat-completions
+# bridge, which calls litellm.acompletion, where an OpenAI model would go to the
+# Responses API that the client wrapper does not patch.
 CHAT_ALIAS = "back-3918-chat"
-# groq has no native Responses API, so LiteLLM bridges /v1/responses to
-# litellm.acompletion for it.
+# openai: LiteLLM reaches it through the openai SDK, which the SDK's OpenAI
+# middleware (imported above) patches, so this route proves that middleware
+# stands aside for a call the guardrail meters.
+OPENAI_SDK_CHAT_ALIAS = "back-4249-openai-chat"
+# ovhcloud has no native Responses API, so LiteLLM bridges /v1/responses to
+# litellm.acompletion for it, and reaches it over its own HTTP client, passing
+# stream_options through, so the upstream's usage chunk is the one metered.
 RESPONSES_BRIDGE_ALIAS = "back-3918-responses-bridge"
+# openai has a native Responses API, which LiteLLM serves without calling
+# litellm.acompletion, so only the guardrail sees these calls.
+RESPONSES_NATIVE_ALIAS = "back-4001-responses-native"
 EMBEDDING_ALIAS = "back-3918-embedding"
 
 GUARDRAIL_SOURCE = "GUARDRAIL"
@@ -96,7 +107,9 @@ def _readme_config(upstream, extra_settings):
         **extra_settings,
         "model_list": [
             _deployment(CHAT_ALIAS, "hosted_vllm/back-3918-model", upstream),
-            _deployment(RESPONSES_BRIDGE_ALIAS, "groq/back-3918-model", upstream),
+            _deployment(OPENAI_SDK_CHAT_ALIAS, "openai/back-3918-model", upstream),
+            _deployment(RESPONSES_BRIDGE_ALIAS, "ovhcloud/back-3918-model", upstream),
+            _deployment(RESPONSES_NATIVE_ALIAS, "openai/back-3918-model", upstream),
             _deployment(EMBEDDING_ALIAS, "hosted_vllm/back-3918-embedding-model", upstream),
         ],
         "guardrails": [
@@ -199,7 +212,30 @@ PROXIED_ROUTES = [
         id="messages-streamed",
     ),
     pytest.param("/v1/embeddings", {"model": EMBEDDING_ALIAS, "input": ["hi"]}, EMBEDDING_TOKENS, id="embeddings"),
+    pytest.param(
+        "/v1/responses", {"model": RESPONSES_BRIDGE_ALIAS, "input": "hi", "stream": True}, CHAT_TOKENS,
+        id="responses-streamed",
+    ),
+    pytest.param(
+        "/v1/responses", {"model": RESPONSES_NATIVE_ALIAS, "input": "hi", "stream": True}, CHAT_TOKENS,
+        id="responses-streamed-native",
+    ),
 ]
+
+
+class TestAProxiedCallThroughTheOpenAISDKIsMeteredOnce:
+    @pytest.mark.parametrize("body", [
+        pytest.param({"model": OPENAI_SDK_CHAT_ALIAS, "messages": MESSAGES}, id="chat"),
+        pytest.param({"model": OPENAI_SDK_CHAT_ALIAS, "messages": MESSAGES, "stream": True}, id="chat-streamed"),
+    ])
+    def test_one_row_and_it_is_the_guardrails(self, proxy, metered_rows, body):
+        """The OpenAI middleware leaves the call to the guardrail (BACK-4249)."""
+        _post(proxy, "/v1/chat/completions", body)
+
+        rows = metered_rows(GUARDRAIL_SOURCE)
+
+        assert [row["middleware_source"] for row in rows] == [GUARDRAIL_SOURCE]
+        assert rows[0]["subscriber"]["id"] == SUBSCRIBER_ID
 
 
 class TestProxiedCallIsMeteredOnceByTheGuardrail:
@@ -238,6 +274,34 @@ class TestProxiedCallIsMeteredOnceByTheGuardrail:
         assert {row["middleware_source"] for row in rows} == {GUARDRAIL_SOURCE}
 
 
+UPSTREAM_MODEL_BY_ROUTE = {
+    "chat": "back-3918-model",
+    "chat-streamed": "back-3918-model",
+    "chat-streamed-caller-asks-for-usage": "back-3918-model",
+    "messages": "back-3918-model",
+    "messages-streamed": "back-3918-model",
+    "embeddings": "back-3918-embedding-model",
+    "responses-streamed": "back-3918-model",
+    "responses-streamed-native": "back-3918-model",
+}
+
+
+class TestTheRowNamesTheDeploymentModel:
+    """The proxy's model alias is not in Revenium's model catalog, so a row named after it is priced at $0."""
+
+    @pytest.mark.parametrize(
+        "path, body, upstream_model",
+        [pytest.param(path, body, UPSTREAM_MODEL_BY_ROUTE[route.id], id=route.id)
+         for route in PROXIED_ROUTES for path, body, _tokens in [route.values]],
+    )
+    def test_the_row_names_the_upstream_model_not_the_proxy_alias(self, proxy, metered_rows, path, body, upstream_model):
+        _post(proxy, path, body)
+
+        rows = metered_rows(GUARDRAIL_SOURCE)
+
+        assert [row["model"] for row in rows] == [upstream_model]
+
+
 class TestCallsOnlyTheClientWrapperMetersStayMetered:
     """Proxied streams the guardrail never sees the end of.
 
@@ -250,9 +314,6 @@ class TestCallsOnlyTheClientWrapperMetersStayMetered:
         [
             pytest.param(
                 "/v1/completions", {"model": CHAT_ALIAS, "prompt": "hi", "stream": True}, id="completions-streamed"
-            ),
-            pytest.param(
-                "/v1/responses", {"model": RESPONSES_BRIDGE_ALIAS, "input": "hi", "stream": True}, id="responses-streamed"
             ),
         ],
     )
@@ -310,6 +371,32 @@ def _proxied_kwargs(**overrides):
     }
 
 
+def _run_in_own_thread(coro):
+    thread = threading.Thread(target=asyncio.run, args=(coro,))
+    thread.start()
+    thread.join()
+    return thread
+
+
+@pytest.fixture
+def client_wrapper_rows():
+    """Every row the client wrapper submits, collected as soon as it is built."""
+    recorded = []
+    with patch.object(client_middleware, "run_async_in_thread", side_effect=_run_in_own_thread), \
+            patch.object(client_middleware, "submit_ai_event", side_effect=lambda _op, args: recorded.append(args)):
+        yield recorded
+
+
+@pytest.fixture
+def configured_callback(monkeypatch):
+    """The deprecated callback, listed in ``litellm.callbacks`` as a proxy config puts it."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        handler = MiddlewareHandler()
+    monkeypatch.setattr(litellm, "callbacks", [*litellm.callbacks, handler])
+    return handler
+
+
 class TestMetersRequest:
     """The per-call answer the client wrapper acts on, for cases a proxy run cannot stage."""
 
@@ -342,6 +429,32 @@ class TestMetersRequest:
         _metering_owner.reset_metering_owner()
 
         assert _metering_owner.guardrail_meters_request(_proxied_kwargs()) is False
+
+    @pytest.mark.parametrize(
+        "kwargs, rows_from_the_client_wrapper",
+        [
+            pytest.param(_proxied_kwargs(stream=True), 0, id="proxied"),
+            pytest.param({**_proxied_kwargs(stream=True), "proxy_server_request": None}, 1, id="direct"),
+        ],
+    )
+    def test_a_registered_callback_owns_proxied_calls_only(
+        self, configured_callback, client_wrapper_rows, kwargs, rows_from_the_client_wrapper
+    ):
+        _metering_owner.reset_metering_owner()
+
+        _call_sync(kwargs)
+
+        assert len(client_wrapper_rows) == rows_from_the_client_wrapper
+
+    def test_a_guardrail_outranks_the_callback(self, guardrail, configured_callback, client_wrapper_rows):
+        """The guardrail never meters a streamed ``/v1/completions`` call, so the client wrapper must."""
+        streamed_text_completion = _proxied_kwargs(
+            stream=True, litellm_logging_obj=SimpleNamespace(call_type="atext_completion")
+        )
+
+        _call_sync(streamed_text_completion)
+
+        assert len(client_wrapper_rows) == 1
 
 
 def _chunk(usage=None, content=None, finish_reason=None):

@@ -7,28 +7,124 @@ Public surface:
 Single-key contract: settings.api_key authenticates both metering (via the
 in-package ReveniumMetering client) and the raw-HTTP fallback for endpoints not provided
 by that client (/meter/v2/tool/events, /profitstream/v2/api/jobs/{id}/outcome).
+
+emit_completion and emit_tool_event queue their record and return at once; it
+is delivered like every automatic record (BACK-4451).
 """
 
 from __future__ import annotations
 
 import json
-import threading
+import logging
+import os
 import urllib.parse
 import uuid
-from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
+from dataclasses import dataclass, field
+from typing import Any, Coroutine, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 import httpx
 from revenium_middleware._core import outcomes as _outcomes
+from revenium_middleware._core.config import (
+    Config,
+    get_profitstream_base_url,
+    get_revenium_address,
+    revenium_address_from_usage_address,
+)
+from revenium_middleware._core.context import snapshot_metadata
+from revenium_middleware._core.metering import (
+    _scoped_client_for,
+    current_client,
+    recorded_under,
+    run_async_in_thread,
+)
+from revenium_middleware._core.metering_submission import submit_ai_event
 from revenium_middleware._core.trace_fields import validate_agent_version
 from revenium_middleware._metering import ReveniumMetering
+from revenium_middleware._metering._exceptions import APIError
+from revenium_middleware._metering.decorator import deliver_tool_event
+from revenium_middleware._metering._utils._transform import _maybe_transform_key, get_type_hints
+from revenium_middleware._metering.types.ai_create_completion_params import AICreateCompletionParams
+
+logger = logging.getLogger(__name__)
+
+_REQUIRED_COMPLETION_KEYS = (
+    "completionStartTime",
+    "costType",
+    "inputTokenCount",
+    "isStreamed",
+    "model",
+    "outputTokenCount",
+    "provider",
+    "requestDuration",
+    "requestTime",
+    "responseTime",
+    "stopReason",
+    "totalTokenCount",
+    "transactionId",
+)
+
+_EXTRA_BODY_COMPLETION_KEYS = (
+    "agenticJobId",
+    "agenticJobName",
+    "agenticJobType",
+    "agenticJobVersion",
+    "squadName",
+    "squadId",
+)
+
+# Read off the metering client's own parameter type, so a field added there is
+# forwarded by emit_completion without an edit here.
+_COMPLETION_KEYWORD_BY_WIRE_NAME: Dict[str, str] = {
+    _maybe_transform_key(keyword, hint): keyword
+    for keyword, hint in get_type_hints(AICreateCompletionParams, include_extras=True).items()
+}
+
+
+def _sdk_meter_base_url(address: str) -> str:
+    root = address.rstrip("/")
+    if root.endswith("/meter"):
+        return f"{root}/"
+    return f"{root}/meter/"
+
+
+def _tool_url(address: str) -> str:
+    return f"{address.rstrip('/')}/meter/v2/tool/events"
+
+
+def _completion_url(address: str) -> str:
+    return f"{address.rstrip('/')}/meter/v2/ai/completions"
+
+
+def _outcome_address_is_configured() -> bool:
+    configured = os.getenv(Config.ENV_REVENIUM_PROFITSTREAM_BASE_URL)
+    return bool(configured and configured.strip())
 
 
 @dataclass(frozen=True)
 class AgenticOutcomeSettings:
+    """Immutable settings for ``AgenticOutcomeClient``.
+
+    ``meter_base_url`` defaults to the usage address in
+    ``REVENIUM_METERING_BASE_URL`` (without its ``/meter`` segment), else
+    ``https://api.revenium.ai``. ``profitstream_base_url`` defaults to
+    ``REVENIUM_PROFITSTREAM_BASE_URL`` when that is set, else it follows
+    ``meter_base_url``, so one address serves usage and outcomes unless a
+    separate outcome address is given on purpose. Both are resolved when the
+    settings are built: ``dataclasses.replace(settings, meter_base_url=...)``
+    keeps the outcome address already resolved.
+
+    While ``meter_base_url`` equals the environment's address (it was not
+    passed, or was passed with that same value), usage records follow the
+    address set in code with ``initialize_metering(base_url=...)`` or a
+    ``metering_key(..., base_url=...)`` block, as automatic records do. Jobs and
+    outcomes follow it too, unless ``profitstream_base_url`` names another
+    address or ``REVENIUM_PROFITSTREAM_BASE_URL`` is set, so a job and its
+    outcome never land on two different addresses.
+    """
+
     api_key: str
-    meter_base_url: str = "https://api.revenium.io"
-    profitstream_base_url: str = "https://api.revenium.io"
+    meter_base_url: str = field(default_factory=get_revenium_address)
+    profitstream_base_url: str = ""
     team_id: str = ""
     # When set, used to authenticate /profitstream/v2/api/jobs[/outcome] calls.
     # Falls back to api_key. Lets callers use a metering key (rev_mk_) for ingestion
@@ -38,25 +134,53 @@ class AgenticOutcomeSettings:
     outcome_retry_initial_seconds: float = 2.0
     # Hard cap on any single retry sleep (also clamps server-supplied Retry-After).
     outcome_retry_max_seconds: float = 90.0
+    _follows_sdk_address: bool = field(default=False, init=False, repr=False, compare=False)
+    _outcomes_follow_usage_address: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        # The dataclass is frozen, so derived and trimmed values are set the
+        # way dataclasses itself sets fields.
+        for key_field in ("api_key", "outcome_api_key"):
+            value = getattr(self, key_field)
+            if value is not None:
+                object.__setattr__(self, key_field, value.strip())
+        if not self.profitstream_base_url:
+            object.__setattr__(
+                self,
+                "profitstream_base_url",
+                get_profitstream_base_url(metering_base_url=self.meter_base_url),
+            )
+        follows_sdk_address = self.meter_base_url == get_revenium_address()
+        object.__setattr__(self, "_follows_sdk_address", follows_sdk_address)
+        object.__setattr__(
+            self,
+            "_outcomes_follow_usage_address",
+            follows_sdk_address
+            and not _outcome_address_is_configured()
+            and self.profitstream_base_url == get_profitstream_base_url(metering_base_url=self.meter_base_url),
+        )
 
     @property
     def tool_url(self) -> str:
-        return f"{self.meter_base_url.rstrip('/')}/meter/v2/tool/events"
+        return _tool_url(self.meter_base_url)
 
     @property
     def completion_url(self) -> str:
-        return f"{self.meter_base_url.rstrip('/')}/meter/v2/ai/completions"
+        return _completion_url(self.meter_base_url)
 
     @property
     def sdk_meter_base_url(self) -> str:
-        root = self.meter_base_url.rstrip("/")
-        if root.endswith("/meter"):
-            return f"{root}/"
-        return f"{root}/meter/"
+        return _sdk_meter_base_url(self.meter_base_url)
 
 
 class AgenticOutcomeClient:
-    """Emit AI completions, tool events, and terminal job outcomes."""
+    """Emit AI completions, tool events, and terminal job outcomes.
+
+    ``emit_completion`` and ``emit_tool_event`` send through the SDK's
+    background delivery, with its timeouts, retries and outage buffer. A
+    ``metering_client`` passed here sends the completions; ``http_client``
+    serves jobs and outcomes only.
+    """
 
     def __init__(
         self,
@@ -67,10 +191,10 @@ class AgenticOutcomeClient:
     ) -> None:
         self.settings = settings
         self._metering_client = metering_client
-        self._metering_lock = threading.Lock()
         self.http_client = http_client or httpx.Client(timeout=60.0)
         self._owns_http_client = http_client is None
-        self._resolved_team_id: Optional[str] = None
+        self._resolved_team_ids: Dict[str, str] = {}
+        self._reported_unknown_keys: Set[str] = set()
 
     def close(self) -> None:
         if self._owns_http_client:
@@ -82,132 +206,95 @@ class AgenticOutcomeClient:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
+    def _usage_address(self) -> str:
+        """Where this call's usage record goes: the SDK's current address when the settings follow it."""
+        if self.settings._follows_sdk_address:
+            sdk_client = current_client()
+            if sdk_client is not None:
+                return revenium_address_from_usage_address(str(sdk_client.base_url))
+        return self.settings.meter_base_url
+
+    def _outcome_address(self) -> str:
+        if self.settings._outcomes_follow_usage_address:
+            return get_profitstream_base_url(metering_base_url=self._usage_address())
+        return self.settings.profitstream_base_url
+
     def _metering(self) -> ReveniumMetering:
-        if self._metering_client is None:
-            with self._metering_lock:
-                if self._metering_client is None:
-                    self._metering_client = ReveniumMetering(
-                        api_key=self.settings.api_key,
-                        base_url=self.settings.sdk_meter_base_url,
-                    )
-        return self._metering_client
+        if self._metering_client is not None:
+            return self._metering_client
+        return _scoped_client_for(self.settings.api_key, _sdk_meter_base_url(self._usage_address()))
 
     # ------------------------------------------------------------------ completions
 
     def emit_completion(self, payload: Dict[str, Any], *, dry_run: bool = False) -> Dict[str, Any]:
+        """Meter one LLM call from a payload keyed by the completions API's field names.
+
+        Every field the metering client accepts is forwarded. An optional field
+        that is absent or ``None`` is left out of the request; a required field
+        is sent as given. A key the API does not know is not sent, and is named
+        in a warning once per client.
+
+        The record is queued and sent in the background, like automatic
+        records: delivery errors are logged, not raised, and a retryable one
+        leaves the record in the outage buffer for replay. Returns ``payload``.
+
+        Raises:
+            ValueError: a required key is missing; nothing is queued.
+        """
         if dry_run:
-            _print_dry_run("POST", self.settings.completion_url, payload)
+            _print_dry_run("POST", _completion_url(self._usage_address()), payload)
             return payload
 
-        # Mandatory keys in the payload to prevent KeyError
-        required = [
-            "completionStartTime",
-            "costType",
-            "inputTokenCount",
-            "isStreamed",
-            "model",
-            "outputTokenCount",
-            "provider",
-            "requestDuration",
-            "requestTime",
-            "responseTime",
-            "stopReason",
-            "totalTokenCount",
-            "transactionId",
-        ]
-        missing = [k for k in required if k not in payload]
+        missing = [k for k in _REQUIRED_COMPLETION_KEYS if k not in payload]
         if missing:
             raise ValueError(f"Missing required keys in payload: {', '.join(missing)}")
 
-        extra_body = {
-            key: payload[key]
-            for key in (
-                "agentName",
-                "agenticJobId",
-                "agenticJobName",
-                "agenticJobType",
-                "agenticJobVersion",
-                "squadName",
-                "squadId",
-                "currency",
-            )
-            if key in payload
-        }
-        agent_version = validate_agent_version(payload.get("agentVersion"))
-        self._metering().ai.create_completion(
-            completion_start_time=payload["completionStartTime"],
-            cost_type=payload["costType"],
-            input_token_count=payload["inputTokenCount"],
-            is_streamed=payload["isStreamed"],
-            model=payload["model"],
-            output_token_count=payload["outputTokenCount"],
-            provider=payload["provider"],
-            request_duration=payload["requestDuration"],
-            request_time=payload["requestTime"],
-            response_time=payload["responseTime"],
-            stop_reason=payload["stopReason"],
-            total_token_count=payload["totalTokenCount"],
-            transaction_id=payload["transactionId"],
-            agent=payload.get("agent"),
-            # The agent's own version (not agenticJobVersion, which travels in
-            # extra_body), run through the same validation as every other
-            # completion path (non-strings dropped, capped at the ingest
-            # limit). Sparse like effort: nothing valid means the key is
-            # omitted so the typed client keeps its NotGiven default.
-            **({"agent_version": agent_version} if agent_version is not None else {}),
-            cache_creation_token_count=payload.get("cacheCreationTokenCount"),
-            cache_read_token_count=payload.get("cacheReadTokenCount"),
-            input_token_cost=payload.get("inputTokenCost"),
-            model_source=payload.get("modelSource"),
-            operation_type=payload.get("operationType"),
-            organization_name=payload.get("organizationName"),
-            output_token_cost=payload.get("outputTokenCost"),
-            product_name=payload.get("productName"),
-            reasoning_token_count=payload.get("reasoningTokenCount"),
-            # Only pass the reasoning effort level when the caller supplied
-            # one: create_completion drops NotGiven but keeps an explicit
-            # None, which would reach the wire as "effort": null. A key
-            # present with None counts as not supplied — callers forwarding
-            # their own .get("effort") must not reintroduce the null.
-            **({"effort": payload["effort"]} if payload.get("effort") is not None else {}),
-            subscriber=payload.get("subscriber"),
-            task_type=payload.get("taskType"),
-            time_to_first_token=payload.get("timeToFirstToken"),
-            total_cost=payload.get("totalCost"),
-            trace_id=payload.get("traceId"),
-            environment=payload.get("environment"),
-            parent_transaction_id=payload.get("parentTransactionId"),
-            retry_number=payload.get("retryNumber"),
-            trace_name=payload.get("traceName"),
-            trace_type=payload.get("traceType"),
-            transaction_name=payload.get("transactionName"),
-            system_prompt=payload.get("systemPrompt"),
-            input_messages=payload.get("inputMessages"),
-            output_response=payload.get("outputResponse"),
-            prompts_truncated=payload.get("promptsTruncated"),
-            error_reason=payload.get("errorReason"),
-            extra_body=extra_body or None,
-            # Per-instance client with an inline idempotency key.
-            extra_headers={"Idempotency-Key": str(uuid.uuid4())},
-        )
+        keywords, extra_body, unknown_keys = _split_completion_payload(payload)
+        self._warn_once_about_unknown_keys(unknown_keys)
+        args = snapshot_metadata({**keywords, "extra_body": extra_body or None})
+        # One key per call, frozen now, so a buffer replay is deduplicated.
+        idempotency_key = str(uuid.uuid4())
+        transaction_id = payload.get("transactionId")
+        with recorded_under(self._metering()):
+            _queue(_send_completion(args, idempotency_key, transaction_id))
         return payload
+
+    def _warn_once_about_unknown_keys(self, unknown_keys: List[str]) -> None:
+        new_keys = set(unknown_keys) - self._reported_unknown_keys
+        if not new_keys:
+            return
+        self._reported_unknown_keys |= new_keys
+        logger.warning(
+            "emit_completion did not send payload keys the completions API does not accept: %s",
+            ", ".join(sorted(new_keys)),
+        )
 
     # ------------------------------------------------------------------ tool events
 
     def emit_tool_event(self, payload: Dict[str, Any], *, dry_run: bool = False) -> Dict[str, Any]:
+        """Meter one tool call; queued and sent in the background, like automatic tool events.
+
+        One attempt with the metering timeouts; a retryable failure leaves the
+        event in the outage buffer for replay. Delivery errors are logged, not
+        raised. Returns ``payload``.
+        """
+        tool_url = _tool_url(self._usage_address())
         if dry_run:
-            _print_dry_run("POST", self.settings.tool_url, payload)
+            _print_dry_run("POST", tool_url, payload)
             return payload
-        _outcomes.post_with_retry(
-            self.http_client,
-            self.settings.tool_url,
-            params=None,
-            body=payload,
-            api_key=self.settings.api_key,
-            retry_attempts=self.settings.outcome_retry_attempts,
-            retry_initial_seconds=self.settings.outcome_retry_initial_seconds,
-            retry_max_seconds=self.settings.outcome_retry_max_seconds,
-        )
+        tool_event = {
+            "url": tool_url,
+            "key": self.settings.api_key,
+            "event_payload": snapshot_metadata(payload),
+            # One key for the first send and every replay of this call: the
+            # tool events API replays its first answer for a repeated key, so
+            # a replay after a gateway error is not stored twice. Not the
+            # payload's transactionId, which a caller may reuse with a
+            # different body and which the API then refuses as a key mismatch.
+            "idempotency_key": str(uuid.uuid4()),
+        }
+        transaction_id = payload.get("transactionId")
+        _queue(_send_tool_event(tool_event, transaction_id), gated_by_circuit=False)
         return payload
 
     # ------------------------------------------------------------------ jobs+outcomes
@@ -234,7 +321,7 @@ class AgenticOutcomeClient:
         job resource, and a dry run or a bodiless 2xx has nothing to parse. So
         the return value always still carries every field the caller supplied.
         """
-        url = f"{self.settings.profitstream_base_url.rstrip('/')}/profitstream/v2/api/jobs"
+        url = f"{self._outcome_address().rstrip('/')}/profitstream/v2/api/jobs"
         body: Dict[str, Any] = {"agenticJobId": agentic_job_id}
         if name:
             body["name"] = name
@@ -279,28 +366,27 @@ class AgenticOutcomeClient:
         which is why create_job never sends it.
 
         Raises OutcomeAlreadyReportedError when the job already has an outcome
-        (backend 409 with structured amendment guidance).
+        (backend 409 with structured amendment guidance). A report that was
+        stored but answered with a gateway error is recognised on the retry and
+        returns normally; see ``report_outcome_request``.
         """
+        outcome_address = self._outcome_address()
         safe_id = urllib.parse.quote(agentic_job_id, safe="")
         url = (
-            f"{self.settings.profitstream_base_url.rstrip('/')}"
+            f"{outcome_address.rstrip('/')}"
             f"/profitstream/v2/api/jobs/{safe_id}/outcome"
         )
         if dry_run:
             _print_dry_run("POST", url, payload)
             return
         team_id = self._get_team_id()
-        params = {"teamId": team_id} if team_id else None
-        # 404 transient: metric ingestion creates the Job asynchronously; a fresh
-        # outcome can race ahead until Kafka catches up.
-        _outcomes.post_with_retry(
+        _outcomes.report_outcome_request(
             self.http_client,
-            url,
-            params=params,
-            body=payload,
+            outcome_address,
+            agentic_job_id,
+            payload,
+            team_id=team_id,
             api_key=self._outcome_key(),
-            retry_on_404=True,
-            raise_typed_on_409=True,
             retry_attempts=self.settings.outcome_retry_attempts,
             retry_initial_seconds=self.settings.outcome_retry_initial_seconds,
             retry_max_seconds=self.settings.outcome_retry_max_seconds,
@@ -342,9 +428,10 @@ class AgenticOutcomeClient:
         validated = _outcomes.normalize_outcome_metrics(
             entries, require_entries=True
         ) or []
+        outcome_address = self._outcome_address()
         safe_id = urllib.parse.quote(agentic_job_id, safe="")
         url = (
-            f"{self.settings.profitstream_base_url.rstrip('/')}"
+            f"{outcome_address.rstrip('/')}"
             f"/profitstream/v2/api/jobs/{safe_id}/outcome/metrics"
         )
         if dry_run:
@@ -354,7 +441,7 @@ class AgenticOutcomeClient:
         team_id = self._get_team_id()
         _outcomes.append_outcome_metrics_request(
             self.http_client,
-            self.settings.profitstream_base_url,
+            outcome_address,
             agentic_job_id,
             validated,
             team_id=team_id,
@@ -375,8 +462,9 @@ class AgenticOutcomeClient:
     def _get_team_id(self) -> str:
         if self.settings.team_id:
             return self.settings.team_id
-        if self._resolved_team_id:
-            return self._resolved_team_id
+        address = self._outcome_address()
+        if address in self._resolved_team_ids:
+            return self._resolved_team_ids[address]
 
         # Delegate auto-resolution (key-prefix + ProfitStream teams API) to the
         # shared transport. use_env=False preserves this client's historical
@@ -386,12 +474,65 @@ class AgenticOutcomeClient:
             "",
             self._outcome_key(),
             self.http_client,
-            self.settings.profitstream_base_url,
+            address,
             use_env=False,
         )
         if resolved:
-            self._resolved_team_id = resolved
+            self._resolved_team_ids[address] = resolved
         return resolved
+
+
+def _queue(coroutine: Coroutine[Any, Any, None], *, gated_by_circuit: bool = True) -> None:
+    if run_async_in_thread(coroutine, gated_by_circuit=gated_by_circuit) is None:
+        # Not queued (shutdown has begun); close it so it is not reported as never awaited.
+        coroutine.close()
+
+
+async def _send_completion(args: Dict[str, Any], idempotency_key: str, transaction_id: Any) -> None:
+    try:
+        submit_ai_event("completion", args, idempotency_key=idempotency_key)
+    except APIError as exc:
+        # submit_ai_event has logged it already.
+        logger.debug("emit_completion record %s was not delivered: %s", transaction_id, type(exc).__name__)
+    except Exception as exc:  # noqa: BLE001 - nothing may escape into the metering worker
+        logger.error("emit_completion record %s was not sent: %s", transaction_id, type(exc).__name__)
+
+
+async def _send_tool_event(tool_event: Dict[str, Any], transaction_id: Any) -> None:
+    try:
+        deliver_tool_event(tool_event)
+    except Exception as exc:  # noqa: BLE001 - nothing may escape into the metering worker
+        logger.error("emit_tool_event record %s was not sent: %s", transaction_id, type(exc).__name__)
+
+
+def _split_completion_payload(
+    payload: Mapping[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any], List[str]]:
+    """Sort a completion payload into typed keywords, extra_body and unknown keys.
+
+    A required key is passed as given, so an explicit ``None`` still reaches
+    the wire as null. Everywhere else ``None`` means not set, and the key is
+    omitted so the typed client keeps its NotGiven default.
+    """
+    keywords: Dict[str, Any] = {}
+    extra_body: Dict[str, Any] = {}
+    unknown_keys: List[str] = []
+    for key, value in payload.items():
+        if key in _REQUIRED_COMPLETION_KEYS:
+            keywords[_COMPLETION_KEYWORD_BY_WIRE_NAME[key]] = value
+        elif key not in _EXTRA_BODY_COMPLETION_KEYS and key not in _COMPLETION_KEYWORD_BY_WIRE_NAME:
+            unknown_keys.append(str(key))
+        elif value is None:
+            continue
+        elif key in _EXTRA_BODY_COMPLETION_KEYS:
+            extra_body[key] = value
+        elif key == "agentVersion":
+            agent_version = validate_agent_version(value)
+            if agent_version is not None:
+                keywords["agent_version"] = agent_version
+        else:
+            keywords[_COMPLETION_KEYWORD_BY_WIRE_NAME[key]] = value
+    return keywords, extra_body, unknown_keys
 
 
 def _job_resource_or(

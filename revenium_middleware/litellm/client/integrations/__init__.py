@@ -14,9 +14,9 @@ Example:
     >>> crew = ReveniumCrewWrapper(
     ...     agents=[...],
     ...     tasks=[...],
-    ...     organization_id="AcmeCorp",
+    ...     organization_name="AcmeCorp",
     ...     subscription_id="82764738",
-    ...     product_id="Platinum"
+    ...     product_name="Platinum"
     ... )
     >>> 
     >>> result = crew.kickoff()

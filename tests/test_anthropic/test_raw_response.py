@@ -5,10 +5,12 @@ Each cell asserts the call returns what the SDK returns without our middleware,
 reaches the stub exactly once, and sends exactly one usage record.
 """
 import asyncio
+import gc
 import json
 import threading
 from unittest.mock import MagicMock, patch
 
+import pydantic
 import pytest
 
 anthropic = pytest.importorskip("anthropic")
@@ -31,25 +33,34 @@ _USAGE = {
     "cache_creation_input_tokens": 0,
     "cache_read_input_tokens": 0,
 }
-MESSAGE_BODY = json.dumps({
-    "id": MESSAGE_ID, "type": "message", "role": "assistant", "model": DATED_MODEL,
-    "content": [{"type": "text", "text": "hi"}], "stop_reason": "end_turn", "stop_sequence": None,
-    "usage": _USAGE,
-}).encode()
-_SSE_EVENTS = [
-    ("message_start", {"type": "message_start", "message": {
-        "id": MESSAGE_ID, "type": "message", "role": "assistant", "model": DATED_MODEL, "content": [],
-        "stop_reason": None, "stop_sequence": None, "usage": {**_USAGE, "output_tokens": 1}}}),
-    ("content_block_start", {"type": "content_block_start", "index": 0,
-                             "content_block": {"type": "text", "text": ""}}),
-    ("content_block_delta", {"type": "content_block_delta", "index": 0,
-                             "delta": {"type": "text_delta", "text": "hi"}}),
-    ("content_block_stop", {"type": "content_block_stop", "index": 0}),
-    ("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                       "usage": _USAGE}),
-    ("message_stop", {"type": "message_stop"}),
-]
-SSE_BODY = "".join(f"event: {name}\ndata: {json.dumps(data)}\n\n" for name, data in _SSE_EVENTS).encode()
+END_TURN = {"stop_reason": "end_turn", "stop_sequence": None}
+
+
+def _message_body(finish):
+    return json.dumps({
+        "id": MESSAGE_ID, "type": "message", "role": "assistant", "model": DATED_MODEL,
+        "content": [{"type": "text", "text": "hi"}], **finish, "usage": _USAGE,
+    }).encode()
+
+
+def _sse_body(finish):
+    events = [
+        ("message_start", {"type": "message_start", "message": {
+            "id": MESSAGE_ID, "type": "message", "role": "assistant", "model": DATED_MODEL, "content": [],
+            "stop_reason": None, "stop_sequence": None, "usage": {**_USAGE, "output_tokens": 1}}}),
+        ("content_block_start", {"type": "content_block_start", "index": 0,
+                                 "content_block": {"type": "text", "text": ""}}),
+        ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                 "delta": {"type": "text_delta", "text": "hi"}}),
+        ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        ("message_delta", {"type": "message_delta", "delta": finish, "usage": _USAGE}),
+        ("message_stop", {"type": "message_stop"}),
+    ]
+    return "".join(f"event: {name}\ndata: {json.dumps(data)}\n\n" for name, data in events).encode()
+
+
+MESSAGE_BODY = _message_body(END_TURN)
+SSE_BODY = _sse_body(END_TURN)
 
 
 CHUNK_SIZE = 64
@@ -68,17 +79,23 @@ class StubAnthropic:
     """Serves bodies as chunk iterators: an httpx2 Response built from bytes is
     read on construction, which would hide whether our wrapper consumed it."""
 
-    def __init__(self):
+    def __init__(self, finish=END_TURN, status=None):
         self.requests = []
+        self._finish = finish
+        self._status = status
 
     def _respond(self, request, as_body):
         assert request.url.host == STUB_HOST
         self.requests.append(request)
+        if self._status:
+            return httpx2.Response(self._status, headers={"content-type": "application/json", "request-id": REQUEST_ID},
+                                   content=as_body(json.dumps({"type": "error", "error": {
+                                       "type": "invalid_request_error", "message": "refused"}}).encode()))
         if json.loads(request.content).get("stream"):
             return httpx2.Response(200, headers={"content-type": "text/event-stream", "request-id": REQUEST_ID},
-                                   content=as_body(SSE_BODY))
+                                   content=as_body(_sse_body(self._finish)))
         return httpx2.Response(200, headers={"content-type": "application/json", "request-id": REQUEST_ID},
-                               content=as_body(MESSAGE_BODY))
+                               content=as_body(_message_body(self._finish)))
 
     def sync_client(self):
         transport = httpx2.MockTransport(lambda request: self._respond(request, lambda body: iter(_chunks(body))))
@@ -312,6 +329,34 @@ class TestStreamingResponse:
         assert_one_record(stub, records, streamed=True)
 
 
+class TestStopSequenceFinish:
+    """A Claude answer that stopped on one of the caller's stop sequences
+    (BACK-4032)."""
+
+    @pytest.fixture
+    def stub(self):
+        return StubAnthropic(finish={"stop_reason": "stop_sequence", "stop_sequence": "###"})
+
+    def test_create(self, stub, records):
+        stub.sync_client().messages.create(stop_sequences=["###"], **REQUEST)
+
+        assert_one_record(stub, records, streamed=False)
+        assert records[0]["stop_reason"] == "END_SEQUENCE"
+
+    def test_create_stream(self, stub, records):
+        list(stub.sync_client().messages.create(stream=True, stop_sequences=["###"], **REQUEST))
+
+        assert_one_record(stub, records, streamed=True)
+        assert records[0]["stop_reason"] == "END_SEQUENCE"
+
+    def test_messages_stream(self, stub, records):
+        with stub.sync_client().messages.stream(stop_sequences=["###"], **REQUEST) as stream:
+            stream.get_final_message()
+
+        assert_one_record(stub, records, streamed=True)
+        assert records[0]["stop_reason"] == "END_SEQUENCE"
+
+
 class TestRawResponseDetection:
     def test_sdk_class_in_another_anthropic_module_is_recognised(self):
         stand_in_class = type("FutureAPIResponse", (), {
@@ -321,7 +366,7 @@ class TestRawResponseDetection:
         })
         assert is_raw_response(stand_in_class())
 
-    def test_test_doubles_and_parsed_results_are_not_raw_responses(self, stub):
+    def test_test_doubles_and_parsed_results_are_not_raw_responses(self, stub, records):
         message = stub.sync_client().messages.create(**REQUEST)
         assert not is_raw_response(MagicMock())
         assert not is_raw_response(message)
@@ -355,3 +400,287 @@ class TestChatAnthropicWithMiddlewareAlone:
 
         assert asyncio.run(call()) == "hi"
         assert_one_record(stub, records, streamed=True)
+
+
+# ---- BACK-4239: a refused call sends one ERROR record --------------------------
+
+def _refused_create(client):
+    return client.messages.create(**REQUEST)
+
+
+def _refused_create_stream(client):
+    return list(client.messages.create(**REQUEST, stream=True))
+
+
+def _refused_messages_stream(client):
+    with client.messages.stream(**REQUEST) as stream:
+        return list(stream)
+
+
+def _refused_async_create(stub):
+    return asyncio.run(stub.async_client().messages.create(**REQUEST))
+
+
+class _Answer(pydantic.BaseModel):
+    answer: str
+
+
+REFUSED_ANTHROPIC_CALLS = [
+    pytest.param(lambda stub: _refused_create(stub.sync_client()), False, id="create"),
+    pytest.param(lambda stub: stub.sync_client().messages.parse(**REQUEST, output_format=_Answer), False, id="parse"),
+    pytest.param(lambda stub: _refused_create_stream(stub.sync_client()), True, id="create-stream"),
+    pytest.param(_refused_async_create, False, id="async-create"),
+    pytest.param(lambda stub: _refused_messages_stream(stub.sync_client()), True, id="messages-stream"),
+]
+
+
+@pytest.fixture
+def raised_errors(monkeypatch):
+    """Every status error the Anthropic client builds, to check the caller gets that same object."""
+    built = []
+    for client_class in (anthropic.Anthropic, anthropic.AsyncAnthropic):
+        build = client_class._make_status_error
+
+        def spy(self, *args, _build=build, **kwargs):
+            error = _build(self, *args, **kwargs)
+            built.append(error)
+            return error
+
+        monkeypatch.setattr(client_class, "_make_status_error", spy)
+    return built
+
+
+@pytest.mark.parametrize("status, error_class", [
+    (400, "BadRequestError"), (429, "RateLimitError"), (500, "InternalServerError"),
+])
+@pytest.mark.parametrize("call, streamed", REFUSED_ANTHROPIC_CALLS)
+def test_refused_create_sends_one_error_record(records, raised_errors, call, streamed, status, error_class):
+    stub = StubAnthropic(status=status)
+
+    with pytest.raises(anthropic.APIStatusError) as exc_info:
+        call(stub)
+
+    assert exc_info.value is raised_errors[-1]
+    assert len(records) == 1, records
+    record = records[0]
+    assert record["stop_reason"] == "ERROR"
+    assert error_class in record["error_reason"]
+    assert f"HTTP {status}" in record["error_reason"]
+    assert record.get("error_code") == status
+    assert (record["input_token_count"], record["output_token_count"], record["total_token_count"]) == (0, 0, 0)
+    assert record["model"] == REQUEST["model"]
+    assert record["provider"] == "ANTHROPIC"
+    assert record["is_streamed"] is streamed
+
+
+# ---- BACK-4239: a stream that breaks off part-way is recorded as ERROR ----------
+
+def _sse_events(body):
+    return [event + b"\n\n" for event in body.split(b"\n\n") if event]
+
+
+class CutOffStubAnthropic(StubAnthropic):
+    """Serves a stream body that breaks off with ``error`` after ``events_before_cut`` events."""
+
+    def __init__(self, events_before_cut):
+        super().__init__()
+        self.error = httpx2.ReadError("connection reset mid-stream")
+        self._events_before_cut = events_before_cut
+
+    def _cut_off(self, body):
+        yield from _sse_events(body)[:self._events_before_cut]
+        raise self.error
+
+    async def _async_cut_off(self, body):
+        for event in self._cut_off(body):
+            yield event
+
+    def sync_client(self):
+        transport = httpx2.MockTransport(lambda request: self._respond(request, self._cut_off))
+        return anthropic.Anthropic(api_key="sk-ant-test", base_url=f"http://{STUB_HOST}", max_retries=0,
+                                   http_client=httpx2.Client(transport=transport))
+
+    def async_client(self):
+        transport = httpx2.MockTransport(lambda request: self._respond(request, self._async_cut_off))
+        return anthropic.AsyncAnthropic(api_key="sk-ant-test", base_url=f"http://{STUB_HOST}", max_retries=0,
+                                        http_client=httpx2.AsyncClient(transport=transport))
+
+
+def _cut_messages_stream(stub):
+    with stub.sync_client().messages.stream(**REQUEST) as stream:
+        for _ in stream:
+            pass
+
+
+def _cut_async_messages_stream(stub):
+    async def call():
+        async with stub.async_client().messages.stream(**REQUEST) as stream:
+            async for _ in stream:
+                pass
+
+    asyncio.run(call())
+
+
+def _cut_raw_create_stream(stub):
+    response = stub.sync_client().messages.with_raw_response.create(stream=True, **REQUEST)
+    for _ in response.parse():
+        pass
+
+
+def _cut_async_raw_create_stream(stub):
+    async def call():
+        response = await stub.async_client().messages.with_raw_response.create(stream=True, **REQUEST)
+        async for _ in await response.parse():
+            pass
+
+    asyncio.run(call())
+
+
+CUT_OFF_STREAMS = [
+    pytest.param(_cut_messages_stream, id="messages-stream"),
+    pytest.param(_cut_async_messages_stream, id="async-messages-stream"),
+    pytest.param(_cut_raw_create_stream, id="raw-create-stream"),
+    pytest.param(_cut_async_raw_create_stream, id="async-raw-create-stream"),
+]
+
+
+@pytest.fixture
+def keyed_records():
+    captured = []
+
+    def record(operation, payload, idempotency_key=None):
+        captured.append((payload, idempotency_key))
+        return MagicMock(status_code=201)
+
+    with patch("revenium_middleware.anthropic.middleware._get_thread_safe_client", return_value=MagicMock()), \
+            patch("revenium_middleware.anthropic.middleware.submit_ai_event", side_effect=record), \
+            patch("revenium_middleware.anthropic.middleware._safe_run_async_in_thread",
+                  side_effect=_run_metering_synchronously):
+        yield captured
+
+
+def _broken_stream_record(keyed_records, monkeypatch, call, events_before_cut):
+    from revenium_middleware import idempotency_key as idempotency_block
+
+    monkeypatch.setenv("REVENIUM_CAPTURE_PROMPTS", "true")
+    stub = CutOffStubAnthropic(events_before_cut)
+    with idempotency_block("blk"):
+        with pytest.raises(httpx2.ReadError) as exc_info:
+            call(stub)
+
+    assert exc_info.value is stub.error
+    assert len(keyed_records) == 1, keyed_records
+    record, key = keyed_records[0]
+    assert record["stop_reason"] == "ERROR"
+    assert "ReadError" in record["error_reason"]
+    assert record.get("error_code") is None
+    assert record["is_streamed"] is True
+    assert key.startswith("blk:err:")
+    assert (record["system_prompt"], record["input_messages"], record["output_response"]) == (None, None, None)
+    return record
+
+
+@pytest.mark.parametrize("call", CUT_OFF_STREAMS)
+def test_stream_breaking_off_part_way_is_recorded_as_error(keyed_records, monkeypatch, call):
+    record = _broken_stream_record(keyed_records, monkeypatch, call, events_before_cut=3)
+
+    assert record["input_token_count"] == INPUT_TOKENS
+    assert record["transaction_id"] == MESSAGE_ID
+    assert record["model"] == DATED_MODEL
+
+
+@pytest.mark.parametrize("call", CUT_OFF_STREAMS)
+def test_stream_breaking_off_before_message_start_sends_one_error_record(keyed_records, monkeypatch, call):
+    record = _broken_stream_record(keyed_records, monkeypatch, call, events_before_cut=0)
+
+    assert (record["input_token_count"], record["output_token_count"]) == (0, 0)
+    assert record["model"] == REQUEST["model"]
+
+
+OVERLOADED_EVENT = ("event: error\ndata: " + json.dumps({
+    "type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}) + "\n\n").encode()
+
+
+class ErrorEventStubAnthropic(StubAnthropic):
+    """Answers 200 and serves a stream that ends in an ``error`` event after ``events_before_error`` events."""
+
+    def __init__(self, events_before_error):
+        super().__init__()
+        self._events_before_error = events_before_error
+
+    def _with_error_event(self, body):
+        return _sse_events(body)[:self._events_before_error] + [OVERLOADED_EVENT]
+
+    async def _async_with_error_event(self, body):
+        for event in self._with_error_event(body):
+            yield event
+
+    def sync_client(self):
+        transport = httpx2.MockTransport(lambda request: self._respond(request, self._with_error_event))
+        return anthropic.Anthropic(api_key="sk-ant-test", base_url=f"http://{STUB_HOST}", max_retries=0,
+                                   http_client=httpx2.Client(transport=transport))
+
+    def async_client(self):
+        transport = httpx2.MockTransport(lambda request: self._respond(request, self._async_with_error_event))
+        return anthropic.AsyncAnthropic(api_key="sk-ant-test", base_url=f"http://{STUB_HOST}", max_retries=0,
+                                        http_client=httpx2.AsyncClient(transport=transport))
+
+
+@pytest.mark.parametrize("call", [
+    pytest.param(_cut_messages_stream, id="messages-stream"),
+    pytest.param(_cut_async_messages_stream, id="async-messages-stream"),
+])
+def test_an_error_event_inside_a_200_stream_sends_no_error_code(records, call):
+    """BACK-4406: the provider answered 200, so the record has no HTTP status to carry as its error code."""
+    with pytest.raises(anthropic.APIStatusError) as exc_info:
+        call(ErrorEventStubAnthropic(events_before_error=3))
+
+    assert exc_info.value.status_code == 200
+    assert len(records) == 1, records
+    record = records[0]
+    assert record["stop_reason"] == "ERROR"
+    assert "error_code" not in record
+
+
+# ---- a delivered parse() answer that fails to parse (BACK-4331) ---------------
+
+MAX_TOKENS = {"stop_reason": "max_tokens", "stop_sequence": None}
+
+
+def _parse(stub):
+    return stub.sync_client().messages.parse(**REQUEST, output_format=_Answer)
+
+
+def _async_parse(stub):
+    return asyncio.run(stub.async_client().messages.parse(**REQUEST, output_format=_Answer))
+
+
+def _beta_parse(stub):
+    return stub.sync_client().beta.messages.parse(**REQUEST, output_format=_Answer)
+
+
+def _async_beta_parse(stub):
+    return asyncio.run(stub.async_client().beta.messages.parse(**REQUEST, output_format=_Answer))
+
+
+@pytest.mark.parametrize("finish, stop_reason", [
+    pytest.param(MAX_TOKENS, "TOKEN_LIMIT", id="max_tokens"),
+    pytest.param(END_TURN, "END", id="end_turn_with_unparseable_text"),
+])
+@pytest.mark.parametrize("call", [_parse, _async_parse, _beta_parse, _async_beta_parse],
+                         ids=lambda c: c.__name__.strip("_"))
+def test_parse_cut_off_at_the_token_limit_is_recorded_with_the_billed_tokens(call, finish, stop_reason, records):
+    stub = StubAnthropic(finish=finish)
+
+    with pytest.raises(pydantic.ValidationError):
+        call(stub)
+
+    assert len(stub.requests) == 1
+    assert len(records) == 1, records
+    record = records[0]
+    assert record["stop_reason"] == stop_reason
+    assert (record["input_token_count"], record["output_token_count"]) == (INPUT_TOKENS, OUTPUT_TOKENS)
+    assert record["transaction_id"] == MESSAGE_ID
+    assert record.get("error_reason") is None
+    gc.collect()
+    assert len(records) == 1

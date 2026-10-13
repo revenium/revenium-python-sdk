@@ -4,181 +4,112 @@ SPDX-License-Identifier: MIT
 """
 
 """
-Tests for Google model name extraction and normalization.
+The model name a Gemini or Vertex AI record carries.
+
+The Vertex AI classes run in the vertex environment (``.[google-vertex]``),
+where vertexai is installed; the Gemini response classes need no provider SDK.
 """
 
+import importlib.util
+from types import SimpleNamespace
+
 import pytest
-from unittest.mock import Mock
+
+from revenium_middleware.google.common.utils import base_model_name, extract_model_name
 
 
-class TestModelNameNormalization:
-    """Test model name cleaning and normalization."""
-
-    def test_clean_publishers_prefix(self):
-        """Test removing 'publishers/google/models/' prefix."""
-        model_name = "publishers/google/models/gemini-1.5-pro"
-        # Would need to import the actual function, mocking for now
-        expected = "gemini-1.5-pro"
-
-        # This tests the pattern that should be implemented
-        if model_name.startswith("publishers/google/models/"):
-            result = model_name.replace("publishers/google/models/", "")
-            assert result == expected
-
-    def test_clean_models_prefix(self):
-        """Test removing 'models/' prefix."""
-        model_name = "models/gemini-2.0-flash-001"
-        expected = "gemini-2.0-flash-001"
-
-        if model_name.startswith("models/"):
-            result = model_name.replace("models/", "")
-            assert result == expected
-
-    def test_clean_google_models_prefix(self):
-        """Test removing 'google/models/' prefix."""
-        model_name = "google/models/text-embedding-004"
-        expected = "text-embedding-004"
-
-        if model_name.startswith("google/models/"):
-            result = model_name.replace("google/models/", "")
-            assert result == expected
-
-    def test_clean_projects_path(self):
-        """Test removing project-based path."""
-        model_name = "projects/my-project/locations/us-central1/models/gemini-1.5-pro"
-
-        # Extract just the model name
-        parts = model_name.split("/")
-        if "models" in parts:
-            model_idx = parts.index("models")
-            if model_idx + 1 < len(parts):
-                result = parts[model_idx + 1]
-                assert result == "gemini-1.5-pro"
-
-    def test_no_prefix_returns_unchanged(self):
-        """Test that model names without prefixes are unchanged."""
-        model_name = "gemini-1.5-flash"
-        # Should return as-is
-        assert model_name == "gemini-1.5-flash"
+def _module_available(name):
+    try:
+        return importlib.util.find_spec(name) is not None
+    except ModuleNotFoundError:
+        return False
 
 
-class TestModelNamePatterns:
-    """Test various Google model name patterns."""
+vertexai_missing = not _module_available("vertexai")
 
-    @pytest.mark.parametrize("model_name,expected", [
-        ("gemini-2.0-flash-001", "gemini-2.0-flash-001"),
-        ("gemini-2.0-flash-lite-001", "gemini-2.0-flash-lite-001"),
-        ("gemini-1.5-pro", "gemini-1.5-pro"),
-        ("gemini-1.5-pro-001", "gemini-1.5-pro-001"),
-        ("gemini-1.5-pro-002", "gemini-1.5-pro-002"),
-        ("gemini-1.5-flash", "gemini-1.5-flash"),
-        ("gemini-1.5-flash-001", "gemini-1.5-flash-001"),
-        ("gemini-pro", "gemini-pro"),
-        ("gemini-pro-vision", "gemini-pro-vision"),
-        ("text-embedding-004", "text-embedding-004"),
-        ("text-bison", "text-bison"),
-        ("text-bison-32k", "text-bison-32k"),
-        ("code-bison", "code-bison"),
-        ("chat-bison", "chat-bison"),
+
+def vertex_middleware():
+    from revenium_middleware.google.vertex_ai import middleware
+    return middleware
+
+
+@pytest.mark.skipif(vertexai_missing, reason="vertexai SDK not installed")
+class TestVertexModelPath:
+    @pytest.mark.parametrize("resource_name", [
+        "publishers/google/models/gemini-1.5-pro",
+        "models/gemini-1.5-pro",
+        "google/models/gemini-1.5-pro",
+        "gemini-1.5-pro",
     ])
-    def test_supported_model_names(self, model_name, expected):
-        """Test that supported model names are recognized."""
-        # These should all be valid model names
-        assert model_name == expected
+    def test_google_path_prefixes_are_stripped(self, resource_name):
+        assert vertex_middleware()._strip_model_path(resource_name) == "gemini-1.5-pro"
 
 
-class TestModelNameExtraction:
-    """Test model name extraction from various sources."""
+@pytest.mark.skipif(vertexai_missing, reason="vertexai SDK not installed")
+class TestVertexModelObjectName:
+    def test_the_private_model_name_wins_and_loses_its_path(self):
+        model = SimpleNamespace(_model_name="publishers/google/models/gemini-2.0-flash", model="ignored")
 
-    def test_extract_from_model_name_attribute(self):
-        """Test extraction from _model_name attribute."""
-        mock_model = Mock()
-        mock_model._model_name = "gemini-1.5-pro"
+        assert vertex_middleware()._model_name_of(model) == "gemini-2.0-flash"
 
-        if hasattr(mock_model, "_model_name"):
-            result = mock_model._model_name
-            assert result == "gemini-1.5-pro"
+    def test_empty_and_non_string_attributes_are_skipped(self):
+        model = SimpleNamespace(_model_name="", model_name=None, _model_id=42, model_id="text-embedding-005")
 
-    def test_extract_from_model_id_attribute(self):
-        """Test extraction from _model_id attribute."""
-        mock_model = Mock()
-        mock_model._model_id = "gemini-2.0-flash-001"
-        del mock_model._model_name  # Simulate _model_name not existing
+        assert vertex_middleware()._model_name_of(model) == "text-embedding-005"
 
-        # Try _model_id as fallback
-        if hasattr(mock_model, "_model_id"):
-            result = mock_model._model_id
-            assert result == "gemini-2.0-flash-001"
-
-    def test_extract_from_string_representation(self):
-        """Test extraction from string representation."""
-        class MockModel:
+    @pytest.mark.parametrize("representation", [
+        "<GenerativeModel model_name='gemini-1.5-flash'>",
+        "GenerativeModel(models/gemini-1.5-flash)",
+    ])
+    def test_the_representation_is_the_last_resort(self, representation):
+        class Model:
             def __str__(self):
-                return "GenerativeModel(model_name='gemini-1.5-flash')"
+                return representation
 
-        mock_model = MockModel()
-        str_repr = str(mock_model)
+        assert vertex_middleware()._model_name_of(Model()) == "gemini-1.5-flash"
 
-        # Extract from string representation
-        import re
-        if "model_name=" in str_repr:
-            match = re.search(r"model_name='([^']+)'", str_repr)
-            if match:
-                result = match.group(1)
-                assert result == "gemini-1.5-flash"
-
-    def test_extract_from_resource_name(self):
-        """Test extraction from _resource_name attribute (Vertex AI specific)."""
-        mock_model = Mock()
-        mock_model._resource_name = "projects/my-project/locations/us-central1/models/gemini-pro"
-
-        if hasattr(mock_model, "_resource_name"):
-            resource_name = mock_model._resource_name
-            if "models/" in resource_name:
-                result = resource_name.split("models/")[-1]
-                assert result == "gemini-pro"
-
-    def test_multiple_extraction_fallbacks(self):
-        """Test that extraction tries multiple methods."""
-        mock_model = Mock()
-        # Simulate no standard attributes
-        mock_model.configure_mock(**{
-            "spec": [],  # No attributes
-            "__str__": lambda self: "GenerativeModel(model_name='gemini-1.5-pro')"
-        })
-
-        # Should fall back to string parsing
-        str_repr = str(mock_model)
-        import re
-        match = re.search(r"model_name='([^']+)'", str_repr)
-        assert match.group(1) == "gemini-1.5-pro"
+    def test_an_object_with_no_model_name_gives_none(self):
+        assert vertex_middleware()._model_name_of(SimpleNamespace()) is None
 
 
-class TestModelVersionHandling:
-    """Test handling of versioned model names."""
+class TestGeminiResponseModelName:
+    def test_model_is_preferred_over_model_version(self):
+        response = SimpleNamespace(model="gemini-2.5-flash", model_version="gemini-2.5-flash-001")
 
-    def test_versioned_models_extracted_correctly(self):
-        """Test that version suffixes are preserved."""
-        versioned_models = [
-            "gemini-1.5-pro-001",
-            "gemini-1.5-pro-002",
-            "gemini-1.5-flash-001",
-            "gemini-2.0-flash-001",
-        ]
+        assert extract_model_name(response) == "gemini-2.5-flash"
 
-        for model in versioned_models:
-            # Versions should be preserved for accurate pricing
-            assert "-001" in model or "-002" in model
+    def test_model_version_is_used_when_it_is_the_only_name(self):
+        response = SimpleNamespace(model_version="gemini-2.5-flash-lite")
 
-    def test_base_model_names_without_version(self):
-        """Test that base model names work without version suffixes."""
-        base_models = [
-            "gemini-1.5-pro",
-            "gemini-1.5-flash",
-            "gemini-pro",
-        ]
+        assert extract_model_name(response) == "gemini-2.5-flash-lite"
 
-        for model in base_models:
-            # Should not have version suffixes
-            assert not model.endswith("-001")
-            assert not model.endswith("-002")
+    def test_the_fallback_is_used_when_the_response_names_no_model(self):
+        assert extract_model_name(SimpleNamespace(model_version=None), "gemini-2.0-flash") == "gemini-2.0-flash"
+
+    def test_no_name_and_no_fallback_gives_unknown_model(self):
+        assert extract_model_name(SimpleNamespace()) == "unknown-model"
+
+    def test_a_missing_response_uses_the_fallback(self):
+        assert extract_model_name(None, "text-embedding-004") == "text-embedding-004"
+
+
+class TestBaseModelName:
+    @pytest.mark.parametrize("name", [
+        "veo-3.0-generate-001",
+        "models/veo-3.0-generate-001",
+        "publishers/google/models/veo-3.0-generate-001",
+        "projects/p/locations/l/publishers/google/models/veo-3.0-generate-001",
+        "google/veo-3.0-generate-001",
+    ])
+    def test_one_google_path_prefix_is_removed(self, name):
+        assert base_model_name(name) == "veo-3.0-generate-001"
+
+    @pytest.mark.parametrize("name", [
+        "tunedModels/x",
+        "projects/p/locations/l/endpoints/123",
+        "publishers/anthropic/models/claude-x",
+        None,
+        7,
+    ])
+    def test_names_that_are_not_a_google_model_path_are_unchanged(self, name):
+        assert base_model_name(name) == name

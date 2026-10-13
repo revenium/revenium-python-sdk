@@ -15,19 +15,44 @@ mid-migration is not double-billed.
 
 import datetime
 import logging
+import os
 import uuid
 import warnings
 
 from litellm.integrations.custom_logger import CustomLogger
 from revenium_middleware import client, get_client, run_async_in_thread
-from revenium_middleware._core.fields import merge_extra_body
-from revenium_middleware._core.cache_tokens import (
+from revenium_middleware._core.fields import extract_skill_fields, merge_extra_body
+from revenium_middleware._core.cache_tokens import (  # noqa: F401  re-exported for guardrail.py
+    ANTHROPIC_MESSAGES_CALL_TYPE,
+    _CACHE_FOLDING_PROVIDERS,
     billable_input_tokens,
+    cache_creation_inside_litellm_prompt,
+    extract_cache_creation_ttl_counts,
     extract_cache_tokens,
     get_usage_field,
+    prompt_tokens_fold_cache,
+    without_openai_cache_writes,
 )
-from revenium_middleware._core.config import is_shared_call_id_enabled
+from revenium_middleware._core.config import (
+    is_organization_pinned_to_key_team,
+    is_shared_call_id_enabled,
+    organization_pin_setting_unrecognised,
+)
 from revenium_middleware._core import submit_ai_event
+from revenium_middleware._core.log_sanitize import sanitize_for_logging
+from revenium_middleware._core.trace_fields import (
+    ENV_REVENIUM_RETRY_NUMBER,
+    get_agent_version,
+    get_credential_alias,
+    get_environment,
+    get_parent_transaction_id,
+    get_region,
+    get_retry_number,
+    get_ticket_id,
+    get_trace_name,
+    get_trace_type,
+    get_transaction_name,
+)
 
 from ._metering_owner import guardrail_owns_metering
 
@@ -122,9 +147,9 @@ def _warn_metering_is_owned_by_the_guardrail():
 
 
 def _extract_organization_name(headers, metadata):
-    organization_name = headers.get("x-revenium-organization-name")
+    organization_name = present_or_none(headers.get("x-revenium-organization-name"))
     if organization_name is None:
-        old_value = headers.get("x-revenium-organization-id")
+        old_value = present_or_none(headers.get("x-revenium-organization-id"))
         if old_value:
             logger.warning(
                 "Header 'x-revenium-organization-id' is deprecated. "
@@ -132,8 +157,64 @@ def _extract_organization_name(headers, metadata):
             )
         organization_name = old_value
     if organization_name is None:
-        organization_name = metadata.get('user_api_key_team_alias', '') or None
+        organization_name = present_or_none(metadata.get('user_api_key_team_alias'))
     return organization_name
+
+
+_KEY_TEAM_ALIAS = "user_api_key_team_alias"
+
+
+def key_team_alias(container):
+    """The calling key's team alias as LiteLLM recorded it, or None.
+
+    On the routes in LiteLLM's ``LITELLM_METADATA_ROUTES`` (``/v1/messages``
+    among them) LiteLLM writes the key's fields to ``litellm_metadata``, always
+    including this one (None for a teamless key), and ``metadata`` is the
+    caller's own request body. So ``metadata`` is read only when
+    ``litellm_metadata`` does not carry the key. LiteLLM 1.105 strips a caller's
+    ``user_api_key_*`` keys from the body, so there a body read finds nothing;
+    older releases inside the supported range may not strip them.
+
+    Args:
+        container: A callback's ``litellm_params`` or a guardrail hook's
+            ``data``. A non-mapping at any level yields None.
+    """
+    container = container if hasattr(container, "get") else {}
+    for key in ("litellm_metadata", "metadata"):
+        level = container.get(key)
+        level = level if hasattr(level, "get") else {}
+        if _KEY_TEAM_ALIAS in level:
+            return present_or_none(level.get(_KEY_TEAM_ALIAS))
+    return None
+
+
+def pinned_key_team(team_alias):
+    """The key's team alias when the operator pinned the organization to it, else None."""
+    team_alias = present_or_none(team_alias)
+    if team_alias is not None and is_organization_pinned_to_key_team():
+        return team_alias
+    return None
+
+
+def log_organization_pin_setting():
+    """Say at startup whether the organization is pinned to the key's team.
+
+    An unrecognised value leaves the pin off, so it is named as a warning:
+    otherwise an operator who set it learns only when spend lands under
+    another organization.
+    """
+    if is_organization_pinned_to_key_team():
+        logger.info(
+            "REVENIUM_LITELLM_PIN_ORGANIZATION_TO_KEY_TEAM is on; the organization "
+            "is pinned to the calling key's team alias, and the organization "
+            "headers apply only to keys with no team."
+        )
+    elif organization_pin_setting_unrecognised():
+        logger.warning(
+            "REVENIUM_LITELLM_PIN_ORGANIZATION_TO_KEY_TEAM is set to a value that "
+            "is not recognised, so the organization is NOT pinned to the calling "
+            "key's team. Use 1, true, yes or on to turn it on."
+        )
 
 
 def extract_request_headers(container):
@@ -185,6 +266,17 @@ SUBSCRIBER_ID_HEADER = "x-revenium-subscriber-id"
 SUBSCRIBER_EMAIL_HEADER = "x-revenium-subscriber-email"
 
 
+def present_or_none(value):
+    """``value`` unchanged, or None when it is None or a blank string.
+
+    A filled value keeps its exact text; only an empty or whitespace-only
+    string is treated as if it had not been sent, so the next fallback applies.
+    """
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
 def header_then_metadata(headers, metadata, name):
     """The caller's non-blank ``name`` value, the captured header ahead of metadata.
 
@@ -208,60 +300,6 @@ def header_then_metadata(headers, metadata, name):
 REVENIUM_CALL_ID_KEY = "revenium_call_id"
 REVENIUM_CALL_TYPE_KEY = "revenium_call_type"
 REVENIUM_CALL_MINT_KEY = "revenium_call_mint"
-ANTHROPIC_MESSAGES_CALL_TYPE = "anthropic_messages"
-
-# LiteLLM ``custom_llm_provider`` values whose usage conversion folds the cache
-# buckets into ``prompt_tokens`` *and* whose rows the platform stores as sent.
-# Anthropic is the one provider Revenium never normalizes server-side (see
-# billable_input_tokens), so it is the one provider whose overlap this row may
-# remove. Bedrock and Vertex Claude are absent deliberately: their LiteLLM
-# transformations are not AnthropicConfig's, so their prompt counts are left
-# exactly as LiteLLM built them until someone has measured one.
-_CACHE_FOLDING_PROVIDERS = frozenset({"anthropic", "anthropic_text"})
-
-
-def prompt_tokens_fold_cache(*sources):
-    """True when this call's ``prompt_tokens`` is an Anthropic count plus cache.
-
-    Only the upstream decides, never the numbers: an OpenAI-shaped provider
-    reports ``cached_tokens`` inside a prompt count the platform itself nets
-    out, so subtracting here would net it out twice and price the input leg at
-    zero. See ``billable_input_tokens`` for both failure modes.
-
-    ``custom_llm_provider`` is the field to read, and which surface carries it
-    depends on the hook, so every caller hands in the ones it has and the first
-    that names a provider decides -- the response's own before the request's.
-    Only surfaces LiteLLM fills qualify: ``data["metadata"]`` on ``/v1/messages``
-    is the caller's request body, so a value there would let a caller pick the
-    arithmetic that sets their billed input count (see BACK-3190 for the same
-    rule on headers).
-    Measured against a live litellm 1.102.0 proxy: the logging event's
-    ``kwargs`` and its ``litellm_params`` both carry it (also on the 1.93.0
-    floor), while on the non-streamed ``/v1/messages`` route the post-call hook
-    is handed a raw provider body with no ``_hidden_params`` and a request dict
-    that names no provider -- there it is ``data["litellm_logging_obj"]``'s
-    ``model_call_details`` that carries both the provider and the call type.
-    An ``anthropic_messages`` call type says the same thing about a route
-    LiteLLM only ever serves from an Anthropic-shaped upstream, and covers a
-    surface carrying the call type but no provider.
-
-    With nothing to read, the prompt count stays as LiteLLM built it: reporting
-    a gross count costs the cache overlap twice for Anthropic only, while
-    reporting a net one costs the whole input leg for every pool the platform
-    normalizes.
-    """
-    for source in sources:
-        level = source if hasattr(source, "get") else {}
-        provider = level.get("custom_llm_provider")
-        if provider:
-            return str(provider).lower() in _CACHE_FOLDING_PROVIDERS
-        if level.get("call_type") == ANTHROPIC_MESSAGES_CALL_TYPE:
-            return True
-    logger.debug(
-        "No upstream provider on this event; reporting prompt_tokens as LiteLLM "
-        "built it rather than assuming the cache tokens are inside it"
-    )
-    return False
 
 # Minted once per proxy process, and the reason a read can tell a value this
 # process minted from one a caller sent. See read_shared_call_id.
@@ -344,9 +382,9 @@ def read_shared_call_id(container, active):
 
 
 def _extract_product_name(headers):
-    product_name = headers.get("x-revenium-product-name")
+    product_name = present_or_none(headers.get("x-revenium-product-name"))
     if product_name is None:
-        old_value = headers.get("x-revenium-product-id")
+        old_value = present_or_none(headers.get("x-revenium-product-id"))
         if old_value:
             logger.warning(
                 "Header 'x-revenium-product-id' is deprecated. "
@@ -354,6 +392,69 @@ def _extract_product_name(headers):
             )
         product_name = old_value
     return product_name
+
+
+# Each trace field a gateway caller can set per call, and the header it rides
+# in. The names are the ones the Griptape driver derives from the snake_case
+# metadata keys, so its tags land here unchanged.
+_TRACE_FIELD_HEADERS = {
+    "environment": "x-revenium-environment",
+    "region": "x-revenium-region",
+    "credential_alias": "x-revenium-credential-alias",
+    "transaction_name": "x-revenium-transaction-name",
+    "trace_type": "x-revenium-trace-type",
+    "trace_name": "x-revenium-trace-name",
+    "ticket_id": "x-revenium-ticket-id",
+    "parent_transaction_id": "x-revenium-parent-transaction-id",
+    "retry_number": "x-revenium-retry-number",
+    "skill_name": "x-revenium-skill-name",
+    "skill_source": "x-revenium-skill-source",
+    "skill_kind": "x-revenium-skill-kind",
+    "skill_plugin_name": "x-revenium-skill-plugin-name",
+    "skill_marketplace_name": "x-revenium-skill-marketplace-name",
+    "skill_invocation_trigger": "x-revenium-skill-invocation-trigger",
+    "agent_version": "x-revenium-agent-version",
+}
+
+_TRACE_FIELD_GETTERS = (
+    ("environment", get_environment),
+    ("region", get_region),
+    ("credential_alias", get_credential_alias),
+    ("transaction_name", get_transaction_name),
+    ("trace_type", get_trace_type),
+    ("trace_name", get_trace_name),
+    ("parent_transaction_id", get_parent_transaction_id),
+    ("ticket_id", get_ticket_id),
+    ("agent_version", get_agent_version),
+)
+
+
+def trace_fields_from_headers(headers):
+    """The trace fields for a gateway record: the call's header, else the host's setting.
+
+    Resolved through the same getters a direct call uses, so precedence,
+    validation and the cloud region fallbacks match. Only fields that resolve
+    to a value are returned, so a gateway with nothing configured sends the
+    record it always sent.
+    """
+    per_call = {
+        field: present_or_none(headers.get(header))
+        for field, header in _TRACE_FIELD_HEADERS.items()
+    }
+    fields = {}
+    for field, getter in _TRACE_FIELD_GETTERS:
+        value = getter(per_call)
+        if value:
+            fields[field] = value
+    fields.update(extract_skill_fields(per_call))
+    if _retry_number_is_set(per_call.get("retry_number")):
+        fields["retry_number"] = get_retry_number(per_call)
+    return fields
+
+
+def _retry_number_is_set(retry_header):
+    header_is_a_number = isinstance(retry_header, str) and retry_header.isdecimal()
+    return header_is_a_number or bool(os.getenv(ENV_REVENIUM_RETRY_NUMBER))
 
 
 def _extract_agentic_job_from_headers(headers):
@@ -382,6 +483,7 @@ class MiddlewareHandler(CustomLogger):
         # Also logged, because a LiteLLM proxy runs with warnings suppressed
         # more often than not, and its operator reads logs.
         logger.warning(DEPRECATION_MESSAGE)
+        log_organization_pin_setting()
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
         if guardrail_owns_metering():
@@ -430,13 +532,12 @@ class MiddlewareHandler(CustomLogger):
         cache_read_tokens, cache_creation_tokens = extract_cache_tokens(usage)
         # An unconverted Anthropic body stays unpriced here on purpose: the
         # guardrail owns that route.
+        upstream_sources = (getattr(response_obj, "_hidden_params", None), kwargs, litellm_params)
         input_tokens = billable_input_tokens(
-            get_usage_field(usage, "prompt_tokens", 0),
+            without_openai_cache_writes(get_usage_field(usage, "prompt_tokens", 0), usage),
             cache_read_tokens,
-            cache_creation_tokens,
-            prompt_tokens_fold_cache(
-                getattr(response_obj, "_hidden_params", None), kwargs, litellm_params
-            ),
+            cache_creation_inside_litellm_prompt(cache_creation_tokens, *upstream_sources),
+            prompt_tokens_fold_cache(*upstream_sources),
         )
         completion_tokens = get_usage_field(usage, "completion_tokens", 0)
         total_tokens = get_usage_field(usage, "total_tokens", 0)
@@ -463,13 +564,17 @@ class MiddlewareHandler(CustomLogger):
                 "value": credential_value
             }
 
-        organization_name = _extract_organization_name(headers, metadata)
+        organization_name = (
+            pinned_key_team(key_team_alias(litellm_params))
+            or _extract_organization_name(headers, metadata)
+        )
         product_name = _extract_product_name(headers)
         agentic_fields = _extract_agentic_job_from_headers(headers)
         extra_body = merge_extra_body(None, agentic_fields)
 
         completion_args = {
             "cache_creation_token_count": cache_creation_tokens,
+            **extract_cache_creation_ttl_counts(usage),
             "cache_read_token_count": cache_read_tokens,
             "input_token_cost": None,
             "output_token_cost": None,
@@ -515,10 +620,11 @@ class MiddlewareHandler(CustomLogger):
             "is_streamed": metadata.get('hidden_params', {}).get('optional_params', {}).get('stream', False),
             "operation_type": "CHAT",
             "mediation_latency": metadata.get('hidden_params', {}).get('litellm_overhead_time_ms', 0),
+            **trace_fields_from_headers(headers),
             "middleware_source": "PROXY",
         }
 
-        logger.debug("Calling client.ai.create_completion with args: %s", completion_args)
+        logger.debug("Calling client.ai.create_completion with args: %s", sanitize_for_logging(completion_args))
 
         async def metering_call():
             try:
@@ -568,13 +674,12 @@ class MiddlewareHandler(CustomLogger):
         cache_read_tokens, cache_creation_tokens = extract_cache_tokens(usage)
         # An unconverted Anthropic body stays unpriced here on purpose: the
         # guardrail owns that route.
+        upstream_sources = (getattr(response_obj, "_hidden_params", None), kwargs, litellm_params)
         input_tokens = billable_input_tokens(
-            get_usage_field(usage, "prompt_tokens", 0),
+            without_openai_cache_writes(get_usage_field(usage, "prompt_tokens", 0), usage),
             cache_read_tokens,
-            cache_creation_tokens,
-            prompt_tokens_fold_cache(
-                getattr(response_obj, "_hidden_params", None), kwargs, litellm_params
-            ),
+            cache_creation_inside_litellm_prompt(cache_creation_tokens, *upstream_sources),
+            prompt_tokens_fold_cache(*upstream_sources),
         )
         completion_tokens = get_usage_field(usage, "completion_tokens", 0)
         total_tokens = get_usage_field(usage, "total_tokens", 0)
@@ -604,13 +709,17 @@ class MiddlewareHandler(CustomLogger):
                 "value": credential_value
             }
 
-        organization_name = _extract_organization_name(headers, metadata)
+        organization_name = (
+            pinned_key_team(key_team_alias(litellm_params))
+            or _extract_organization_name(headers, metadata)
+        )
         product_name = _extract_product_name(headers)
         agentic_fields = _extract_agentic_job_from_headers(headers)
         extra_body = merge_extra_body(None, agentic_fields)
 
         completion_args = {
             "cache_creation_token_count": cache_creation_tokens,
+            **extract_cache_creation_ttl_counts(usage),
             "cache_read_token_count": cache_read_tokens,
             "input_token_cost": None,
             "output_token_cost": None,
@@ -669,10 +778,11 @@ class MiddlewareHandler(CustomLogger):
             "response_quality_score": headers.get("x-revenium-response-quality-score"),
             "is_streamed": metadata.get('hidden_params', {}).get('optional_params', {}).get('stream', False),
             "operation_type": "CHAT",
+            **trace_fields_from_headers(headers),
             "middleware_source": "PROXY",
         }
 
-        logger.debug("Calling client.ai.create_completion with args (failure): %s", completion_args)
+        logger.debug("Calling client.ai.create_completion with args (failure): %s", sanitize_for_logging(completion_args))
 
         async def metering_call():
             try:

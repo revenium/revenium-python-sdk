@@ -87,19 +87,15 @@ class TestTraceFieldCapture:
         assert get_parent_transaction_id() == "parent-123"
 
     def test_get_transaction_name(self, monkeypatch):
-        """Test transaction name with fallback to task_type."""
-        # Test env var (highest priority)
+        """A per-call transaction name wins over the env var, which wins over task_type."""
         monkeypatch.setenv("REVENIUM_TRANSACTION_NAME", "env-transaction")
         metadata = {"transactionName": "metadata-transaction", "task_type": "task"}
-        assert get_transaction_name(metadata) == "env-transaction"
-
-        # Test metadata transactionName
-        monkeypatch.delenv("REVENIUM_TRANSACTION_NAME")
         assert get_transaction_name(metadata) == "metadata-transaction"
 
-        # Test fallback to task_type
-        metadata_no_name = {"task_type": "classification"}
-        assert get_transaction_name(metadata_no_name) == "classification"
+        assert get_transaction_name({"task_type": "classification"}) == "env-transaction"
+
+        monkeypatch.delenv("REVENIUM_TRANSACTION_NAME")
+        assert get_transaction_name({"task_type": "classification"}) == "classification"
 
     def test_get_retry_number(self, monkeypatch):
         """Test retry number capture and parsing."""
@@ -240,25 +236,26 @@ class TestTraceFieldIntegration:
 
     def test_transaction_name_fallback_chain(self, monkeypatch):
         """Test complete fallback chain for transaction_name."""
-        # Priority 1: Environment variable
         monkeypatch.setenv("REVENIUM_TRANSACTION_NAME", "env-name")
         metadata = {
             "transactionName": "camel-case-name",
             "transaction_name": "snake-case-name",
             "task_type": "fallback-task"
         }
-        assert get_transaction_name(metadata) == "env-name"
 
-        # Priority 2: transactionName (camelCase)
-        monkeypatch.delenv("REVENIUM_TRANSACTION_NAME")
+        # Priority 1: transactionName (camelCase), even with the env var set
         assert get_transaction_name(metadata) == "camel-case-name"
 
-        # Priority 3: transaction_name (snake_case)
+        # Priority 2: transaction_name (snake_case)
         del metadata["transactionName"]
         assert get_transaction_name(metadata) == "snake-case-name"
 
-        # Priority 4: task_type fallback
+        # Priority 3: environment variable, over task_type
         del metadata["transaction_name"]
+        assert get_transaction_name(metadata) == "env-name"
+
+        # Priority 4: task_type fallback
+        monkeypatch.delenv("REVENIUM_TRANSACTION_NAME")
         assert get_transaction_name(metadata) == "fallback-task"
 
         # No metadata at all

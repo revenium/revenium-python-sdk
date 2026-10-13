@@ -161,7 +161,7 @@ def capture_metering(payloads):
     """Intercept the metering dispatch and run it inline on this thread."""
     return patch.multiple(
         mw,
-        submit_ai_event=MagicMock(side_effect=lambda operation, args: payloads.append(args)),
+        submit_ai_event=MagicMock(side_effect=lambda operation, args, idempotency_key=None: payloads.append(args)),
         _safe_run_async_in_thread=MagicMock(side_effect=run_metering_inline),
         _get_thread_safe_client=MagicMock(return_value=MagicMock()),
     )
@@ -434,6 +434,7 @@ def test_an_exception_mid_stream_propagates_and_reports_the_partial_usage():
     payloads = stream_payloads(consume_events, fail_after=2, expect_error=RuntimeError)
 
     assert len(payloads) == 1
+    assert payloads[0]["stop_reason"] == "ERROR"
     assert payloads[0]["input_token_count"] == 13
     assert payloads[0]["output_token_count"] == 1
 

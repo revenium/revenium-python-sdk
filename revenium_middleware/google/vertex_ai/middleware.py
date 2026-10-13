@@ -17,14 +17,20 @@ import datetime
 import importlib
 import logging
 import re
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Dict, Any, Optional, List, Tuple
 
 import wrapt
 from revenium_middleware import run_async_in_thread
 from revenium_middleware._core.config import is_selective_metering_enabled
-from revenium_middleware._core.context import is_inside_decorated_function, overlay_metadata
+from revenium_middleware._core.context import is_inside_decorated_function, merge_metadata, overlay_metadata
+from revenium_middleware._core.selective_metering import reported_if_unmetered
+from revenium_middleware._core.enforcement import check_enforcement, is_bypass_enabled, is_circuit_breaker_enabled
 from revenium_middleware._core.log_sanitize import sanitize_for_logging
-from revenium_middleware._core.patch_registry import register_patch
+from revenium_middleware._core.call_context import CallContext
+from revenium_middleware._core.metering import current_client, recorded_under
+from revenium_middleware._core.patch_registry import wrap_once
 
 # Import common utilities and types
 from ..common import (
@@ -37,10 +43,14 @@ from ..common import (
     create_metering_call,
     create_image_metering_call,
     create_usage_data,
+    embedding_statistics_token_total,
     extract_model_name,
     extract_token_counts,
+    generation_token_counts,
     StreamingError,
     handle_metering_error,
+    generated_image_count,
+    image_output_of,
     safe_getattr,
 )
 from ..common.trace_fields import detect_vision_content
@@ -171,6 +181,7 @@ def extract_vertex_ai_usage_data(
         request_time=request_time,
         response_time=response_time,
         cache_read_token_count=token_counts.cached_tokens,
+        reasoning_token_count=token_counts.reasoning_tokens,
     )
 
 
@@ -185,27 +196,22 @@ def extract_vertex_ai_generation_tokens(response: Any) -> TokenCounts:
     )
 
     if hasattr(response, "usage_metadata") and response.usage_metadata:
-        usage_metadata = response.usage_metadata
-
-        # Vertex AI uses different attribute names than Google AI SDK
-        token_counts.input_tokens = getattr(usage_metadata, "prompt_token_count", 0)
-        token_counts.output_tokens = getattr(
-            usage_metadata, "candidates_token_count", 0
-        )
-        token_counts.total_tokens = getattr(
-            usage_metadata,
-            "total_token_count",
-            token_counts.input_tokens + token_counts.output_tokens,
-        )
-
-        # Vertex AI may provide cached token counts
-        token_counts.cached_tokens = getattr(
-            usage_metadata, "cached_content_token_count", 0
-        )
+        token_counts = generation_token_counts(response.usage_metadata)
     else:
         logger.warning("No usage metadata found in Vertex AI generation response")
 
     return token_counts
+
+
+def _batch_billable_characters(embeddings: List[Any]) -> Optional[Any]:
+    """The billable character count of the whole request; every embedding shares one prediction response."""
+    prediction_response = getattr(embeddings[0], "_prediction_response", None)
+    metadata = getattr(prediction_response, "metadata", None) if prediction_response else None
+    if not metadata:
+        return None
+    if isinstance(metadata, Mapping):
+        return metadata.get("billableCharacterCount")
+    return getattr(metadata, "billableCharacterCount", None)
 
 
 def extract_vertex_ai_embedding_tokens(response: Any) -> TokenCounts:
@@ -218,51 +224,25 @@ def extract_vertex_ai_embedding_tokens(response: Any) -> TokenCounts:
         input_tokens=0, output_tokens=0, total_tokens=0, cached_tokens=0
     )
 
-    # Vertex AI embeddings response is a list of TextEmbedding objects
+    # Vertex AI embeddings response is a list of TextEmbedding objects, one per text
     if isinstance(response, list) and len(response) > 0:
-        # Get the first embedding object
-        first_embedding = response[0]
+        token_count = embedding_statistics_token_total(response)
+        if token_count is not None:
+            token_counts.input_tokens = token_count
+            token_counts.total_tokens = token_count
+            logger.debug("Extracted token count from Vertex AI embedding statistics: %s", token_count)
+            return token_counts
 
-        # Check if it has statistics with token_count
-        if hasattr(first_embedding, "statistics") and first_embedding.statistics:
-            stats = first_embedding.statistics
-            if hasattr(stats, "token_count"):
-                # Convert to int if it's a float
-                token_count = (
-                    int(stats.token_count)
-                    if hasattr(stats.token_count, "__int__")
-                    else stats.token_count
-                )
-                token_counts.input_tokens = token_count
-                token_counts.total_tokens = token_count
-                # Embeddings don't generate output tokens
-                token_counts.output_tokens = 0
-                logger.debug(
-                    f"Extracted token count from Vertex AI embedding statistics: {token_count}"
-                )
-                return token_counts
-
-        # Check if the embedding has _prediction_response with metadata
-        if (
-            hasattr(first_embedding, "_prediction_response")
-            and first_embedding._prediction_response
-        ):
-            pred_response = first_embedding._prediction_response
-            if hasattr(pred_response, "metadata") and pred_response.metadata:
-                # Check for billableCharacterCount or other token-related fields
-                metadata = pred_response.metadata
-                if hasattr(metadata, "billableCharacterCount"):
-                    # Use billable character count as a proxy for tokens
-                    char_count = metadata.billableCharacterCount
-                    # Rough approximation: 4 characters per token (common for many tokenizers)
-                    estimated_tokens = max(1, int(char_count / 4))
-                    token_counts.input_tokens = estimated_tokens
-                    token_counts.total_tokens = estimated_tokens
-                    token_counts.output_tokens = 0
-                    logger.debug(
-                        f"Estimated token count from billable characters: {char_count} chars -> {estimated_tokens} tokens"
-                    )
-                    return token_counts
+        char_count = _batch_billable_characters(response)
+        if char_count is not None:
+            # Rough approximation: 4 characters per token (common for many tokenizers)
+            estimated_tokens = max(1, int(char_count / 4))
+            token_counts.input_tokens = estimated_tokens
+            token_counts.total_tokens = estimated_tokens
+            logger.debug(
+                "Estimated token count from billable characters: %s chars -> %s tokens", char_count, estimated_tokens
+            )
+            return token_counts
 
     # Fallback: check if response itself has statistics or usage_metadata
     elif hasattr(response, "statistics") and response.statistics:
@@ -301,14 +281,17 @@ def create_vertex_ai_metering_call(
     input_messages: Optional[str] = None,
     output_response: Optional[str] = None,
     prompts_truncated: Optional[bool] = None,
+    response_time_dt: Optional[datetime.datetime] = None,
+    image_count: Optional[int] = None,
 ) -> None:
     """
     Create and execute a metering call for Vertex AI SDK responses.
 
-    This is the main function used by the wrapper functions.
+    This is the main function used by the wrapper functions. ``image_count`` is
+    the number of images a stream generated; for a whole response it is read
+    from the response.
     """
-    # Record response timing
-    response_time_dt = datetime.datetime.now(datetime.timezone.utc)
+    response_time_dt = response_time_dt or _now()
 
     # Extract usage data using Vertex AI specific logic
     usage_data = extract_vertex_ai_usage_data(
@@ -330,6 +313,7 @@ def create_vertex_ai_metering_call(
         input_messages=input_messages,
         output_response=output_response,
         prompts_truncated=prompts_truncated,
+        image_output=image_output_of(response, image_count) if operation_type == OperationType.CHAT else None,
     )
 
 
@@ -350,19 +334,124 @@ def _metering_this_call():
         _inside_metered_call.reset(token)
 
 
-def _passes_through() -> bool:
-    if _inside_metered_call.get():
-        return True
-    return is_selective_metering_enabled() and not is_inside_decorated_function()
+def _now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+# A ChatSession with an AutomaticFunctionCallingResponder sends one request per tool
+# round through the model's private _generate_content and returns only the last
+# response. The taps on that private method collect each request of the call being
+# metered; the public wrap keeps the policy and records every collected request.
+@dataclass(frozen=True)
+class _Round:
+    request_time: datetime.datetime
+    response_time: datetime.datetime
+    contents: Any
+    response: Any
+    model_name: Optional[str]
+
+
+_collected_rounds: contextvars.ContextVar[Optional[List[_Round]]] = contextvars.ContextVar(
+    "revenium_vertex_collected_rounds", default=None
+)
+
+
+@contextlib.contextmanager
+def _rounds_collected_into(rounds: List[_Round]):
+    token = _collected_rounds.set(rounds)
+    try:
+        yield
+    finally:
+        _collected_rounds.reset(token)
+
+
+def _contents_snapshot(args: Tuple, kwargs: Dict[str, Any]) -> Any:
+    contents = _first_argument(args, kwargs, "contents")
+    return list(contents) if isinstance(contents, list) else contents
+
+
+def _record_round(rounds: List[_Round], instance: Any, request_time: datetime.datetime,
+                  contents: Any, response: Any) -> None:
+    try:
+        rounds.append(_Round(request_time, _now(), contents, response, _model_name_of(instance)))
+    except Exception as e:
+        logger.error("Error collecting a Vertex AI request for metering: %s", e)
+
+
+def _generate_content_round_tap(wrapped, instance, args, kwargs):
+    rounds = _collected_rounds.get()
+    if rounds is None:
+        return wrapped(*args, **kwargs)
+    request_time, contents = _now(), _contents_snapshot(args, kwargs)
+    response = wrapped(*args, **kwargs)
+    _record_round(rounds, instance, request_time, contents, response)
+    return response
+
+
+def _async_generate_content_round_tap(wrapped, instance, args, kwargs):
+    rounds = _collected_rounds.get()
+    if rounds is None:
+        return wrapped(*args, **kwargs)
+
+    async def call():
+        request_time, contents = _now(), _contents_snapshot(args, kwargs)
+        response = await wrapped(*args, **kwargs)
+        _record_round(rounds, instance, request_time, contents, response)
+        return response
+    return call()
+
+
+class _Outcome:
+    """What a metered call produced: the response it returned and the model requests collected on the way."""
+
+    def __init__(self):
+        self.response: Any = None
+        self.rounds: List[_Round] = []
+
+
+def _response_rejected_by(error: BaseException) -> Any:
+    """The billed response a ResponseValidationError carries, for a call that raised before returning it."""
+    responses = getattr(error, "responses", None)
+    return responses[-1] if isinstance(responses, list) and responses else None
+
+
+def _chunk_text(chunk: Any) -> Optional[str]:
+    # GenerationResponse.text raises ValueError, which hasattr does not swallow, for a
+    # function call, several candidates, or an answer stopped with no content.
+    try:
+        return chunk.text
+    except (AttributeError, ValueError):
+        return None
+
+
+@contextlib.contextmanager
+def _one_request_metered():
+    with _metering_this_call():
+        yield _Outcome()
+
+
+def _selectively_unmetered() -> bool:
+    return reported_if_unmetered(is_selective_metering_enabled() and not is_inside_decorated_function())
+
+
+def _check_caps(usage_metadata: Dict[str, Any], model_name: Optional[str]) -> None:
+    check_enforcement(usage_metadata, model=model_name, provider=get_provider_metadata().provider)
+
+
+def _call_unmetered(wrapped, args, kwargs):
+    """Call Vertex AI without metering, minus the Revenium-only ``usage_metadata`` keyword."""
+    kwargs.pop("usage_metadata", None)
+    return wrapped(*args, **kwargs)
 
 
 def _pop_usage_metadata(kwargs: Dict[str, Any], *owners: Any) -> Dict[str, Any]:
-    """The owners' ``_revenium_usage_metadata``, least specific first, overlaid by the call's own."""
+    """The decorator's metadata, then the owners' ``_revenium_usage_metadata``, least specific first,
+    overlaid by the call's own."""
     merged: Dict[str, Any] = {}
     for owner in owners:
         from_owner = getattr(owner, "_revenium_usage_metadata", None)
         merged = overlay_metadata(merged, from_owner if isinstance(from_owner, dict) else None)
-    return overlay_metadata(merged, kwargs.pop("usage_metadata", None))
+    return merge_metadata(overlay_metadata(merged, kwargs.pop("usage_metadata", None)))
 
 
 def _as_turns(contents: Any) -> List[Any]:
@@ -387,47 +476,87 @@ class _GenerationCall:
         )
         self.usage_metadata = usage_metadata
         self.model_name = _model_name_of(model)
-        if detect_vision_content(contents):
-            self.usage_metadata["has_vision_content"] = True
         self.is_streaming = bool(kwargs.get("stream", False))
         prompt = [*history, *_as_turns(contents)] if history else contents
         self.request_kwargs = {**kwargs, "contents": prompt}
         self.request_args = args
-        self.request_time = datetime.datetime.now(datetime.timezone.utc)
+        self.request_time = _now()
+        self.metering_client = current_client()
+
+    @contextlib.contextmanager
+    def requests_metered(self):
+        """A non-streamed call records every model request made inside the block, once it ends, even
+        when it ends in an exception. A streamed call is one request, recorded by its stream wrapper."""
+        if self.is_streaming:
+            with _one_request_metered() as outcome:
+                yield outcome
+            return
+        outcome = _Outcome()
+        try:
+            with _metering_this_call(), _rounds_collected_into(outcome.rounds):
+                yield outcome
+        except BaseException as error:
+            outcome.response = _response_rejected_by(error)
+            raise
+        finally:
+            self._meter_requests(outcome)
 
     def metered(self, response: Any) -> Any:
         if self.is_streaming:
-            return VertexAIStreamWrapper(response, **self._stream_context())
-        self._meter(response)
+            with recorded_under(self.metering_client):
+                return VertexAIStreamWrapper(response, **self._stream_context())
         return response
 
     def metered_async(self, response: Any) -> Any:
         if self.is_streaming:
-            return VertexAIAsyncStreamWrapper(response, **self._stream_context())
-        self._meter(response)
+            with recorded_under(self.metering_client):
+                return VertexAIAsyncStreamWrapper(response, **self._stream_context())
         return response
 
     def _stream_context(self) -> Dict[str, Any]:
         return {
             "request_time_dt": self.request_time,
-            "usage_metadata": self.usage_metadata,
+            "usage_metadata": self._usage_metadata_for(self.request_kwargs.get("contents")),
             "model_name_fallback": self.model_name,
             "request_kwargs": self.request_kwargs,
             "request_args": self.request_args,
         }
 
-    def _meter(self, response: Any) -> None:
+    def _usage_metadata_for(self, contents: Any) -> Dict[str, Any]:
+        metadata = dict(self.usage_metadata)
+        if detect_vision_content(contents):
+            metadata["has_vision_content"] = True
+        return metadata
+
+    def _meter_requests(self, outcome: _Outcome) -> None:
+        with recorded_under(self.metering_client):
+            for round_ in outcome.rounds or self._uncollected_request(outcome):
+                try:
+                    self._meter(round_)
+                except Exception as e:
+                    logger.error("Error metering a Vertex AI request: %s", e)
+
+    def _uncollected_request(self, outcome: _Outcome) -> List[_Round]:
+        """The returned or rejected response, for a call whose requests did not go through the tapped method."""
+        if outcome.response is None:
+            return []
+        return [_Round(self.request_time, _now(), self.request_kwargs.get("contents"), outcome.response,
+                       self.model_name)]
+
+    def _meter(self, round_: _Round) -> None:
+        request_kwargs = {**self.request_kwargs, "contents": round_.contents}
         system_prompt, input_messages, output_response, prompts_truncated = (
             extract_prompt_data_if_enabled(
-                self.request_kwargs, args=self.request_args, response=response
+                request_kwargs, args=self.request_args, response=round_.response
             )
         )
         create_vertex_ai_metering_call(
-            response=response,
+            response=round_.response,
             operation_type=OperationType.CHAT,
-            request_time_dt=self.request_time,
-            usage_metadata=self.usage_metadata,
-            model_name_fallback=self.model_name,
+            request_time_dt=round_.request_time,
+            response_time_dt=round_.response_time,
+            usage_metadata=self._usage_metadata_for(round_.contents),
+            model_name_fallback=round_.model_name or self.model_name,
             system_prompt=system_prompt,
             input_messages=input_messages,
             output_response=output_response,
@@ -451,32 +580,73 @@ def _send_message_call(instance, args, kwargs) -> _GenerationCall:
 
 
 def _call_and_meter(call, wrapped, args, kwargs):
-    with _metering_this_call():
-        response = wrapped(*args, **kwargs)
-    return call.metered(response)
+    with call.requests_metered() as outcome:
+        outcome.response = wrapped(*args, **kwargs)
+    return call.metered(outcome.response)
 
 
-async def _await_and_meter(call, wrapped, args, kwargs):
-    with _metering_this_call():
-        response = await wrapped(*args, **kwargs)
-    return call.metered_async(response)
+async def _check_await_and_meter(call, wrapped, args, kwargs):
+    _check_call(call)
+    with call.requests_metered() as outcome:
+        outcome.response = await wrapped(*args, **kwargs)
+    return call.metered_async(outcome.response)
+
+
+async def _check_then_await_unmetered(call, wrapped, args, kwargs):
+    _check_if_described(call)
+    return await _call_unmetered(wrapped, args, kwargs)
+
+
+def _check_call(call) -> None:
+    _check_caps(call.usage_metadata, call.model_name)
+
+
+def _checked_call(build_call, instance, args, kwargs):
+    """The call object, once a breached cap has had the chance to refuse the request it describes."""
+    call = build_call(instance, args, kwargs)
+    _check_call(call)
+    return call
+
+
+def _unmetered_call_to_check(build_call, instance, args, kwargs):
+    """A call selective metering leaves unmetered is still refused by a breached cap; its
+    identity is worked out only when caps are checked."""
+    if is_circuit_breaker_enabled() and not is_bypass_enabled():
+        return build_call(instance, args, kwargs)
+    return None
+
+
+def _check_if_described(call) -> None:
+    if call is not None:
+        _check_call(call)
+
+
+def _check_unmetered_call(build_call, instance, args, kwargs):
+    _check_if_described(_unmetered_call_to_check(build_call, instance, args, kwargs))
 
 
 def _sync_metered(build_call):
-    """A wrapt wrapper that meters a sync Vertex AI method through the call object ``build_call`` returns."""
+    """A wrapt wrapper that meters a sync Vertex AI method through the call object ``build_call`` returns.
+    A call nested inside one already metered (and checked) passes straight through."""
     def wrapper(wrapped, instance, args, kwargs):
-        if _passes_through():
-            return wrapped(*args, **kwargs)
-        return _call_and_meter(build_call(instance, args, kwargs), wrapped, args, kwargs)
+        if _inside_metered_call.get():
+            return _call_unmetered(wrapped, args, kwargs)
+        if _selectively_unmetered():
+            _check_unmetered_call(build_call, instance, args, kwargs)
+            return _call_unmetered(wrapped, args, kwargs)
+        return _call_and_meter(_checked_call(build_call, instance, args, kwargs), wrapped, args, kwargs)
     return wrapper
 
 
 def _async_metered(build_call):
-    """The same for a method whose result is awaited."""
+    """The same for a method whose result is awaited, checked when it is awaited."""
     def wrapper(wrapped, instance, args, kwargs):
-        if _passes_through():
-            return wrapped(*args, **kwargs)
-        return _await_and_meter(build_call(instance, args, kwargs), wrapped, args, kwargs)
+        if _inside_metered_call.get():
+            return _call_unmetered(wrapped, args, kwargs)
+        if _selectively_unmetered():
+            unmetered = _unmetered_call_to_check(build_call, instance, args, kwargs)
+            return _check_then_await_unmetered(unmetered, wrapped, args, kwargs)
+        return _check_await_and_meter(build_call(instance, args, kwargs), wrapped, args, kwargs)
     return wrapper
 
 
@@ -508,6 +678,29 @@ _WRAPPERS_BY_CLASS = {
 }
 
 
+_PRIVATE_GENERATIVE_MODULE = "vertexai.generative_models._generative_models"
+_ROUND_TAPS = {
+    "_GenerativeModel._generate_content": _generate_content_round_tap,
+    "_GenerativeModel._generate_content_async": _async_generate_content_round_tap,
+}
+
+
+def _apply_round_taps() -> List[str]:
+    try:
+        module = importlib.import_module(_PRIVATE_GENERATIVE_MODULE)
+    except ImportError:
+        return []
+    applied = []
+    for attribute, tap in _ROUND_TAPS.items():
+        class_name, _, method_name = attribute.partition(".")
+        if method_name not in vars(getattr(module, class_name, object)):
+            continue
+        patch_key = f"{_PRIVATE_GENERATIVE_MODULE}.{attribute}"
+        if wrap_once(patch_key, module, attribute, tap):
+            applied.append(patch_key)
+    return applied
+
+
 def _is_our_wrapper(attribute: Any) -> bool:
     return isinstance(attribute, wrapt.FunctionWrapper) and attribute._self_wrapper.__module__ == __name__
 
@@ -528,8 +721,7 @@ def _wrap_methods(module, class_name: str, wrappers: Dict[str, Any]) -> List[str
         if not hasattr(cls, method_name) or _inherits_our_wrapper(cls, method_name):
             continue
         patch_key = f"{module.__name__}.{class_name}.{method_name}"
-        if register_patch(patch_key):
-            wrapt.wrap_function_wrapper(module, f"{class_name}.{method_name}", wrapper)
+        if wrap_once(patch_key, module, f"{class_name}.{method_name}", wrapper):
             applied.append(patch_key)
     return applied
 
@@ -545,6 +737,7 @@ def _apply_generative_model_wrappers() -> List[str]:
             continue
         for class_name, wrappers in _WRAPPERS_BY_CLASS.items():
             applied += _wrap_methods(module, class_name, wrappers)
+    applied += _apply_round_taps()
 
     if applied:
         logger.info(" Vertex AI generation wrappers applied to: %s", ", ".join(applied))
@@ -559,7 +752,11 @@ class _EmbeddingCall:
     def __init__(self, instance: Any, args: Tuple, kwargs: Dict[str, Any]):
         self.usage_metadata = _pop_usage_metadata(kwargs, instance)
         self.model_name = _model_name_of(instance)
-        self.request_time = datetime.datetime.now(datetime.timezone.utc)
+        self.request_time = _now()
+
+    @staticmethod
+    def requests_metered():
+        return _one_request_metered()
 
     def metered(self, response: Any) -> Any:
         create_vertex_ai_metering_call(
@@ -574,15 +771,11 @@ class _EmbeddingCall:
     metered_async = metered
 
 
-if register_patch("vertexai.language_models.TextEmbeddingModel.get_embeddings"):
-    wrapt.wrap_function_wrapper(
-        "vertexai.language_models", "TextEmbeddingModel.get_embeddings", _sync_metered(_EmbeddingCall)
-    )
+wrap_once("vertexai.language_models.TextEmbeddingModel.get_embeddings",
+          "vertexai.language_models", "TextEmbeddingModel.get_embeddings", _sync_metered(_EmbeddingCall))
 
-if register_patch("vertexai.language_models.TextEmbeddingModel.get_embeddings_async"):
-    wrapt.wrap_function_wrapper(
-        "vertexai.language_models", "TextEmbeddingModel.get_embeddings_async", _async_metered(_EmbeddingCall)
-    )
+wrap_once("vertexai.language_models.TextEmbeddingModel.get_embeddings_async",
+          "vertexai.language_models", "TextEmbeddingModel.get_embeddings_async", _async_metered(_EmbeddingCall))
 
 
 class VertexAIStreamWrapper:
@@ -591,6 +784,8 @@ class VertexAIStreamWrapper:
     def __init__(self, stream, request_time_dt, usage_metadata, model_name_fallback=None,
                  request_kwargs=None, request_args=None):
         self.stream = stream
+        self._metering_client = current_client()
+        self._call_context = CallContext()
         self._request_time_dt = request_time_dt
         self._metering_metadata = usage_metadata
         self._request_kwargs = request_kwargs
@@ -601,8 +796,11 @@ class VertexAIStreamWrapper:
         self.finish_reason = None
         self.usage_metadata = None
         self.first_chunk_time = None
+        self._last_chunk = None
         self._closed = False
         self._usage_logged = False
+        self._failed = False
+        self.generated_images = 0
         self.streaming_truncated = False  # Track if streaming response was truncated
 
         # Limit chunk storage to prevent memory issues
@@ -673,7 +871,9 @@ class VertexAIStreamWrapper:
     def _handle_error(self, error: Exception):
         """Handle errors during streaming."""
         logger.error("Error in Vertex AI streaming response: %s", error)
+        self._failed = True
         if not self._usage_logged:
+            self._process_rejected_chunk(error)
             # Try to log partial usage data
             try:
                 self._log_usage()
@@ -684,8 +884,20 @@ class VertexAIStreamWrapper:
                     log_error,
                 )
 
+    def _process_rejected_chunk(self, error: Exception):
+        """The SDK validates each chunk before yielding it, so the one it rejected, with its usage and
+        finish reason, reaches the wrapper only on the error."""
+        rejected = _response_rejected_by(error)
+        if rejected is None or rejected is self._last_chunk:
+            return
+        try:
+            self._process_chunk(rejected)
+        except Exception as e:
+            logger.error("Error reading the Vertex AI chunk the SDK rejected: %s", e)
+
     def _process_chunk(self, chunk):
         """Process each chunk to extract metadata"""
+        self._last_chunk = chunk
         # Limit chunk storage to prevent memory issues
         if len(self.chunks) < self._max_chunks:
             self.chunks.append(chunk)
@@ -703,45 +915,6 @@ class VertexAIStreamWrapper:
         if self.model is None:
             self.model = extract_model_name(chunk, self.model)
 
-        # Accumulate text for prompt capture (with early truncation to prevent unbounded memory growth)
-        from ..config import Config
-        current_len = sum(len(t) for t in self.accumulated_text)
-
-        if hasattr(chunk, 'text') and chunk.text:
-            # Check if adding this chunk would exceed the limit
-            chunk_len = len(chunk.text)
-            if current_len + chunk_len <= Config.MAX_PROMPT_LENGTH:
-                self.accumulated_text.append(chunk.text)
-            elif current_len < Config.MAX_PROMPT_LENGTH:
-                # Partial append: only add what fits
-                remaining = Config.MAX_PROMPT_LENGTH - current_len
-                self.accumulated_text.append(chunk.text[:remaining])
-                self.streaming_truncated = True
-            else:
-                # Already at limit, mark as truncated
-                self.streaming_truncated = True
-        elif hasattr(chunk, 'candidates') and chunk.candidates:
-            for candidate in chunk.candidates:
-                if hasattr(candidate, 'content') and candidate.content:
-                    if hasattr(candidate.content, 'parts'):
-                        for part in candidate.content.parts:
-                            if hasattr(part, 'text') and part.text:
-                                part_len = len(part.text)
-                                if current_len + part_len <= Config.MAX_PROMPT_LENGTH:
-                                    self.accumulated_text.append(part.text)
-                                    current_len += part_len
-                                elif current_len < Config.MAX_PROMPT_LENGTH:
-                                    # Partial append: only add what fits
-                                    remaining = Config.MAX_PROMPT_LENGTH - current_len
-                                    self.accumulated_text.append(part.text[:remaining])
-                                    current_len = Config.MAX_PROMPT_LENGTH
-                                    self.streaming_truncated = True
-                                    break
-                                else:
-                                    # Already at limit
-                                    self.streaming_truncated = True
-                                    break
-
         # Check for finish reason and usage metadata in the chunk using safe access
         candidates = safe_getattr(chunk, "candidates")
         if candidates and len(candidates) > 0:
@@ -754,6 +927,48 @@ class VertexAIStreamWrapper:
         usage_metadata = safe_getattr(chunk, "usage_metadata")
         if usage_metadata:
             self.usage_metadata = usage_metadata
+        self.generated_images += generated_image_count(chunk)
+
+        # Accumulate text for prompt capture (with early truncation to prevent unbounded memory growth)
+        from ..config import Config
+        current_len = sum(len(t) for t in self.accumulated_text)
+
+        chunk_text = _chunk_text(chunk)
+        if chunk_text:
+            # Check if adding this chunk would exceed the limit
+            chunk_len = len(chunk_text)
+            if current_len + chunk_len <= Config.MAX_PROMPT_LENGTH:
+                self.accumulated_text.append(chunk_text)
+            elif current_len < Config.MAX_PROMPT_LENGTH:
+                # Partial append: only add what fits
+                remaining = Config.MAX_PROMPT_LENGTH - current_len
+                self.accumulated_text.append(chunk_text[:remaining])
+                self.streaming_truncated = True
+            else:
+                # Already at limit, mark as truncated
+                self.streaming_truncated = True
+        elif hasattr(chunk, 'candidates') and chunk.candidates:
+            for candidate in chunk.candidates:
+                if hasattr(candidate, 'content') and candidate.content:
+                    if hasattr(candidate.content, 'parts'):
+                        for part in candidate.content.parts:
+                            part_text = _chunk_text(part)
+                            if part_text:
+                                part_len = len(part_text)
+                                if current_len + part_len <= Config.MAX_PROMPT_LENGTH:
+                                    self.accumulated_text.append(part_text)
+                                    current_len += part_len
+                                elif current_len < Config.MAX_PROMPT_LENGTH:
+                                    # Partial append: only add what fits
+                                    remaining = Config.MAX_PROMPT_LENGTH - current_len
+                                    self.accumulated_text.append(part_text[:remaining])
+                                    current_len = Config.MAX_PROMPT_LENGTH
+                                    self.streaming_truncated = True
+                                    break
+                                else:
+                                    # Already at limit
+                                    self.streaming_truncated = True
+                                    break
 
     def _log_usage(self):
         """Log usage after stream completion"""
@@ -810,7 +1025,8 @@ class VertexAIStreamWrapper:
             )
 
             # Create metering call for streaming response
-            create_vertex_ai_metering_call(
+            self._call_context.run_recorded_under(
+                self._metering_client, create_vertex_ai_metering_call,
                 response=synthetic_response,
                 operation_type=OperationType.CHAT,
                 request_time_dt=self._request_time_dt,
@@ -823,6 +1039,7 @@ class VertexAIStreamWrapper:
                 input_messages=input_messages,
                 output_response=output_response,
                 prompts_truncated=prompts_truncated,
+                image_count=0 if self._failed else self.generated_images,
             )
 
             logger.debug(
@@ -915,25 +1132,15 @@ def _apply_imagen_wrappers():
 
                 if hasattr(img_model_class, "generate_images"):
                     patch_key = f"{module_path}.ImageGenerationModel.generate_images"
-                    if register_patch(patch_key):
-                        @wrapt.patch_function_wrapper(
-                            module_path, "ImageGenerationModel.generate_images"
-                        )
-                        def generate_images_wrapper_dynamic(wrapped, instance, args, kwargs):
-                            return _imagen_generate_images_impl(wrapped, instance, args, kwargs)
-
+                    if wrap_once(patch_key, module_path, "ImageGenerationModel.generate_images",
+                                 _imagen_generate_images_impl):
                         wrapped_modules.append(patch_key)
                         logger.debug(f" Applied Imagen wrapper to {patch_key}")
 
                 if hasattr(img_model_class, "edit_image"):
                     patch_key = f"{module_path}.ImageGenerationModel.edit_image"
-                    if register_patch(patch_key):
-                        @wrapt.patch_function_wrapper(
-                            module_path, "ImageGenerationModel.edit_image"
-                        )
-                        def edit_image_wrapper_dynamic(wrapped, instance, args, kwargs):
-                            return _imagen_edit_image_impl(wrapped, instance, args, kwargs)
-
+                    if wrap_once(patch_key, module_path, "ImageGenerationModel.edit_image",
+                                 _imagen_edit_image_impl):
                         wrapped_modules.append(patch_key)
                         logger.debug(f" Applied Imagen wrapper to {patch_key}")
 
@@ -949,16 +1156,13 @@ def _apply_imagen_wrappers():
 
 
 def _imagen_generate_images_impl(wrapped, instance, args, kwargs):
-    if is_selective_metering_enabled() and not is_inside_decorated_function():
+    usage_metadata = _pop_usage_metadata(kwargs, instance)
+    model_name = _model_name_of(instance) or "imagen-3.0-generate-001"
+    _check_caps(usage_metadata, model_name)
+    if _selectively_unmetered():
         return wrapped(*args, **kwargs)
 
     logger.debug("Vertex AI ImageGenerationModel.generate_images wrapper called")
-
-    usage_metadata = getattr(instance, "_revenium_usage_metadata", {}) or kwargs.pop(
-        "usage_metadata", {}
-    )
-
-    model_name = _model_name_of(instance) or "imagen-3.0-generate-001"
 
     # Extract image count from kwargs
     number_of_images = kwargs.get("number_of_images", 1)
@@ -1001,16 +1205,13 @@ def _imagen_generate_images_impl(wrapped, instance, args, kwargs):
 
 
 def _imagen_edit_image_impl(wrapped, instance, args, kwargs):
-    if is_selective_metering_enabled() and not is_inside_decorated_function():
+    usage_metadata = _pop_usage_metadata(kwargs, instance)
+    model_name = _model_name_of(instance) or "imagen-3.0-generate-001"
+    _check_caps(usage_metadata, model_name)
+    if _selectively_unmetered():
         return wrapped(*args, **kwargs)
 
     logger.debug("Vertex AI ImageGenerationModel.edit_image wrapper called")
-
-    usage_metadata = getattr(instance, "_revenium_usage_metadata", {}) or kwargs.pop(
-        "usage_metadata", {}
-    )
-
-    model_name = _model_name_of(instance) or "imagen-3.0-generate-001"
 
     number_of_images = kwargs.get("number_of_images", 1)
 

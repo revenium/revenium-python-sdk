@@ -15,6 +15,8 @@ Installation:
     pip install revenium-python-sdk[openai,langchain]
 """
 
+import logging
+import threading
 from typing import Any, TYPE_CHECKING
 
 # Only import types during type checking to avoid runtime dependencies
@@ -30,6 +32,44 @@ if TYPE_CHECKING:
 
 # Import our enhanced dependency checking utilities
 from ._utils import require_langchain_or_raise, is_langchain_available  # noqa: F401
+from ._abandoned_runs import install_abandoned_run_cleanup
+from ._perplexity_cost_capture import install_perplexity_cost_capture
+from ._text_completion_usage import install_text_completion_usage_capture
+
+install_perplexity_cost_capture()
+install_text_completion_usage_capture()
+install_abandoned_run_cleanup()
+
+logger = logging.getLogger("revenium_middleware.langchain")
+
+_WARNED_NO_CALLBACKS_CLASSES = set()
+_WARNED_NO_CALLBACKS_LOCK = threading.Lock()
+
+
+def _warn_no_callbacks_field_once(llm) -> None:
+    from langchain_core.embeddings import Embeddings as LangChainEmbeddings
+
+    model_class = type(llm)
+    with _WARNED_NO_CALLBACKS_LOCK:
+        if model_class in _WARNED_NO_CALLBACKS_CLASSES:
+            return
+        _WARNED_NO_CALLBACKS_CLASSES.add(model_class)
+    if isinstance(llm, LangChainEmbeddings):
+        logger.warning(
+            "wrap() and attach_to() cannot attach Revenium tracking to %s: LangChain embeddings models run no "
+            "callbacks, so the usage_metadata given to wrap() is not applied. OpenAI and Azure OpenAI embeddings "
+            "are still recorded by the OpenAI middleware; tag them with @revenium_metadata. Embeddings that "
+            "reach a vendor client with its own Revenium middleware, such as Ollama, are recorded by that "
+            "middleware. Embeddings from other vendors are not metered.",
+            model_class.__name__,
+        )
+    else:
+        logger.warning(
+            "wrap() and attach_to() cannot attach Revenium tracking to %s: it has no callbacks field, so "
+            "nothing LangChain will call was attached. Wrap the chat model or LLM inside it, or pass the handler in "
+            "config={'callbacks': [handler]}.",
+            model_class.__name__,
+        )
 
 
 # Lazy loading implementation using __getattr__
@@ -49,16 +89,20 @@ def __getattr__(name: str) -> Any:
             """Wrap a LangChain LLM with Revenium usage tracking."""
             handler = UnifiedReveniumCallbackHandler(**kwargs)
 
-            # Attach handler to LLM
+            # Attach handler to LLM, replacing any Revenium handler attached before
             if hasattr(llm, 'callbacks'):
                 if llm.callbacks is None:
-                    llm.callbacks = [handler]
+                    existing = []
                 elif isinstance(llm.callbacks, list):
-                    llm.callbacks.append(handler)
+                    existing = llm.callbacks
                 else:
                     # Convert to list if it's something else
-                    llm.callbacks = [llm.callbacks, handler]
+                    existing = [llm.callbacks]
+                llm.callbacks = [
+                    c for c in existing if not isinstance(c, UnifiedReveniumCallbackHandler)
+                ] + [handler]
             else:
+                _warn_no_callbacks_field_once(llm)
                 # Try to add callbacks attribute
                 try:
                     llm.callbacks = [handler]

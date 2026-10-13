@@ -5,6 +5,9 @@ This module tests the prompt extraction and capture features for both
 Google AI SDK and Vertex AI SDK.
 """
 
+import importlib
+import json
+
 import pytest
 from unittest.mock import Mock, patch
 from revenium_middleware.google.config import Config
@@ -161,3 +164,45 @@ class TestPromptExtraction:
         assert result['inputMessages'] is None
         assert result['promptsTruncated'] is False
 
+
+
+def _reload_google_capture():
+    from revenium_middleware.google import config, prompt_extractor
+    importlib.reload(config)
+    return importlib.reload(prompt_extractor)
+
+
+@pytest.fixture
+def default_limit_extractor(monkeypatch):
+    """The Gemini extractor as it loads with no length setting; reloaded back so later tests see the default."""
+    with monkeypatch.context() as scoped:
+        scoped.setenv('REVENIUM_CAPTURE_PROMPTS', 'true')
+        scoped.delenv('REVENIUM_MAX_PROMPT_SIZE', raising=False)
+        scoped.delenv('REVENIUM_MAX_PROMPT_LENGTH', raising=False)
+        extractor = _reload_google_capture()
+        yield extractor
+    _reload_google_capture()
+
+
+class TestInputCaptureLength:
+    """Gemini input is cut inside its text so it stays valid JSON within the limit."""
+
+    def test_gemini_input_full_of_quotes_is_cut_not_replaced(self, default_limit_extractor):
+        result = default_limit_extractor.extract_prompts_from_request({'contents': '"' * 45_000})
+
+        stored = json.loads(result['inputMessages'])
+        text = stored[0]['parts'][0]['text']
+        assert len(result['inputMessages']) <= 50_000
+        assert result['promptsTruncated'] is True
+        assert text.startswith('"' * 100)
+        assert text.endswith('...[TRUNCATED]')
+        assert 'Content truncated - exceeded' not in result['inputMessages']
+
+    def test_gemini_keeps_the_short_turns_when_one_part_is_long(self, default_limit_extractor):
+        result = default_limit_extractor.extract_prompts_from_request(
+            {'contents': ['q1', 'D' * 60_000, 'final question']})
+
+        first, middle, last = (turn['parts'][0]['text'] for turn in json.loads(result['inputMessages']))
+        assert (first, last) == ('q1', 'final question')
+        assert middle.endswith('...[TRUNCATED]')
+        assert result['promptsTruncated'] is True

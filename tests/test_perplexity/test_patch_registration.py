@@ -25,8 +25,10 @@ def fake_module(monkeypatch):
     module = types.ModuleType(FAKE_MODULE)
     monkeypatch.setitem(sys.modules, FAKE_MODULE, module)
     monkeypatch.setattr(perplexity_sdk, "NATIVE_COMPLETIONS_MODULE", FAKE_MODULE)
+    monkeypatch.setattr(perplexity_sdk, "NATIVE_RESPONSES_MODULE", FAKE_MODULE)
     yield module
-    for name in ("CompletionsResource", "AsyncCompletionsResource", "Missing"):
+    for name in ("CompletionsResource", "AsyncCompletionsResource", "ResponsesResource", "AsyncResponsesResource",
+                 "Missing"):
         unregister_patch(f"{FAKE_MODULE}.{name}.create")
 
 
@@ -70,16 +72,18 @@ class TestNativeClientTargets:
         assert is_patched("perplexity.resources.chat.completions.CompletionsResource.create")
         assert is_patched("perplexity.resources.chat.completions.AsyncCompletionsResource.create")
         assert not is_patched("perplexity.resources.chat.completions.Completions.create")
+        assert is_patched("perplexity.resources.responses.responses.ResponsesResource.create")
+        assert is_patched("perplexity.resources.responses.responses.AsyncResponsesResource.create")
 
     def test_a_release_without_the_resource_classes_is_not_reported_and_is_warned(self, fake_module, caplog):
         with caplog.at_level(logging.WARNING, logger="revenium_middleware.perplexity"):
             perplexity_sdk.patch_native_client()
 
-        assert not is_patched(f"{FAKE_MODULE}.CompletionsResource.create")
-        assert not is_patched(f"{FAKE_MODULE}.AsyncCompletionsResource.create")
+        resources = ("CompletionsResource", "AsyncCompletionsResource", "ResponsesResource", "AsyncResponsesResource")
         messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-        assert any(f"{FAKE_MODULE}.CompletionsResource.create" in m for m in messages)
-        assert any(f"{FAKE_MODULE}.AsyncCompletionsResource.create" in m for m in messages)
+        for resource in resources:
+            assert not is_patched(f"{FAKE_MODULE}.{resource}.create")
+            assert any(f"{FAKE_MODULE}.{resource}.create" in m for m in messages)
 
 
 def test_the_native_client_is_wrapped_when_the_openai_package_is_not_installed():
@@ -99,6 +103,18 @@ def test_the_native_client_is_wrapped_when_the_openai_package_is_not_installed()
 
     assert result["native"] is True
     assert result["patched"] == [
+        "perplexity.resources.async_.chat.completions.AsyncCompletionsResource.create",
+        "perplexity.resources.async_.chat.completions.CompletionsResource.create",
+        "perplexity.resources.browser.sessions.AsyncSessionsResource.create",
+        "perplexity.resources.browser.sessions.SessionsResource.create",
         "perplexity.resources.chat.completions.AsyncCompletionsResource.create",
         "perplexity.resources.chat.completions.CompletionsResource.create",
+        "perplexity.resources.contextualized_embeddings.AsyncContextualizedEmbeddingsResource.create",
+        "perplexity.resources.contextualized_embeddings.ContextualizedEmbeddingsResource.create",
+        "perplexity.resources.embeddings.AsyncEmbeddingsResource.create",
+        "perplexity.resources.embeddings.EmbeddingsResource.create",
+        "perplexity.resources.responses.responses.AsyncResponsesResource.create",
+        "perplexity.resources.responses.responses.ResponsesResource.create",
+        "perplexity.resources.search.AsyncSearchResource.create",
+        "perplexity.resources.search.SearchResource.create",
     ]

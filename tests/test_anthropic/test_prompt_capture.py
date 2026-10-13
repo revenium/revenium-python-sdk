@@ -95,11 +95,12 @@ class TestExtractPromptsFromRequest:
 
         result = extract_prompts_from_request(kwargs)
 
-        # Should be truncated to exactly MAX_PROMPT_LENGTH (marker included)
-        assert len(result['inputMessages']) == MAX_PROMPT_LENGTH
-        assert result['inputMessages'].endswith(TRUNCATION_MARKER)
+        # The list is cut inside its texts, so it still parses and fits the limit
+        stored = json.loads(result['inputMessages'])
+        assert len(result['inputMessages']) <= MAX_PROMPT_LENGTH
+        assert all(message['content'].endswith(TRUNCATION_MARKER) for message in stored)
         assert result['promptsTruncated'] is True
-    
+
     def test_multimodal_content(self):
         """Test handling of multimodal content (arrays)."""
         kwargs = {
@@ -248,3 +249,75 @@ class TestPromptCaptureIntegration:
 
         assert Config.MAX_PROMPT_LENGTH == 50_000
 
+
+
+def test_message_capture_masks_credentials(monkeypatch, mock_revenium_client):
+    """BACK-4237: an Anthropic call sends its captured prompt with credentials masked."""
+    from .test_raw_response import REQUEST, StubAnthropic, _run_metering_synchronously
+
+    monkeypatch.setenv("REVENIUM_CAPTURE_PROMPTS", "true")
+    monkeypatch.setattr("revenium_middleware.anthropic.middleware._safe_run_async_in_thread",
+                        _run_metering_synchronously)
+    request = dict(
+        REQUEST,
+        system="Authorization: Bearer FAKEBEARERTOKENFAKEBEARERTOKEN0002",
+        messages=[{"role": "user", "content": "My key is sk-ant-FAKE" + "3" * 24 + " and password: FAKEpassw0rd!"}],
+    )
+
+    StubAnthropic().sync_client().messages.create(**request)
+
+    mock_revenium_client.ai.create_completion.assert_called_once()
+    sent = mock_revenium_client.ai.create_completion.call_args.kwargs
+    for field in ("system_prompt", "input_messages"):
+        assert "FAKE" not in sent[field], (field, sent[field])
+        assert "***REDACTED***" in sent[field], (field, sent[field])
+    assert json.loads(sent["input_messages"])
+
+
+LIMIT = 50_000
+
+
+@pytest.fixture
+def limit_50000(monkeypatch):
+    monkeypatch.setattr("revenium_middleware.anthropic.prompt_extractor.Config.MAX_PROMPT_LENGTH", LIMIT)
+
+
+def _user(content):
+    return {'role': 'user', 'content': content}
+
+
+@pytest.mark.usefixtures('limit_50000')
+class TestMessageListLimit:
+    """input_messages is whole when it fits and valid JSON within the limit when it does not."""
+
+    def test_a_single_30000_character_message_is_kept_whole(self):
+        result = extract_prompts_from_request({'messages': [_user('D' * 30_000)]})
+
+        assert json.loads(result['inputMessages']) == [_user('D' * 30_000)]
+        assert result['promptsTruncated'] is False
+
+    def test_a_single_30000_character_text_block_is_kept_whole(self):
+        message = _user([{'type': 'text', 'text': 'D' * 30_000}])
+
+        result = extract_prompts_from_request({'messages': [message]})
+
+        assert json.loads(result['inputMessages']) == [message]
+        assert result['promptsTruncated'] is False
+
+    def test_an_overflowing_message_list_is_valid_json_within_the_limit(self):
+        tool_use = {'type': 'tool_use', 'id': 'toolu_01', 'name': 'search', 'input': {'q': 'x'}}
+        tool_result = {'type': 'tool_result', 'tool_use_id': 'toolu_01', 'content': 'R' * 30_000}
+        image = {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/png', 'data': 'I' * 10_000}}
+        messages = [
+            _user([{'type': 'text', 'text': 'T' * 30_000}]),
+            {'role': 'assistant', 'content': [tool_use]},
+            _user([tool_result, image]),
+        ]
+
+        result = extract_prompts_from_request({'messages': messages})
+
+        stored = json.loads(result['inputMessages'])
+        assert len(result['inputMessages']) <= LIMIT
+        assert stored[1]['content'][0] == tool_use
+        assert stored[2]['content'][1]['source']['media_type'] == 'image/png'
+        assert result['promptsTruncated'] is True
