@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.1] - 2026-10-14
+
+### Changed
+- LiteLLM proxy guardrail: a call's Revenium trace id now defaults to the LiteLLM session id the caller sent (the `x-litellm-session-id` or `x-litellm-trace-id` header, or `litellm_session_id` or `metadata.session_id` in the request body, `litellm_metadata.session_id` on `/v1/messages`), so calls grouped into one LiteLLM session read as one trace. `x-revenium-trace-id` still wins, and `x-claude-code-session-id` is now the fallback after the LiteLLM session id, so a call that sends both a LiteLLM session id and `x-claude-code-session-id` now takes the LiteLLM session id as its trace id. The id LiteLLM generates for every request is never used, and neither is a session id LiteLLM generated itself under its `missing_session_id: generate` policy, so a call that names no session still has no trace id. The deprecated callback is unchanged.
+
 ## [0.10.0] - 2026-10-13
 
 ### Behaviour changes
@@ -558,6 +563,7 @@ These can change what your application sees when you upgrade from 0.9.2. Each on
 - Selective metering via `REVENIUM_SELECTIVE_METERING` environment variable
 - Configurable logging with `REVENIUM_LOG_LEVEL`
 
+[0.10.1]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.10.1
 [0.10.0]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.10.0
 [0.9.2]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.9.2
 [0.9.1]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.9.1

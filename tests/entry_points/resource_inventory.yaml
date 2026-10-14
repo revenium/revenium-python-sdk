@@ -25,8 +25,10 @@
 # make, so their groups say which hooks and driver calls reach a wrap.
 #
 # Allowed reasons are judgements made on 2026-10-05 and, for the roots added by
-# BACK-4027, on 2026-10-08, and by BACK-4229, on 2026-10-10. Group A is the list of known billable gaps: moving a
-# method out of A means adding its wrap and its manifest rows.
+# BACK-4027, on 2026-10-08, and by BACK-4229, on 2026-10-10. New methods added to
+# existing roots by BACK-4571 were judged on 2026-10-14. Group A is the list of
+# known billable gaps: moving a method out of A means adding its wrap and its
+# manifest rows.
 #
 # A group marked `disclose: true` is one the customer pays the provider for while
 # nothing reaches Revenium. README.md's "Calls the SDK does not meter" list must
@@ -626,6 +628,7 @@ providers:
           - "AsyncOpenAI.admin.organization.projects.api_keys.delete"
           - "AsyncOpenAI.admin.organization.projects.api_keys.list"
           - "AsyncOpenAI.admin.organization.projects.api_keys.retrieve"
+          - "AsyncOpenAI.admin.organization.projects.api_keys.update"
           - "AsyncOpenAI.admin.organization.projects.archive"
           - "AsyncOpenAI.admin.organization.projects.certificates.activate"
           - "AsyncOpenAI.admin.organization.projects.certificates.deactivate"
@@ -697,6 +700,7 @@ providers:
           - "AsyncOpenAI.admin.organization.usage.code_interpreter_sessions"
           - "AsyncOpenAI.admin.organization.usage.completions"
           - "AsyncOpenAI.admin.organization.usage.costs"
+          - "AsyncOpenAI.admin.organization.usage.decisions"
           - "AsyncOpenAI.admin.organization.usage.embeddings"
           - "AsyncOpenAI.admin.organization.usage.file_search_calls"
           - "AsyncOpenAI.admin.organization.usage.images"
@@ -750,6 +754,7 @@ providers:
           - "OpenAI.admin.organization.projects.api_keys.delete"
           - "OpenAI.admin.organization.projects.api_keys.list"
           - "OpenAI.admin.organization.projects.api_keys.retrieve"
+          - "OpenAI.admin.organization.projects.api_keys.update"
           - "OpenAI.admin.organization.projects.archive"
           - "OpenAI.admin.organization.projects.certificates.activate"
           - "OpenAI.admin.organization.projects.certificates.deactivate"
@@ -821,6 +826,7 @@ providers:
           - "OpenAI.admin.organization.usage.code_interpreter_sessions"
           - "OpenAI.admin.organization.usage.completions"
           - "OpenAI.admin.organization.usage.costs"
+          - "OpenAI.admin.organization.usage.decisions"
           - "OpenAI.admin.organization.usage.embeddings"
           - "OpenAI.admin.organization.usage.file_search_calls"
           - "OpenAI.admin.organization.usage.images"

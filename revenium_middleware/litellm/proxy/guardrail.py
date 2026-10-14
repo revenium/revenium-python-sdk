@@ -745,6 +745,47 @@ def _key_team_alias(user_api_key_dict, data):
     return key_team_alias(data)
 
 
+# LiteLLM stamps this on a metadata container when its ``missing_session_id``
+# policy minted the session id itself rather than taking one from the caller.
+_SESSION_ID_GENERATED_KEY = "litellm_session_id_generated"
+
+
+def _litellm_session_id(container):
+    """The LiteLLM session id the caller supplied, or None.
+
+    ``container`` is a hook's request surface: ``data`` / ``request_data`` on the
+    guardrail hooks, ``litellm_params`` on the logging path, never the logging
+    kwargs' top level, where LiteLLM spreads provider params and ``metadata``
+    can be the caller's body. LiteLLM fills ``litellm_session_id`` only from
+    caller input (the ``x-litellm-session-id`` / ``x-litellm-trace-id`` headers
+    or the request body), and mirrors it into ``session_id`` in the route's
+    metadata container. ``litellm_metadata`` is read before ``metadata`` because
+    on the routes that use it, ``metadata`` is the caller's own body.
+
+    LiteLLM's per-request trace id is deliberately not read: it mints a fresh
+    uuid4 for every request, so using it would make every call its own trace.
+    For the same reason, a session id LiteLLM minted itself (its opt-in
+    ``missing_session_id: generate`` policy) is ignored when LiteLLM marked it.
+
+    Only a non-blank string counts; anything else falls through to the next
+    source, because this runs in-band and a non-string must never reach the wire.
+    """
+    container = _as_mapping(container)
+    metadata_containers = [
+        _as_mapping(container.get(key)) for key in ("litellm_metadata", "metadata")
+    ]
+    if any(level.get(_SESSION_ID_GENERATED_KEY) for level in metadata_containers):
+        return None
+    candidates = (
+        container.get("litellm_session_id"),
+        *(level.get("session_id") for level in metadata_containers),
+    )
+    for candidate in candidates:
+        if isinstance(candidate, str) and present_or_none(candidate) is not None:
+            return candidate
+    return None
+
+
 def _organization_name(data, headers, metadata, user_api_key_dict, key_metadata):
     """Organization attribution, headers first then key/team identity.
 
@@ -1357,6 +1398,7 @@ class ReveniumGuardrail(CustomGuardrail):
                 request_duration=duration_ms,
                 mediation_latency=mediation_latency,
                 stop_reason="END",
+                litellm_session_id=_litellm_session_id(data),
                 # LiteLLM-populated surfaces only: data["metadata"] (and so
                 # hidden_params) is the caller's own request body on
                 # /v1/messages, and a caller must not be able to name the
@@ -1500,6 +1542,9 @@ class ReveniumGuardrail(CustomGuardrail):
                 request_duration=duration_ms,
                 mediation_latency=hidden_params.get("litellm_overhead_time_ms") or 0,
                 stop_reason="END",
+                # litellm_params, not kwargs: LiteLLM spreads provider params
+                # across the kwargs' top level, which the caller can shape.
+                litellm_session_id=_litellm_session_id(litellm_params),
                 upstream_sources=(
                     getattr(response_obj, "_hidden_params", None),
                     kwargs,
@@ -1629,6 +1674,7 @@ class ReveniumGuardrail(CustomGuardrail):
                 request_duration=0,
                 mediation_latency=hidden_params.get("litellm_overhead_time_ms") or 0,
                 stop_reason="ERROR",
+                litellm_session_id=_litellm_session_id(request_data),
                 upstream_sources=(
                     getattr(original_exception, "_hidden_params", None),
                     request_data.get("litellm_params"),
@@ -1665,6 +1711,7 @@ class ReveniumGuardrail(CustomGuardrail):
         stop_reason,
         upstream_sources,
         is_streamed=None,
+        litellm_session_id=None,
     ):
         """Build the completion metering payload shared by all three hooks.
 
@@ -1687,6 +1734,12 @@ class ReveniumGuardrail(CustomGuardrail):
                 ``async_log_success_event`` knows from the call it was gated
                 on, and says so rather than depending on a nested key the
                 logging path does not always carry.
+            litellm_session_id: The session id the caller gave LiteLLM, as the
+                calling hook resolved it from its own request surface with
+                ``_litellm_session_id``. It is the trace id when no
+                ``x-revenium-trace-id`` header was sent. Resolved by the hook
+                because the logging path's ``data`` is not a LiteLLM-owned
+                surface at its top level.
 
         Returns:
             A ``(completion_args, extra_body)`` tuple -- ``extra_body`` carries
@@ -1735,12 +1788,17 @@ class ReveniumGuardrail(CustomGuardrail):
             "stop_reason": stop_reason,
             "total_token_count": total_tokens,
             "transaction_id": transaction_id,
-            # Claude Code stamps its session id on its own telemetry rows as
-            # their trace id, so reading it here is what makes one session
-            # read as one trace on both records. Never the transaction id: a
+            # Order: the x-revenium-trace-id header, the LiteLLM session id the
+            # caller supplied, then Claude Code's session id. A session id
+            # groups calls into one trace, and Claude Code stamps its own on
+            # its telemetry rows as their trace id, so one session reads as one
+            # trace on both records. LiteLLM's own per-request trace id is
+            # never a fallback: it mints a fresh uuid4 for every request, which
+            # would make every call its own trace. Never the transaction id: a
             # session covers many calls, and keying the duplicate gate on it
             # would fold a whole session into one record and under-bill it.
             "trace_id": (headers.get("x-revenium-trace-id")
+                         or litellm_session_id
                          or headers.get("x-claude-code-session-id")),
             "task_type": headers.get("x-revenium-task-type"),
             "subscriber": subscriber if subscriber else None,
