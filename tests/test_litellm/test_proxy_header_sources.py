@@ -220,6 +220,45 @@ async def drive_guardrail_failure(guardrail, data, error=None):
     return submit
 
 
+async def drive_guardrail_logging(guardrail, data, response=None):
+    """Drive ``async_log_success_event`` with the logging kwargs ``data`` describes.
+
+    LiteLLM hands the logging path its request surfaces one level down, under
+    ``litellm_params``, and writes the caller's session id there too (see
+    ``get_litellm_params``); the generated trace id and the standard logging
+    object sit at the kwargs top level. ``data`` is laid out the way the
+    guardrail hooks see it, so each of those lands where the logging path has it.
+    """
+    params = {
+        key: data[key]
+        for key in (
+            "litellm_metadata", "proxy_server_request", "metadata",
+            "litellm_session_id", "litellm_trace_id",
+        )
+        if key in data
+    }
+    params.setdefault("metadata", {})
+    kwargs = {
+        "model": data["model"],
+        "call_type": "anthropic_messages",
+        "stream": True,
+        "litellm_call_id": "litellm-call-id-1",
+        "litellm_params": params,
+    }
+    for key in ("litellm_trace_id", "standard_logging_object"):
+        if key in data:
+            kwargs[key] = data[key]
+    with patch.object(gmod, "submit_ai_event") as submit, \
+            patch.object(gmod, "run_async_in_thread", side_effect=drive_metering):
+        await guardrail.async_log_success_event(
+            kwargs,
+            response if response is not None else GuardrailResponse(usage=Usage()),
+            NOW,
+            LATER,
+        )
+    return submit
+
+
 # The four metered paths, behind one await-able signature so a property that
 # must hold on all of them is written once and cannot be left half-pinned.
 
@@ -603,6 +642,212 @@ class TestSessionIdBecomesTraceId:
             assert FAILURE_SUFFIX.search(args["transaction_id"])
         else:
             assert args["transaction_id"].startswith("chatcmpl-")
+
+
+# The session id a gateway caller chose, and the shape of the per-request id
+# LiteLLM mints for itself (a fresh uuid4 for every request). The second must
+# never reach the record's trace id.
+LITELLM_SESSION_ID = "checkout-flow-7731"
+AUTO_TRACE_ID = "7d2f4c1e-5b8a-4e63-9f0d-2a6c8b1e4d95"
+
+# Every guardrail hook, behind one await-able signature.
+GUARDRAIL_HOOKS = [
+    pytest.param(drive_guardrail_success, id="guardrail-success"),
+    pytest.param(drive_guardrail_failure, id="guardrail-failure"),
+    pytest.param(drive_guardrail_logging, id="guardrail-logging"),
+]
+
+
+def _top_level(data):
+    data["litellm_session_id"] = LITELLM_SESSION_ID
+    return data
+
+
+def _body_metadata(data):
+    data["metadata"]["session_id"] = LITELLM_SESSION_ID
+    return data
+
+
+def _litellm_metadata(data):
+    data["litellm_metadata"]["session_id"] = LITELLM_SESSION_ID
+    return data
+
+
+def _session_header(data):
+    """The x-litellm-session-id header as LiteLLM files it (pre_call_utils)."""
+    data["litellm_metadata"]["headers"] = {"x-litellm-session-id": LITELLM_SESSION_ID}
+    data["litellm_metadata"].update(session_id=LITELLM_SESSION_ID, trace_id=LITELLM_SESSION_ID)
+    data["litellm_session_id"] = LITELLM_SESSION_ID
+    data["litellm_trace_id"] = LITELLM_SESSION_ID
+    return data
+
+
+# (the request shape's metadata key, what puts the session id in the request)
+SESSION_SOURCES = [
+    pytest.param("metadata", _top_level, id="top-level-litellm-session-id"),
+    pytest.param("metadata", _body_metadata, id="metadata-session-id"),
+    pytest.param("litellm_metadata", _litellm_metadata, id="v1-messages-litellm-metadata"),
+    pytest.param("litellm_metadata", _session_header, id="x-litellm-session-id-header"),
+]
+
+
+class TestLiteLLMSessionIdBecomesTraceId:
+    """A caller's LiteLLM session id is the trace id when no Revenium header is.
+
+    The order is x-revenium-trace-id, then the LiteLLM session id the caller
+    supplied, then x-claude-code-session-id, then nothing. Calls a customer
+    groups into one LiteLLM session therefore read as one trace in Revenium.
+
+    LiteLLM's own per-request trace id is never read. It mints a fresh uuid4 for
+    every request, so falling back to it would make every call its own trace.
+    ``test_litellm_generated_ids_are_never_the_trace_id`` feeds every place that
+    id can sit to each hook.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_litellm_session_id_becomes_trace_id(self, guardrail, drive):
+        """The caller's session id is recorded when no trace header is sent."""
+        data = guardrail_data()
+        data["litellm_session_id"] = LITELLM_SESSION_ID
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["trace_id"] == LITELLM_SESSION_ID
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_revenium_trace_id_wins_over_litellm_session_id(self, guardrail, drive):
+        """An explicit Revenium header is never overruled by a grouping default."""
+        data = guardrail_data(headers={"x-revenium-trace-id": "customer-supplied"})
+        data["litellm_session_id"] = LITELLM_SESSION_ID
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["trace_id"] == "customer-supplied"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_litellm_session_id_wins_over_claude_code_session_id(self, guardrail, drive):
+        """The session the caller named outranks the Claude Code header."""
+        data = guardrail_data(headers={"x-claude-code-session-id": SESSION_ID})
+        data["litellm_session_id"] = LITELLM_SESSION_ID
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["trace_id"] == LITELLM_SESSION_ID
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    @pytest.mark.parametrize(
+        "headers,expected",
+        [
+            pytest.param({}, None, id="no-header"),
+            pytest.param({"x-claude-code-session-id": SESSION_ID}, SESSION_ID, id="claude-code"),
+        ],
+    )
+    async def test_litellm_generated_ids_are_never_the_trace_id(
+        self, guardrail, drive, headers, expected
+    ):
+        """LiteLLM's per-request ids fall through to the next tier."""
+        data = guardrail_data(headers=headers, metadata={"trace_id": AUTO_TRACE_ID})
+        data["litellm_trace_id"] = AUTO_TRACE_ID
+        data["standard_logging_object"] = {"trace_id": AUTO_TRACE_ID}
+        submit = await drive(guardrail, data)
+        trace_id = submitted_args(submit)["trace_id"]
+        assert trace_id == expected
+        assert trace_id != AUTO_TRACE_ID
+
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    @pytest.mark.parametrize("key,place", SESSION_SOURCES)
+    async def test_every_session_source_becomes_the_trace_id(
+        self, guardrail, drive, key, place
+    ):
+        """Each place a caller can put a session id reaches the record on each hook."""
+        submit = await drive(guardrail, place(guardrail_data(metadata_key=key)))
+        assert submitted_args(submit)["trace_id"] == LITELLM_SESSION_ID
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_top_level_session_id_beats_metadata_session_id(self, guardrail, drive):
+        """litellm_session_id is read before the metadata container's session_id."""
+        data = guardrail_data(metadata={"session_id": "from-metadata"})
+        data["litellm_session_id"] = LITELLM_SESSION_ID
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["trace_id"] == LITELLM_SESSION_ID
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_litellm_metadata_beats_the_callers_body_on_v1_messages(
+        self, guardrail, drive
+    ):
+        """On /v1/messages, ``metadata`` is the caller's body, so it is read second."""
+        data = guardrail_data(
+            metadata_key="litellm_metadata", metadata={"session_id": "from-the-body"}
+        )
+        data["litellm_metadata"]["session_id"] = LITELLM_SESSION_ID
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["trace_id"] == LITELLM_SESSION_ID
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            pytest.param("", id="empty"),
+            pytest.param("   ", id="blank"),
+            pytest.param(42, id="int"),
+            pytest.param({"id": "x"}, id="dict"),
+        ],
+    )
+    async def test_an_unusable_session_id_falls_through(self, guardrail, drive, bad):
+        """A malformed value never raises or costs the record; the next tier wins."""
+        data = guardrail_data(headers={"x-claude-code-session-id": SESSION_ID})
+        data["litellm_session_id"] = bad
+        data["metadata"]["session_id"] = bad
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["trace_id"] == SESSION_ID
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_a_non_mapping_litellm_metadata_falls_through(self, guardrail, drive):
+        """A non-mapping container is skipped, not fatal."""
+        data = guardrail_data(headers={"x-claude-code-session-id": SESSION_ID})
+        data["litellm_metadata"] = "not-a-mapping"
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["trace_id"] == SESSION_ID
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_a_session_id_litellm_generated_is_ignored(self, guardrail, drive):
+        """LiteLLM's ``missing_session_id: generate`` policy mints a per-request id.
+
+        It fills litellm_session_id and the metadata session_id and marks the
+        metadata, so the marked value is as much LiteLLM's own as its trace id.
+        """
+        data = guardrail_data(
+            headers={"x-claude-code-session-id": SESSION_ID},
+            metadata={"session_id": AUTO_TRACE_ID, "litellm_session_id_generated": True},
+        )
+        data["litellm_session_id"] = AUTO_TRACE_ID
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["trace_id"] == SESSION_ID
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive,is_failure", [
+        pytest.param(drive_guardrail_success, False, id="guardrail-success"),
+        pytest.param(drive_guardrail_failure, True, id="guardrail-failure"),
+        pytest.param(drive_guardrail_logging, False, id="guardrail-logging"),
+    ])
+    async def test_litellm_session_id_is_never_the_transaction_id(
+        self, guardrail, drive, is_failure
+    ):
+        """The false-merge guard: a session covers many calls, a transaction one."""
+        data = guardrail_data()
+        data["litellm_session_id"] = LITELLM_SESSION_ID
+        submit = await drive(guardrail, data)
+        args = submitted_args(submit)
+        assert args["trace_id"] == LITELLM_SESSION_ID
+        assert args["transaction_id"] != LITELLM_SESSION_ID
+        assert LITELLM_SESSION_ID not in args["transaction_id"]
+        if is_failure:
+            assert FAILURE_SUFFIX.search(args["transaction_id"])
 
 
 class TestFailureIdentity:

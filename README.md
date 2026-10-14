@@ -1081,6 +1081,18 @@ the others to be recorded. A malformed header value, such as a quality score of
 `high` or an effort of `very high`, is left off the record with a WARNING in the
 gateway log; the call is still recorded.
 
+**Trace id.** The guardrail takes a record's trace id from `x-revenium-trace-id`.
+Without that header it takes the LiteLLM session id the caller sent: the
+`x-litellm-session-id` or `x-litellm-trace-id` header, or `litellm_session_id` or
+`metadata.session_id` in the request body (`litellm_metadata.session_id` on
+`/v1/messages`). Calls a customer groups into one LiteLLM session therefore read
+as one trace in Revenium. Failing both, it uses Claude Code's
+`x-claude-code-session-id`, so one Claude Code session is one trace. A call with
+none of these has no trace id. The id LiteLLM generates for every request is never
+used, because it would make each call a trace of its own, and neither is a session
+id LiteLLM minted itself under its `missing_session_id: generate` policy. The
+deprecated callback reads only `x-revenium-trace-id` and `x-claude-code-session-id`.
+
 **Organization caps and the organization header.** By default the
 `x-revenium-organization-name` header (and the retired `x-revenium-organization-id`)
 wins over the calling virtual key's team alias, for the budget check and the record
