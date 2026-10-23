@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "revenium-python-sdk"
-version = "0.10.1"
+version = "0.11.0"
 description = "The official Revenium Python SDK — unified AI metering middleware for OpenAI, Anthropic, Google, Ollama, LiteLLM, Perplexity, and fal.ai."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -141,7 +141,12 @@ dev = [
     # tests/test_patch_coverage.py and tests/entry_points import every provider
     # SDK unconditionally, so a missing one fails the run instead of skipping.
     "openai>=1.0.0",
-    "litellm>=1.40.0",
+    # Below 1.106: litellm 1.106.0 imports mcp inside completion() for any call
+    # that carries tools but declares mcp only under its proxy and mcp extras
+    # (mcp>=2.2), while crewai 1.15 pins mcp~=1.28, so installing mcp here
+    # makes pip resolve crewai back to 1.6. Lift the bound when litellm ships
+    # the import behind its extra again or declares mcp as a core dependency.
+    "litellm>=1.40.0,<1.106",
     "fal-client>=0.13.0",
     "perplexityai>=0.1.0",
     "google-genai>=0.1.0",

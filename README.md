@@ -76,12 +76,12 @@ Some billable provider calls are not metered at all: see [Calls the SDK does not
 The calls below are billed by the provider (some, such as batch and fine-tuning jobs, when the job runs rather than when you call them), but the SDK records no usage for them: nothing reaches Revenium and nothing is logged. On every build a test compares this list with the SDK's inventory of the public calls of the OpenAI, Anthropic, Perplexity, Gemini, Ollama, LiteLLM and fal clients, boto3's Bedrock Runtime client, and the Vertex AI model, session, batch prediction, tuning and context-cache classes, on the provider versions the SDK is tested on. Calls reached another way, for example LangChain classes that call their own vendor SDK, are outside that check, except LangChain embeddings, listed by hand below; wrapping one with `wrap()` logs a warning. Sync and async forms are folded into one name, and the `with_raw_response` and `with_streaming_response` forms of a listed call are not metered either. To record any of these calls, wrap it with `@meter_tool` (see [Tool Metering](#tool-metering)).
 
 <!-- not-metered:start -->
-- **OpenAI** (`OpenAI` and `AsyncOpenAI` clients): `batches.create`, `beta.agents.sessions.create`, `beta.agents.sessions.events.create`, `beta.agents.sessions.events.stream`, `beta.agents.sessions.stream`, `beta.agents.sessions.update`, `beta.chatkit.sessions.create`, `beta.realtime.connect`, `beta.responses.compact`, `beta.responses.connect`, `beta.responses.create`, `beta.threads.create_and_run`, `beta.threads.create_and_run_poll`, `beta.threads.create_and_run_stream`, `beta.threads.runs.create`, `beta.threads.runs.create_and_poll`, `beta.threads.runs.create_and_stream`, `beta.threads.runs.stream`, `beta.threads.runs.submit_tool_outputs`, `beta.threads.runs.submit_tool_outputs_and_poll`, `beta.threads.runs.submit_tool_outputs_stream`, `completions.create`, `decisions.create`, `evals.runs.create`, `fine_tuning.alpha.graders.run`, `fine_tuning.jobs.create`, `images.create_variation`, `images.edit`, `images.generate`, `live.connect`, `live.create`, `live.forks.connect`, `live.sessions.accept`, `live.sessions.fork`, `live.sideband.connect`, `realtime.calls.accept`, `realtime.calls.create`, `realtime.connect`, `responses.compact`, `responses.connect`, `videos.create`, `videos.create_and_poll`, `videos.create_character`, `videos.edit`, `videos.extend`, `videos.remix`
+- **OpenAI** (`OpenAI` and `AsyncOpenAI` clients): `batches.create`, `beta.agents.sessions.create`, `beta.agents.sessions.events.create`, `beta.agents.sessions.events.stream`, `beta.agents.sessions.stream`, `beta.agents.sessions.update`, `beta.chatkit.sessions.create`, `beta.realtime.connect`, `beta.responses.compact`, `beta.responses.connect`, `beta.responses.create`, `beta.threads.create_and_run`, `beta.threads.create_and_run_poll`, `beta.threads.create_and_run_stream`, `beta.threads.runs.create`, `beta.threads.runs.create_and_poll`, `beta.threads.runs.create_and_stream`, `beta.threads.runs.stream`, `beta.threads.runs.submit_tool_outputs`, `beta.threads.runs.submit_tool_outputs_and_poll`, `beta.threads.runs.submit_tool_outputs_stream`, `completions.create`, `decisions.create`, `evals.runs.create`, `fine_tuning.alpha.graders.run`, `fine_tuning.jobs.create`, `images.create_variation`, `images.edit`, `images.generate`, `live.connect`, `live.create`, `live.forks.connect`, `live.sessions.accept`, `live.sessions.fork`, `live.sideband.connect`, `realtime.calls.accept`, `realtime.calls.create`, `realtime.connect`, `realtime.translations.connect`, `responses.compact`, `responses.connect`, `videos.create`, `videos.create_and_poll`, `videos.create_character`, `videos.edit`, `videos.extend`, `videos.remix`
 - **Anthropic** (`Anthropic` and `AsyncAnthropic` clients): `beta.deployments.run`, `beta.dreams.create`, `beta.environments.work.poller`, `beta.environments.work.worker`, `beta.messages.batches.create`, `beta.sessions.create`, `beta.sessions.events.send`, `beta.sessions.events.stream`, `beta.sessions.events.tool_runner`, `beta.sessions.threads.events.stream`, `messages.batches.create`
 - **Google Gemini** (`google.genai` `Client` and `Client.aio`): `batches.create`, `batches.create_embeddings`, `caches.create`, `caches.update`, `file_search_stores.import_file`, `file_search_stores.upload_to_file_search_store`, `interactions.create`, `live.connect`, `live.music.connect`, `models.edit_image`, `models.recontext_image`, `models.segment_image`, `models.upscale_image`, `triggers.run`, `tunings.tune`
 - **Google Vertex AI** (`vertexai` classes): `batch_prediction.BatchPredictionJob.submit`, `caching.CachedContent.create`, `caching.CachedContent.update`, `language_models.ChatModel.tune_model`, `language_models.ChatModel.tune_model_rlhf`, `language_models.ChatSession.send_message`, `language_models.ChatSession.send_message_async`, `language_models.ChatSession.send_message_streaming`, `language_models.ChatSession.send_message_streaming_async`, `language_models.CodeChatModel.tune_model`, `language_models.CodeChatSession.send_message`, `language_models.CodeChatSession.send_message_async`, `language_models.CodeChatSession.send_message_streaming`, `language_models.CodeChatSession.send_message_streaming_async`, `language_models.CodeGenerationModel.batch_predict`, `language_models.CodeGenerationModel.predict`, `language_models.CodeGenerationModel.predict_async`, `language_models.CodeGenerationModel.predict_streaming`, `language_models.CodeGenerationModel.predict_streaming_async`, `language_models.CodeGenerationModel.tune_model`, `language_models.TextEmbeddingModel.batch_predict`, `language_models.TextEmbeddingModel.deploy_tuned_model`, `language_models.TextEmbeddingModel.tune_model`, `language_models.TextGenerationModel.batch_predict`, `language_models.TextGenerationModel.predict`, `language_models.TextGenerationModel.predict_async`, `language_models.TextGenerationModel.predict_streaming`, `language_models.TextGenerationModel.predict_streaming_async`, `language_models.TextGenerationModel.tune_model`, `language_models.TextGenerationModel.tune_model_rlhf`, `preview.caching.CachedContent.create`, `preview.caching.CachedContent.update`, `preview.vision_models.ImageCaptioningModel.get_captions`, `preview.vision_models.ImageGenerationModel.upscale_image`, `preview.vision_models.ImageQnAModel.ask_question`, `preview.vision_models.ImageSegmentationModel.segment_image`, `preview.vision_models.ImageTextModel.ask_question`, `preview.vision_models.ImageTextModel.get_captions`, `preview.vision_models.MultiModalEmbeddingModel.get_embeddings`, `preview.vision_models.WatermarkVerificationModel.verify_image`, `tuning.sft.train`, `vision_models.ImageCaptioningModel.get_captions`, `vision_models.ImageGenerationModel.upscale_image`, `vision_models.ImageQnAModel.ask_question`, `vision_models.ImageTextModel.ask_question`, `vision_models.ImageTextModel.get_captions`, `vision_models.MultiModalEmbeddingModel.get_embeddings`
 - **AWS Bedrock** (boto3 bedrock-runtime client; Claude models are metered when REVENIUM_BEDROCK_TRANSPORT is on): `apply_guardrail`, `converse`, `converse_stream`, `invoke_guardrail_checks`, `invoke_model`, `invoke_model_with_response_stream`, `start_async_invoke`
-- **Perplexity** (`Perplexity` and `AsyncPerplexity` clients): `async_.chat.completions.create`, `browser.sessions.create`, `contextualized_embeddings.create`, `embeddings.create`, `responses.create`, `search.create`
+- **Perplexity** (`Perplexity` and `AsyncPerplexity` clients): `async_.chat.completions.create`, `batches.create`, `browser.sessions.create`, `contextualized_embeddings.create`, `decisions.create`, `embeddings.create`, `responses.create`, `search.create`
 - **LiteLLM** (the `litellm` module): `aadapter_completion`, `aadapter_generate_content`, `acode_interpreter_tool`, `acompact_responses`, `acreate_batch`, `acreate_fine_tuning_job`, `acreate_run`, `acreate_sandbox`, `adapter_completion`, `adecisions`, `agenerate_content`, `aimage_edit`, `aimage_generation`, `aimage_variation`, `aingest`, `anthropic_interface.messages.acreate`, `anthropic_interface.messages.create`, `anthropic_messages`, `anthropic_messages_handler`, `aocr`, `aquery`, `arealtime_calls`, `arerank`, `aresponses`, `aresponses_api_with_mcp`, `aresponses_with_retries`, `arun_code`, `arun_thread`, `arun_thread_stream`, `asearch`, `aspeech`, `asystemone`, `atranscription`, `avideo_create_character`, `avideo_edit`, `avideo_extension`, `avideo_generation`, `avideo_remix`, `compact_responses`, `config_completion`, `create_batch`, `create_fine_tuning_job`, `create_run`, `decisions`, `image_edit`, `image_generation`, `image_variation`, `ingest`, `nlp_cloud_chat_completion`, `ocr`, `query`, `replicate_chat_completion`, `rerank`, `responses`, `responses_with_retries`, `run_thread`, `run_thread_stream`, `search`, `speech`, `systemone`, `transcription`, `video_create_character`, `video_edit`, `video_extension`, `video_generation`, `video_remix`
 - **Ollama** (`Client`, `AsyncClient` and the `ollama` module): `systemone`, `web_fetch`, `web_search`
 - **fal.ai** (`SyncClient`, `AsyncClient` and the `fal_client` module): `realtime`, `realtime_async`, `ws_connect`, `ws_connect_async`
@@ -1677,6 +1677,7 @@ characters, and `product_name` at 224. Other text fields are sent as given.
 | `agent` | AI agent or bot identifier | Distinguish between multiple AI agents or automation workflows |
 | `response_quality_score` | Custom quality rating (0.0-1.0) | Track user satisfaction or automated quality metrics for model performance analysis |
 | `effort` | Reasoning effort level requested of the model (free-form string, max 16 chars, `^[A-Za-z0-9_-]+$`) | Report what share of AI spend is high-effort reasoning, and compare cost per effort level |
+| `entrypoint` | How the coding assistant that made the call was launched, such as `cli`, `sdk-py` or `claude-vscode` (completions only, 1 to 64 chars, `^[A-Za-z0-9._-]+$`) | Split coding-assistant spend between the terminal, the SDKs and the editor or chat integrations |
 
 **Example:**
 
@@ -1711,13 +1712,22 @@ string, not an enum -- vendor vocabularies differ and drift, so `low`, `medium`,
 `high`, `xhigh` and `ultra` are all real values, and a level this SDK release has
 never heard of is passed through untouched rather than rejected or rewritten. The
 Revenium backend rule is at most 16 characters, matching `^[A-Za-z0-9_-]+$`; a
-value outside it is left off the record with a WARNING, and the call is still
+value outside it, an empty one included, is left off the record with a WARNING, and the call is still
 recorded with its tokens and cost. It is distinct from the reported reasoning token count,
 which measures the tokens actually spent rather than the level requested.
 
 Set it per call in `usage_metadata` on any provider integration. In LiteLLM proxy
 mode, where per-call attribution travels as request headers rather than
 `usage_metadata`, send `x-revenium-effort` instead.
+
+**Coding-assistant entrypoint:** `entrypoint` records how the coding assistant
+that made a completion was launched. Claude Code sends `cli`, `sdk-cli`,
+`sdk-ts`, `sdk-py`, `claude-vscode` or `claude-in-slack`; any other value of
+the same shape is sent as given, not rewritten. A value that is empty, longer
+than 64 characters or holds anything but letters, digits, dots, hyphens and
+underscores is left off the record with a WARNING, and the call is still
+recorded. It is sent on completions only; image, video and audio calls ignore
+it, and the LiteLLM proxy does not read it.
 
 **Deprecation notice:** The legacy field aliases `organizationId`, `organization_id`, `productId`, and `product_id` are accepted by this SDK only as an input-layer convenience and emit a `DeprecationWarning`. The Revenium backend no longer accepts them — they are translated to `organizationName` / `productName` before the wire call. Migrate to `organization_name` / `organizationName` and `product_name` / `productName` now; the input-layer aliases will be removed in the next major release.
 
@@ -2240,6 +2250,23 @@ if roster:
 ```
 
 `fetch_enforcement_rule_roster` takes `page`, `size`, `search` and `band` (`BLOCKED`, `WARNED`, `UNDER`, `ALL`); the server does the filtering, sorting, banding and paging, and the three band counts always describe the whole roster rather than the page you asked for. Both calls return `None` rather than raising when the team has no such compiled rule, the rule has no reading yet, or the enforcement API cannot be reached — the same fail-open posture as the rest of the circuit breaker. An empty `rule_id` raises `ValueError`.
+
+### Reading Advisory Budgets
+
+Notify-only per-person budgets (alerts) never block a call, so the cost-limit cache does not carry them. `fetch_advisory_budgets()` reads them on demand, like the two calls above: it sends `include=advisory` on the team-wide enforcement read, which the API serves from 2.25.0, and returns only the advisory rows.
+
+```python
+from revenium_middleware._core import fetch_advisory_budgets
+
+budgets = fetch_advisory_budgets()  # list of advisory rows, [] if none, None on failure
+
+for budget in budgets or []:
+    print(f"{budget['name']} (reading at {budget.get('readingAt')})")
+    for person in budget.get("groupBreakdown") or []:
+        print(f"  {person['groupValue']}: ${person['currentValue']}")
+```
+
+Each row has `source` `ANOMALY` and `action` `NOTIFY`, groups by `SUBSCRIBER` with a per-person `groupBreakdown`, and carries `readingAt` when the current window has a reading. The call returns `[]` when the team has no advisory budgets and `None` when the enforcement API cannot be reached.
 
 The background poller is unaffected: it keeps reading the **whole team's** rules every `REVENIUM_CB_POLL_INTERVAL_SECONDS`. That is deliberate. The server computes the department-budget maps team-wide and attaches them to the team-wide read, so a poll narrowed to a single rule would stop receiving them and department budgets would quietly stop blocking anyone. Narrowing is an explicit, opt-in inspection call and never the refresh.
 

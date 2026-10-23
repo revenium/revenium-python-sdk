@@ -59,6 +59,14 @@ def _gemini_response():
     }
 
 
+_COUNT_TOKENS_PATH = "/messages/count_tokens"
+
+
+def _generation_paths():
+    """The requests that generate text: CrewAI 1.15.29 preflights an Anthropic call with a free token count."""
+    return [path for path in _ProviderHandler.paths if not path.endswith(_COUNT_TOKENS_PATH)]
+
+
 class _ProviderHandler(fake_openai_upstream._Handler):
     """OpenAI shapes from the shared fake upstream, plus Anthropic and Gemini."""
 
@@ -66,9 +74,13 @@ class _ProviderHandler(fake_openai_upstream._Handler):
 
     def do_POST(self):
         type(self).paths.append(self.path)
-        if self.path.endswith("/messages") or "generateContent" in self.path:
+        if self.path.endswith(_COUNT_TOKENS_PATH) or self.path.endswith("/messages") \
+                or "generateContent" in self.path:
             length = int(self.headers.get("content-length", 0))
             body = json.loads(self.rfile.read(length) or b"{}")
+            if self.path.endswith(_COUNT_TOKENS_PATH):
+                self._send("application/json", json.dumps({"input_tokens": 11}).encode())
+                return
             reply = _anthropic_message(body) if self.path.endswith("/messages") else _gemini_response()
             self._send("application/json", json.dumps(reply).encode())
             return
@@ -160,7 +172,7 @@ def test_anthropic_native_crew_records_one_attributed_call(stub, mock_revenium_c
     wrapper.kickoff()
 
     records = _records(mock_revenium_client)
-    assert _ProviderHandler.paths == ["/v1/messages"]
+    assert _generation_paths() == ["/v1/messages"]
     assert len(records) == 1
     assert records[0].get("provider") == "ANTHROPIC"
     _assert_crew_attribution(records[0], wrapper)

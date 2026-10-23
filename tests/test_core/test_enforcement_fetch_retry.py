@@ -235,9 +235,9 @@ class TestOrgUnitBudgetBlocks:
                                    json=lambda: None)
         stub_get(monkeypatch, [response])
 
-        # Rules, the department block map, the per-person balance map and the
-        # warn-tier map.
-        assert enforcement._fetch_rules() == ([], {}, {}, {})
+        # Rules, the department block map, the per-person balance map, the
+        # warn-tier map and the candidate map.
+        assert enforcement._fetch_rules() == ([], {}, {}, {}, {})
 
     def test_refresh_caches_the_map_with_the_rules(self, fetch_env):
         monkeypatch, _ = fetch_env

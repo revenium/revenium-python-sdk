@@ -131,6 +131,14 @@ class AICreateCompletionParams(TypedDict, total=False):
     desktop app; the backend owns the vocabulary.
     """
 
+    entrypoint: str
+    """How the coding assistant that made this call was launched (max 64 chars).
+
+    For example cli, sdk-cli, sdk-ts, sdk-py, claude-vscode or claude-in-slack;
+    other values of the same shape are stored as sent. Must match
+    ^[A-Za-z0-9._-]{1,64}$.
+    """
+
     prompt_id: Annotated[str, PropertyInfo(alias="promptId")]
     """Identifier of the user prompt that produced this completion (max 64 chars)"""
 

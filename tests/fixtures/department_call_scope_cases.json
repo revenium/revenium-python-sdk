@@ -1,0 +1,2238 @@
+{
+  "backendSource": "hypercurrent metering/src/test/resources/enforcement/department-call-scope-cases.json, run by metering/src/test/kotlin/io/hypercurrent/profitstream/metering/service/enforcement/EnforcementEvaluationServiceTest.kt (EnforcementEvaluationService department candidates, EnforcementFilterMatcher.matchesCallScope)",
+  "sourceCommit": "6d0dbc2c375b9187c42cc59a81f7e7c62c887233",
+  "refreshNote": "The canonical copy is the hypercurrent file named in backendSource. When a case changes there, copy the file verbatim into revenium-python-sdk-internal tests/fixtures/ and revenium-middleware-go-internal core/enforcement/testdata/, add sourceCommit naming the hypercurrent commit it was copied from, and run each repo's department call-scope test.",
+  "description": "A department cap's verdict names a person; the cap's other filter rows decide which of that person's calls it covers. Each case is a compiled payload as the backend serves it, one call, and whether that call is blocked (and by which rule). The call fields are: subscriberEmail, provider, model, agent, taskType, productName, organizationName, credentialName, credentialValue (the raw credential, sent without a name). Absent means the call does not carry it.",
+  "knownDivergence": [
+    "Dated model spellings (gpt-4o vs gpt-4o-2024-08-06) are folded by the Python SDK, by Go only when the served model may be dated, and never by metering; no case here depends on them.",
+    "A call whose provider or model the SDK was not told keeps the cap applying in the Python SDK; metering always knows both, so no case here leaves them out.",
+    "A candidate whose rule window has ended is skipped by the Python SDK, as its single-slot and ordinary rules already are; the Go SDK and metering do not skip it, and no case here has an ended window."
+  ],
+  "cases": [
+    {
+      "name": "provider cap blocks a matching call",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "PROVIDER",
+                "operator": "IS",
+                "value": "openai",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "openai",
+        "model": "gpt-4o"
+      },
+      "expect": {
+        "blocked": true,
+        "ruleId": 1
+      }
+    },
+    {
+      "name": "provider cap lets a call to another provider through",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "PROVIDER",
+                "operator": "IS",
+                "value": "openai",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5"
+      },
+      "expect": {
+        "blocked": false
+      }
+    },
+    {
+      "name": "model cap blocks a matching call",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "MODEL",
+                "operator": "IS",
+                "value": "gpt-4o",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "openai",
+        "model": "gpt-4o"
+      },
+      "expect": {
+        "blocked": true,
+        "ruleId": 1
+      }
+    },
+    {
+      "name": "model cap lets another model through",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "MODEL",
+                "operator": "IS",
+                "value": "gpt-4o",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5"
+      },
+      "expect": {
+        "blocked": false
+      }
+    },
+    {
+      "name": "agent cap matches the call's agent ignoring letter case, as the cap's total does",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "AGENT",
+                "operator": "IS",
+                "value": "ClaudeCode",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "openai",
+        "model": "gpt-4o",
+        "agent": "claudecode"
+      },
+      "expect": {
+        "blocked": true,
+        "ruleId": 1
+      }
+    },
+    {
+      "name": "agent cap lets another agent through",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "AGENT",
+                "operator": "IS",
+                "value": "ClaudeCode",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "openai",
+        "model": "gpt-4o",
+        "agent": "codex"
+      },
+      "expect": {
+        "blocked": false
+      }
+    },
+    {
+      "name": "agent cap lets a call with no agent through",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "AGENT",
+                "operator": "IS",
+                "value": "ClaudeCode",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "openai",
+        "model": "gpt-4o"
+      },
+      "expect": {
+        "blocked": false
+      }
+    },
+    {
+      "name": "ancestor cap on a provider blocks a matching call",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "PROVIDER",
+                "operator": "IS",
+                "value": "openai",
+                "values": []
+              }
+            ],
+            "groupBy": null,
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": null
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "openai",
+        "model": "gpt-4o"
+      },
+      "expect": {
+        "blocked": true,
+        "ruleId": 1
+      }
+    },
+    {
+      "name": "ancestor cap on a provider lets another provider through",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "PROVIDER",
+                "operator": "IS",
+                "value": "openai",
+                "values": []
+              }
+            ],
+            "groupBy": null,
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": null
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5"
+      },
+      "expect": {
+        "blocked": false
+      }
+    },
+    {
+      "name": "department-grouped cap on a provider lets another provider through",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "PROVIDER",
+                "operator": "IS",
+                "value": "openai",
+                "values": []
+              }
+            ],
+            "groupBy": "DEPARTMENT",
+            "departmentId": null,
+            "departmentPath": null
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5"
+      },
+      "expect": {
+        "blocked": false
+      }
+    },
+    {
+      "name": "department-grouped cap on a provider blocks a matching call",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "PROVIDER",
+                "operator": "IS",
+                "value": "openai",
+                "values": []
+              }
+            ],
+            "groupBy": "DEPARTMENT",
+            "departmentId": null,
+            "departmentPath": null
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "openai",
+        "model": "gpt-4o"
+      },
+      "expect": {
+        "blocked": true,
+        "ruleId": 1
+      }
+    },
+    {
+      "name": "two caps on two providers: the second cap blocks its own provider's call",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "PROVIDER",
+                "operator": "IS",
+                "value": "openai",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          },
+          {
+            "ruleId": 2,
+            "teamId": 1,
+            "name": "Department cap 2",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "PROVIDER",
+                "operator": "IS",
+                "value": "anthropic",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            },
+            {
+              "ruleId": 2,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 15
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5"
+      },
+      "expect": {
+        "blocked": true,
+        "ruleId": 2
+      }
+    },
+    {
+      "name": "two caps on two providers: a third provider goes through",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "PROVIDER",
+                "operator": "IS",
+                "value": "openai",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          },
+          {
+            "ruleId": 2,
+            "teamId": 1,
+            "name": "Department cap 2",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "PROVIDER",
+                "operator": "IS",
+                "value": "anthropic",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            },
+            {
+              "ruleId": 2,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 15
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "google",
+        "model": "gemini-2.5-pro"
+      },
+      "expect": {
+        "blocked": false
+      }
+    },
+    {
+      "name": "no candidate list: the single slot blocks every call, as before",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "PROVIDER",
+                "operator": "IS",
+                "value": "openai",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5"
+      },
+      "expect": {
+        "blocked": true,
+        "ruleId": 1
+      }
+    },
+    {
+      "name": "an empty candidate list falls back to the single slot",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "PROVIDER",
+                "operator": "IS",
+                "value": "openai",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": []
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5"
+      },
+      "expect": {
+        "blocked": true,
+        "ruleId": 1
+      }
+    },
+    {
+      "name": "a department-only cap in the list blocks every call",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5"
+      },
+      "expect": {
+        "blocked": true,
+        "ruleId": 1
+      }
+    },
+    {
+      "name": "a filter row on an unsupported dimension counts as matching",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "WORKSPACE",
+                "operator": "IS",
+                "value": "w1",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5"
+      },
+      "expect": {
+        "blocked": true,
+        "ruleId": 1
+      }
+    },
+    {
+      "name": "a filter row with an unknown operator counts as matching",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "PROVIDER",
+                "operator": "MATCHES",
+                "value": "openai",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5"
+      },
+      "expect": {
+        "blocked": true,
+        "ruleId": 1
+      }
+    },
+    {
+      "name": "a candidate whose rule is missing from the payload still blocks",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 5,
+            "teamId": 1,
+            "name": "Team cap 5",
+            "metricType": "TOTAL_COST",
+            "threshold": 1000,
+            "currentValue": 3,
+            "breached": false,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": []
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 99
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 99,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5"
+      },
+      "expect": {
+        "blocked": true,
+        "ruleId": 99
+      }
+    },
+    {
+      "name": "an Anthropic cap covers Foundry-served Claude through the provider alias",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "PROVIDER",
+                "operator": "IS",
+                "value": "ANTHROPIC",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "foundry",
+        "model": "claude-sonnet-4-5"
+      },
+      "expect": {
+        "blocked": true,
+        "ruleId": 1
+      }
+    },
+    {
+      "name": "a provider IN cap blocks a listed provider",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "PROVIDER",
+                "operator": "IN",
+                "value": "openai,google",
+                "values": [
+                  "openai",
+                  "google"
+                ]
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "google",
+        "model": "gemini-2.5-pro"
+      },
+      "expect": {
+        "blocked": true,
+        "ruleId": 1
+      }
+    },
+    {
+      "name": "a provider IN cap lets an unlisted provider through",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "PROVIDER",
+                "operator": "IN",
+                "value": "openai,google",
+                "values": [
+                  "openai",
+                  "google"
+                ]
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5"
+      },
+      "expect": {
+        "blocked": false
+      }
+    },
+    {
+      "name": "a provider IS_NOT cap blocks every other provider",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "PROVIDER",
+                "operator": "IS_NOT",
+                "value": "openai",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5"
+      },
+      "expect": {
+        "blocked": true,
+        "ruleId": 1
+      }
+    },
+    {
+      "name": "a provider IS_NOT cap lets the excluded provider through",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "PROVIDER",
+                "operator": "IS_NOT",
+                "value": "openai",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "openai",
+        "model": "gpt-4o"
+      },
+      "expect": {
+        "blocked": false
+      }
+    },
+    {
+      "name": "a live provider cap and a shadow cap: the shadow cap never blocks the other provider",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "PROVIDER",
+                "operator": "IS",
+                "value": "openai",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          },
+          {
+            "ruleId": 2,
+            "teamId": 1,
+            "name": "Department cap 2",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": true,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            },
+            {
+              "ruleId": 2,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5"
+      },
+      "expect": {
+        "blocked": false
+      }
+    },
+    {
+      "name": "a live provider cap and a shadow cap: the live cap blocks its provider",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "PROVIDER",
+                "operator": "IS",
+                "value": "openai",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          },
+          {
+            "ruleId": 2,
+            "teamId": 1,
+            "name": "Department cap 2",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": true,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            },
+            {
+              "ruleId": 2,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "openai",
+        "model": "gpt-4o"
+      },
+      "expect": {
+        "blocked": true,
+        "ruleId": 1
+      }
+    },
+    {
+      "name": "a subscriber row is decided by the compiler, never against the call",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "SUBSCRIBER",
+                "operator": "IS",
+                "value": "bob@example.com",
+                "values": []
+              },
+              {
+                "dimension": "PROVIDER",
+                "operator": "IS",
+                "value": "openai",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "openai",
+        "model": "gpt-4o"
+      },
+      "expect": {
+        "blocked": true,
+        "ruleId": 1
+      }
+    },
+    {
+      "name": "a matching warn-tier candidate does not block",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "PROVIDER",
+                "operator": "IS",
+                "value": "openai",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          },
+          {
+            "ruleId": 2,
+            "teamId": 1,
+            "name": "Department cap 2",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "PROVIDER",
+                "operator": "IS",
+                "value": "anthropic",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            },
+            {
+              "ruleId": 2,
+              "tier": "WARN",
+              "departmentId": 7,
+              "balance": 9
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5"
+      },
+      "expect": {
+        "blocked": false
+      }
+    },
+    {
+      "name": "a task type cap matches ignoring letter case",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "TASK_TYPE",
+                "operator": "IS",
+                "value": "Chat",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "openai",
+        "model": "gpt-4o",
+        "taskType": "chat"
+      },
+      "expect": {
+        "blocked": true,
+        "ruleId": 1
+      }
+    },
+    {
+      "name": "a model CONTAINS cap matches ignoring letter case",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "MODEL",
+                "operator": "CONTAINS",
+                "value": "GPT",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "openai",
+        "model": "gpt-4o-mini"
+      },
+      "expect": {
+        "blocked": true,
+        "ruleId": 1
+      }
+    },
+    {
+      "name": "a credential cap matches the call's credential name ignoring letter case",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "CREDENTIAL",
+                "operator": "IS",
+                "value": "Prod Key",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "openai",
+        "model": "gpt-4o",
+        "credentialName": "prod key"
+      },
+      "expect": {
+        "blocked": true,
+        "ruleId": 1
+      }
+    },
+    {
+      "name": "a credential cap lets a call under another credential name through",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "CREDENTIAL",
+                "operator": "IS",
+                "value": "Prod Key",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "openai",
+        "model": "gpt-4o",
+        "credentialName": "staging key"
+      },
+      "expect": {
+        "blocked": false
+      }
+    },
+    {
+      "name": "a credential cap covers a call that names its credential only by raw value",
+      "payload": {
+        "rules": [
+          {
+            "ruleId": 1,
+            "teamId": 1,
+            "name": "Department cap 1",
+            "metricType": "TOTAL_COST",
+            "threshold": 10,
+            "currentValue": 12,
+            "breached": true,
+            "shadowMode": false,
+            "action": "BLOCK",
+            "filters": [
+              {
+                "dimension": "DEPARTMENT",
+                "operator": "IS",
+                "value": "7",
+                "values": []
+              },
+              {
+                "dimension": "CREDENTIAL",
+                "operator": "IS",
+                "value": "Prod Key",
+                "values": []
+              }
+            ],
+            "groupBy": "SUBSCRIBER",
+            "departmentId": 7,
+            "departmentPath": "/7/"
+          }
+        ],
+        "departmentBudgetBlocks": {
+          "alice@example.com": 1
+        },
+        "departmentBudgetWarnings": {},
+        "departmentBudgetBlockUnits": {
+          "alice@example.com": 7
+        },
+        "departmentBudgetBlockBalances": {
+          "alice@example.com": 12
+        },
+        "departmentBudgetCandidates": {
+          "alice@example.com": [
+            {
+              "ruleId": 1,
+              "tier": "BLOCK",
+              "departmentId": 7,
+              "balance": 12
+            }
+          ]
+        }
+      },
+      "call": {
+        "subscriberEmail": "alice@example.com",
+        "provider": "openai",
+        "model": "gpt-4o",
+        "credentialValue": "sk-test-not-a-real-key"
+      },
+      "expect": {
+        "blocked": true,
+        "ruleId": 1
+      }
+    }
+  ]
+}

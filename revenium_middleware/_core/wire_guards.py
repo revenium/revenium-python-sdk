@@ -17,7 +17,12 @@ from typing import Any, Callable, Dict, Mapping
 
 logger = logging.getLogger("revenium_middleware")
 
-__all__ = ["STORED_LENGTHS", "guard_wire_fields", "stored_subscriber_value"]
+__all__ = [
+    "COMPLETION_FIELDS_REFUSING_EMPTY",
+    "STORED_LENGTHS",
+    "guard_wire_fields",
+    "stored_subscriber_value",
+]
 
 _SLUG = re.compile(r"[A-Za-z0-9_-]+")
 _SOURCE_SLUG = re.compile(r"[A-Za-z0-9._:-]+")
@@ -131,6 +136,7 @@ _RULES_BY_OPERATION: Dict[str, Dict[str, Callable[[Any], Any]]] = {
         "query_source": _slug(_SOURCE_SLUG, 128, _SOURCE_CHARACTERS),
         "subagent_type": _slug(_SOURCE_SLUG, 128, _SOURCE_CHARACTERS),
         "client_surface": _slug(_SURFACE_SLUG, 64, _SURFACE_CHARACTERS),
+        "entrypoint": _slug(_SURFACE_SLUG, 64, _SURFACE_CHARACTERS),
         "prompt_id": _slug(_SLUG, 64, _SLUG_CHARACTERS),
         "prompt_length": _prompt_length,
         "response_quality_score": _quality_score,
@@ -151,6 +157,19 @@ def _drop_malformed(record: Mapping[str, Any], rules: Mapping[str, Callable[[Any
             del checked[field]
             logger.warning(_DROPPED_MESSAGE, prefix, field, problem)
     return checked
+
+
+def _refuses(rule: Callable[[Any], Any], value: Any) -> bool:
+    try:
+        rule(value)
+    except _Malformed:
+        return True
+    return False
+
+
+COMPLETION_FIELDS_REFUSING_EMPTY = frozenset(
+    field for field, rule in _RULES_BY_OPERATION["completion"].items() if _refuses(rule, "")
+)
 
 
 def stored_subscriber_value(field: str, value: Any) -> Any:
