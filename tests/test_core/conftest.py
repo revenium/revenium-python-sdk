@@ -148,7 +148,8 @@ def fetch_env(monkeypatch):
 def department_cache(monkeypatch):
     """Circuit breaker on, the whole department payload seeded, nothing live.
 
-    Returns a callable taking ``(rules, blocks, balances, warnings)`` and
+    Returns a callable taking ``(rules, blocks, balances, warnings,
+    candidates)`` and
     installing them as a fresh, initialized cache, so ``check_enforcement``
     evaluates them with no network and no poller thread. A map is installed
     exactly as given -- a malformed value reaches the code under test rather
@@ -167,7 +168,7 @@ def department_cache(monkeypatch):
     monkeypatch.setattr(enforcement, "_load_cache_from_disk", lambda: None)
     monkeypatch.setattr(enforcement, "_ensure_poller_running", lambda: None)
 
-    def load(rules, blocks=None, balances=None, warnings=None):
+    def load(rules, blocks=None, balances=None, warnings=None, candidates=None):
         # ``is None`` means "not supplied", never ``or {}``: a test that seeds a
         # deliberately malformed map has to see it reach the cache, and every
         # interesting malformed value ([], "", 0) is falsy. Coercing those to an
@@ -179,6 +180,8 @@ def department_cache(monkeypatch):
                             balances if balances is not None else {})
         monkeypatch.setattr(enforcement, "_cached_org_unit_warnings",
                             warnings if warnings is not None else {})
+        monkeypatch.setattr(enforcement, "_cached_org_unit_candidates",
+                            candidates if candidates is not None else {})
         monkeypatch.setattr(enforcement, "_cache_timestamp", enforcement.time.monotonic())
         monkeypatch.setattr(enforcement, "_cache_initialized", True)
         enforcement._begin_cache_generation()
@@ -200,6 +203,7 @@ def department_snapshot_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(enforcement, "_cached_org_unit_blocks", {})
     monkeypatch.setattr(enforcement, "_cached_org_unit_block_balances", {})
     monkeypatch.setattr(enforcement, "_cached_org_unit_warnings", {})
+    monkeypatch.setattr(enforcement, "_cached_org_unit_candidates", {})
     monkeypatch.setattr(enforcement, "_cache_timestamp", 0.0)
     monkeypatch.setattr(enforcement, "_cache_initialized", False)
     return tmp_path

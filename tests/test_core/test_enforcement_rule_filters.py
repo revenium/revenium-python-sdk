@@ -757,7 +757,8 @@ def test_filters_survive_the_disk_snapshot_round_trip(department_snapshot_dir, m
 def restore_the_cache(monkeypatch):
     """Put back whatever the poller installs, so no rule outlives its test."""
     for name in ("_cached_rules", "_cached_org_unit_blocks", "_cached_org_unit_block_balances",
-                 "_cached_org_unit_warnings", "_cache_timestamp", "_cache_initialized"):
+                 "_cached_org_unit_warnings", "_cached_org_unit_candidates", "_cache_timestamp",
+                 "_cache_initialized"):
         monkeypatch.setattr(enforcement, name, getattr(enforcement, name))
 
 

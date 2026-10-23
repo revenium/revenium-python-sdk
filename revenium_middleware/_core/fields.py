@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Set, Tuple
 
 from .config import Config
 from .context import get_agentic_job_fields, is_blank_metadata_value
+from .wire_guards import COMPLETION_FIELDS_REFUSING_EMPTY
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +121,7 @@ EFFORT_FIELD_MAP = {
 # the values pass through verbatim because the backend owns their vocabulary.
 PROMPT_CONTEXT_FIELD_MAP = {
     "client_surface": ("client_surface", "clientSurface"),
+    "entrypoint": ("entrypoint",),
     "prompt_id": ("prompt_id", "promptId"),
     "prompt_length": ("prompt_length", "promptLength"),
     "query_source": ("query_source", "querySource"),
@@ -250,6 +252,7 @@ def _resolve_field_map(
     source: Mapping[str, Any],
     field_map: Mapping[str, tuple],
     fallback: Optional[Callable[[str], Any]] = None,
+    empty_is_supplied: frozenset = frozenset(),
 ) -> Dict[str, Any]:
     """Resolve a field family from caller metadata.
 
@@ -257,15 +260,19 @@ def _resolve_field_map(
     (snake_case before camelCase); when every alias misses, the optional
     ``fallback(name)`` supplies the value (contextvar or env lookup, per
     family). A blank alias (None or "") counts as a miss, so it neither hides
-    a later alias nor the fallback. Absent fields are omitted entirely (never
-    emitted as None).
+    a later alias nor the fallback. For the fields named in
+    ``empty_is_supplied``, an explicit "" is still returned when nothing else
+    supplies a value, so the wire guard can warn about it. Absent fields are
+    omitted entirely (never emitted as None).
     """
     result = {}
     for name, aliases in field_map.items():
-        value = next((source.get(alias) for alias in aliases
-                      if not is_blank_metadata_value(source.get(alias))), None)
+        values = [source.get(alias) for alias in aliases]
+        value = next((value for value in values if not is_blank_metadata_value(value)), None)
         if value is None and fallback is not None:
             value = fallback(name)
+        if value is None and name in empty_is_supplied and "" in values:
+            value = ""
         if value is not None:
             result[name] = value
     return result
@@ -349,11 +356,11 @@ def extract_effort_field(source: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     """
     if not source:
         return {}
-    return _resolve_field_map(source, EFFORT_FIELD_MAP)
+    return _resolve_field_map(source, EFFORT_FIELD_MAP, empty_is_supplied=COMPLETION_FIELDS_REFUSING_EMPTY)
 
 
 def extract_prompt_context_fields(source: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
-    """Resolve client-surface, prompt, speed-mode and subagent attribution from caller metadata.
+    """Resolve client-surface, entrypoint, prompt, speed-mode and subagent attribution from caller metadata.
 
     Each field resolves from its snake_case key then its camelCase alias and is
     returned under the snake_case keyword ``create_completion`` expects. Absent
@@ -363,7 +370,7 @@ def extract_prompt_context_fields(source: Optional[Mapping[str, Any]]) -> Dict[s
     """
     if not source:
         return {}
-    return _resolve_field_map(source, PROMPT_CONTEXT_FIELD_MAP)
+    return _resolve_field_map(source, PROMPT_CONTEXT_FIELD_MAP, empty_is_supplied=COMPLETION_FIELDS_REFUSING_EMPTY)
 
 
 def extract_service_tier_fields(

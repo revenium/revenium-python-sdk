@@ -13,6 +13,7 @@ from .metering_submission import submit_ai_event
 from .exceptions import BudgetExceededError
 from .enforcement import (
     check_enforcement,
+    fetch_advisory_budgets,
     fetch_enforcement_rule,
     fetch_enforcement_rule_roster,
     is_circuit_breaker_enabled,
@@ -71,6 +72,7 @@ __all__ = [
     # Enforcement / circuit breaker
     "BudgetExceededError",
     "check_enforcement",
+    "fetch_advisory_budgets",
     "fetch_enforcement_rule",
     "fetch_enforcement_rule_roster",
     "is_circuit_breaker_enabled",

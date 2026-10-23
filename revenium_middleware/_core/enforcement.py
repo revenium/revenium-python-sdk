@@ -42,12 +42,14 @@ it names no address because these maps are PII (see ``_normalize_map_keys``).
 An integrator who wants more can read the map, which is cached and persisted
 like the other two. Revisit if a caller asks for a programmatic warn signal.
 
-Two inspection calls sit beside the enforcement path without being part of
+Three inspection calls sit beside the enforcement path without being part of
 it. ``fetch_enforcement_rule(rule_id)`` reads one rule straight from the
-server, and ``fetch_enforcement_rule_roster(rule_id)`` reads the people (or
-departments) that rule is measuring, each with their spend, cap and band.
-Neither is cached and neither is consulted by ``check_enforcement``: they
-answer "why was this caller blocked, and who else does this rule cover?" for
+server, ``fetch_enforcement_rule_roster(rule_id)`` reads the people (or
+departments) that rule is measuring, each with their spend, cap and band, and
+``fetch_advisory_budgets()`` reads the team's notify-only budgets (the
+advisory rows the team-wide read serves only when asked). None is cached and
+none is consulted by ``check_enforcement``: they answer "why was this caller
+blocked, who else does this rule cover, and which advisory budgets exist?" for
 a person debugging, and a cached answer to that question would be worse than
 no answer. The polling refresh stays team-wide for the reason given on
 ``_fetch_rules``.
@@ -112,12 +114,15 @@ _FETCH_RETRYABLE_STATUS = frozenset({408, 429})  # plus any 5xx
 # The number follows the path shape. The rules refresh runs only on the
 # poller thread, where a wait parks nobody, so it gets the 60 s the metering
 # client honours (``_parse_retry_after_header`` in
-# ``_metering/_base_client.py``). The two inspection reads,
-# ``fetch_enforcement_rule`` and ``fetch_enforcement_rule_roster``, still run
-# on their caller's thread and keep 20 s. Cross-SDK numbers:
+# ``_metering/_base_client.py``). The three inspection reads,
+# ``fetch_enforcement_rule``, ``fetch_enforcement_rule_roster`` and
+# ``fetch_advisory_budgets``, still run on their caller's thread and keep 20 s. Cross-SDK numbers:
 # ``docs/conventions/retry-after.md``.
 _REFRESH_RETRY_AFTER_GIVE_UP_SECONDS = 60.0
 _INSPECTION_RETRY_AFTER_GIVE_UP_SECONDS = 20.0
+
+_ADVISORY_INCLUDE = "advisory"
+_ADVISORY_SOURCE = "ANOMALY"
 
 # Longest a single Retry-After may suppress rule refreshes. It applies to the
 # server-supplied interval only; the backoff after a failed refresh is the SDK's
@@ -160,6 +165,20 @@ _ORG_UNIT_BLOCK_BALANCES_KEYS = ("departmentBudgetBlockBalances", "orgUnitBudget
 # is not warned) and never a block verdict -- see the module docstring's
 # BACK-3077 decision. Absent on a server predating it, which warns nobody.
 _ORG_UNIT_WARNINGS_KEYS = ("departmentBudgetWarnings", "orgUnitBudgetWarnings")
+# Top-level key of the per-person candidate lists: normalized email -> every
+# department cap that could apply to that person, best first, each as
+# ``{ruleId, tier, departmentId, balance}``. Published only for people with at
+# least one candidate whose rule has a call-scope filter row; for them it
+# replaces the three single-slot maps above, because one slot cannot say
+# whether a second cap, matching a call the first does not cover, is hidden.
+# It has no org-unit spelling: it postdates the rename.
+_ORG_UNIT_CANDIDATES_KEYS = ("departmentBudgetCandidates",)
+_CANDIDATE_TIERS = frozenset({"BLOCK", "WARN"})
+# Filter rows of a candidate's rule that the server already decided when it
+# put the candidate on the person's list, so the SDK never judges them against
+# the call: a SUBSCRIBER row names whoever the cap was written for, not
+# necessarily the caller it was resolved to.
+_CANDIDATE_DECIDED_DIMENSIONS = frozenset({"DEPARTMENT", "ORG_UNIT", "SUBSCRIBER"})
 # ``groupBy`` values of a department rule. Such rules are skipped by the
 # per-rule loop: their verdict comes only from _ORG_UNIT_BLOCKS_KEYS, matching
 # the server's own ``applicableRules`` filter.
@@ -198,6 +217,10 @@ _cached_org_unit_block_balances: Dict[str, float] = {}
 # blocked by it; it only decides who hears _warn_org_unit_threshold's line,
 # once per _cache_generation.
 _cached_org_unit_warnings: Dict[str, int] = {}
+# Server-computed subscriber-email -> candidate list map (see
+# _ORG_UNIT_CANDIDATES_KEYS), cached, persisted and re-keyed like the others,
+# each list already cleaned by _usable_candidates.
+_cached_org_unit_candidates: Dict[str, List[dict]] = {}
 _cache_lock = threading.Lock()
 _cache_timestamp = 0.0
 # The (enforcement base URL, team id) the cached rules were loaded for, the
@@ -466,9 +489,12 @@ class _DepartmentBudgets(NamedTuple):
     is an ancestor cap (there the rule's own ``currentValue`` already is the
     scope's spend). ``warnings`` is normalized subscriber email -> the rule
     whose warn tier that person crossed *without* being blocked; it decides
-    only who hears a log line, never who is blocked.
+    only who hears a log line, never who is blocked. ``candidates`` is
+    normalized subscriber email -> that person's department caps, best first;
+    for a person it names, it is the verdict and the other three are not read
+    (``_check_org_unit_block``).
 
-    All three are keyed by ``_normalize_email`` because whoever built them
+    All four are keyed by ``_normalize_email`` because whoever built them
     re-keyed them, never by the raw key the payload or the snapshot carried.
 
     ``generation`` is which cache generation these maps are, so a check can
@@ -482,6 +508,7 @@ class _DepartmentBudgets(NamedTuple):
     blocks: dict
     balances: dict
     warnings: dict
+    candidates: dict
     generation: int = 0
 
 
@@ -553,6 +580,56 @@ def _coerce_balances(raw) -> Dict[str, float]:
     return balances
 
 
+def _json_integer(value) -> Optional[int]:
+    """``value`` when it is a JSON integer, else ``None``."""
+    # bool is an int subclass; a JSON ``true`` is not an id.
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _usable_candidates(raw) -> List[dict]:
+    """The well-formed items of one person's candidate list, in their order.
+
+    An item is dropped, not guessed at, when it is not an object, its
+    ``ruleId`` is not an integer or its ``tier`` is neither ``BLOCK`` nor
+    ``WARN``; an unusable ``balance`` becomes ``None``, which reports the
+    rule's own value, as an absent balance always has.
+    """
+    if not isinstance(raw, list):
+        return []
+    usable = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        rule_id, tier = _json_integer(item.get("ruleId")), item.get("tier")
+        if rule_id is None:
+            continue
+        if not isinstance(tier, str) or tier.strip().upper() not in _CANDIDATE_TIERS:
+            continue
+        balance = None if isinstance(item.get("balance"), bool) else _coerce_float(item.get("balance"))
+        usable.append({
+            "ruleId": rule_id,
+            "tier": tier.strip().upper(),
+            "departmentId": _json_integer(item.get("departmentId")),
+            "balance": balance if balance is not None and math.isfinite(balance) else None,
+        })
+    return usable
+
+
+def _coerce_candidates(raw) -> Dict[str, List[dict]]:
+    """Re-key the candidate map by normalized address and clean every list.
+
+    A person whose list is empty once its malformed items are dropped is left
+    out, so the lookup sends them down the single-slot path, exactly like a
+    person the server published no list for.
+    """
+    candidates: Dict[str, List[dict]] = {}
+    for email, items in _normalize_map_keys(raw).items():
+        usable = _usable_candidates(items)
+        if usable:
+            candidates[email] = usable
+    return candidates
+
+
 def _load_department_budgets_from_disk(rules: list, owner: Optional[Tuple[str, str]] = None) -> _DepartmentBudgets:
     """Read the department-budget snapshot written beside ``rules``.
 
@@ -564,7 +641,7 @@ def _load_department_budgets_from_disk(rules: list, owner: Optional[Tuple[str, s
     so the maps are dropped instead -- department blocks resume on the next
     successful fetch.
     """
-    empty = _DepartmentBudgets({}, {}, {})
+    empty = _DepartmentBudgets({}, {}, {}, {})
     blocks_path = _org_unit_blocks_cache_file_path(owner)
     if not blocks_path or not os.path.exists(blocks_path):
         return empty
@@ -578,14 +655,16 @@ def _load_department_budgets_from_disk(rules: list, owner: Optional[Tuple[str, s
         ):
             # Re-keyed on the way in, like the wire payload: a snapshot
             # written by an older SDK (or edited by hand) can carry keys the
-            # server had not normalized. ``balances`` and ``warnings`` are
-            # absent from an envelope written before each map existed: the
-            # first reports the rule's own value as it always did, the second
-            # warns nobody until the next successful fetch.
+            # server had not normalized. ``balances``, ``warnings`` and
+            # ``candidates`` are absent from an envelope written before each
+            # map existed: the first reports the rule's own value as it always
+            # did, the second warns nobody until the next successful fetch,
+            # and the third leaves everyone on the single-slot verdict.
             return _DepartmentBudgets(
                 _normalize_map_keys(loaded["blocks"]),
                 _coerce_balances(loaded.get("balances")),
                 _normalize_map_keys(loaded.get("warnings")),
+                _coerce_candidates(loaded.get("candidates")),
             )
         logger.debug(
             "Dropping department map from %s: it was not written "
@@ -600,7 +679,7 @@ def _load_department_budgets_from_disk(rules: list, owner: Optional[Tuple[str, s
 
 def _load_cache_from_disk() -> None:
     global _cached_rules, _cached_org_unit_blocks, _cached_org_unit_block_balances
-    global _cached_org_unit_warnings
+    global _cached_org_unit_warnings, _cached_org_unit_candidates
     global _cache_timestamp, _disk_load_attempted, _cache_initialized, _cache_owner
     # Check-and-set under _cache_lock so two cold-start callers can't both
     # observe _disk_load_attempted=False and race on the snapshot read.
@@ -634,6 +713,7 @@ def _load_cache_from_disk() -> None:
             _cached_org_unit_blocks = departments.blocks
             _cached_org_unit_block_balances = departments.balances
             _cached_org_unit_warnings = departments.warnings
+            _cached_org_unit_candidates = departments.candidates
             _begin_cache_generation()
             # Treat as stale so the next call still triggers a refresh,
             # but the disk snapshot prevents fail-closed from raising on
@@ -651,7 +731,8 @@ def _load_cache_from_disk() -> None:
 def _persist_cache_to_disk(rules: list, org_unit_blocks: Optional[dict] = None,
                            org_unit_block_balances: Optional[dict] = None,
                            org_unit_warnings: Optional[dict] = None,
-                           owner: Optional[Tuple[str, str]] = None) -> None:
+                           *, owner: Optional[Tuple[str, str]] = None,
+                           org_unit_candidates: Optional[dict] = None) -> None:
     """Write the rules snapshot (legacy bare-list shape) and the maps beside it.
 
     The rules file keeps the exact shape every published SDK version reads —
@@ -682,6 +763,7 @@ def _persist_cache_to_disk(rules: list, org_unit_blocks: Optional[dict] = None,
                 "blocks": org_unit_blocks or {},
                 "balances": org_unit_block_balances or {},
                 "warnings": org_unit_warnings or {},
+                "candidates": org_unit_candidates or {},
             })
         _write_private_json(path, rules)
     except Exception:
@@ -850,6 +932,7 @@ class _FetchedRules(NamedTuple):
     org_unit_blocks: dict
     org_unit_block_balances: dict
     org_unit_warnings: dict
+    org_unit_candidates: dict
 
 
 def _fetched_from_payload(data) -> Optional[_FetchedRules]:
@@ -867,13 +950,14 @@ def _fetched_from_payload(data) -> Optional[_FetchedRules]:
     cannot drift apart in what they accept (``_org_unit_map_entry``).
     """
     if isinstance(data, list):
-        return _FetchedRules(data, {}, {}, {})
+        return _FetchedRules(data, {}, {}, {}, {})
     if isinstance(data, dict):
         return _FetchedRules(
             data.get("rules", []),
             _normalize_map_keys(_wire_value(data, _ORG_UNIT_BLOCKS_KEYS)),
             _coerce_balances(_wire_value(data, _ORG_UNIT_BLOCK_BALANCES_KEYS)),
             _normalize_map_keys(_wire_value(data, _ORG_UNIT_WARNINGS_KEYS)),
+            _coerce_candidates(_wire_value(data, _ORG_UNIT_CANDIDATES_KEYS)),
         )
     logger.warning("Unexpected enforcement response shape: %r", type(data).__name__)
     return None
@@ -994,8 +1078,20 @@ def _get_enforcement(url: str, api_key: str, resource: str,
     return None
 
 
+def _rules_query(rule_id: Optional[str], include_advisory: bool) -> Optional[dict]:
+    """The query string of one rules read, ``None`` for the bare whole-team read."""
+    if rule_id and include_advisory:
+        raise ValueError("advisory rows are served only on the whole-team read; drop rule_id")
+    if rule_id:
+        return {"ruleId": rule_id}
+    if include_advisory:
+        return {"include": _ADVISORY_INCLUDE}
+    return None
+
+
 def _fetch_rules(rule_id: Optional[str] = None,
                  retry_after_budget: float = _REFRESH_RETRY_AFTER_GIVE_UP_SECONDS,
+                 *, include_advisory: bool = False,
                  ) -> Optional[_FetchedRules]:
     """Fetch the current enforcement payload from the Revenium API.
 
@@ -1010,12 +1106,21 @@ def _fetch_rules(rule_id: Optional[str] = None,
     budgets would silently stop blocking anybody (BACK-3066). Narrowing is for
     an integrator inspecting one rule, never for the cache the pre-call path
     reads.
+
+    ``include_advisory`` sends ``include=advisory``, which makes the server
+    append the team's notify-only per-person budgets (rows whose ``source`` is
+    ``ANOMALY`` and whose ``action`` is ``NOTIFY``) after the cost-control
+    rows. It is opt-in for the same reason as ``rule_id`` and must never reach
+    the cache: the server says an anomaly's numeric id can equal a cost
+    control's, and the pre-call path keys its warnings and lookups on that id.
+    The server drops advisory rows whenever ``ruleId`` is sent, so asking for
+    both raises ``ValueError``.
     """
+    params = _rules_query(rule_id, include_advisory)
     target = _fetch_target()
     if target is None:
         return None
 
-    params = {"ruleId": rule_id} if rule_id else None
     response = _get_enforcement(target.team_url, target.api_key, "rule", params,
                                 retry_after_budget, target.owner)
     if response is None:
@@ -1024,7 +1129,7 @@ def _fetch_rules(rule_id: Optional[str] = None,
     try:
         # 204 No Content == no rules configured for this team; cache empty
         if response.status_code == 204:
-            return _FetchedRules([], {}, {}, {})
+            return _FetchedRules([], {}, {}, {}, {})
         response.raise_for_status()
         # Server currently returns ``{"rules": [...], "compiledAt": ...,
         # "departmentBudgetBlocks": {...}, "departmentBudgetBlockBalances":
@@ -1119,6 +1224,30 @@ def fetch_enforcement_rule(rule_id: str) -> Optional[dict]:
     return fetched.rules[0]
 
 
+def _is_advisory_row(rule) -> bool:
+    return isinstance(rule, dict) and rule.get("source") == _ADVISORY_SOURCE
+
+
+def fetch_advisory_budgets() -> Optional[list]:
+    """Read the team's notify-only per-person budgets, bypassing the rule cache.
+
+    An inspection call for integrators, like ``fetch_enforcement_rule``: it is
+    not on the pre-call path and neither reads nor writes the cache
+    ``check_enforcement`` evaluates, so an advisory budget never blocks a call.
+
+    Returns:
+        The rows whose ``source`` is ``ANOMALY``, each with ``action``
+        ``NOTIFY``, a per-person ``groupBreakdown`` and, when the current
+        window has a reading, ``readingAt``. ``[]`` when the team has none,
+        and ``None`` when the read could not be completed.
+    """
+    fetched = _fetch_rules(include_advisory=True,
+                           retry_after_budget=_INSPECTION_RETRY_AFTER_GIVE_UP_SECONDS)
+    if fetched is None or not isinstance(fetched.rules, list):
+        return None
+    return [rule for rule in fetched.rules if _is_advisory_row(rule)]
+
+
 def fetch_enforcement_rule_roster(rule_id: str, page: int = 0, size: int = 25,
                                   search: Optional[str] = None,
                                   band: Optional[str] = None) -> Optional[dict]:
@@ -1181,7 +1310,7 @@ def _refresh_cache_holding_lock() -> None:
     can't block concurrent ``check_enforcement`` callers on the pre-call path.
     """
     global _cached_rules, _cached_org_unit_blocks, _cached_org_unit_block_balances
-    global _cached_org_unit_warnings
+    global _cached_org_unit_warnings, _cached_org_unit_candidates
     global _cache_timestamp, _cache_initialized, _cache_owner
     if _refresh_is_on_cooldown():
         logger.debug("Enforcement refresh skipped: a cooldown is still in force")
@@ -1216,12 +1345,14 @@ def _refresh_cache_holding_lock() -> None:
         _cached_org_unit_blocks = fetched.org_unit_blocks
         _cached_org_unit_block_balances = fetched.org_unit_block_balances
         _cached_org_unit_warnings = fetched.org_unit_warnings
+        _cached_org_unit_candidates = fetched.org_unit_candidates
         _begin_cache_generation()
         _cache_timestamp = time.monotonic()
         _cache_initialized = True
     _persist_cache_to_disk(fetched.rules, fetched.org_unit_blocks,
                            fetched.org_unit_block_balances,
-                           fetched.org_unit_warnings, owner)
+                           fetched.org_unit_warnings, owner=owner,
+                           org_unit_candidates=fetched.org_unit_candidates)
 
 
 def _poll_loop() -> None:
@@ -1257,8 +1388,8 @@ def _forget_another_owners_rules() -> None:
     nobody owns yet (never loaded, or seeded by hand) is adopted as it is.
     """
     global _cached_rules, _cached_org_unit_blocks, _cached_org_unit_block_balances
-    global _cached_org_unit_warnings, _cache_timestamp, _cache_initialized
-    global _disk_load_attempted, _refresh_cooldown_until, _cache_owner
+    global _cached_org_unit_warnings, _cached_org_unit_candidates, _cache_timestamp
+    global _cache_initialized, _disk_load_attempted, _refresh_cooldown_until, _cache_owner
     owner = _current_owner()
     if _cache_owner == owner:
         return
@@ -1272,6 +1403,7 @@ def _forget_another_owners_rules() -> None:
         _cached_org_unit_blocks = {}
         _cached_org_unit_block_balances = {}
         _cached_org_unit_warnings = {}
+        _cached_org_unit_candidates = {}
         _begin_cache_generation()
         _cache_timestamp = 0.0
         _cache_initialized = False
@@ -1302,8 +1434,10 @@ def _snapshot_department_budgets() -> _DepartmentBudgets:
                 if isinstance(_cached_org_unit_block_balances, dict) else {})
     warnings = (_cached_org_unit_warnings
                 if isinstance(_cached_org_unit_warnings, dict) else {})
+    candidates = (_cached_org_unit_candidates
+                  if isinstance(_cached_org_unit_candidates, dict) else {})
     return _DepartmentBudgets(dict(blocks), dict(balances), dict(warnings),
-                              _cache_generation)
+                              dict(candidates), _cache_generation)
 
 
 def _get_rules() -> Tuple[list, _DepartmentBudgets, bool]:
@@ -1596,10 +1730,14 @@ def _subscriber_value(metadata: dict):
     return stored_subscriber_value("id", subscriber.get("id"))
 
 
-def _credential_value(metadata: dict):
+def _credential_sent(metadata: dict) -> dict:
     subscriber = subscriber_with_credential_alias(
         extract_subscriber_from_metadata(metadata), get_credential_alias(metadata))
-    credential = subscriber.get("credential") or {}
+    return subscriber.get("credential") or {}
+
+
+def _credential_value(metadata: dict):
+    credential = _credential_sent(metadata)
     name = credential.get("name")
     return name if name is not None else credential.get("value")
 
@@ -1635,6 +1773,10 @@ class _CallScope:
         if dimension not in self._values:
             self._values[dimension] = _METADATA_DIMENSION_READERS[dimension](self._metadata)
         return self._values[dimension]
+
+    def names_credential_only_by_value(self) -> bool:
+        credential = _credential_sent(self._metadata)
+        return credential.get("name") is None and credential.get("value") is not None
 
 
 def _filter_cannot_be_evaluated(rule: dict, dimension, operator, reason: str) -> bool:
@@ -1676,12 +1818,21 @@ def _as_given(value: str) -> str:
     return value
 
 
-def _comparison_form(dimension: str, operator: str, actual: str):
+def _comparison_form(dimension: str, operator: str, actual: str, ignore_case: bool = False):
     """How both sides are put before comparing: a subscriber email ignores
-    case, and is trimmed as well for the equality operators."""
+    case, and is trimmed as well for the equality operators; any other value
+    is compared as given unless ``ignore_case`` asks otherwise."""
     if isinstance(actual, _SubscriberEmail):
         return normalize_email if operator in _EMAIL_EQUALITY_OPERATORS else str.lower
-    return _as_given
+    return str.lower if ignore_case else _as_given
+
+
+def _lowercased_model(model: str) -> str:
+    """``model`` in lower case, keeping the other names it is known by."""
+    aliases = getattr(model, "aliases", None)
+    if aliases is None:
+        return model.lower()
+    return ModelKnownByAliases(model.lower(), *(alias.lower() for alias in aliases))
 
 
 def _satisfies_via_alias(actual: str, expected: str) -> bool:
@@ -1812,19 +1963,24 @@ def _filter_spellings(operator: str, expected: List[str]) -> List[List[str]]:
     return [expected] if dash_dated == expected else [expected, dash_dated]
 
 
-def _filter_matches(rule: dict, entry, scope: _CallScope) -> bool:
+def _filter_matches(rule: dict, entry, scope: _CallScope, ignore_case: bool = False,
+                    decided_dimensions: frozenset = frozenset()) -> bool:
     """Whether the call is inside one entry of a rule's ``filters``.
 
     Mirrors the server's matcher, except that a filter the SDK cannot judge
     (a malformed entry, an unknown dimension or operator, a model or provider
     it was not told, a value that is not a string) matches, so the cap keeps
-    applying rather than being weakened.
+    applying rather than being weakened. An entry on one of
+    ``decided_dimensions`` matches without being judged, and ``ignore_case``
+    compares every dimension without regard to letter case.
     """
     if not isinstance(entry, dict):
         return _filter_cannot_be_evaluated(rule, None, None, "malformed entry")
     dimension, operator = entry.get("dimension"), entry.get("operator")
     if not isinstance(dimension, str) or not isinstance(operator, str):
         return _filter_cannot_be_evaluated(rule, dimension, operator, "malformed entry")
+    if dimension in decided_dimensions:
+        return True
     if operator not in _FILTER_OPERATORS:
         return _filter_cannot_be_evaluated(rule, dimension, operator, "unknown operator")
     if not scope.knows(dimension):
@@ -1838,19 +1994,23 @@ def _filter_matches(rule: dict, entry, scope: _CallScope) -> bool:
     if not isinstance(actual, str):
         return _filter_cannot_be_evaluated(rule, dimension, operator, "call value unknown")
     if dimension == "MODEL":
+        if ignore_case:
+            actual, expected = _lowercased_model(actual), [value.lower() for value in expected]
         return _model_filter_matches(operator, expected, actual, scope.value("PROVIDER"))
     if dimension == "PROVIDER":
         return _provider_filter_matches(operator, actual, expected)
-    form = _comparison_form(dimension, operator, actual)
+    form = _comparison_form(dimension, operator, actual, ignore_case)
     return _compare(operator, form(actual), [form(value) for value in expected])
 
 
-def _rule_applies_to_call(rule: dict, scope: _CallScope) -> bool:
+def _rule_applies_to_call(rule: dict, scope: _CallScope, ignore_case: bool = False,
+                          decided_dimensions: frozenset = frozenset()) -> bool:
     """True when the call is inside every one of the rule's ``filters``.
 
     A rule with no filters applies to every call. Anything that goes wrong
     while judging them keeps the rule applying: this runs before the paid
-    provider call, so it must neither raise nor weaken a cap.
+    provider call, so it must neither raise nor weaken a cap. ``ignore_case``
+    and ``decided_dimensions`` are passed to every ``_filter_matches``.
     """
     filters = rule.get("filters")
     if filters is None or filters == []:
@@ -1858,7 +2018,8 @@ def _rule_applies_to_call(rule: dict, scope: _CallScope) -> bool:
     if not isinstance(filters, list):
         return _filter_cannot_be_evaluated(rule, None, None, "filters not a list")
     try:
-        return all(_filter_matches(rule, entry, scope) for entry in filters)
+        return all(_filter_matches(rule, entry, scope, ignore_case, decided_dimensions)
+                   for entry in filters)
     except Exception:
         return _filter_cannot_be_evaluated(rule, None, None, "evaluation failed")
 
@@ -2027,7 +2188,8 @@ def _action_blocks(rule: dict) -> bool:
 
     Only ``BLOCK`` blocks: the server's own live block is
     ``!shadowMode && action == "BLOCK"``, and ``WARN_ONLY`` (or the legacy
-    ``THROTTLE``) is a notice the customer chose instead of a stop. An absent
+    ``THROTTLE``) is a notice the customer chose instead of a stop, and
+    ``NOTIFY`` marks an advisory budget, which never blocks. An absent
     ``action`` is treated as BLOCK, so a payload that omits the field falls
     toward enforcing, not toward spend; the server always sends it.
     """
@@ -2123,8 +2285,16 @@ def _raise_org_unit_block(rules: list, departments: _DepartmentBudgets,
     rule_id = _org_unit_block_rule_id(departments.blocks, usage_metadata)
     if rule_id is None:
         return
+    _raise_department_verdict(
+        rules, rule_id, _caller_block_balance(departments.balances, usage_metadata))
 
-    own_balance = _caller_block_balance(departments.balances, usage_metadata)
+
+def _raise_department_verdict(rules: list, rule_id: int, own_balance: Optional[float]) -> None:
+    """Act on a department block the server decided for the caller under ``rule_id``.
+
+    ``own_balance`` is the balance the server judged the caller against, or
+    ``None`` to report the rule's own ``currentValue``.
+    """
     rule = _rule_by_id(rules, rule_id)
     if rule is None:
         raise BudgetExceededError(
@@ -2249,15 +2419,22 @@ def _warn_org_unit_threshold(rules: list, departments: _DepartmentBudgets,
     if entry is None:
         return
     caller_key, rule_id = entry
-    if not _claim_org_unit_warning(departments.generation, caller_key, rule_id):
+    _warn_department_threshold(
+        rules, departments.generation, caller_key, rule_id,
+        _caller_block_balance(departments.balances, usage_metadata),
+    )
+
+
+def _warn_department_threshold(rules: list, generation: int, caller_key: str, rule_id: int,
+                               balance: Optional[float]) -> None:
+    """Log, once per cache generation, that ``caller_key`` crossed ``rule_id``'s warn tier."""
+    if not _claim_org_unit_warning(generation, caller_key, rule_id):
         return
 
     rule = _rule_by_id(rules, rule_id)
     rule_name = (rule.get("name") if isinstance(rule, dict) else None) or str(rule_id)
     threshold = _coerce_float(rule.get("threshold")) if isinstance(rule, dict) else None
-    clause = _warning_spend_clause(
-        _caller_block_balance(departments.balances, usage_metadata), threshold,
-    )
+    clause = _warning_spend_clause(balance, threshold)
     logger.warning(
         "Approaching the Revenium department budget enforced by rule %s%s; "
         "calls are blocked once the threshold is crossed",
@@ -2265,9 +2442,81 @@ def _warn_org_unit_threshold(rules: list, departments: _DepartmentBudgets,
     )
 
 
+def _caller_candidates(candidates: dict,
+                       usage_metadata: Optional[dict]) -> Optional[Tuple[str, List[dict]]]:
+    """The caller's key and candidate list, or ``None`` when there is none.
+
+    The cached lists were cleaned by ``_coerce_candidates`` on every path that
+    fills the cache, so they are returned as stored.
+    """
+    if not isinstance(candidates, dict) or not candidates:
+        return None
+    for email in _caller_emails(usage_metadata):
+        usable = candidates.get(email)
+        if isinstance(usable, list) and usable:
+            return email, usable
+    return None
+
+
+def _candidate_unjudged_dimensions(scope: _CallScope) -> frozenset:
+    """The rows of a candidate's rule that count as covering the call unjudged.
+
+    Besides the rows the server decided, a CREDENTIAL row when the call names
+    its credential only by raw value: the server counted the cap's total under
+    the credential's saved name, which a raw value cannot be matched to, so
+    the cap keeps applying, as it does on the server.
+    """
+    if scope.names_credential_only_by_value():
+        return _CANDIDATE_DECIDED_DIMENSIONS | {"CREDENTIAL"}
+    return _CANDIDATE_DECIDED_DIMENSIONS
+
+
+def _first_candidate_for_call(rules: list, candidates: List[dict],
+                              scope: _CallScope) -> Optional[dict]:
+    """The first candidate whose cap covers this call, else ``None``.
+
+    A candidate whose rule the cached rules do not carry covers it, as a
+    single-slot block naming a missing rule always has. One whose window has
+    ended is passed over for the next. Otherwise its rule's filter rows are
+    judged against the call as the server counted the cap's total: without
+    regard to case, and without the rows the server decided in building the
+    list.
+    """
+    for candidate in candidates:
+        rule = _rule_by_id(rules, candidate["ruleId"])
+        if rule is None:
+            return candidate
+        if _window_has_ended(rule):
+            continue
+        if _rule_applies_to_call(rule, scope, ignore_case=True,
+                                 decided_dimensions=_candidate_unjudged_dimensions(scope)):
+            return candidate
+    return None
+
+
+def _act_on_department_candidates(rules: list, generation: int, caller_key: str,
+                                  candidates: List[dict], scope: _CallScope) -> None:
+    """Block or warn on the first candidate covering the call; nothing when none does."""
+    chosen = _first_candidate_for_call(rules, candidates, scope)
+    if chosen is None:
+        return
+    if chosen["tier"] == "BLOCK":
+        _raise_department_verdict(rules, chosen["ruleId"], chosen["balance"])
+    else:
+        _warn_department_threshold(rules, generation, caller_key, chosen["ruleId"], chosen["balance"])
+
+
 def _check_org_unit_block(rules: list, departments: _DepartmentBudgets,
-                          usage_metadata: Optional[dict]) -> None:
-    """``_raise_org_unit_block`` with a fail-open guard, then the warn tier.
+                          usage_metadata: Optional[dict],
+                          scope: Optional[_CallScope] = None) -> None:
+    """The caller's department verdict, behind a fail-open guard.
+
+    A caller the server published candidates for is judged on the first one
+    covering this call (``_first_candidate_for_call``), and the single-slot maps
+    are not read for them. Without a ``scope`` the call's model and provider
+    are unknown, which keeps a cap scoped to either applying. Anyone else
+    gets ``_raise_org_unit_block`` and then the warn tier, exactly as before
+    the candidates existed.
 
     The pre-provider hook may raise ``BudgetExceededError`` and nothing else,
     so a malformed map degrades to "no block" instead of taking the caller's
@@ -2279,6 +2528,11 @@ def _check_org_unit_block(rules: list, departments: _DepartmentBudgets,
     has no use for the news that they were nearly blocked.
     """
     try:
+        listed = _caller_candidates(departments.candidates, usage_metadata)
+        if listed is not None:
+            _act_on_department_candidates(rules, departments.generation, *listed,
+                                          scope or _CallScope(usage_metadata, None, None))
+            return
         _raise_org_unit_block(rules, departments, usage_metadata)
         _warn_org_unit_threshold(rules, departments, usage_metadata)
     except BudgetExceededError:
@@ -2315,6 +2569,10 @@ def check_enforcement(usage_metadata: Optional[dict] = None, *,
     (``departmentBudgetWarnings``) is never blocked and never raised on: they get
     one log line per refreshed verdict, so the block is not the first thing
     they hear about their department budget. See ``_warn_org_unit_threshold``.
+    A caller the server also lists in ``departmentBudgetCandidates`` is judged
+    instead on the first of those caps whose own filters cover this call, so a
+    department cap scoped to one provider or model no longer blocks the rest;
+    see ``_first_candidate_for_call``.
 
     A rule that carries ``filters`` (a cap scoped to an agent, model, provider,
     subscriber, credential, task type, product or organization) blocks or
@@ -2361,10 +2619,10 @@ def check_enforcement(usage_metadata: Optional[dict] = None, *,
     # verdict, so it is consulted before and independently of the per-rule
     # loop — a department block can name a rule the cache has not seen yet.
     # A caller who is only near the cap is warned here, never blocked.
-    _check_org_unit_block(rules, departments, usage_metadata)
+    scope = _CallScope(usage_metadata, model, provider)
+    _check_org_unit_block(rules, departments, usage_metadata, scope)
 
     credential = (usage_metadata or {}).get("subscriber_credential", "")
-    scope = _CallScope(usage_metadata, model, provider)
 
     for rule in rules:
         if not isinstance(rule, dict):

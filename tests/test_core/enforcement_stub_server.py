@@ -16,7 +16,8 @@ import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import List, NamedTuple, Optional
+from typing import Dict, List, NamedTuple, Optional
+from urllib.parse import parse_qs, urlsplit
 
 from revenium_middleware._core import enforcement
 
@@ -25,6 +26,7 @@ REFUSE = "refuse"
 UNAVAILABLE = "503"
 FORBIDDEN = "403"
 HEALTHY = "healthy"
+NO_CONTENT = "204"
 # Answers like HEALTHY, but only once ``release`` is set: a fetch still in flight.
 SLOW = "slow"
 FAILURE_MODES = (HANG, REFUSE, UNAVAILABLE, FORBIDDEN)
@@ -47,18 +49,25 @@ def _free_port() -> int:
 class EnforcementStub:
     """A rules endpoint that hangs, refuses, fails or answers, as asked.
 
-    ``hits`` counts the requests that reached it and ``api_keys`` lists the
-    ``x-api-key`` each one carried. A ``refuse`` stub has no listener at all,
-    so nothing can reach it and its count stays zero.
+    ``hits`` counts the requests that reached it, ``api_keys`` lists the
+    ``x-api-key`` each one carried and ``queries`` the parsed query string of
+    each. A ``refuse`` stub has no listener at all, so nothing can reach it
+    and its count stays zero.
+
+    ``advisory_rules`` are appended after ``rules`` only on a request with
+    ``include=advisory`` and no ``ruleId``, as the server does.
     """
 
-    def __init__(self, mode: str, rules: Optional[list] = None, departments: Optional[dict] = None):
+    def __init__(self, mode: str, rules: Optional[list] = None, departments: Optional[dict] = None,
+                 advisory_rules: Optional[list] = None):
         self.mode = mode
         self.rules = rules or []
         self.departments = departments or {}
+        self.advisory_rules = advisory_rules or []
         self.release = threading.Event()
         self._lock = threading.Lock()
         self._api_keys: List[Optional[str]] = []
+        self._queries: List[Dict[str, List[str]]] = []
         self._server: Optional[ThreadingHTTPServer] = None
         self.port = _free_port()
         if mode != REFUSE:
@@ -81,9 +90,20 @@ class EnforcementStub:
         with self._lock:
             return list(self._api_keys)
 
-    def _record_hit(self, api_key: Optional[str]) -> None:
+    @property
+    def queries(self) -> List[Dict[str, List[str]]]:
+        with self._lock:
+            return list(self._queries)
+
+    def _record_hit(self, api_key: Optional[str], query: Dict[str, List[str]]) -> None:
         with self._lock:
             self._api_keys.append(api_key)
+            self._queries.append(query)
+
+    def _rules_for(self, query: Dict[str, List[str]]) -> list:
+        if query.get("include") == ["advisory"] and "ruleId" not in query:
+            return self.rules + self.advisory_rules
+        return self.rules
 
     def _handler(self):
         stub = self
@@ -93,7 +113,8 @@ class EnforcementStub:
                 pass
 
             def do_GET(self):
-                stub._record_hit(self.headers.get("x-api-key"))
+                query = parse_qs(urlsplit(self.path).query)
+                stub._record_hit(self.headers.get("x-api-key"), query)
                 if stub.mode == HANG:
                     stub.release.wait(_HANG_CAP_SECONDS)
                     self.close_connection = True
@@ -101,7 +122,11 @@ class EnforcementStub:
                 if stub.mode == SLOW:
                     stub.release.wait(_HANG_CAP_SECONDS)
                 if stub.mode in (HEALTHY, SLOW):
-                    self._send(200, {"rules": stub.rules, **stub.departments})
+                    self._send(200, {"rules": stub._rules_for(query), **stub.departments})
+                    return
+                if stub.mode == NO_CONTENT:
+                    self.send_response(204)
+                    self.end_headers()
                     return
                 stub.release.wait(_ROUND_TRIP_SECONDS)
                 self._send(int(stub.mode), {"error": stub.mode})

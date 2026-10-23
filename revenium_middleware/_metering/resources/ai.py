@@ -24,9 +24,16 @@ from .._response import (
 )
 from .._base_client import make_request_options
 from ..._core.subscriber import subscriber_with_credential_alias
+from ..._core.wire_guards import guard_wire_fields
 from ..types.metering_response_resource import MeteringResponseResource
 
 __all__ = ["AIResource", "AsyncAIResource"]
+
+
+def _accepted_completion(body: dict[str, object]) -> dict[str, object]:
+    given = {field: value for field, value in body.items() if not isinstance(value, NotGiven)}
+    accepted = guard_wire_fields(given, "completion")
+    return {field: accepted.get(field, NOT_GIVEN) for field in body}
 
 
 class AIResource(SyncAPIResource):
@@ -78,6 +85,7 @@ class AIResource(SyncAPIResource):
         coding_assistant_account_uuid: str | NotGiven = NOT_GIVEN,
         effort: str | NotGiven = NOT_GIVEN,
         client_surface: str | NotGiven = NOT_GIVEN,
+        entrypoint: str | NotGiven = NOT_GIVEN,
         prompt_id: str | NotGiven = NOT_GIVEN,
         prompt_length: int | NotGiven = NOT_GIVEN,
         query_source: str | NotGiven = NOT_GIVEN,
@@ -224,6 +232,11 @@ class AIResource(SyncAPIResource):
           client_surface: The first-party app that sent this coding-assistant call, for example
               claude-code (terminal CLI) or claude-code-desktop (desktop app); the backend
               owns the vocabulary (max 64 chars)
+
+          entrypoint: How the coding assistant that made this call was launched, for example cli,
+              sdk-cli, sdk-ts, sdk-py, claude-vscode or claude-in-slack; other values of the
+              same shape are stored as sent (1 to 64 letters, digits, dots, hyphens or
+              underscores)
 
           prompt_id: Identifier of the user prompt that produced this completion, so every call
               made while serving one prompt can be grouped (max 64 chars)
@@ -378,7 +391,7 @@ class AIResource(SyncAPIResource):
         return self._post(
             "/v2/ai/completions",
             body=maybe_transform(
-                {
+                _accepted_completion({
                     "completion_start_time": completion_start_time,
                     "cost_type": cost_type,
                     "input_token_count": input_token_count,
@@ -403,6 +416,7 @@ class AIResource(SyncAPIResource):
                     "coding_assistant_account_uuid": coding_assistant_account_uuid,
                     "effort": effort,
                     "client_surface": client_surface,
+                    "entrypoint": entrypoint,
                     "prompt_id": prompt_id,
                     "prompt_length": prompt_length,
                     "query_source": query_source,
@@ -463,7 +477,7 @@ class AIResource(SyncAPIResource):
                     "pricing_tier": pricing_tier,
                     "subscription_tier": subscription_tier,
                     "cost_multiplier": cost_multiplier,
-                },
+                }),
                 ai_create_completion_params.AICreateCompletionParams,
             ),
             options=make_request_options(
@@ -1385,6 +1399,7 @@ class AsyncAIResource(AsyncAPIResource):
         coding_assistant_account_uuid: str | NotGiven = NOT_GIVEN,
         effort: str | NotGiven = NOT_GIVEN,
         client_surface: str | NotGiven = NOT_GIVEN,
+        entrypoint: str | NotGiven = NOT_GIVEN,
         prompt_id: str | NotGiven = NOT_GIVEN,
         prompt_length: int | NotGiven = NOT_GIVEN,
         query_source: str | NotGiven = NOT_GIVEN,
@@ -1531,6 +1546,11 @@ class AsyncAIResource(AsyncAPIResource):
           client_surface: The first-party app that sent this coding-assistant call, for example
               claude-code (terminal CLI) or claude-code-desktop (desktop app); the backend
               owns the vocabulary (max 64 chars)
+
+          entrypoint: How the coding assistant that made this call was launched, for example cli,
+              sdk-cli, sdk-ts, sdk-py, claude-vscode or claude-in-slack; other values of the
+              same shape are stored as sent (1 to 64 letters, digits, dots, hyphens or
+              underscores)
 
           prompt_id: Identifier of the user prompt that produced this completion, so every call
               made while serving one prompt can be grouped (max 64 chars)
@@ -1685,7 +1705,7 @@ class AsyncAIResource(AsyncAPIResource):
         return await self._post(
             "/v2/ai/completions",
             body=await async_maybe_transform(
-                {
+                _accepted_completion({
                     "completion_start_time": completion_start_time,
                     "cost_type": cost_type,
                     "input_token_count": input_token_count,
@@ -1710,6 +1730,7 @@ class AsyncAIResource(AsyncAPIResource):
                     "coding_assistant_account_uuid": coding_assistant_account_uuid,
                     "effort": effort,
                     "client_surface": client_surface,
+                    "entrypoint": entrypoint,
                     "prompt_id": prompt_id,
                     "prompt_length": prompt_length,
                     "query_source": query_source,
@@ -1770,7 +1791,7 @@ class AsyncAIResource(AsyncAPIResource):
                     "pricing_tier": pricing_tier,
                     "subscription_tier": subscription_tier,
                     "cost_multiplier": cost_multiplier,
-                },
+                }),
                 ai_create_completion_params.AICreateCompletionParams,
             ),
             options=make_request_options(
