@@ -850,6 +850,200 @@ class TestLiteLLMSessionIdBecomesTraceId:
             assert FAILURE_SUFFIX.search(args["transaction_id"])
 
 
+# The trace name a gateway caller gave LiteLLM in metadata.trace_name.
+LITELLM_TRACE_NAME = "Checkout Flow"
+
+
+def _body_trace_name(data):
+    data["metadata"]["trace_name"] = LITELLM_TRACE_NAME
+    return data
+
+
+def _promoted_trace_name(data):
+    """On /v1/messages LiteLLM promotes the caller's trace_name into litellm_metadata."""
+    data["litellm_metadata"]["trace_name"] = LITELLM_TRACE_NAME
+    return data
+
+
+# (the request shape's metadata key, what puts the trace name in the request)
+TRACE_NAME_SOURCES = [
+    pytest.param("metadata", _body_trace_name, id="metadata-trace-name"),
+    pytest.param("litellm_metadata", _promoted_trace_name, id="v1-messages-litellm-metadata"),
+]
+
+
+class TestLiteLLMTraceNameBecomesTraceName:
+    """A caller's LiteLLM trace name is the trace name when no Revenium header is.
+
+    The order is x-revenium-trace-name, then the trace name the caller gave
+    LiteLLM, then the host's REVENIUM_TRACE_NAME, then the caller's LiteLLM
+    session id, then nothing. A gateway caller that names its traces for LiteLLM
+    sees the same names in Revenium, and one that only groups calls into a
+    session sees that session's id rather than an unnamed trace.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_host_trace_name(self, monkeypatch):
+        monkeypatch.delenv("REVENIUM_TRACE_NAME", raising=False)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    @pytest.mark.parametrize("key,place", TRACE_NAME_SOURCES)
+    async def test_every_trace_name_source_becomes_the_trace_name(
+        self, guardrail, drive, key, place
+    ):
+        """Each place a caller can put a trace name reaches the record on each hook."""
+        submit = await drive(guardrail, place(guardrail_data(metadata_key=key)))
+        assert submitted_args(submit)["trace_name"] == LITELLM_TRACE_NAME
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_revenium_trace_name_wins_over_litellm_trace_name(self, guardrail, drive):
+        """An explicit Revenium header is never overruled by the LiteLLM field."""
+        data = guardrail_data(
+            headers={"x-revenium-trace-name": "header-trace-name"},
+            metadata={"trace_name": LITELLM_TRACE_NAME},
+        )
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["trace_name"] == "header-trace-name"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_litellm_trace_name_wins_over_the_host_setting(
+        self, guardrail, drive, monkeypatch
+    ):
+        """The caller's per-call name outranks the gateway's deployment-wide one."""
+        monkeypatch.setenv("REVENIUM_TRACE_NAME", "env-trace-name")
+        data = guardrail_data(metadata={"trace_name": LITELLM_TRACE_NAME})
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["trace_name"] == LITELLM_TRACE_NAME
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_litellm_metadata_beats_the_callers_body_on_v1_messages(
+        self, guardrail, drive
+    ):
+        """On /v1/messages, ``metadata`` is the caller's body, so it is read second."""
+        data = guardrail_data(
+            metadata_key="litellm_metadata", metadata={"trace_name": "from-the-body"}
+        )
+        data["litellm_metadata"]["trace_name"] = LITELLM_TRACE_NAME
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["trace_name"] == LITELLM_TRACE_NAME
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            pytest.param("", id="empty"),
+            pytest.param("   ", id="blank"),
+            pytest.param(42, id="int"),
+            pytest.param({"name": "x"}, id="dict"),
+        ],
+    )
+    async def test_an_unusable_trace_name_falls_through(
+        self, guardrail, drive, bad, monkeypatch
+    ):
+        """A malformed value never raises or costs the record; the host setting wins."""
+        monkeypatch.setenv("REVENIUM_TRACE_NAME", "env-trace-name")
+        data = guardrail_data(metadata={"trace_name": bad})
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["trace_name"] == "env-trace-name"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_a_long_trace_name_is_truncated(self, guardrail, drive):
+        """The LiteLLM field is validated like the header: cut to 256 characters."""
+        data = guardrail_data(metadata={"trace_name": "n" * 300})
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["trace_name"] == "n" * 256
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    @pytest.mark.parametrize("key,place", SESSION_SOURCES)
+    async def test_an_untitled_session_is_named_by_its_id(
+        self, guardrail, drive, key, place
+    ):
+        """With no trace name anywhere, the caller's session id names the trace."""
+        submit = await drive(guardrail, place(guardrail_data(metadata_key=key)))
+        args = submitted_args(submit)
+        assert args["trace_name"] == LITELLM_SESSION_ID
+        assert args["trace_id"] == LITELLM_SESSION_ID
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    @pytest.mark.parametrize(
+        "headers,metadata,env,expected",
+        [
+            pytest.param(
+                {"x-revenium-trace-name": "header-trace-name"}, {}, None,
+                "header-trace-name", id="header",
+            ),
+            pytest.param(
+                {}, {"trace_name": LITELLM_TRACE_NAME}, None,
+                LITELLM_TRACE_NAME, id="litellm-trace-name",
+            ),
+            pytest.param({}, {}, "env-trace-name", "env-trace-name", id="host-setting"),
+        ],
+    )
+    async def test_any_trace_name_wins_over_the_session_id(
+        self, guardrail, drive, headers, metadata, env, expected, monkeypatch
+    ):
+        """The session id is the last resort, below even the host's setting."""
+        if env:
+            monkeypatch.setenv("REVENIUM_TRACE_NAME", env)
+        data = guardrail_data(headers=headers, metadata=metadata)
+        data["litellm_session_id"] = LITELLM_SESSION_ID
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["trace_name"] == expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_a_session_under_a_revenium_trace_id_names_nothing(self, guardrail, drive):
+        """The session id names only the trace it is; under a caller's own trace id it is not."""
+        data = guardrail_data(headers={"x-revenium-trace-id": "customer-supplied"})
+        data["litellm_session_id"] = LITELLM_SESSION_ID
+        submit = await drive(guardrail, data)
+        args = submitted_args(submit)
+        assert args["trace_id"] == "customer-supplied"
+        assert "trace_name" not in args
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_a_long_session_id_is_truncated_as_a_name(self, guardrail, drive):
+        """The trace id keeps the full session id; the name is cut to 256."""
+        data = guardrail_data()
+        data["litellm_session_id"] = "s" * 300
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["trace_name"] == "s" * 256
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            pytest.param({}, id="no-session"),
+            pytest.param({"x-claude-code-session-id": SESSION_ID}, id="claude-code-only"),
+        ],
+    )
+    async def test_no_litellm_session_sends_no_trace_name(self, guardrail, drive, headers):
+        """Only a LiteLLM session names a trace; without one the record has no name."""
+        submit = await drive(guardrail, guardrail_data(headers=headers))
+        assert "trace_name" not in submitted_args(submit)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_a_session_id_litellm_generated_names_nothing(self, guardrail, drive):
+        """LiteLLM's own minted session id is no more a name than it is a trace id."""
+        data = guardrail_data(
+            metadata={"session_id": AUTO_TRACE_ID, "litellm_session_id_generated": True},
+        )
+        data["litellm_session_id"] = AUTO_TRACE_ID
+        submit = await drive(guardrail, data)
+        assert "trace_name" not in submitted_args(submit)
+
+
 class TestFailureIdentity:
     """Every failed attempt is stored, and never under a success's identity.
 

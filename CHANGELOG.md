@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-10-26
+
+### Changed
+- LiteLLM proxy guardrail: a call's Revenium trace name now defaults to the trace name the caller gave LiteLLM (`metadata.trace_name` in the request body, `litellm_metadata.trace_name` on `/v1/messages`), so gateway callers that name their LiteLLM traces see the same names in Revenium. `x-revenium-trace-name` still wins, and the caller's LiteLLM trace name now outranks the gateway's `REVENIUM_TRACE_NAME`. A call that sets neither takes `REVENIUM_TRACE_NAME`, and failing that, the LiteLLM session id the caller sent (the same id that became its trace id, cut to 256 characters), so a session that was never titled no longer shows as an unnamed trace. A call that sends `x-revenium-trace-id` is never named after its LiteLLM session, since that session is not its trace. A Claude Code session id or a session id LiteLLM generated itself never names a trace, and a call with no session and no name still has no trace name. The deprecated callback is unchanged.
+
 ## [0.11.0] - 2026-10-23
 
 ### Added
@@ -14,8 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - A department cost cap scoped to a provider, model, agent, task type, product, organization or credential no longer blocks the person's other calls. The cap's verdict used to reach the SDK as one rule per person, which the pre-call check applied to every call they made, so a breached cap on OpenAI also refused their Anthropic calls. When the API publishes `departmentBudgetCandidates` for a person (every department cap that could apply to them, best first), the check now takes the first cap whose own filters cover the call, compared without regard to letter case as the cap's total is counted, and blocks or warns on that one alone; a call no candidate covers gets no department verdict. A filter the SDK cannot judge still counts as covering the call, and so does a credential filter on a call that names its credential only by raw value (the cap's total is counted under the credential's saved name), a cap whose window has ended is passed over for the next, and a person the API publishes no list for keeps the single-rule verdict exactly as before. The list is kept in the department snapshot under `REVENIUM_CACHE_DIR`, and a snapshot written by an earlier version still loads.
 - An empty `client_surface`, `effort`, `speed`, `prompt_id`, `prompt_length`, `query_source` or `subagent_type` in `usage_metadata` now gets the WARNING promised for a value Revenium refuses, and is left off the record, unless the field's other spelling (`clientSurface` beside `client_surface`, for example) carries a value, which is then sent; before, it was silently treated as unset, so a caller had no sign that the tag was missing. A direct `create_completion` call (sync or async) now runs the same check the provider integrations run before sending: any optional value Revenium would refuse is left off with one WARNING per field (a subscriber id or email included), and a text tag longer than Revenium stores is shortened with a WARNING; before, the value was sent as given and Revenium refused the whole record with a 400, so the call's tokens and cost were never stored.
-- The SDK's check that every public provider call is either metered or knowingly left out passes again on anthropic 1.17.0 and openai 3.36. The calls those releases added (Anthropic `user_profiles`, organization `webhooks` and workspace `rate_limits.update`; OpenAI `audio.voice_consents`) manage accounts, settings and consent recordings and never call a model, so the README's "Calls the SDK does not meter" list is unchanged.
-- The same check passes again on perplexityai 0.45.0 and later, which added `batches` and `files`. `batches.create` submits a batch job that Perplexity bills as it runs, so the SDK records no usage for it and the README's "Calls the SDK does not meter" list now names it for Perplexity. The other `batches` calls and every `files` call manage jobs and their input files and never call a model.
+- The SDK's check that every public provider call is either metered or knowingly left out passes again on anthropic 1.17.0 and openai 3.36. The calls those releases added (Anthropic `user_profiles`, organization `webhooks` and workspace `rate_limits.update`; OpenAI `audio.voice_consents`) manage accounts, settings and consent recordings and never call a model, so none of them changes what the SDK meters. One OpenAI call this release newly discloses as billable and not metered: `realtime.translations.connect`, added by openai 3.35, is a realtime session like `realtime.connect`, and the README's "Calls the SDK does not meter" list now names it for OpenAI.
+- The same check passes again on perplexityai 0.45.0 and later, which added `batches` and `files`. `batches.create` submits a batch job that Perplexity bills as it runs, so the SDK records no usage for it and the README's "Calls the SDK does not meter" list now names it for Perplexity, next to `decisions.create`, which the list had left out since it was classified. The other `batches` calls and every `files` call manage jobs and their input files and never call a model.
 
 ## [0.10.1] - 2026-10-14
 
@@ -575,6 +580,7 @@ These can change what your application sees when you upgrade from 0.9.2. Each on
 - Selective metering via `REVENIUM_SELECTIVE_METERING` environment variable
 - Configurable logging with `REVENIUM_LOG_LEVEL`
 
+[0.12.0]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.12.0
 [0.11.0]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.11.0
 [0.10.1]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.10.1
 [0.10.0]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.10.0

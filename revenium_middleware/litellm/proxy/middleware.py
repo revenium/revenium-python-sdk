@@ -52,6 +52,7 @@ from revenium_middleware._core.trace_fields import (
     get_trace_name,
     get_trace_type,
     get_transaction_name,
+    validate_trace_name,
 )
 
 from ._metering_owner import guardrail_owns_metering
@@ -429,23 +430,36 @@ _TRACE_FIELD_GETTERS = (
 )
 
 
-def trace_fields_from_headers(headers):
+def trace_fields_from_headers(headers, litellm_trace_name=None, default_trace_name=None):
     """The trace fields for a gateway record: the call's header, else the host's setting.
 
     Resolved through the same getters a direct call uses, so precedence,
     validation and the cloud region fallbacks match. Only fields that resolve
     to a value are returned, so a gateway with nothing configured sends the
     record it always sent.
+
+    The trace name's order is the ``x-revenium-trace-name`` header, then
+    ``litellm_trace_name``, then the host's ``REVENIUM_TRACE_NAME``, then
+    ``default_trace_name``. ``litellm_trace_name`` is the trace name the caller
+    gave LiteLLM itself; it is per-call, so it outranks the host's setting.
+    ``default_trace_name`` is a derived label, the guardrail's LiteLLM session
+    id, so it never overrules a name anyone set.
     """
     per_call = {
         field: present_or_none(headers.get(header))
         for field, header in _TRACE_FIELD_HEADERS.items()
     }
+    if per_call["trace_name"] is None:
+        per_call["trace_name"] = litellm_trace_name
     fields = {}
     for field, getter in _TRACE_FIELD_GETTERS:
         value = getter(per_call)
         if value:
             fields[field] = value
+    if "trace_name" not in fields and default_trace_name:
+        default_name = validate_trace_name(default_trace_name)
+        if default_name:
+            fields["trace_name"] = default_name
     fields.update(extract_skill_fields(per_call))
     if _retry_number_is_set(per_call.get("retry_number")):
         fields["retry_number"] = get_retry_number(per_call)
