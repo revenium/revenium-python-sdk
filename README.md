@@ -1093,6 +1093,17 @@ used, because it would make each call a trace of its own, and neither is a sessi
 id LiteLLM minted itself under its `missing_session_id: generate` policy. The
 deprecated callback reads only `x-revenium-trace-id` and `x-claude-code-session-id`.
 
+**Trace name.** The guardrail takes a record's trace name from
+`x-revenium-trace-name`. Without that header it takes the trace name the caller
+gave LiteLLM, `metadata.trace_name` in the request body (`litellm_metadata.trace_name`
+on `/v1/messages`), the same field LiteLLM passes to its own logging integrations.
+Failing both, it uses the gateway's `REVENIUM_TRACE_NAME`, and failing that, the
+LiteLLM session id that became the trace id (see above), so a session the caller
+did not title is still named. A call that sends its own `x-revenium-trace-id` is
+never named after its LiteLLM session. A name over 256 characters is cut to 256. A call
+with no LiteLLM session and no name has no trace name. The deprecated callback
+reads only the header and `REVENIUM_TRACE_NAME`.
+
 **Organization caps and the organization header.** By default the
 `x-revenium-organization-name` header (and the retired `x-revenium-organization-id`)
 wins over the calling virtual key's team alias, for the budget check and the record

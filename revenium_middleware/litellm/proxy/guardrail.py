@@ -786,6 +786,26 @@ def _litellm_session_id(container):
     return None
 
 
+def _litellm_trace_name(container):
+    """The trace name the caller gave LiteLLM, or None.
+
+    LiteLLM takes a trace name as ``metadata.trace_name``, one of its trace
+    control fields alongside ``session_id``, and on the routes that use
+    ``litellm_metadata`` it promotes the caller's value there. ``container`` is
+    the same per-hook request surface ``_litellm_session_id`` reads, and
+    ``litellm_metadata`` is read first for the same reason.
+
+    Only a non-blank string counts, because this runs in-band and a non-string
+    must never reach the wire.
+    """
+    container = _as_mapping(container)
+    for key in ("litellm_metadata", "metadata"):
+        candidate = _as_mapping(container.get(key)).get("trace_name")
+        if isinstance(candidate, str) and present_or_none(candidate) is not None:
+            return candidate
+    return None
+
+
 def _organization_name(data, headers, metadata, user_api_key_dict, key_metadata):
     """Organization attribution, headers first then key/team identity.
 
@@ -1399,6 +1419,7 @@ class ReveniumGuardrail(CustomGuardrail):
                 mediation_latency=mediation_latency,
                 stop_reason="END",
                 litellm_session_id=_litellm_session_id(data),
+                litellm_trace_name=_litellm_trace_name(data),
                 # LiteLLM-populated surfaces only: data["metadata"] (and so
                 # hidden_params) is the caller's own request body on
                 # /v1/messages, and a caller must not be able to name the
@@ -1545,6 +1566,7 @@ class ReveniumGuardrail(CustomGuardrail):
                 # litellm_params, not kwargs: LiteLLM spreads provider params
                 # across the kwargs' top level, which the caller can shape.
                 litellm_session_id=_litellm_session_id(litellm_params),
+                litellm_trace_name=_litellm_trace_name(litellm_params),
                 upstream_sources=(
                     getattr(response_obj, "_hidden_params", None),
                     kwargs,
@@ -1675,6 +1697,7 @@ class ReveniumGuardrail(CustomGuardrail):
                 mediation_latency=hidden_params.get("litellm_overhead_time_ms") or 0,
                 stop_reason="ERROR",
                 litellm_session_id=_litellm_session_id(request_data),
+                litellm_trace_name=_litellm_trace_name(request_data),
                 upstream_sources=(
                     getattr(original_exception, "_hidden_params", None),
                     request_data.get("litellm_params"),
@@ -1712,6 +1735,7 @@ class ReveniumGuardrail(CustomGuardrail):
         upstream_sources,
         is_streamed=None,
         litellm_session_id=None,
+        litellm_trace_name=None,
     ):
         """Build the completion metering payload shared by all three hooks.
 
@@ -1740,6 +1764,12 @@ class ReveniumGuardrail(CustomGuardrail):
                 ``x-revenium-trace-id`` header was sent. Resolved by the hook
                 because the logging path's ``data`` is not a LiteLLM-owned
                 surface at its top level.
+            litellm_trace_name: The trace name the caller gave LiteLLM,
+                resolved by the hook with ``_litellm_trace_name``. It is the
+                trace name when no ``x-revenium-trace-name`` header was sent,
+                and outranks the host's ``REVENIUM_TRACE_NAME``. When none of
+                the three is set, ``litellm_session_id`` names the trace, but
+                only when it is also the trace id.
 
         Returns:
             A ``(completion_args, extra_body)`` tuple -- ``extra_body`` carries
@@ -1766,6 +1796,31 @@ class ReveniumGuardrail(CustomGuardrail):
         # is what keeps the published "Z" honest for both.
         response_time_str = format_utc_timestamp(response_time)
 
+        # Order: the x-revenium-trace-id header, the LiteLLM session id the
+        # caller supplied, then Claude Code's session id. A session id groups
+        # calls into one trace, and Claude Code stamps its own on its telemetry
+        # rows as their trace id, so one session reads as one trace on both
+        # records. LiteLLM's own per-request trace id is never a fallback: it
+        # mints a fresh uuid4 for every request, which would make every call
+        # its own trace. Never the transaction id: a session covers many calls,
+        # and keying the duplicate gate on it would fold a whole session into
+        # one record and under-bill it.
+        trace_id = (headers.get("x-revenium-trace-id")
+                    or litellm_session_id
+                    or headers.get("x-claude-code-session-id"))
+        # The session id names the trace only when it is the trace: under a
+        # caller's own x-revenium-trace-id it would label that trace with an id
+        # it does not carry.
+        trace_fields = trace_fields_from_headers(
+            headers,
+            litellm_trace_name=litellm_trace_name,
+            default_trace_name=(
+                litellm_session_id
+                if litellm_session_id and trace_id == litellm_session_id
+                else None
+            ),
+        )
+
         completion_args = {
             "cache_creation_token_count": cache_creation_tokens,
             **extract_cache_creation_ttl_counts(usage),
@@ -1788,18 +1843,7 @@ class ReveniumGuardrail(CustomGuardrail):
             "stop_reason": stop_reason,
             "total_token_count": total_tokens,
             "transaction_id": transaction_id,
-            # Order: the x-revenium-trace-id header, the LiteLLM session id the
-            # caller supplied, then Claude Code's session id. A session id
-            # groups calls into one trace, and Claude Code stamps its own on
-            # its telemetry rows as their trace id, so one session reads as one
-            # trace on both records. LiteLLM's own per-request trace id is
-            # never a fallback: it mints a fresh uuid4 for every request, which
-            # would make every call its own trace. Never the transaction id: a
-            # session covers many calls, and keying the duplicate gate on it
-            # would fold a whole session into one record and under-bill it.
-            "trace_id": (headers.get("x-revenium-trace-id")
-                         or litellm_session_id
-                         or headers.get("x-claude-code-session-id")),
+            "trace_id": trace_id,
             "task_type": headers.get("x-revenium-task-type"),
             "subscriber": subscriber if subscriber else None,
             "organization_name": _organization_name(
@@ -1820,7 +1864,7 @@ class ReveniumGuardrail(CustomGuardrail):
             "is_streamed": bool(is_streamed),
             "operation_type": operation_type,
             "mediation_latency": mediation_latency,
-            **trace_fields_from_headers(headers),
+            **trace_fields,
             "middleware_source": "GUARDRAIL",
         }
         extra_body = merge_extra_body(None, _job_fields(headers, key_metadata))
