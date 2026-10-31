@@ -24,7 +24,7 @@ Pre-requisites
        REVENIUM_CIRCUIT_BREAKER_ENABLED=true
        REVENIUM_METERING_API_KEY=hak_...
        REVENIUM_TEAM_ID=...                # hashed team ID
-       REVENIUM_ENFORCEMENT_BASE_URL=https://api.revenium.ai/profitstream
+       REVENIUM_ENFORCEMENT_BASE_URL=https://api.revenium.ai/profitstream  # the default when unset
        OPENAI_API_KEY=sk-...
 
 Run::

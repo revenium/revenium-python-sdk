@@ -264,3 +264,9 @@ def redact_error_text(text: str, max_len: int) -> str:
     redacted = _EMAIL_WORD_PATTERN.sub(_REDACTED, redacted)
     redacted = _SECRET_SHAPED_WORD_PATTERN.sub(_REDACTED, redacted)
     return redacted[:max_len]
+
+
+def address_without_credentials(url) -> str:
+    """Scheme, host, port and path of an ``httpx.URL``: never its userinfo, query or fragment."""
+    port = f":{url.port}" if url.port is not None else ""
+    return f"{url.scheme}://{url.host}{port}{url.path}"

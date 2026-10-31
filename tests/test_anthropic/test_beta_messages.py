@@ -18,6 +18,7 @@ httpx2 = pytest.importorskip("httpx2")
 
 import revenium_middleware.anthropic  # noqa: E402,F401  installs the patches
 from revenium_middleware import idempotency_key as idempotency_block  # noqa: E402
+from revenium_middleware import revenium_metadata  # noqa: E402
 from revenium_middleware.anthropic.provider import Provider  # noqa: E402
 from revenium_middleware._core.call_ownership import (  # noqa: E402
     ANTHROPIC, claimed_by_transport, reset_claimed_response_ids, transport_claim_mark,
@@ -66,6 +67,12 @@ def _sse_body(start_usage, delta_usage):
     return "".join(f"event: {name}\ndata: {json.dumps(data)}\n\n" for name, data in events).encode()
 
 
+def _is_beta_request(request):
+    # anthropic 2.3.0 stopped adding `?beta=true` to client.beta.messages URLs, so a beta call is told apart by the
+    # `anthropic-beta` header that `betas=` sets on every version.
+    return "anthropic-beta" in request.headers
+
+
 class StubAnthropic:
     def __init__(self, usage=_USAGE, start_usage=None, delta_usage=None):
         self.requests = []
@@ -80,7 +87,7 @@ class StubAnthropic:
         self.requests.append(request)
         if json.loads(request.content).get("stream"):
             return httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=self._sse_body)
-        body = self._message_body if "beta=true" in str(request.url) else self._standard_message_body
+        body = self._message_body if _is_beta_request(request) else self._standard_message_body
         return httpx2.Response(200, headers={"content-type": "application/json"}, content=body)
 
     def sync_client(self):
@@ -393,6 +400,51 @@ class TestBetaToolRunner:
     def test_async(self, runner_stub, records, stream):
         asyncio.run(_run_async_tool_runner(runner_stub.async_client(), stream))
         self.assert_one_record_per_step(runner_stub, records, stream)
+
+
+def _send_sync(thread):
+    thread.send()
+
+
+def _stream_sync(thread):
+    with thread.stream() as stream:
+        list(stream)
+
+
+async def _send_async(thread):
+    await thread.send()
+
+
+async def _stream_async(thread):
+    async with thread.stream() as stream:
+        [event async for event in stream]
+
+
+@pytest.mark.skipif(not hasattr(anthropic.resources.beta.Messages, "thread"),
+                    reason="client.beta.messages.thread arrived in anthropic 2.3.0")
+class TestBetaMessageThread:
+    """A thread sends nothing itself; each turn is one beta messages.create call, so one record per turn."""
+
+    @pytest.mark.parametrize("turn, streamed", [(_send_sync, False), (_stream_sync, True)], ids=["send", "stream"])
+    def test_sync_turn(self, stub, records, turn, streamed):
+        turn(stub.sync_client().beta.messages.thread(**BETA_REQUEST))
+        assert_one_record(stub, records, streamed=streamed)
+
+    @pytest.mark.parametrize("turn, streamed", [(_send_async, False), (_stream_async, True)], ids=["send", "stream"])
+    def test_async_turn(self, stub, records, turn, streamed):
+        asyncio.run(turn(stub.async_client().beta.messages.thread(**BETA_REQUEST)))
+        assert_one_record(stub, records, streamed=streamed)
+
+    def test_each_turn_carries_decorator_metadata(self, stub, records):
+        @revenium_metadata(organization_id="org-thread")
+        def two_turns():
+            thread = stub.sync_client().beta.messages.thread(**BETA_REQUEST)
+            thread.send()
+            thread.send({"role": "user", "content": "again"})
+
+        two_turns()
+        assert len(stub.requests) == 2
+        assert [record["organization_name"] for record in records] == ["org-thread", "org-thread"]
 
 
 ADVISOR_MODEL = "claude-opus-5"
