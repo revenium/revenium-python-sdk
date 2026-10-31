@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.1] - 2026-10-30
+
+### Fixed
+- When `REVENIUM_CIRCUIT_BREAKER_ENABLED=true`, spending caps (cost controls) now work against the hosted Revenium API without an address override. With `REVENIUM_ENFORCEMENT_BASE_URL` unset, the SDK read its enforcement rules from `https://api.revenium.ai/v2/api/ai/enforcement-rules/{teamId}`, which the API does not serve (it lives under `/profitstream`), so every read answered 404 and the SDK never held any rules: by default every call went through a cap that should have blocked it, and with `REVENIUM_CB_FAIL_MODE=closed` every AI call was refused. The default now follows the same address every other SDK call uses: `REVENIUM_PROFITSTREAM_BASE_URL`, else the metering address with `/meter` removed, plus `/profitstream`, so the hosted default is `https://api.revenium.ai/profitstream`. Setting `REVENIUM_ENFORCEMENT_BASE_URL=https://api.revenium.ai/profitstream`, the workaround until now, keeps working and is now the same as leaving it unset.
+- When a rules read answers 404, the SDK now tries the sibling address once (adding `/profitstream` when it was missing, or removing it when a self-hosted API serves the rules at the root), adopts the address that served them for the rest of the process, and logs one WARNING naming both addresses and the variable to set to skip the lookup. The retry shares the original read's `Retry-After` budget, so a throttled lookup does not wait twice. On a rules read, a 401, 403 or 404 that the SDK does not retry is now logged at WARNING with the URL (credentials stripped) and the status, with a hint naming `REVENIUM_ENFORCEMENT_BASE_URL` on 404 and `REVENIUM_METERING_API_KEY` and `REVENIUM_TEAM_ID` on 401 and 403; before, a refused read logged only that the rules could not be refreshed, with the URL-less cause at DEBUG.
+- README: `REVENIUM_ENFORCEMENT_BASE_URL` is documented with its default and derivation instead of as an optional override with no default stated.
+
 ## [0.12.0] - 2026-10-26
 
 ### Changed
@@ -580,6 +587,7 @@ These can change what your application sees when you upgrade from 0.9.2. Each on
 - Selective metering via `REVENIUM_SELECTIVE_METERING` environment variable
 - Configurable logging with `REVENIUM_LOG_LEVEL`
 
+[0.12.1]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.12.1
 [0.12.0]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.12.0
 [0.11.0]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.11.0
 [0.10.1]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.10.1

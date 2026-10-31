@@ -29,6 +29,7 @@ from typing import Any, Callable, Deque, Dict, Iterator, List, NamedTuple, Optio
 import httpx
 
 from revenium_middleware._core.config import read_env_number
+from revenium_middleware._core.log_sanitize import address_without_credentials as _address_without_credentials
 from revenium_middleware._core.delivery_circuit import get_circuit
 from revenium_middleware._core.metering_status import (
     record_metering_error,
@@ -376,11 +377,6 @@ def is_retryable_failure(exc: BaseException) -> bool:
         return True
 
     return False
-
-
-def _address_without_credentials(url: httpx.URL) -> str:
-    port = f":{url.port}" if url.port is not None else ""
-    return f"{url.scheme}://{url.host}{port}{url.path}"
 
 
 def _redirect_target(response: httpx.Response) -> str:

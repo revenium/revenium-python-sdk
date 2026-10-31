@@ -376,3 +376,15 @@ def isolated_metering(monkeypatch):
         client.close()
     reset_metering_status()
     delivery_circuit.reset()
+
+
+@pytest.fixture(autouse=True)
+def reset_recovered_enforcement_addresses():
+    """Forget which configured address answered 404 and which sibling answered instead.
+
+    Mutated in place by a fallback read, so a recovered address in one test
+    would otherwise redirect every read in whichever test ran next.
+    """
+    enforcement._recovered_enforcement_addresses.clear()
+    yield
+    enforcement._recovered_enforcement_addresses.clear()

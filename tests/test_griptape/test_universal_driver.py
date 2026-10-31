@@ -460,16 +460,23 @@ def _stub_anthropic_transport(monkeypatch):
     return captured
 
 
+def _anthropic_auth_headers(api_key):
+    import anthropic
+
+    return anthropic.Anthropic(api_key=api_key).auth_headers
+
+
 def test_wrapped_anthropic_driver_calls_through_callers_client(monkeypatch):
     captured = _stub_anthropic_transport(monkeypatch)
     base_driver = _anthropic_base_driver(stream=False)
 
     ReveniumDriver(base_driver=base_driver, usage_metadata={"trace_id": "t-1"}).run(_user_stack())
 
+    gateway_auth = _anthropic_auth_headers(FAKE_GATEWAY_KEY)
     assert captured, "the wrapped Anthropic driver sent no request"
     for request in captured:
         assert request.url.host == GATEWAY_HOST
-        assert request.headers.get("x-api-key") == FAKE_GATEWAY_KEY
+        assert {name: request.headers.get(name) for name in gateway_auth} == gateway_auth
         assert json.loads(request.content)["metadata"] == {"user_id": "u-42"}
     assert all(request.url.host != PUBLIC_HOST for request in captured)
 

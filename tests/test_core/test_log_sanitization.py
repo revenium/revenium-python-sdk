@@ -1088,6 +1088,8 @@ SAFE_LOG_LINES = {
     ('_core/enforcement.py', 'response.status_code, retry_after, budget_remaining,'): NUMBER,
     ('_core/enforcement.py', 'budget_total, cooldown,'): NUMBER,
     ('_core/enforcement.py', 'owner[1], backoff,'): SETTING,
+    ('_core/enforcement.py', '_loggable_address(tried), _loggable_address(served), Config.ENV_REVENIUM_ENFORCEMENT_BASE_URL,'): LOCATION,
+    ('_core/enforcement.py', 'address_without_credentials(response.request.url), status, hint)'): LOCATION,
     ('_core/enforcement.py', 'logger.info("Enforcement rules of the previous team were dropped; loading the rules of team %s", owner[1])'): SETTING,
     ('_core/enforcement.py', 'rule_id, rule.get("action"),'): OPERATION,
     ('_core/enforcement.py', 'rule_id, sanitize_for_logging(dimension), sanitize_for_logging(operator), reason,'): OPERATION,

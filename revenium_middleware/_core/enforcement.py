@@ -69,13 +69,14 @@ import threading
 import time
 from email.utils import parsedate_to_datetime
 from typing import Dict, List, NamedTuple, Optional, Set, Tuple
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 
 from .call_ownership import peek_callback_metadata
 from .closable_scope import ClosableScope
-from .config import Config, env_choice, env_flag_enabled
+from .config import Config, env_choice, env_flag_enabled, get_profitstream_base_url
+from .log_sanitize import address_without_credentials
 from .context import merge_metadata, overlay_metadata
 from .exceptions import BudgetExceededError
 from .fields import extract_common_metadata, extract_organization_name, extract_product_name
@@ -462,21 +463,73 @@ def _process_metering_url() -> Optional[str]:
     return _valid_base_url(str(client.base_url)) if client is not None else None
 
 
-def _get_enforcement_base_url() -> str:
-    """Base URL for enforcement API calls.
+_PROFITSTREAM_PATH = "/profitstream"
 
-    Prefers ``REVENIUM_ENFORCEMENT_BASE_URL`` so a context-path
-    (``http://localhost:8080/profitstream``) survives intact. Falls back to
-    the origin of the metering client's URL, set by ``initialize_metering()``
-    or ``REVENIUM_METERING_BASE_URL``.
+# Configured enforcement address -> the sibling address (with or without
+# ``/profitstream``) that served the rules after the configured one answered
+# 404. The cache owner and the snapshot scope keep the configured address;
+# only the request URL moves (BACK-5240).
+_recovered_enforcement_addresses: Dict[str, str] = {}
+
+
+def _get_enforcement_base_url() -> str:
+    """The enforcement address as configured: the one the cache belongs to.
+
+    ``REVENIUM_ENFORCEMENT_BASE_URL`` is taken as given, so a context path
+    (``http://localhost:8080/profitstream``) survives intact. Otherwise it is
+    the address outcomes and jobs use (``REVENIUM_PROFITSTREAM_BASE_URL``,
+    else the Revenium address the metering client's URL sits under, set by
+    ``initialize_metering()`` or ``REVENIUM_METERING_BASE_URL``) plus
+    ``/profitstream``, where the hosted API serves the enforcement rules.
     """
     explicit = os.environ.get(Config.ENV_REVENIUM_ENFORCEMENT_BASE_URL, "")
     if explicit:
         return explicit.rstrip("/")
-    metering_url = _process_metering_url() or os.environ.get(
-        Config.ENV_REVENIUM_BASE_URL, "https://api.revenium.ai/meter/")
-    parsed = urlparse(metering_url)
-    return f"{parsed.scheme}://{parsed.netloc}"
+    revenium_address = get_profitstream_base_url(metering_base_url=_process_metering_url())
+    return revenium_address.rstrip("/") + _PROFITSTREAM_PATH
+
+
+def _sibling_enforcement_address(address: str) -> str:
+    """The same address with ``/profitstream`` removed if present, added if not."""
+    parts = urlsplit(address)
+    path = parts.path.rstrip("/")
+    if path.lower().endswith(_PROFITSTREAM_PATH):
+        path = path[: -len(_PROFITSTREAM_PATH)]
+    else:
+        path = path + _PROFITSTREAM_PATH
+    return urlunsplit(parts._replace(path=path)).rstrip("/")
+
+
+def _effective_enforcement_address(configured: str) -> str:
+    return _recovered_enforcement_addresses.get(configured, configured)
+
+
+def _loggable_address(address: str) -> str:
+    """An address as the logs may show it: no credentials, query or fragment."""
+    try:
+        return address_without_credentials(httpx.URL(address)).rstrip("/")
+    except Exception:  # noqa: BLE001 - an address httpx cannot parse is not worth a traceback
+        return "the configured enforcement address"
+
+
+def _adopt_enforcement_address(configured: str, tried: str, served: str) -> None:
+    """Send every later read for ``configured`` to ``served``, which just proved it serves the rules."""
+    if served == configured:
+        _recovered_enforcement_addresses.pop(configured, None)
+    else:
+        _recovered_enforcement_addresses[configured] = served
+    logger.warning(
+        "Enforcement rules were not found at %s (HTTP 404) but are served at %s; using that "
+        "address from now on. Set %s to it to skip this lookup.",
+        _loggable_address(tried), _loggable_address(served), Config.ENV_REVENIUM_ENFORCEMENT_BASE_URL,
+    )
+
+
+def _team_rules_url(address: str, team_id: str) -> str:
+    # Percent-encode the team_id path segment so a misconfigured value
+    # containing '/', '..', or '?' cannot retarget the request to a
+    # different endpoint on the same origin.
+    return f"{address}/v2/api/ai/enforcement-rules/{quote(team_id, safe='')}"
 
 
 class _DepartmentBudgets(NamedTuple):
@@ -969,6 +1022,9 @@ class _FetchTarget(NamedTuple):
     api_key: str
     team_url: str
     owner: Tuple[str, str]
+    # The address ``team_url`` was built on: the configured one, or the
+    # sibling an earlier 404 recovered to.
+    address: str
 
 
 def _fetch_target() -> Optional[_FetchTarget]:
@@ -1007,18 +1063,25 @@ def _fetch_target() -> Optional[_FetchTarget]:
         return None
 
     base_url = _get_enforcement_base_url()
-    # Percent-encode the team_id path segment so a misconfigured value
-    # containing '/', '..', or '?' cannot retarget the request to a
-    # different endpoint on the same origin.
-    safe_team_id = quote(team_id, safe="")
-    return _FetchTarget(api_key, f"{base_url}/v2/api/ai/enforcement-rules/{safe_team_id}",
-                        (base_url, team_id))
+    address = _effective_enforcement_address(base_url)
+    return _FetchTarget(api_key, _team_rules_url(address, team_id), (base_url, team_id), address)
 
 
 def _get_enforcement(url: str, api_key: str, resource: str,
                      params: Optional[dict], retry_after_budget: float,
                      owner: Tuple[str, str]) -> Optional["httpx.Response"]:
+    """``_get_enforcement_spending`` for a read that has no second address to spend the rest on."""
+    return _get_enforcement_spending(url, api_key, resource, params, retry_after_budget, owner)[0]
+
+
+def _get_enforcement_spending(url: str, api_key: str, resource: str,
+                              params: Optional[dict], retry_after_budget: float,
+                              owner: Tuple[str, str]) -> Tuple[Optional["httpx.Response"], float]:
     """GET one enforcement resource under the shared retry and Retry-After budget.
+
+    Returns the response and the Retry-After budget this read left unspent, so
+    a read that goes on to a second address (``_rules_at_sibling_address``)
+    spends one budget across both and never doubles the documented wait.
 
     Returns the first response the retry policy does not retry -- the caller
     reads its status and its body -- or ``None`` once the fetch has given up,
@@ -1051,10 +1114,10 @@ def _get_enforcement(url: str, api_key: str, resource: str,
             continue
         except Exception:
             logger.debug("Failed to fetch enforcement %s, falling open", resource, exc_info=True)
-            return None
+            return None, retry_after_budget
 
         if not _is_retryable_status(response.status_code):
-            return response
+            return response, retry_after_budget
 
         plan = _plan_retry(response, backoff, retry_after_budget, budget_total, owner)
         retry_after_budget = plan.budget_remaining
@@ -1062,7 +1125,7 @@ def _get_enforcement(url: str, api_key: str, resource: str,
             # Give up without waiting and without retrying: the cooldown
             # _plan_retry recorded keeps the server's interval, and the caller
             # falls open on the reading it already has.
-            return None
+            return None, retry_after_budget
         if attempt == _FETCH_MAX_ATTEMPTS - 1:
             break
         if _sleep(plan.wait_seconds):
@@ -1075,7 +1138,7 @@ def _get_enforcement(url: str, api_key: str, resource: str,
         "Enforcement %s fetch exhausted %d attempts; failing open",
         resource, _FETCH_MAX_ATTEMPTS,
     )
-    return None
+    return None, retry_after_budget
 
 
 def _rules_query(rule_id: Optional[str], include_advisory: bool) -> Optional[dict]:
@@ -1121,15 +1184,25 @@ def _fetch_rules(rule_id: Optional[str] = None,
     if target is None:
         return None
 
-    response = _get_enforcement(target.team_url, target.api_key, "rule", params,
-                                retry_after_budget, target.owner)
+    response, budget_left = _get_enforcement_spending(target.team_url, target.api_key, "rule",
+                                                      params, retry_after_budget, target.owner)
     if response is None:
         return None
+    if response.status_code == 404:
+        recovered = _rules_at_sibling_address(target, params, budget_left)
+        if recovered is not None:
+            return recovered.fetched
+    return _rules_from_response(response)
 
+
+def _rules_from_response(response: "httpx.Response") -> Optional[_FetchedRules]:
+    """The rules a rules read answered with, or ``None`` when it answered with anything else."""
     try:
         # 204 No Content == no rules configured for this team; cache empty
         if response.status_code == 204:
             return _FetchedRules([], {}, {}, {}, {})
+        if 400 <= response.status_code < 500:
+            _warn_refused_rules_read(response)
         response.raise_for_status()
         # Server currently returns ``{"rules": [...], "compiledAt": ...,
         # "departmentBudgetBlocks": {...}, "departmentBudgetBlockBalances":
@@ -1139,6 +1212,60 @@ def _fetch_rules(rule_id: Optional[str] = None,
     except Exception:
         logger.debug("Failed to fetch enforcement rules, falling open", exc_info=True)
         return None
+
+
+class _RecoveredRules(NamedTuple):
+    address: str
+    fetched: _FetchedRules
+    budget_left: float
+
+
+def _rules_at_sibling_address(target: _FetchTarget, params: Optional[dict],
+                              retry_after_budget: float) -> Optional[_RecoveredRules]:
+    """Read the rules once at the sibling of the address that answered 404, and adopt it if it serves them.
+
+    The hosted API serves enforcement under ``/profitstream``; a self-hosted
+    server may serve it at the root, and an operator may have configured
+    either address without that segment. A 404 says the rules are not at this
+    address at all, not that the team has none (that is a 204), so the one
+    other address is tried. It is adopted for every later read only once it
+    has answered with rules (a 204, or a body ``_fetched_from_payload``
+    accepts): a refusal or an unreadable body there leaves the configured
+    address in use, so the next poll reads it again. A refusal at the sibling
+    (any 4xx but 404) is logged by ``_warn_refused_rules_read`` as well, so a
+    wrong key or team id at the working address is not hidden behind the
+    first address's 404.
+    """
+    configured, team_id = target.owner
+    sibling = _sibling_enforcement_address(target.address)
+    response, budget_left = _get_enforcement_spending(
+        _team_rules_url(sibling, team_id), target.api_key, "rule", params,
+        retry_after_budget, target.owner)
+    if response is None:
+        return None
+    if not (response.is_success or response.status_code == 204):
+        if 400 <= response.status_code < 500 and response.status_code != 404:
+            _warn_refused_rules_read(response)
+        return None
+    fetched = _rules_from_response(response)
+    if fetched is None:
+        return None
+    _adopt_enforcement_address(configured, target.address, sibling)
+    return _RecoveredRules(sibling, fetched, budget_left)
+
+
+def _warn_refused_rules_read(response: "httpx.Response") -> None:
+    """Say which URL refused the rules read and why, so a wrong address or key is visible."""
+    status = response.status_code
+    if status == 404:
+        hint = (" The enforcement API is not at this address: set %s to the Revenium address "
+                "that serves /v2/api/ai/enforcement-rules." % Config.ENV_REVENIUM_ENFORCEMENT_BASE_URL)
+    elif status in (401, 403):
+        hint = " Check %s and %s." % (Config.ENV_REVENIUM_API_KEY, Config.ENV_REVENIUM_TEAM_ID)
+    else:
+        hint = ""
+    logger.warning("Enforcement rules could not be read: GET %s answered HTTP %d.%s",
+                   address_without_credentials(response.request.url), status, hint)
 
 
 def _fetch_roster(rule_id: str, page: int = 0, size: int = 25,
@@ -1172,11 +1299,23 @@ def _fetch_roster(rule_id: str, page: int = 0, size: int = 25,
     if band:
         params["band"] = band
 
-    response = _get_enforcement(f"{target.team_url}/roster", target.api_key,
-                                "roster", params, _INSPECTION_RETRY_AFTER_GIVE_UP_SECONDS,
-                                target.owner)
+    response, budget_left = _get_enforcement_spending(
+        f"{target.team_url}/roster", target.api_key, "roster", params,
+        _INSPECTION_RETRY_AFTER_GIVE_UP_SECONDS, target.owner)
     if response is None:
         return None
+    if response.status_code == 404:
+        # Either the rule has no roster or the rules are not at this address.
+        # Only a rules read can tell: if it recovers the address, the roster
+        # is read once more there.
+        recovered = _rules_at_sibling_address(target, None, budget_left)
+        if recovered is None:
+            return None
+        response = _get_enforcement(f"{_team_rules_url(recovered.address, target.owner[1])}/roster",
+                                    target.api_key, "roster", params, recovered.budget_left,
+                                    target.owner)
+        if response is None:
+            return None
 
     try:
         # 204 No Content == the rule has no compiled reading yet, which is a
