@@ -168,24 +168,34 @@ _KEY_TEAM_ALIAS = "user_api_key_team_alias"
 def key_team_alias(container):
     """The calling key's team alias as LiteLLM recorded it, or None.
 
+    See ``recorded_key_field``, which this reads ``user_api_key_team_alias``
+    through.
+    """
+    return recorded_key_field(container, _KEY_TEAM_ALIAS)
+
+
+def recorded_key_field(container, field):
+    """A ``user_api_key_*`` field LiteLLM recorded for the calling key, or None.
+
     On the routes in LiteLLM's ``LITELLM_METADATA_ROUTES`` (``/v1/messages``
     among them) LiteLLM writes the key's fields to ``litellm_metadata``, always
-    including this one (None for a teamless key), and ``metadata`` is the
-    caller's own request body. So ``metadata`` is read only when
-    ``litellm_metadata`` does not carry the key. LiteLLM 1.105 strips a caller's
-    ``user_api_key_*`` keys from the body, so there a body read finds nothing;
-    older releases inside the supported range may not strip them.
+    including the identity ones (None where the key has none), and ``metadata``
+    is the caller's own request body. So ``metadata`` is read only when
+    ``litellm_metadata`` does not carry the field. LiteLLM 1.105 strips a
+    caller's ``user_api_key_*`` keys from the body, so there a body read finds
+    nothing; older releases inside the supported range may not strip them.
 
     Args:
         container: A callback's ``litellm_params`` or a guardrail hook's
             ``data``. A non-mapping at any level yields None.
+        field: The flat metadata key, such as ``user_api_key_team_alias``.
     """
     container = container if hasattr(container, "get") else {}
     for key in ("litellm_metadata", "metadata"):
         level = container.get(key)
         level = level if hasattr(level, "get") else {}
-        if _KEY_TEAM_ALIAS in level:
-            return present_or_none(level.get(_KEY_TEAM_ALIAS))
+        if field in level:
+            return present_or_none(level.get(field))
     return None
 
 

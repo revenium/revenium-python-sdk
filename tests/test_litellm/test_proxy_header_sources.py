@@ -1422,3 +1422,285 @@ class TestHostTraceSettingsReachGatewayRecords:
         monkeypatch.setenv("REVENIUM_TICKET_ID", "JIRA-123")
         args = submitted_args(await path(guardrail, handler, headers, "metadata"))
         assert args.get("ticket_id") == "JIRA-123"
+
+
+# The descriptive fields a LiteLLM tag can fill, as (tag field, record field, value).
+# The values are valid for every field's validator, trace type's pattern included.
+TAG_FIELDS = [
+    pytest.param("trace_type", "trace_type", "research-brief", id="trace-type"),
+    pytest.param("task_type", "task_type", "research.plan", id="task-type"),
+    pytest.param("agent", "agent", "research-planner", id="agent"),
+    pytest.param("product_name", "product_name", "Research Assistant", id="product-name"),
+    pytest.param("environment", "environment", "demo", id="environment"),
+    pytest.param("transaction_name", "transaction_name", "Plan Research", id="transaction-name"),
+]
+
+
+def _tagged(tags, inherited=None, metadata_key="metadata"):
+    """A request whose merged LiteLLM tags are ``tags``, ``inherited`` among them.
+
+    LiteLLM merges the caller's, key's, team's and project's tags into one
+    ``tags`` list and records the key/team/project share as ``inherited_tags``
+    before any guardrail runs; this lays the request out the way it leaves that.
+    """
+    data = guardrail_data(metadata_key=metadata_key)
+    level = data.setdefault(metadata_key, {})
+    level["tags"] = list(tags) + list(inherited or ())
+    if inherited is not None:
+        level["inherited_tags"] = tuple(inherited)
+    return data
+
+
+def _metering_guardrail(event_hook):
+    """A guardrail that writes the record itself (default_on, post_call in its mode)."""
+    return ReveniumGuardrail(guardrail_name="revenium", event_hook=event_hook, default_on=True)
+
+
+class TestLiteLLMTagsFillDescriptiveFields:
+    """A ``<field>:<value>`` LiteLLM tag fills a descriptive field no header set.
+
+    The order per field is the x-revenium-* header, then the caller's tag, then
+    a tag inherited from the calling key, team or project, then the field's
+    host fallback. A gateway caller can therefore describe its traffic with
+    LiteLLM's own tags, without any Revenium header, and see it in Revenium.
+    Organization, subscriber and the agentic job never come from a tag.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_host_trace_settings(self, monkeypatch):
+        for variable in HOST_TRACE_VARIABLES:
+            monkeypatch.delenv(variable, raising=False)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    @pytest.mark.parametrize("field,record_field,value", TAG_FIELDS)
+    async def test_a_request_tag_fills_its_field(
+        self, guardrail, drive, field, record_field, value
+    ):
+        submit = await drive(guardrail, _tagged([f"{field}:{value}", "unrelated"]))
+        assert submitted_args(submit)[record_field] == value
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_tags_are_read_from_litellm_metadata_on_v1_messages(
+        self, guardrail, drive
+    ):
+        data = _tagged(["trace_type:research-brief"], metadata_key="litellm_metadata")
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["trace_type"] == "research-brief"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    @pytest.mark.parametrize("field,record_field,value", TAG_FIELDS)
+    async def test_the_revenium_header_wins_over_a_tag(
+        self, guardrail, drive, field, record_field, value
+    ):
+        header = gmod._TAG_ATTRIBUTION_HEADERS[field]
+        data = _tagged([f"{field}:tag-value"])
+        data["metadata"]["headers"] = {header: value}
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)[record_field] == value
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_a_blank_header_does_not_hide_the_tag(self, guardrail, drive):
+        data = _tagged(["trace_type:research-brief"])
+        data["metadata"]["headers"] = {"x-revenium-trace-type": "   "}
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["trace_type"] == "research-brief"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_a_tag_wins_over_the_host_setting(self, guardrail, drive, monkeypatch):
+        monkeypatch.setenv("REVENIUM_TRACE_TYPE", "env-trace-type")
+        submit = await drive(guardrail, _tagged(["trace_type:research-brief"]))
+        assert submitted_args(submit)["trace_type"] == "research-brief"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_the_callers_tag_wins_over_an_inherited_one(self, guardrail, drive):
+        data = _tagged(["trace_type:from-request"], inherited=["trace_type:from-team"])
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["trace_type"] == "from-request"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_an_inherited_tag_applies_when_the_caller_sends_none(
+        self, guardrail, drive
+    ):
+        data = _tagged(["unrelated"], inherited=["trace_type:from-team"])
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["trace_type"] == "from-team"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_conflicting_tags_at_one_level_are_ignored(self, guardrail, drive):
+        """Two values at one level decide nothing; the next level decides."""
+        data = _tagged(
+            ["trace_type:first", "trace_type:second"],
+            inherited=["trace_type:from-team"],
+        )
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["trace_type"] == "from-team"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_conflicting_tags_with_nothing_below_fall_back_to_the_host_setting(
+        self, guardrail, drive, monkeypatch
+    ):
+        monkeypatch.setenv("REVENIUM_TRACE_TYPE", "env-trace-type")
+        data = _tagged(["trace_type:first", "trace_type:second"])
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["trace_type"] == "env-trace-type"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_conflicting_tags_with_no_fallback_leave_the_field_unset(
+        self, guardrail, drive
+    ):
+        data = _tagged(["trace_type:first", "trace_type:second"])
+        submit = await drive(guardrail, data)
+        assert "trace_type" not in submitted_args(submit)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_a_caller_tag_the_team_also_carries_stays_the_callers(
+        self, guardrail, drive
+    ):
+        """LiteLLM's caller_tags keeps a caller's choice even when a key or team repeats it.
+
+        The team carries two conflicting values; the caller picked one of them.
+        Without caller_tags the shared string would count as inherited only, the
+        inherited level would conflict, and the caller's choice would be lost.
+        """
+        data = _tagged(
+            ["trace_type:research"],
+            inherited=["trace_type:research", "trace_type:support"],
+        )
+        data["metadata"]["caller_tags"] = ("trace_type:research",)
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["trace_type"] == "research"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_a_repeated_identical_tag_is_not_a_conflict(self, guardrail, drive):
+        data = _tagged(["trace_type:research-brief", "trace_type:research-brief"])
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["trace_type"] == "research-brief"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_a_tag_value_is_validated_like_the_header(self, guardrail, drive):
+        """trace type admits letters, digits, '-' and '_' only; anything else is omitted."""
+        submit = await drive(guardrail, _tagged(["trace_type:not valid!"]))
+        assert "trace_type" not in submitted_args(submit)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    async def test_the_retired_product_id_header_still_wins(self, guardrail, drive):
+        data = _tagged(["product_name:from-tag"])
+        data["metadata"]["headers"] = {"x-revenium-product-id": "from-header"}
+        submit = await drive(guardrail, data)
+        assert submitted_args(submit)["product_name"] == "from-header"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    @pytest.mark.parametrize(
+        "tag",
+        [
+            pytest.param("organization_name:Forged Org", id="organization"),
+            pytest.param("organization_id:Forged Org", id="organization-id"),
+            pytest.param("subscriber_id:forged", id="subscriber-id"),
+            pytest.param("subscriber_email:forged@example.com", id="subscriber-email"),
+            pytest.param("subscription_id:forged", id="subscription"),
+            pytest.param("agentic_job_id:forged", id="agentic-job"),
+            pytest.param("trace_id:forged", id="trace-id"),
+        ],
+    )
+    async def test_a_tag_never_sets_identity_or_trace_grouping(
+        self, guardrail, drive, tag
+    ):
+        """Identity feeds enforcement and billing, so tags are descriptive only."""
+        submit = await drive(guardrail, _tagged([tag]))
+        args = submitted_args(submit)
+        assert "forged" not in repr(args).lower()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drive", GUARDRAIL_HOOKS)
+    @pytest.mark.parametrize(
+        "tags",
+        [
+            pytest.param("trace_type:research-brief", id="string-not-list"),
+            pytest.param({"trace_type": "research-brief"}, id="dict"),
+            pytest.param([42, None, {"a": 1}, "trace_type:"], id="non-strings-and-blank"),
+            pytest.param(["trace_type:   "], id="blank-value"),
+        ],
+    )
+    async def test_malformed_tags_never_cost_the_record(self, guardrail, drive, tags):
+        data = guardrail_data()
+        data["metadata"]["tags"] = tags
+        submit = await drive(guardrail, data)
+        assert "trace_type" not in submitted_args(submit)
+
+    @pytest.mark.asyncio
+    async def test_tags_reach_the_enforcement_check(self, monkeypatch):
+        """Where the guardrail writes the record, the check sees its tag-filled fields."""
+        guardrail = _metering_guardrail(["pre_call", "post_call"])
+        seen = {}
+        monkeypatch.setattr(
+            gmod, "check_enforcement", lambda metadata, **_keywords: seen.update(metadata)
+        )
+        data = _tagged(["task_type:research.plan", "agent:research-planner",
+                        "product_name:Research Assistant"])
+        await guardrail.async_pre_call_hook(
+            user_api_key_dict=make_key_dict(), cache=MagicMock(), data=data,
+            call_type="completion",
+        )
+        assert seen["task_type"] == "research.plan"
+        assert seen["agent"] == "research-planner"
+        assert seen["product_name"] == "Research Assistant"
+
+    @pytest.mark.asyncio
+    async def test_tags_stay_out_of_the_check_when_the_callback_meters(self, guardrail, monkeypatch):
+        """A guardrail that does not write the record checks headers only.
+
+        The deprecated callback meters without tags, so a tag-filled check would
+        judge a call by values its record never carries.
+        """
+        seen = {}
+        monkeypatch.setattr(
+            gmod, "check_enforcement", lambda metadata, **_keywords: seen.update(metadata)
+        )
+        data = _tagged(["agent:research-planner"])
+        await guardrail.async_pre_call_hook(
+            user_api_key_dict=make_key_dict(), cache=MagicMock(), data=data,
+            call_type="completion",
+        )
+        assert seen["agent"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_conflict_is_warned_once_per_request(self, monkeypatch, caplog):
+        """The pre-call hook warns; the metering hooks that read the same tags do not."""
+        guardrail = _metering_guardrail(["pre_call", "post_call"])
+        monkeypatch.setattr(gmod, "check_enforcement", lambda metadata, **_keywords: None)
+        data = _tagged(["trace_type:first", "trace_type:second"])
+        with caplog.at_level("DEBUG", logger=gmod.logger.name):
+            await guardrail.async_pre_call_hook(
+                user_api_key_dict=make_key_dict(), cache=MagicMock(), data=data,
+                call_type="completion",
+            )
+            await drive_guardrail_success(guardrail, data)
+            await drive_guardrail_logging(guardrail, data)
+        conflicts = [r for r in caplog.records if "'trace_type:' tags" in r.getMessage()]
+        assert [r.levelname for r in conflicts].count("WARNING") == 1
+        assert len(conflicts) >= 2
+
+    @pytest.mark.asyncio
+    async def test_a_post_call_only_guardrail_still_warns_once(self, caplog):
+        """With no pre-call hook to own it, the metering hook logs the WARNING."""
+        guardrail = _metering_guardrail("post_call")
+        data = _tagged(["trace_type:first", "trace_type:second"])
+        with caplog.at_level("DEBUG", logger=gmod.logger.name):
+            await drive_guardrail_success(guardrail, data)
+        conflicts = [r for r in caplog.records if "'trace_type:' tags" in r.getMessage()]
+        assert [r.levelname for r in conflicts] == ["WARNING"]
