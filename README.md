@@ -1081,6 +1081,24 @@ the others to be recorded. A malformed header value, such as a quality score of
 `high` or an effort of `very high`, is left off the record with a WARNING in the
 gateway log; the call is still recorded.
 
+**LiteLLM identities.** Below those sources, the guardrail also reads what
+LiteLLM itself resolved for the call:
+
+| Revenium field | LiteLLM source | Used when |
+|---|---|---|
+| `subscriber.id` | The end user: the request's `user`, or the header named by LiteLLM's `user_header_name` | Nothing else named a subscriber id or email. A key with an owner keeps attributing to the owner, and the end user is never paired with the owner's email. |
+| `organizationName` | The alias of the LiteLLM organization the key belongs to | No header, team alias or `revenium_organization_name` key metadata named one |
+| `productName` | The alias of the LiteLLM project the key belongs to | No `x-revenium-product-name` header or `product_name:` tag |
+
+LiteLLM organizations and projects need a LiteLLM enterprise license; without
+one these fallbacks never apply. Every record also carries `reasoningTokenCount`
+from LiteLLM's normalized usage (it is already inside the output count, which is
+unchanged) and `modelHost`, the LiteLLM provider that served the call (`openai`,
+`azure`, `bedrock`, ...; LiteLLM's `vertex_ai` is sent as `vertex` and `azure_ai` as
+`foundry`, the names coding-assistant records use). `provider` stays `LITELLM`, so
+provider-scoped spending caps and existing breakdowns are unaffected. The
+deprecated callback reads none of these.
+
 **Trace id.** The guardrail takes a record's trace id from `x-revenium-trace-id`.
 Without that header it takes the LiteLLM session id the caller sent: the
 `x-litellm-session-id` or `x-litellm-trace-id` header, or `litellm_session_id` or
@@ -1103,6 +1121,58 @@ did not title is still named. A call that sends its own `x-revenium-trace-id` is
 never named after its LiteLLM session. A name over 256 characters is cut to 256. A call
 with no LiteLLM session and no name has no trace name. The deprecated callback
 reads only the header and `REVENIUM_TRACE_NAME`.
+
+**Attribution from LiteLLM tags.** Six fields can also come from LiteLLM's own tags,
+so a gateway caller needs no Revenium header to set them. A tag `<field>:<value>`
+fills the field when its `x-revenium-*` header is absent or blank:
+
+| Tag | Fills | Instead of |
+|-----|-------|------------|
+| `trace_type:<value>` | trace type | `x-revenium-trace-type` |
+| `task_type:<value>` | task type | `x-revenium-task-type` |
+| `agent:<value>` | agent | `x-revenium-agent` |
+| `product_name:<value>` | product name | `x-revenium-product-name` |
+| `environment:<value>` | environment | `x-revenium-environment` |
+| `transaction_name:<value>` | transaction name | `x-revenium-transaction-name` |
+
+The guardrail reads the tags LiteLLM has merged by the time it runs: the caller's
+(body `metadata.tags` or root `tags`, or the `x-litellm-tags` header) and those of
+the calling virtual key, team and project. For each field the header wins, then the
+caller's tag, then a key, team or project tag, then the gateway setting such as
+`REVENIUM_TRACE_TYPE`. Two different values at one level are ignored and the next
+level decides; a WARNING names the field once per request. Values are validated as
+the header's are. A key or team tag is a per-customer default; a request tag
+describes one call:
+
+```python
+client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[...],
+    extra_body={"metadata": {"tags": ["trace_type:research-brief", "agent:research-planner"]}},
+)
+```
+
+A tag carries the same weight as its header. Agent, task type and product also
+decide which spending caps apply, so a `product_name:`, `agent:` or `task_type:` tag
+can move a call into or out of a cap filtered on that field, and a caller's request
+tag overrides a key's or team's. On upgrade, a key or team that already carries tags
+of this form starts setting these fields, for the record and the cap check alike;
+review existing tags before upgrading if you filter caps on agent, task type or
+product.
+
+Tags reach the pre-call cap check only when the guardrail writes the record itself
+(`default_on: true` with `post_call` in its mode), so a call is never checked under a
+value its record lacks. The deprecated callback reads headers only.
+
+LiteLLM records which tags the request itself sent (`caller_tags`), so a caller's tag
+stays the caller's even when the key or team carries the same string. Body
+`metadata.tags` on `/chat/completions` is the exception: LiteLLM leaves it out of
+that record, so there a tag that is also a key or team tag counts as the key's or
+team's.
+
+Tags never set the organization, subscriber, subscription, agentic job or trace id:
+those are billing identity and trace grouping, and keep coming from headers and the
+virtual key.
 
 **Organization caps and the organization header.** By default the
 `x-revenium-organization-name` header (and the retired `x-revenium-organization-id`)

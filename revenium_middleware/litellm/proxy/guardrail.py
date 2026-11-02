@@ -111,6 +111,7 @@ from revenium_middleware._core.cache_tokens import (
     extract_cache_tokens,
     get_usage_field,
     total_priced_tokens,
+    upstream_provider,
     without_openai_cache_writes,
 )
 from revenium_middleware._core.config import is_shared_call_id_enabled, shared_call_id_setting
@@ -132,10 +133,10 @@ from .middleware import (
     extract_request_headers,
     format_utc_timestamp,
     header_then_metadata,
-    key_team_alias,
     log_organization_pin_setting,
     pinned_key_team,
     present_or_none,
+    recorded_key_field,
     read_shared_call_id,
     record_shared_call_id,
     resolve_transaction_id,
@@ -345,6 +346,67 @@ def _resolve_usage(response):
         return response["usage"]
     except (TypeError, KeyError, IndexError):
         return None
+
+
+def _reasoning_token_count(usage):
+    """The reasoning tokens the provider reported, or 0.
+
+    LiteLLM normalizes every provider's usage to OpenAI's shape:
+    ``completion_tokens_details.reasoning_tokens`` on chat-shaped calls and
+    ``output_tokens_details.reasoning_tokens`` on the Responses API. The count
+    is already inside the output count, which is reported unchanged, so it
+    shows how much of the output was reasoning without pricing it twice -- the
+    OpenAI integration reports it the same way.
+    """
+    for details, field in (
+        ("completion_tokens_details", "reasoning_tokens"),
+        ("output_tokens_details", "reasoning_tokens"),
+    ):
+        count = get_usage_field(get_usage_field(usage, details, None), field, 0)
+        if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+            return count
+    return 0
+
+
+# LiteLLM's provider names are short lower-case slugs such as ``openai``,
+# ``azure``, ``bedrock`` or ``vertex_ai``; anything else is not sent.
+_MODEL_HOST_MAX_LENGTH = 64
+# LiteLLM provider names that differ from the ones coding-assistant records
+# already carry in ``modelHost``, so one host groups as one value.
+_MODEL_HOST_NAMES = {
+    "vertex_ai": "vertex",
+    "vertex_ai_beta": "vertex",
+    "azure_ai": "foundry",
+}
+
+
+def _model_host(upstream_sources):
+    """``modelHost``: the LiteLLM provider that served the call, when known.
+
+    The row's ``provider`` stays ``LITELLM``, the gateway that metered it,
+    because provider-scoped spending caps and existing breakdowns key on that
+    label. ``modelHost`` says where the model actually ran, so an
+    ``azure/gpt-4o`` call and an ``openai/gpt-4o`` call can be told apart.
+    Read only from the LiteLLM-populated ``upstream_sources``, never the
+    caller's body. Omitted rather than sent as null when unknown.
+    """
+    # Every source is asked for a named provider before the Anthropic-route
+    # shortcut applies: on the streamed /v1/messages path the first source
+    # carries only the call type, and a Claude model LiteLLM served from
+    # Bedrock or Vertex must not be called ``anthropic``.
+    naming_a_provider = [
+        source for source in upstream_sources
+        if _as_mapping(source).get("custom_llm_provider")
+    ]
+    host = upstream_provider(*naming_a_provider) or upstream_provider(*upstream_sources)
+    host = _MODEL_HOST_NAMES.get(host, host)
+    if (
+        isinstance(host, str)
+        and 0 < len(host) <= _MODEL_HOST_MAX_LENGTH
+        and all(c.isascii() and (c.isalnum() or c in "_.-") for c in host)
+    ):
+        return {"model_host": host}
+    return {}
 
 
 def _token_counts(usage, cache_read_tokens, cache_creation_tokens, upstream_sources):
@@ -649,11 +711,18 @@ def _failure_operation_type(request_data, metadata, user_api_key_dict):
     return "CHAT"
 
 
-def _key_metadata(metadata, user_api_key_dict):
-    """Custom metadata attached to the calling virtual key."""
+def _key_metadata(metadata, user_api_key_dict, data):
+    """Custom metadata attached to the calling virtual key.
+
+    Without a ``UserAPIKeyAuth`` object (the logging path) the last source is
+    what LiteLLM recorded for the key, which on ``/v1/messages`` is in
+    ``litellm_metadata`` rather than the ``metadata`` passed here.
+    """
     key_metadata = _as_mapping(metadata.get("user_api_key_metadata"))
     if not key_metadata:
-        key_metadata = _as_mapping(getattr(user_api_key_dict, "metadata", None))
+        key_metadata = _as_mapping(
+            _recorded_key_value(user_api_key_dict, data, "metadata", "user_api_key_metadata")
+        )
     return key_metadata
 
 
@@ -661,10 +730,10 @@ def _key_owner_id(key_metadata):
     return str(key_metadata.get("revenium_user_id", "") or "")
 
 
-def _key_owner_email(metadata, user_api_key_dict, key_metadata):
+def _key_owner_email(data, metadata, user_api_key_dict, key_metadata):
     return (
         metadata.get("user_api_key_user_email", "")
-        or getattr(user_api_key_dict, "user_email", "")
+        or _key_identity(user_api_key_dict, data, "user_email", _KEY_USER_EMAIL)
         or key_metadata.get("email", "")
         or ""
     )
@@ -678,12 +747,12 @@ def _same_email(first, second):
     )
 
 
-def _build_subscriber(headers, metadata, user_api_key_dict, key_metadata):
+def _build_subscriber(data, headers, metadata, user_api_key_dict, key_metadata):
     """Build the metering subscriber block.
 
     Fallback chain, most explicit first: ``x-revenium-*`` headers, then LiteLLM
     request metadata, then the ``UserAPIKeyAuth`` fields, then the virtual key's
-    own ``revenium_*`` custom metadata.
+    own ``revenium_*`` custom metadata, then LiteLLM's end user.
 
     ``x-revenium-subscriber-id`` and ``x-revenium-subscriber-email`` are taken
     as the caller states them, with no check against the key: a virtual key
@@ -696,16 +765,26 @@ def _build_subscriber(headers, metadata, user_api_key_dict, key_metadata):
     owner's own. A per-call email naming someone else gets no id, because
     grouped enforcement matches ``subscriber.id`` before the email, so the
     owner's id would check the owner's balance instead of the caller's.
+
+    LiteLLM's end user (the request's ``user``, or the operator's configured
+    end-user header) becomes the subscriber id only when nothing above named a
+    subscriber id or email, so a key with an owner keeps attributing to that
+    owner. It is never paired with the owner's email: that would record one
+    person's id under another person's address.
     """
     subscriber = {}
     per_call_id = header_then_metadata(headers, metadata, SUBSCRIBER_ID_HEADER)
     per_call_email = header_then_metadata(headers, metadata, SUBSCRIBER_EMAIL_HEADER)
-    owner_email = _key_owner_email(metadata, user_api_key_dict, key_metadata)
+    owner_email = _key_owner_email(data, metadata, user_api_key_dict, key_metadata)
     names_someone_else = per_call_email and not _same_email(per_call_email, owner_email)
     subscriber_id = per_call_id or (
         "" if names_someone_else else _key_owner_id(key_metadata)
     )
     subscriber_email = per_call_email or owner_email
+    if not (subscriber_id or subscriber_email):
+        subscriber_id = _key_identity(
+            user_api_key_dict, data, "end_user_id", _KEY_END_USER_ID
+        ) or ""
     credential_name = (
         metadata.get("user_api_key_alias", "")
         or getattr(user_api_key_dict, "key_alias", "")
@@ -727,22 +806,48 @@ def _build_subscriber(headers, metadata, user_api_key_dict, key_metadata):
 _REQUEST_BODY_VALUE_TYPES = (Mapping, str, bytes, list, int, float)
 
 
-def _key_team_alias(user_api_key_dict, data):
-    """The calling key's team alias, read only where LiteLLM itself wrote it.
+# The flat metadata keys LiteLLM records the calling key's fields under.
+_KEY_TEAM_ALIAS = "user_api_key_team_alias"
+_KEY_USER_EMAIL = "user_api_key_user_email"
+_KEY_END_USER_ID = "user_api_key_end_user_id"
+_KEY_ORGANIZATION_ALIAS = "user_api_key_org_alias"
+_KEY_PROJECT_ALIAS = "user_api_key_project_alias"
 
-    The ``UserAPIKeyAuth`` object decides whenever a hook has one. Without it
-    (the logging path) the alias comes from the logging kwargs'
-    ``litellm_params`` first, because LiteLLM spreads request params into the
-    kwargs' top level, where ``metadata`` can be the caller's body. The logging
-    path takes its ``user_api_key_auth`` from that ``metadata``, so a value a
-    JSON body can carry is never treated as the auth object.
+
+def _recorded_key_value(user_api_key_dict, data, attribute, field):
+    """A field of the calling key, read only where LiteLLM itself wrote it.
+
+    The ``UserAPIKeyAuth`` object's ``attribute`` decides whenever a hook has
+    one. Without it (the logging path) the value is the ``field`` LiteLLM
+    recorded, read from the logging kwargs' ``litellm_params`` first, because
+    LiteLLM spreads request params into the kwargs' top level, where
+    ``metadata`` can be the caller's body; see ``recorded_key_field`` for why
+    ``litellm_metadata`` is read before ``metadata``. The logging path takes
+    its ``user_api_key_auth`` from that ``metadata``, so a value a JSON body
+    can carry is never treated as the auth object.
     """
     if user_api_key_dict is not None and not isinstance(user_api_key_dict, _REQUEST_BODY_VALUE_TYPES):
-        return present_or_none(getattr(user_api_key_dict, "team_alias", None))
+        return getattr(user_api_key_dict, attribute, None)
     litellm_params = _as_mapping(data).get("litellm_params")
-    if hasattr(litellm_params, "get"):
-        return key_team_alias(litellm_params)
-    return key_team_alias(data)
+    return recorded_key_field(
+        litellm_params if hasattr(litellm_params, "get") else data, field
+    )
+
+
+def _key_identity(user_api_key_dict, data, attribute, field):
+    """``_recorded_key_value`` when it is a non-blank string, else None.
+
+    This runs in-band, and a non-string must never reach the wire.
+    """
+    value = _recorded_key_value(user_api_key_dict, data, attribute, field)
+    if isinstance(value, str) and present_or_none(value) is not None:
+        return value
+    return None
+
+
+def _key_team_alias(user_api_key_dict, data):
+    """The calling key's team alias, read only where LiteLLM itself wrote it."""
+    return _key_identity(user_api_key_dict, data, "team_alias", _KEY_TEAM_ALIAS)
 
 
 # LiteLLM stamps this on a metadata container when its ``missing_session_id``
@@ -806,12 +911,141 @@ def _litellm_trace_name(container):
     return None
 
 
+# The fields a LiteLLM tag can fill, as ``<name>:<value>``, and the header each
+# one stands in for. A tag is a second way to send one of these headers, so it
+# carries the header's weight: agent, task type and product also scope spending
+# caps, so a tag on them can move a call into or out of a cap filtered on them,
+# exactly as the header can. Organization, subscriber, subscription, agentic job
+# and trace id are not on the list: they are billing identity and trace
+# grouping, and keep coming from headers and the virtual key.
+_TAG_ATTRIBUTION_HEADERS = {
+    "trace_type": "x-revenium-trace-type",
+    "task_type": "x-revenium-task-type",
+    "agent": "x-revenium-agent",
+    "product_name": "x-revenium-product-name",
+    "environment": "x-revenium-environment",
+    "transaction_name": "x-revenium-transaction-name",
+}
+
+# A header that already decides a tag field. The retired product id header
+# still names the product (see _extract_product_name), so a tag must not
+# overrule it either.
+_TAG_FIELD_SHADOWS = {
+    "x-revenium-product-name": ("x-revenium-product-name", "x-revenium-product-id"),
+}
+
+
+def _string_tags(value):
+    """The string entries of a LiteLLM tag list, or [] for anything that is not one.
+
+    Non-strings are skipped because this runs in-band and a non-string must
+    never reach the wire; ``_tag_value`` drops blank values.
+    """
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [tag for tag in value if isinstance(tag, str)]
+
+
+def _litellm_tags(container):
+    """The request's LiteLLM tags, split into the caller's and the inherited.
+
+    LiteLLM merges the caller's tags (body ``metadata.tags``, root ``tags``, the
+    ``x-litellm-tags`` header) with the calling key's, team's and project's into
+    one ``tags`` list before any guardrail runs. It records the key, team and
+    project share as ``inherited_tags``, and what the request itself supplied as
+    ``caller_tags``. ``caller_tags`` counts first, so a caller's tag stays the
+    caller's even when a key or team carries the same string. Where LiteLLM
+    leaves a caller's tag out of ``caller_tags`` (body ``metadata.tags`` on the
+    routes that use ``metadata``), a tag counts as the caller's unless it is
+    inherited. Without ``inherited_tags`` (older LiteLLM) every tag counts as the
+    caller's. ``litellm_metadata`` is read before ``metadata`` for the reason
+    ``_litellm_trace_name`` gives.
+    """
+    container = _as_mapping(container)
+    for key in ("litellm_metadata", "metadata"):
+        level = _as_mapping(container.get(key))
+        if not isinstance(level.get("tags"), (list, tuple)):
+            continue
+        tags = _string_tags(level.get("tags"))
+        inherited = set(_string_tags(level.get("inherited_tags")))
+        caller = list(dict.fromkeys(
+            _string_tags(level.get("caller_tags"))
+            + [tag for tag in tags if tag not in inherited]
+        ))
+        return caller, [tag for tag in tags if tag in inherited]
+    return [], []
+
+
+def _tag_value(tags, field, warn):
+    """The one value ``tags`` gives ``field``, or None when none or several do.
+
+    A conflict is logged at WARNING only when ``warn`` is set, so a request is
+    reported once rather than once per hook that reads it.
+    """
+    prefix = field + ":"
+    values = list(dict.fromkeys(
+        value
+        for value in (
+            present_or_none(tag[len(prefix):].strip())
+            for tag in tags
+            if tag.startswith(prefix)
+        )
+        if value is not None
+    ))
+    if len(values) > 1:
+        if warn:
+            logger.warning(
+                "ReveniumGuardrail: %d different '%s:' tags on one request -- "
+                "ignoring them", len(values), field
+            )
+        else:
+            logger.debug(
+                "ReveniumGuardrail: %d different '%s:' tags on one request -- "
+                "ignoring them", len(values), field
+            )
+        return None
+    return values[0] if values else None
+
+
+def _attributed_headers(container, tags=True, warn=False):
+    """The request's headers, with a LiteLLM tag filling each field they leave unset.
+
+    ``container`` is the hook's request surface; headers and tags are both read
+    from it, so they can never come from two different surfaces. The order for
+    each field in ``_TAG_ATTRIBUTION_HEADERS`` is the ``x-revenium-*`` header,
+    then the caller's tag, then a tag inherited from the calling key, team or
+    project, then whatever the field falls back to without either (for most,
+    the gateway's ``REVENIUM_*`` setting). Tags therefore reach the record
+    through the same getters and validation a header does. Two different values
+    at one level are a conflict and that level is skipped; ``warn`` makes that
+    a WARNING. ``tags=False`` returns the headers alone.
+    """
+    headers = _as_mapping(extract_request_headers(container))
+    if not tags:
+        return headers
+    caller_tags, inherited_tags = _litellm_tags(container)
+    if not caller_tags and not inherited_tags:
+        return headers
+    merged = dict(headers)
+    for field, header in _TAG_ATTRIBUTION_HEADERS.items():
+        shadows = _TAG_FIELD_SHADOWS.get(header, (header,))
+        if any(present_or_none(merged.get(name)) is not None for name in shadows):
+            continue
+        for level in (caller_tags, inherited_tags):
+            value = _tag_value(level, field, warn)
+            if value is not None:
+                merged[header] = value
+                break
+    return merged
+
+
 def _organization_name(data, headers, metadata, user_api_key_dict, key_metadata):
     """Organization attribution, headers first then key/team identity.
 
     When the operator pins the organization to the key's team
     (``REVENIUM_LITELLM_PIN_ORGANIZATION_TO_KEY_TEAM``) a key with a team alias
-    decides it before any header is read.
+    decides it before any header is read. The LiteLLM organization the key
+    belongs to is the last fallback, for a key with no team.
 
     The header half is ``middleware._extract_organization_name`` -- the same
     implementation the callback uses, including its deprecation warning for
@@ -822,10 +1056,25 @@ def _organization_name(data, headers, metadata, user_api_key_dict, key_metadata)
         return pinned
     organization_name = _extract_organization_name(headers, metadata)
     if organization_name is None:
-        organization_name = present_or_none(getattr(user_api_key_dict, "team_alias", None))
+        organization_name = _key_team_alias(user_api_key_dict, data)
     if organization_name is None:
         organization_name = present_or_none(key_metadata.get("revenium_organization_name"))
+    if organization_name is None:
+        organization_name = _key_identity(
+            user_api_key_dict, data, "organization_alias", _KEY_ORGANIZATION_ALIAS
+        )
     return organization_name
+
+
+def _product_name(data, headers, user_api_key_dict):
+    """Product attribution: the ``x-revenium-product-name`` header, else the
+    LiteLLM project the calling key belongs to."""
+    product_name = _extract_product_name(headers)
+    if product_name is None:
+        product_name = _key_identity(
+            user_api_key_dict, data, "project_alias", _KEY_PROJECT_ALIAS
+        )
+    return product_name
 
 
 def _job_fields(headers, key_metadata):
@@ -863,15 +1112,15 @@ def _enforcement_metadata(data, headers, metadata, user_api_key_dict):
     of the SDK uses for the same request and are carried so a future rule
     dimension finds them already populated.
     """
-    key_metadata = _key_metadata(metadata, user_api_key_dict)
-    subscriber = _build_subscriber(headers, metadata, user_api_key_dict, key_metadata)
+    key_metadata = _key_metadata(metadata, user_api_key_dict, data)
+    subscriber = _build_subscriber(data, headers, metadata, user_api_key_dict, key_metadata)
     credential = (subscriber.get("credential") or {}).get("value") or ""
     usage_metadata = {
         "model": data.get("model"),
         "organization_name": _organization_name(
             data, headers, metadata, user_api_key_dict, key_metadata
         ),
-        "product_name": _extract_product_name(headers),
+        "product_name": _product_name(data, headers, user_api_key_dict),
         "task_type": headers.get("x-revenium-task-type"),
         "agent": headers.get("x-revenium-agent"),
         "subscriber_credential": credential,
@@ -1054,6 +1303,11 @@ class ReveniumGuardrail(CustomGuardrail):
         self._meter_key_trusted = bool(
             pre_call_runs_every_request and self._meters_every_request
         )
+        # LiteLLM tags reach the pre-call budget check only where this guardrail
+        # both runs that check on every request and writes the record, so a call
+        # is never checked under a tag value its record lacks. That check then
+        # owns the conflict WARNING; otherwise the metering hooks log it.
+        self._checks_tags_pre_call = self._meter_key_trusted
         if shared_call_id_flag:
             try:
                 litellm_version = importlib.metadata.version("litellm")
@@ -1211,7 +1465,14 @@ class ReveniumGuardrail(CustomGuardrail):
         metadata = _as_mapping(data.get("metadata"))
         # NOT metadata["headers"]: on /v1/messages LiteLLM fills
         # litellm_metadata instead. See extract_request_headers.
-        headers = _as_mapping(extract_request_headers(data))
+        # Tags join the check only where this guardrail writes the record, so
+        # the call is checked against the values it is recorded under; the
+        # deprecated callback reads headers alone.
+        headers = _attributed_headers(
+            data,
+            tags=self._checks_tags_pre_call,
+            warn=self._checks_tags_pre_call,
+        )
         try:
             usage_metadata = _enforcement_metadata(
                 data, headers, metadata, user_api_key_dict
@@ -1364,7 +1625,7 @@ class ReveniumGuardrail(CustomGuardrail):
             metadata = _as_mapping(data.get("metadata"))
             # NOT metadata["headers"]: on /v1/messages LiteLLM fills
             # litellm_metadata instead. See extract_request_headers.
-            headers = _as_mapping(extract_request_headers(data))
+            headers = _attributed_headers(data, warn=not self._checks_tags_pre_call)
 
             hidden_params = _as_mapping(metadata.get("hidden_params"))
             if not hidden_params:
@@ -1517,7 +1778,9 @@ class ReveniumGuardrail(CustomGuardrail):
             # request body, so reading metadata alone drops every documented
             # x-revenium-* header here and takes a forged one where the caller
             # planted it. See extract_request_headers.
-            headers = _as_mapping(extract_request_headers(litellm_params))
+            headers = _attributed_headers(
+                litellm_params, warn=not self._checks_tags_pre_call
+            )
             hidden_params = _as_mapping(metadata.get("hidden_params"))
             if not hidden_params:
                 hidden_params = _as_mapping(getattr(response_obj, "_hidden_params", None))
@@ -1649,7 +1912,9 @@ class ReveniumGuardrail(CustomGuardrail):
             metadata = _as_mapping(request_data.get("metadata"))
             # NOT metadata["headers"]: on /v1/messages LiteLLM fills
             # litellm_metadata instead. See extract_request_headers.
-            headers = _as_mapping(extract_request_headers(request_data))
+            headers = _attributed_headers(
+                request_data, warn=not self._checks_tags_pre_call
+            )
             hidden_params = _as_mapping(metadata.get("hidden_params"))
             if not hidden_params:
                 hidden_params = _as_mapping(
@@ -1776,7 +2041,7 @@ class ReveniumGuardrail(CustomGuardrail):
             the ``agenticJob*`` fields, which the metering API has no typed
             parameters for.
         """
-        key_metadata = _key_metadata(metadata, user_api_key_dict)
+        key_metadata = _key_metadata(metadata, user_api_key_dict, data)
         cache_read_tokens, cache_creation_tokens = extract_cache_tokens(usage)
         input_tokens, completion_tokens, total_tokens = _token_counts(
             usage, cache_read_tokens, cache_creation_tokens, upstream_sources
@@ -1788,7 +2053,7 @@ class ReveniumGuardrail(CustomGuardrail):
                 )
             )
         subscriber = _build_subscriber(
-            headers, metadata, user_api_key_dict, key_metadata
+            data, headers, metadata, user_api_key_dict, key_metadata
         )
         # Both callers reach here, and only one of them arrives in UTC: the
         # post-call hook builds aware values, while the logging event is handed
@@ -1834,7 +2099,8 @@ class ReveniumGuardrail(CustomGuardrail):
             "input_token_count": input_tokens,
             "provider": LITELLM_PROVIDER,
             "model_source": LITELLM_PROVIDER,
-            "reasoning_token_count": 0,
+            "reasoning_token_count": _reasoning_token_count(usage),
+            **_model_host(upstream_sources),
             "request_time": format_utc_timestamp(request_time),
             "response_time": response_time_str,
             "completion_start_time": response_time_str,
@@ -1850,7 +2116,7 @@ class ReveniumGuardrail(CustomGuardrail):
                 data, headers, metadata, user_api_key_dict, key_metadata
             ),
             "subscription_id": headers.get("x-revenium-subscription-id"),
-            "product_name": _extract_product_name(headers),
+            "product_name": _product_name(data, headers, user_api_key_dict),
             "agent": headers.get("x-revenium-agent"),
             # Present only when the caller sent the header: create_completion
             # drops NotGiven but keeps an explicit None, which would reach the

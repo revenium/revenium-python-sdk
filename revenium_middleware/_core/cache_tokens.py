@@ -238,6 +238,15 @@ def _upstream_provider(sources) -> Optional[str]:
     return None
 
 
+def upstream_provider(*sources) -> Optional[str]:
+    """The LiteLLM provider that served the call, lower-cased, or None.
+
+    ``sources`` are LiteLLM-populated surfaces in lookup order, as for
+    ``prompt_tokens_fold_cache``; the first that names a provider decides.
+    """
+    return _upstream_provider(sources)
+
+
 def _provider_folds_cache(provider: str, sources) -> bool:
     if provider in _CACHE_FOLDING_PROVIDERS:
         return True

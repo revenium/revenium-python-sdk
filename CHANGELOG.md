@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-11-02
+
+### Added
+- LiteLLM proxy guardrail: a call's trace type, task type, agent, product name, environment and transaction name can now come from LiteLLM's own tags, so a gateway caller can describe its traffic without any `x-revenium-*` header. A tag of the form `<field>:<value>` (`trace_type:research-brief`, `task_type:research.plan`, `agent:research-planner`, `product_name:Research Assistant`, `environment:demo`, `transaction_name:Plan Research`) fills that field when its header is absent or blank. Tags are read wherever LiteLLM merges them before the guardrail runs: body `metadata.tags` or root `tags`, the `x-litellm-tags` header, and the calling virtual key's, team's and project's `tags`. For each field the order is the `x-revenium-*` header, then the caller's tag, then a tag inherited from the key, team or project, then the gateway setting (`REVENIUM_TRACE_TYPE` and the like). Two different values at one level are ignored and the next level decides, with one WARNING per request. Values go through the same validation as the header, so a trace type with characters Revenium refuses is still left off. A tag carries its header's weight: agent, task type and product also scope spending caps, so on upgrade a key or team that already carries tags of this form starts setting those fields for the record and the cap check. Tags join the pre-call cap check only when the guardrail writes the record itself, so a call is never checked under a value its record lacks. Organization, subscriber, subscription, agentic job and trace id never come from a tag. The deprecated callback reads headers only.
+- LiteLLM proxy guardrail: records carry more of what LiteLLM already knows about a call, so a proxy that relies on LiteLLM's own objects instead of `x-revenium-*` headers loses less attribution. LiteLLM's end user (the request's `user`, or the configured end-user header) becomes `subscriber.id` when nothing else named a subscriber id or email; a key with an owner keeps attributing to the owner. The alias of the LiteLLM organization a key belongs to becomes the organization name when no header, team alias or `revenium_organization_name` key metadata named one, and the alias of its LiteLLM project becomes the product name when no `x-revenium-product-name` header or `product_name:` tag did; both need a LiteLLM enterprise license. Spending caps see the same subscriber, organization and product as the record.
+- LiteLLM proxy guardrail: `reasoningTokenCount` is the reasoning tokens LiteLLM's normalized usage reports (`completion_tokens_details.reasoning_tokens`, or `output_tokens_details.reasoning_tokens` on the Responses API) instead of always 0. The output token count, which already includes them, is unchanged, so cost is unchanged.
+- LiteLLM proxy guardrail: `modelHost` names the LiteLLM provider that served the call (`openai`, `azure`, `bedrock`, ...; `vertex_ai` is sent as `vertex` and `azure_ai` as `foundry`, the names coding-assistant records already use), so an `azure/gpt-4o` call and an `openai/gpt-4o` call can be told apart. It is read only from LiteLLM's own record of the call, never the request body, and left off when unknown. `provider` and `modelSource` stay `LITELLM`, so provider-scoped spending caps and existing breakdowns are unaffected. The deprecated callback is unchanged.
+
+### Fixed
+- LiteLLM proxy guardrail: a streamed `/v1/messages` call (Claude Code's route) is attributed to the calling key's owner, team and key metadata (`revenium_user_id`, `revenium_organization_name`, agentic job fields) as LiteLLM recorded them. That path read them from the request's `metadata`, which on this route is the caller's own body, so the owner's email and id, the team alias as organization, and the key metadata were dropped from the record while the pre-call spending-cap check, which reads LiteLLM's key object, still used them.
+
 ## [0.12.1] - 2026-10-30
 
 ### Fixed
@@ -587,6 +598,7 @@ These can change what your application sees when you upgrade from 0.9.2. Each on
 - Selective metering via `REVENIUM_SELECTIVE_METERING` environment variable
 - Configurable logging with `REVENIUM_LOG_LEVEL`
 
+[0.13.0]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.13.0
 [0.12.1]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.12.1
 [0.12.0]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.12.0
 [0.11.0]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.11.0

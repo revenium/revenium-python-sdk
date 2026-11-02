@@ -1262,6 +1262,7 @@ SAFE_LOG_LINES = {
     ('litellm/client/middleware.py', 'logger.debug("Metering thread started: %s", thread)'): THREAD,
     ('litellm/client/middleware.py', 'logger.debug("Metering call result: %s", result)'): METERING_RESULT,
     ('litellm/proxy/guardrail.py', 'count,'): NUMBER,
+    ('litellm/proxy/guardrail.py', '"ignoring them", len(values), field'): ID_LIST,
     ('litellm/proxy/guardrail.py', 'getattr(self, "guardrail_name", None),'): SETTING,
     ('litellm/proxy/guardrail.py', 'getattr(self, "event_hook", None),'): SETTING,
     ('litellm/proxy/guardrail.py', 'scan_raw_request,'): SETTING,
