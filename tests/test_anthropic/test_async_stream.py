@@ -608,8 +608,8 @@ def test_foundry_label_survives_bedrock_being_disabled(monkeypatch):
     assert payload["provider"] == "Foundry"
 
 
-def test_bedrock_async_stream_is_attributed_to_aws_without_rerouting(monkeypatch):
-    """An async Bedrock stream stays on the SDK transport and is labelled AWS.
+def test_bedrock_async_stream_is_attributed_to_bedrock_without_rerouting(monkeypatch):
+    """An async Bedrock stream stays on the SDK transport and is labelled Bedrock.
 
     The sync wrapper's Bedrock fast path is a blocking boto3 call and cannot
     serve an async context manager, so this path must not hand the request to
@@ -624,7 +624,7 @@ def test_bedrock_async_stream_is_attributed_to_aws_without_rerouting(monkeypatch
         payload = stream_payloads(consume_events, client=client)[0]
 
     bedrock_handler.assert_not_called()
-    assert payload["provider"] == "AWS"
+    assert payload["provider"] == "Bedrock"
     assert payload["model_source"] == "ANTHROPIC"
 
 

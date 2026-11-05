@@ -28,9 +28,12 @@
 # BACK-4027, on 2026-10-08, and by BACK-4229, on 2026-10-10. New methods added to
 # existing roots by BACK-4571 were judged on 2026-10-14, by BACK-4888 on
 # 2026-10-20, by BACK-4958 and BACK-4978 on 2026-10-22, by BACK-5241 on
-# 2026-10-30, and the organization admin roots anthropic 2.4.0 added on
-# 2026-11-02. Group A is the list of known billable gaps: moving a method out of
-# A means adding its wrap and its manifest rows.
+# 2026-10-30, the organization admin roots anthropic 2.4.0 added on
+# 2026-11-02, and the admin workload identity providers openai 3.44.0 added and
+# the project service tier settings openai 3.45.0 added on 2026-11-05, and the
+# organization users sign_out anthropic 2.6.0 added, also on 2026-11-05. Group A is
+# the list of known billable gaps: moving a method out of A means adding its wrap
+# and its manifest rows.
 #
 # A group marked `disclose: true` is one the customer pays the provider for while
 # nothing reaches Revenium. README.md's "Calls the SDK does not meter" list must
@@ -701,6 +704,8 @@ providers:
           - "AsyncOpenAI.admin.organization.projects.service_accounts.list"
           - "AsyncOpenAI.admin.organization.projects.service_accounts.retrieve"
           - "AsyncOpenAI.admin.organization.projects.service_accounts.update"
+          - "AsyncOpenAI.admin.organization.projects.service_tier_settings.retrieve"
+          - "AsyncOpenAI.admin.organization.projects.service_tier_settings.update"
           - "AsyncOpenAI.admin.organization.projects.spend_alerts.create"
           - "AsyncOpenAI.admin.organization.projects.spend_alerts.delete"
           - "AsyncOpenAI.admin.organization.projects.spend_alerts.list"
@@ -752,6 +757,16 @@ providers:
           - "AsyncOpenAI.admin.organization.users.roles.list"
           - "AsyncOpenAI.admin.organization.users.roles.retrieve"
           - "AsyncOpenAI.admin.organization.users.update"
+          - "AsyncOpenAI.admin.organization.workload_identity_providers.create"
+          - "AsyncOpenAI.admin.organization.workload_identity_providers.delete"
+          - "AsyncOpenAI.admin.organization.workload_identity_providers.federation_rules.create"
+          - "AsyncOpenAI.admin.organization.workload_identity_providers.federation_rules.delete"
+          - "AsyncOpenAI.admin.organization.workload_identity_providers.federation_rules.list"
+          - "AsyncOpenAI.admin.organization.workload_identity_providers.federation_rules.retrieve"
+          - "AsyncOpenAI.admin.organization.workload_identity_providers.federation_rules.update"
+          - "AsyncOpenAI.admin.organization.workload_identity_providers.list"
+          - "AsyncOpenAI.admin.organization.workload_identity_providers.retrieve"
+          - "AsyncOpenAI.admin.organization.workload_identity_providers.update"
           - "OpenAI.admin.organization.admin_api_keys.create"
           - "OpenAI.admin.organization.admin_api_keys.delete"
           - "OpenAI.admin.organization.admin_api_keys.list"
@@ -832,6 +847,8 @@ providers:
           - "OpenAI.admin.organization.projects.service_accounts.list"
           - "OpenAI.admin.organization.projects.service_accounts.retrieve"
           - "OpenAI.admin.organization.projects.service_accounts.update"
+          - "OpenAI.admin.organization.projects.service_tier_settings.retrieve"
+          - "OpenAI.admin.organization.projects.service_tier_settings.update"
           - "OpenAI.admin.organization.projects.spend_alerts.create"
           - "OpenAI.admin.organization.projects.spend_alerts.delete"
           - "OpenAI.admin.organization.projects.spend_alerts.list"
@@ -883,6 +900,16 @@ providers:
           - "OpenAI.admin.organization.users.roles.list"
           - "OpenAI.admin.organization.users.roles.retrieve"
           - "OpenAI.admin.organization.users.update"
+          - "OpenAI.admin.organization.workload_identity_providers.create"
+          - "OpenAI.admin.organization.workload_identity_providers.delete"
+          - "OpenAI.admin.organization.workload_identity_providers.federation_rules.create"
+          - "OpenAI.admin.organization.workload_identity_providers.federation_rules.delete"
+          - "OpenAI.admin.organization.workload_identity_providers.federation_rules.list"
+          - "OpenAI.admin.organization.workload_identity_providers.federation_rules.retrieve"
+          - "OpenAI.admin.organization.workload_identity_providers.federation_rules.update"
+          - "OpenAI.admin.organization.workload_identity_providers.list"
+          - "OpenAI.admin.organization.workload_identity_providers.retrieve"
+          - "OpenAI.admin.organization.workload_identity_providers.update"
       - reason: "local helper, token count, moderation, ephemeral credential, polling or signature check: no billable model usage on this call"
         methods:
           - "AsyncOpenAI.beta.realtime.sessions.create"
@@ -1409,6 +1436,7 @@ providers:
           - "Anthropic.beta.organization.users.list"
           - "Anthropic.beta.organization.users.remove"
           - "Anthropic.beta.organization.users.retrieve"
+          - "Anthropic.beta.organization.users.sign_out"
           - "Anthropic.beta.organization.users.update"
           - "Anthropic.beta.organization.webhooks.create"
           - "Anthropic.beta.organization.webhooks.delete"
@@ -1630,6 +1658,7 @@ providers:
           - "AsyncAnthropic.beta.organization.users.list"
           - "AsyncAnthropic.beta.organization.users.remove"
           - "AsyncAnthropic.beta.organization.users.retrieve"
+          - "AsyncAnthropic.beta.organization.users.sign_out"
           - "AsyncAnthropic.beta.organization.users.update"
           - "AsyncAnthropic.beta.organization.webhooks.create"
           - "AsyncAnthropic.beta.organization.webhooks.delete"
@@ -2501,6 +2530,7 @@ providers:
           - "litellm.holds_secret_pointer"
           - "litellm.http2_enabled"
           - "litellm.identify"
+          - "litellm.invalid_provider_routing_hints_message"
           - "litellm.is_bedrock_pricing_only_model"
           - "litellm.is_decisions_model_mode"
           - "litellm.is_nested_path"
@@ -2528,6 +2558,7 @@ providers:
           - "litellm.prompt_factory"
           - "litellm.read_config_args"
           - "litellm.realtime_health_check"
+          - "litellm.reasoning_effort_with_summary_alias"
           - "litellm.redact_message_input_output_from_logging"
           - "litellm.redact_string"
           - "litellm.register_model"
@@ -2560,6 +2591,7 @@ providers:
           - "litellm.supports_reasoning"
           - "litellm.supports_response_schema"
           - "litellm.supports_system_messages"
+          - "litellm.supports_tool_search"
           - "litellm.supports_url_context"
           - "litellm.supports_video_input"
           - "litellm.supports_vision"

@@ -1178,7 +1178,7 @@ SAFE_LOG_LINES = {
     ('anthropic/middleware.py', 'logger.debug("Anthropic client.messages.create wrapper called: %s: %s", wrapped, sanitize_for_logging(args))'): CALLABLE,
     ('anthropic/prompt_extractor.py', 'f"truncated: {prompts_truncated}"'): NUMBER,
     ('anthropic/provider.py', 'logger.debug(f"Provider detection completed: {cache.detected_provider}")'): MODEL_OR_PROVIDER,
-    ('anthropic/provider.py', 'logger.debug(f"Foundry provider detected via base_url: {candidate}")'): LOCATION,
+    ('anthropic/provider.py', 'logger.debug(f"{route.provider.name} provider detected via base_url: {candidate}")'): LOCATION,
     ('anthropic/provider.py', 'logger.debug(f"Bedrock provider detected via base_url: {base_url}")'): LOCATION,
     ('anthropic/provider.py', 'logger.debug(f"Bedrock provider detected via client.base_url: {client.base_url}")'): LOCATION,
     ('fal/_metering.py', 'logger.debug("Metering thread started: %s", thread)'): THREAD,

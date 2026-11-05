@@ -126,7 +126,7 @@ class PlatformStub:
 
 
 PLATFORMS = {
-    "bedrock": (BEDROCK_REQUEST, "AWS"),
+    "bedrock": (BEDROCK_REQUEST, "Bedrock"),
     "vertex": (VERTEX_REQUEST, "ANTHROPIC"),
     "foundry": (FOUNDRY_REQUEST, "Foundry"),
 }

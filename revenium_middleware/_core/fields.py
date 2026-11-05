@@ -122,6 +122,8 @@ EFFORT_FIELD_MAP = {
 PROMPT_CONTEXT_FIELD_MAP = {
     "client_surface": ("client_surface", "clientSurface"),
     "entrypoint": ("entrypoint",),
+    "ccr_session_id": ("ccr_session_id", "ccrSessionId"),
+    "inference_geo": ("inference_geo", "inferenceGeo"),
     "prompt_id": ("prompt_id", "promptId"),
     "prompt_length": ("prompt_length", "promptLength"),
     "query_source": ("query_source", "querySource"),
@@ -360,7 +362,7 @@ def extract_effort_field(source: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
 
 
 def extract_prompt_context_fields(source: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
-    """Resolve client-surface, entrypoint, prompt, speed-mode and subagent attribution from caller metadata.
+    """Resolve client-surface, entrypoint, cloud-session, inference-geo, prompt, speed-mode and subagent attribution.
 
     Each field resolves from its snake_case key then its camelCase alias and is
     returned under the snake_case keyword ``create_completion`` expects. Absent

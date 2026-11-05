@@ -290,12 +290,12 @@ class TestBedrockClientsStayOnTheSdkTransport:
         pytest.param(lambda client: _standard(client).parse(**REQUEST), False, id="standard-parse"),
         pytest.param(lambda client: _drain_sync_stream(_beta(client), BETA_REQUEST), True, id="beta-stream"),
     ])
-    def test_metered_under_the_aws_label_without_rerouting(self, stub, records, bedrock_detected, call, streamed):
+    def test_metered_under_the_bedrock_label_without_rerouting(self, stub, records, bedrock_detected, call, streamed):
         call(stub.sync_client())
         fast_create, fast_stream = bedrock_detected
         fast_create.assert_not_called()
         fast_stream.assert_not_called()
-        assert_one_record(stub, records, streamed=streamed, provider="AWS")
+        assert_one_record(stub, records, streamed=streamed, provider="Bedrock")
 
 
 TOOL_STEP_ID = "msg_tool_step"
@@ -862,7 +862,7 @@ class TestUsageIterations:
             stub = iteration_stub()
             _call(_create_sync, _beta, stub, BETA_REQUEST)
         fast_create.assert_not_called()
-        assert_iteration_records(stub, records, streamed=False, provider="AWS")
+        assert_iteration_records(stub, records, streamed=False, provider="Bedrock")
 
     def test_streaming_response_raw_stream_meters_iterations(self, records):
         stub = iteration_stub()

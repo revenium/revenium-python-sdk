@@ -41,6 +41,7 @@ from revenium_middleware.anthropic.provider import Provider  # noqa: E402
 RULE_ID = 4190
 REQUESTED_CLAUDE = "claude-3-sonnet-20240229"
 FAL_MODEL = "fal_ai/" + calls.FAL_APP
+BEDROCK_CAP_SPELLINGS = ["AWS", "aws", "Amazon Bedrock", "AWS BEDROCK", "Bedrock", "bedrock"]
 
 
 def cap(*filters, action="BLOCK"):
@@ -79,8 +80,10 @@ BEDROCK_FAST_PATHS = [
 ]
 
 
+@pytest.mark.parametrize("spelling", BEDROCK_CAP_SPELLINGS)
 @pytest.mark.parametrize("wrapper, handler", BEDROCK_FAST_PATHS)
-def test_anthropic_bedrock_fast_path_is_refused_before_boto3(wrapper, handler, seed):
+def test_anthropic_bedrock_fast_path_is_refused_before_boto3(wrapper, handler, spelling, seed, monkeypatch):
+    checks = record_cap_checks(monkeypatch)
     instance = SimpleNamespace(_client=SimpleNamespace(aws_region="us-east-1"))
     wrapped = MagicMock()
 
@@ -90,7 +93,7 @@ def test_anthropic_bedrock_fast_path_is_refused_before_boto3(wrapper, handler, s
 
     with patch.object(anthropic_middleware, "detect_provider", return_value=Provider.BEDROCK), \
             patch.object(anthropic_middleware, handler) as bedrock:
-        seed(cap(scoped("PROVIDER", "IS", "AWS"), scoped("MODEL", "IS", REQUESTED_CLAUDE)))
+        seed(cap(scoped("PROVIDER", "IS", spelling), scoped("MODEL", "IS", REQUESTED_CLAUDE)))
         with pytest.raises(BudgetExceededError):
             call()
         bedrock.assert_not_called()
@@ -99,6 +102,7 @@ def test_anthropic_bedrock_fast_path_is_refused_before_boto3(wrapper, handler, s
         call()
         bedrock.assert_called_once()
     wrapped.assert_not_called()
+    assert {check.provider for check in checks} == {"Bedrock"}
 
 
 def test_anthropic_foundry_call_is_checked_under_the_foundry_label(seed):
@@ -150,10 +154,12 @@ def test_selectively_unmetered_calls_are_still_refused(call_id, provider, model,
 CLAUDE_ON_BEDROCK = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 
 
+@pytest.mark.parametrize("spelling", BEDROCK_CAP_SPELLINGS)
 @pytest.mark.parametrize("operation", ["InvokeModel", "Converse"])
-def test_bedrock_transport_refuses_a_raw_boto3_call(operation, monkeypatch, seed):
+def test_bedrock_transport_refuses_a_raw_boto3_call(operation, spelling, monkeypatch, seed):
     from revenium_middleware.anthropic import bedrock_transport
 
+    checks = record_cap_checks(monkeypatch)
     monkeypatch.setenv("REVENIUM_BEDROCK_TRANSPORT", "1")
     instance = SimpleNamespace(meta=SimpleNamespace(service_model=SimpleNamespace(service_name="bedrock-runtime"),
                                                     region_name="us-east-1"))
@@ -163,14 +169,17 @@ def test_bedrock_transport_refuses_a_raw_boto3_call(operation, monkeypatch, seed
         bedrock_transport._make_api_call_wrapper(boto3_call, instance, (operation, {"modelId": CLAUDE_ON_BEDROCK}), {})
 
     with patch.object(bedrock_transport, "_observe_response"):
-        seed(cap(scoped("PROVIDER", "IS", "AWS"), scoped("MODEL", "IS", CLAUDE_ON_BEDROCK)))
+        seed(cap(scoped("PROVIDER", "IS", spelling), scoped("MODEL", "IS", CLAUDE_ON_BEDROCK)))
         with pytest.raises(BudgetExceededError):
             call()
         boto3_call.assert_not_called()
 
-        seed(cap(scoped("PROVIDER", "IS_NOT", "AWS")))
+        seed(cap(scoped("PROVIDER", "IS_NOT", spelling)))
         call()
-    boto3_call.assert_called_once()
+        seed(cap(scoped("PROVIDER", "IS", "ANTHROPIC")))
+        call()
+    assert boto3_call.call_count == 2
+    assert {check.provider for check in checks} == {"Bedrock"}
 
 
 def _invoke_model_answer():
@@ -186,12 +195,13 @@ def _converse_answer():
             "output": {"message": {"role": "assistant", "content": []}}}
 
 
+@pytest.mark.parametrize("spelling", BEDROCK_CAP_SPELLINGS)
 @pytest.mark.parametrize("operation, answer", [
     pytest.param("InvokeModel", _invoke_model_answer, id="InvokeModel"),
     pytest.param("Converse", _converse_answer, id="Converse"),
 ])
 def test_bedrock_transport_refuses_a_selectively_unmetered_raw_boto3_call(
-        operation, answer, selective_metering, monkeypatch, seed):
+        operation, answer, spelling, selective_metering, monkeypatch, seed):
     """BACK-4320: a raw boto3 call outside a @revenium_meter function is still capped under the
     LangChain attribution, then passed through unrecorded, leaving that attribution for the record."""
     from revenium_middleware._core.call_ownership import (
@@ -203,6 +213,7 @@ def test_bedrock_transport_refuses_a_selectively_unmetered_raw_boto3_call(
     instance = SimpleNamespace(meta=SimpleNamespace(service_model=SimpleNamespace(service_name="bedrock-runtime"),
                                                     region_name="us-east-1"))
     boto3_call = MagicMock(side_effect=lambda *args, **kwargs: answer())
+    checks = record_cap_checks(monkeypatch)
 
     def call():
         bedrock_transport._make_api_call_wrapper(boto3_call, instance, (operation, {"modelId": CLAUDE_ON_BEDROCK}), {})
@@ -211,14 +222,17 @@ def test_bedrock_transport_refuses_a_selectively_unmetered_raw_boto3_call(
     try:
         publish_callback_metadata({"agent": "langchain-agent"}, providers={BEDROCK})
         with patch.object(bedrock_transport, "_emit_completion") as emit:
-            seed(cap(scoped("PROVIDER", "IS", "AWS"), scoped("MODEL", "IS", CLAUDE_ON_BEDROCK)))
+            seed(cap(scoped("PROVIDER", "IS", spelling), scoped("MODEL", "IS", CLAUDE_ON_BEDROCK)))
             with pytest.raises(BudgetExceededError):
                 call()
             boto3_call.assert_not_called()
 
-            seed(cap(scoped("PROVIDER", "IS_NOT", "AWS")))
+            seed(cap(scoped("PROVIDER", "IS_NOT", spelling)))
             call()
-        boto3_call.assert_called_once()
+            seed(cap(scoped("PROVIDER", "IS", "ANTHROPIC")))
+            call()
+        assert boto3_call.call_count == 2
+        assert {check.provider for check in checks} == {"Bedrock"}
         emit.assert_not_called()
         assert peek_callback_metadata(BEDROCK) == {"agent": "langchain-agent"}
     finally:
@@ -547,12 +561,14 @@ def test_langchain_callback_refuses_a_vendor_on_its_own_sdk(invoke, ls_provider,
 
 @pytest.mark.parametrize("ls_provider, judged_as", [
     ("groq", "OPENAI"), ("mistral", "MISTRAL"), ("a-vendor-revenium-does-not-know", "OPENAI"),
+    ("amazon_bedrock", "Bedrock"),
 ])
 def test_an_unlisted_vendor_is_not_refused_by_another_providers_cap(ls_provider, judged_as, seed, monkeypatch):
     """BACK-4220, BACK-4258: the callback checks under the label the record is sent with."""
     from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
     from langchain_core.messages import AIMessage
 
+    monkeypatch.delenv("REVENIUM_BEDROCK_TRANSPORT", raising=False)
     model = _with_ls_provider(GenericFakeChatModel, ls_provider)(
         messages=iter([AIMessage(content="hello")]), callbacks=[_langchain_handler("own-sdk-agent")])
     seed(cap(scoped("PROVIDER", "IS", "ANTHROPIC")))
@@ -560,6 +576,24 @@ def test_an_unlisted_vendor_is_not_refused_by_another_providers_cap(ls_provider,
 
     assert model.invoke("hi").content == "hello"
     assert [(check.provider, check.usage_metadata.get("agent")) for check in checks] == [(judged_as, "own-sdk-agent")]
+
+
+@pytest.mark.parametrize("spelling", BEDROCK_CAP_SPELLINGS)
+def test_a_langchain_bedrock_call_is_refused_by_every_bedrock_spelling(spelling, seed, monkeypatch):
+    """BACK-4462: with the boto3 transport off, the callback refuses a Bedrock model under a cap
+    written with any spelling of Bedrock."""
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.messages import AIMessage
+
+    monkeypatch.delenv("REVENIUM_BEDROCK_TRANSPORT", raising=False)
+    answers = iter([AIMessage(content="hello")])
+    model = _with_ls_provider(GenericFakeChatModel, "amazon_bedrock")(
+        messages=answers, callbacks=[_langchain_handler("bedrock-agent")])
+    seed(cap(scoped("PROVIDER", "IS", spelling)))
+
+    with pytest.raises(BudgetExceededError):
+        model.invoke("hi")
+    assert next(answers).content == "hello", "the model was called"
 
 
 MISTRAL_CAPS = [
@@ -1425,6 +1459,45 @@ def test_a_foundry_client_is_judged_as_anthropic_by_provider_caps(rule_filter, r
         _assert_judged(_foundry, refused, provider_requests)
 
 
+def _google_cloud():
+    import httpx2
+    return anthropic.AnthropicGoogleCloud(project="demo-project", location="global", workspace_id="wrkspc_demo",
+                                          skip_auth=True,
+                                          http_client=httpx2.Client(
+                                              transport=httpx2.MockTransport(calls._anthropic_handler)))
+
+
+requires_google_cloud_client = pytest.mark.skipif(
+    not hasattr(anthropic, "AnthropicGoogleCloud"),
+    reason="Installed anthropic SDK predates the Google Cloud client classes")
+
+# The server's ProviderVocabulary gives GOOGLE no Anthropic alias bucket, so
+# Anthropic-scoped caps do not count Claude billed through Google Cloud.
+GOOGLE_CLOUD_PROVIDER_CAPS = [
+    pytest.param(scoped("PROVIDER", "IS", "Google"), True, id="is_google"),
+    pytest.param(scoped("PROVIDER", "IS", "GOOGLE"), True, id="is_google_uppercase"),
+    pytest.param({"dimension": "PROVIDER", "operator": "IN", "value": "GOOGLE", "values": ["GOOGLE"]}, True,
+                 id="in_google"),
+    pytest.param(scoped("PROVIDER", "IS_NOT", "GOOGLE"), False, id="is_not_google"),
+    pytest.param(scoped("PROVIDER", "IS", "ANTHROPIC"), False, id="is_anthropic"),
+]
+
+
+@requires_google_cloud_client
+@pytest.mark.parametrize("rule_filter, refused", GOOGLE_CLOUD_PROVIDER_CAPS)
+def test_a_google_cloud_cap_judges_a_google_cloud_client_as_google(rule_filter, refused, seed, provider_requests):
+    seed(cap(rule_filter))
+    with patch.object(anthropic_middleware, "_meter_message"):
+        _assert_judged(_google_cloud, refused, provider_requests)
+
+
+@requires_google_cloud_client
+def test_a_google_cloud_cap_refuses_a_selectively_unmetered_google_cloud_call(
+        selective_metering, seed, provider_requests):
+    seed(cap(scoped("PROVIDER", "IS", "GOOGLE")))
+    _assert_judged(_google_cloud, True, provider_requests)
+
+
 @requires_foundry_client
 def test_a_selectively_unmetered_foundry_call_is_judged_as_anthropic_by_provider_caps(
         selective_metering, seed, provider_requests):
@@ -1506,3 +1579,58 @@ def test_an_xai_short_name_is_refused_before_xai_by_a_cap_on_its_served_model(
         call(client, requested)
 
     assert provider_requests["httpx"] == 0
+
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_MODEL = "openai/gpt-4o-mini"
+
+
+def _openrouter_chat(client):
+    return client.chat.completions.create(model=OPENROUTER_MODEL, messages=calls.USER_MESSAGES)
+
+
+def _openrouter_chat_stream(client):
+    for _chunk in client.chat.completions.create(model=OPENROUTER_MODEL, messages=calls.USER_MESSAGES, stream=True):
+        pass
+
+
+def _openrouter_responses(client):
+    return client.responses.create(model=OPENROUTER_MODEL, input="hi")
+
+
+def _openrouter_embeddings(client):
+    return client.embeddings.create(model=OPENROUTER_MODEL, input="hi")
+
+
+def _async_openrouter_chat(client):
+    return asyncio.run(client.chat.completions.create(model=OPENROUTER_MODEL, messages=calls.USER_MESSAGES))
+
+
+def _async_openrouter_embeddings(client):
+    return asyncio.run(client.embeddings.create(model=OPENROUTER_MODEL, input="hi"))
+
+
+OPENROUTER_CALLS = [
+    pytest.param(calls._openai, _openrouter_chat, id="chat"),
+    pytest.param(calls._openai, _openrouter_chat_stream, id="stream"),
+    pytest.param(calls._openai, _openrouter_responses, id="responses"),
+    pytest.param(calls._openai, _openrouter_embeddings, id="embeddings"),
+    pytest.param(calls._async_openai, _async_openrouter_chat, id="async-chat"),
+    pytest.param(calls._async_openai, _async_openrouter_embeddings, id="async-embeddings"),
+]
+
+
+@pytest.mark.parametrize("client_at, call", OPENROUTER_CALLS)
+def test_an_openrouter_call_is_refused_by_a_cap_on_openrouter_and_not_by_a_cap_on_openai(
+        client_at, call, seed, provider_requests, released_stub_response_id):
+    """An OpenAI client on openrouter.ai is capped as OpenRouter (BACK-5421)."""
+    client = client_at(base_url=OPENROUTER_BASE_URL, model=OPENROUTER_MODEL)
+
+    seed(cap(scoped("PROVIDER", "IS", "OPENROUTER")))
+    with pytest.raises(BudgetExceededError):
+        call(client)
+    assert provider_requests["httpx"] == 0
+
+    seed(cap(scoped("PROVIDER", "IS", "OPENAI")))
+    call(client)
+    assert provider_requests["httpx"] == 1

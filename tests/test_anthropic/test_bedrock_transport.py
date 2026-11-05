@@ -317,7 +317,7 @@ class TestPayloadContract:
         assert len(payloads) == 1
         op, args = payloads[0]
         assert op == "completion"
-        assert args["provider"] == "AWS"
+        assert args["provider"] == "Bedrock"
         assert args["model_source"] == "ANTHROPIC"
         assert args["model"] == CLAUDE_PROFILE
         assert args["input_token_count"] == 20
@@ -328,6 +328,21 @@ class TestPayloadContract:
         assert args["transaction_id"] == "req-converse-1"
         assert args["stop_reason"] == "END"
         assert "subscriber" in args and "organization_name" in args
+
+    @pytest.mark.parametrize("operation, response", [
+        ("InvokeModel", invoke_model_response),
+        ("InvokeModelWithResponseStream", invoke_stream_response),
+        ("Converse", converse_response),
+        ("ConverseStream", converse_stream_response),
+    ])
+    def test_every_operation_is_recorded_under_the_bedrock_label(self, operation, response):
+        with patch.dict("os.environ", {"REVENIUM_BEDROCK_TRANSPORT": "1"}):
+            payloads = self._emit_and_capture(operation, response())
+
+        assert len(payloads) == 1
+        _, args = payloads[0]
+        assert (args["provider"], args["model_source"]) == ("Bedrock", "ANTHROPIC")
+        assert args["is_streamed"] is (operation in bt._STREAMING_OPERATIONS)
 
     def test_stream_payload_uses_aws_request_id(self):
         with patch.dict("os.environ", {"REVENIUM_BEDROCK_TRANSPORT": "1"}):
@@ -612,7 +627,7 @@ METERED_LANGCHAIN_RUNS = [
 
 class TestLangChainCallback:
     """A LangChain Bedrock call with the Revenium callback attached is
-    recorded once, as AWS (BACK-4002)."""
+    recorded once, as Bedrock (BACK-4002)."""
 
     @pytest.fixture(autouse=True)
     def _langchain(self):
@@ -649,8 +664,8 @@ class TestLangChainCallback:
         return _bedrock_converse_stand_in_class()(callbacks=[handler], **kwargs)
 
     @staticmethod
-    def _assert_aws_with_attribution(record):
-        assert (record["provider"], record["model_source"]) == ("AWS", "ANTHROPIC")
+    def _assert_bedrock_with_attribution(record):
+        assert (record["provider"], record["model_source"]) == ("Bedrock", "ANTHROPIC")
         assert record["organization_name"] == "org-callback"
         assert record["trace_id"] == "trace-callback"
 
@@ -658,26 +673,26 @@ class TestLangChainCallback:
         pytest.param(lambda model: model.invoke("hi"), id="invoke"),
         pytest.param(lambda model: asyncio.run(model.ainvoke("hi")), id="ainvoke"),
     ])
-    def test_a_converse_call_with_the_callback_is_recorded_once_as_aws(self, transport_on, records, run):
+    def test_a_converse_call_with_the_callback_is_recorded_once_as_bedrock(self, transport_on, records, run):
         assert run(self._model(request_id="req-lc-once")).text == "hi"
         sent = records()
         assert len(sent) == 1, sent
-        self._assert_aws_with_attribution(sent[0])
+        self._assert_bedrock_with_attribution(sent[0])
         assert sent[0]["transaction_id"] == "req-lc-once"
 
-    def test_without_the_transport_the_callback_record_is_aws(self, records, monkeypatch):
+    def test_without_the_transport_the_callback_record_is_bedrock(self, records, monkeypatch):
         monkeypatch.delenv("REVENIUM_BEDROCK_TRANSPORT", raising=False)
         assert self._model().invoke("hi").text == "hi"
         sent = records()
         assert len(sent) == 1, sent
-        self._assert_aws_with_attribution(sent[0])
+        self._assert_bedrock_with_attribution(sent[0])
         assert sent[0]["transaction_id"].startswith("langchain-")
 
     def test_a_converse_stream_with_the_callback_is_recorded_once(self, transport_on, records):
         assert "".join(chunk.text for chunk in self._model(request_id="req-lc-stream").stream("hi")) == "hi"
         sent = records()
         assert len(sent) == 1, sent
-        self._assert_aws_with_attribution(sent[0])
+        self._assert_bedrock_with_attribution(sent[0])
         assert sent[0]["transaction_id"] == "req-lc-stream"
         assert sent[0]["is_streamed"] is True
 
@@ -696,7 +711,7 @@ class TestLangChainCallback:
         assert run(self._model(request_id="req-lc-once")) == "hi"
         sent = records()
         assert len(sent) == 1, sent
-        self._assert_aws_with_attribution(sent[0])
+        self._assert_bedrock_with_attribution(sent[0])
         assert sent[0]["transaction_id"] == "req-lc-once"
 
     def test_a_converse_call_outside_a_metered_function_is_refused_by_a_cap_on_the_callback_attribution(

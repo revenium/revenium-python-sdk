@@ -28,8 +28,10 @@ The official Revenium Python SDK — unified AI metering middleware for deeply a
 | OpenAI | `openai` | `pip install revenium-python-sdk[openai]` |
 | Azure OpenAI | `openai` | `pip install revenium-python-sdk[openai]` |
 | xAI (Grok, via OpenAI SDK) | `openai` | `pip install revenium-python-sdk[openai]` |
+| OpenRouter (via OpenAI SDK) | `openai` | `pip install revenium-python-sdk[openai]` |
 | Anthropic | `anthropic` | `pip install revenium-python-sdk[anthropic]` |
 | AWS Bedrock (Anthropic) | `anthropic` | `pip install revenium-python-sdk[anthropic]` |
+| Google Cloud (Anthropic managed) | `anthropic` | `pip install revenium-python-sdk[anthropic]` |
 | Google Gemini | `google-genai` | `pip install revenium-python-sdk[google-genai]` |
 | Google Vertex AI | `google-vertex` | `pip install revenium-python-sdk[google-vertex]` |
 | Ollama | `ollama` | `pip install revenium-python-sdk[ollama]` |
@@ -671,6 +673,26 @@ response = client.chat.completions.create(
 )
 ```
 
+#### OpenRouter
+
+Point the OpenAI client at OpenRouter and calls are recorded with provider and model source `OPENROUTER`, so OpenRouter spend is reported as OpenRouter rather than OpenAI and a spending cap scoped to OpenRouter applies to it. This covers chat, Responses and embeddings calls, sync and async, streamed or not, on any base URL whose host is `openrouter.ai` or one of its subdomains; a proxy or gateway on your own domain is recorded as the OpenAI-compatible call it appears to be.
+
+```python
+import os
+from openai import OpenAI
+import revenium_middleware.openai
+
+client = OpenAI(
+    api_key=os.getenv("OPENROUTER_API_KEY"),
+    base_url="https://openrouter.ai/api/v1"
+)
+
+response = client.chat.completions.create(
+    model="openai/gpt-4o-mini",
+    messages=[{"role": "user", "content": "Hello!"}]
+)
+```
+
 ---
 
 ### Anthropic
@@ -760,7 +782,7 @@ message = client.messages.create(
 
 **Provider detection** automatically routes between Bedrock and direct Anthropic API based on:
 - AWS credentials availability (`aws configure`, IAM roles, environment variables)
-- Base URL detection (when `base_url` contains `amazonaws.com`)
+- Base URL detection (when `base_url` contains `amazonaws.com`). The Anthropic SDK's Foundry and Google Cloud clients are labelled by their class first, so one behind an AWS-hosted gateway stays `Foundry` or `Google`
 - Defaults to direct Anthropic API - Bedrock only used when explicitly configured
 
 **Bedrock environment variables:**
@@ -768,7 +790,7 @@ message = client.messages.create(
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `AWS_REGION` | AWS region for Bedrock | `us-east-1` |
-| `REVENIUM_BEDROCK_DISABLE` | Set to `1` to disable Bedrock support for Anthropic clients (Bedrock detection only - Foundry detection is unaffected). Raw boto3 calls metered with `REVENIUM_BEDROCK_TRANSPORT`, and LangChain's `ChatBedrock` and `ChatBedrockConverse`, are still recorded as AWS | Not set |
+| `REVENIUM_BEDROCK_DISABLE` | Set to `1` to disable Bedrock support for Anthropic clients (Bedrock detection only - Foundry and Google Cloud detection are unaffected). Raw boto3 calls metered with `REVENIUM_BEDROCK_TRANSPORT`, and LangChain's `ChatBedrock` and `ChatBedrockConverse`, are recorded as Bedrock | Not set |
 | `REVENIUM_BEDROCK_TRANSPORT` | Set to `1` or `true` to meter Claude models called through a raw `boto3.client("bedrock-runtime")` (`invoke_model`, `invoke_model_with_response_stream`, `converse`, `converse_stream`); other Bedrock models are never metered this way | Not set |
 
 **AWS authentication**: an `AnthropicBedrock` client uses its own `aws_access_key` / `aws_secret_key` / `aws_session_token`, `aws_profile` or Bedrock `api_key`, exactly as without the middleware. A plain `anthropic.Anthropic` client with a Bedrock `base_url` uses the standard credential chain: environment variables, `~/.aws/credentials`, IAM roles, AWS SSO. Required permissions: `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream`.
@@ -792,6 +814,8 @@ message = client.messages.create(
 | `claude-3-5-haiku-20241022` | `anthropic.claude-3-5-haiku-20241022-v1:0` |
 
 For other models, the middleware uses the format `anthropic.{model_name}`.
+
+Bedrock usage is reported with provider `Bedrock` and model source `ANTHROPIC` (or the model's vendor for LangChain `ChatBedrock`), and caps on `AWS` still match.
 
 #### Microsoft Foundry
 
@@ -818,6 +842,36 @@ Foundry usage is reported with provider `Foundry` and model source `ANTHROPIC`, 
 is separated from direct-Anthropic totals while still priced against the Anthropic rate card
 that Foundry bills at. `AsyncAnthropicFoundry` is metered the same way, as is
 `client.messages.stream()`.
+
+#### Google Cloud (Anthropic managed)
+
+Claude reached through your Google Cloud project with the Anthropic SDK's Google Cloud
+client (anthropic 2.4.0 or later) is metered by the same patched endpoints, with no extra setup.
+
+```python
+import anthropic
+import revenium_middleware.anthropic
+
+# Detected from the client class, so a custom base_url is fine too
+client = anthropic.AnthropicGoogleCloud(
+    project="your-project",
+    location="global",
+    workspace_id="your-workspace-id",
+)
+
+message = client.messages.create(
+    model="claude-opus-4-7",
+    max_tokens=100,
+    messages=[{"role": "user", "content": "Hello from Google Cloud!"}]
+)
+```
+
+Google Cloud usage is reported with provider `Google` and model source `ANTHROPIC`, the
+values the Node SDK sends for Google-billed Claude, because Google Cloud Marketplace bills
+these calls. `AsyncAnthropicGoogleCloud` is metered the same way, as is
+`client.messages.stream()`. A spending cap scoped to the `Google` provider counts these
+calls; one scoped to `ANTHROPIC` does not. Claude through the older `AnthropicVertex`
+client is still reported with provider `ANTHROPIC`.
 
 **Examples:** `examples/anthropic/` - `anthropic-basic.py`, `anthropic-streaming.py`, `anthropic-bedrock.py`, `anthropic-advanced.py`
 
@@ -1759,6 +1813,8 @@ characters, and `product_name` at 224. Other text fields are sent as given.
 | `response_quality_score` | Custom quality rating (0.0-1.0) | Track user satisfaction or automated quality metrics for model performance analysis |
 | `effort` | Reasoning effort level requested of the model (free-form string, max 16 chars, `^[A-Za-z0-9_-]+$`) | Report what share of AI spend is high-effort reasoning, and compare cost per effort level |
 | `entrypoint` | How the coding assistant that made the call was launched, such as `cli`, `sdk-py` or `claude-vscode` (completions only, 1 to 64 chars, `^[A-Za-z0-9._-]+$`) | Split coding-assistant spend between the terminal, the SDKs and the editor or chat integrations |
+| `ccr_session_id` | The Claude Code cloud session the call ran in; `ccrSessionId` also accepted (completions only, 1 to 128 chars, `^[A-Za-z0-9_-]+$`) | Group the spend of one Claude Code cloud session |
+| `inference_geo` | Where the provider reports the inference ran, such as `us`; `inferenceGeo` also accepted (completions only, 1 to 16 chars, `^[A-Za-z0-9_-]+$`) | Passed to Revenium with the call; it is not stored as a dimension to group spend by |
 
 **Example:**
 
@@ -1809,6 +1865,18 @@ than 64 characters or holds anything but letters, digits, dots, hyphens and
 underscores is left off the record with a WARNING, and the call is still
 recorded. It is sent on completions only; image, video and audio calls ignore
 it, and the LiteLLM proxy does not read it.
+
+**Claude Code cloud session and inference geography:** `ccr_session_id` records
+the Claude Code cloud session a completion ran in, and `inference_geo` records
+where the provider says the inference ran. Both are values you supply per call;
+the SDK does not read them from the environment or from the provider response.
+`inference_geo` is sent exactly as given, with no lowercasing or allow-list;
+the backend normalizes it. It is not stored as a dimension to group spend by,
+so it cannot break spend down by geography. A value that is empty, too long (128 characters
+for `ccr_session_id`, 16 for `inference_geo`) or holds anything but letters,
+digits, hyphens and underscores is left off the record with a WARNING, and the
+call is still recorded. Both are sent on completions only; image, video and
+audio calls ignore them, and the LiteLLM proxy does not read them.
 
 **Deprecation notice:** The legacy field aliases `organizationId`, `organization_id`, `productId`, and `product_id` are accepted by this SDK only as an input-layer convenience and emit a `DeprecationWarning`. The Revenium backend no longer accepts them — they are translated to `organizationName` / `productName` before the wire call. Migrate to `organization_name` / `organizationName` and `product_name` / `productName` now; the input-layer aliases will be removed in the next major release.
 
@@ -2183,7 +2251,7 @@ Block outbound provider requests client-side when a Revenium cost control trips.
 
 > **Terminology note:** The customer-facing entity is called a **cost control**, served by the backend at `/v2/api/ai/cost-controls`. This SDK polls a separate compiled-rules feed at `/v2/api/ai/enforcement-rules/{teamId}` and is unaffected by changes to the CRUD path — no SDK upgrade is required.
 
-Every provider middleware checks the cap: OpenAI, Azure OpenAI, Anthropic (including Claude on Bedrock and Foundry), Google Gemini and Vertex AI, Ollama, Perplexity, fal, the LiteLLM client and proxy, and the LangChain callback.
+Every provider middleware checks the cap: OpenAI, Azure OpenAI, Anthropic (including Claude on Bedrock, Foundry and Google Cloud), Google Gemini and Vertex AI, Ollama, Perplexity, fal, the LiteLLM client and proxy, and the LangChain callback.
 
 ### Enable
 
@@ -2226,7 +2294,7 @@ client = openai.OpenAI()
 The pre-call check fires before every call these middlewares meter, including streamed, raw-response, beta and async variants and calls selective metering leaves unmetered:
 
 - OpenAI and Azure OpenAI: chat completions, responses, embeddings and audio.
-- Anthropic, including Claude on Bedrock (`AnthropicBedrock`, and raw boto3 calls with `REVENIUM_BEDROCK_TRANSPORT=1`), Claude on Vertex AI (`AnthropicVertex`) and Foundry: `messages.create`, `stream` and `parse`, and their beta twins.
+- Anthropic, including Claude on Bedrock (`AnthropicBedrock`, and raw boto3 calls with `REVENIUM_BEDROCK_TRANSPORT=1`), Claude on Vertex AI (`AnthropicVertex`), Foundry and Google Cloud (`AnthropicGoogleCloud`): `messages.create`, `stream` and `parse`, and their beta twins.
 - Google: google-genai content, embeddings, Imagen and Veo, and Vertex AI generation, chat, embeddings and Imagen.
 - Ollama: chat, generate, embed and embeddings.
 - Perplexity: the native client and the OpenAI-compatible client.
@@ -2605,7 +2673,7 @@ timeout raises `ValueError`.
 | `REVENIUM_WRITE_API_KEY` | - | Primary write-scope key (`rev_sk_`) for the agentic outcomes API (report/amend/history); falls back to `REVENIUM_OUTCOME_API_KEY` (deprecated), then `REVENIUM_METERING_API_KEY` |
 | `REVENIUM_OUTCOME_API_KEY` | - | Deprecated fallback name for the write-scope key; used only when `REVENIUM_WRITE_API_KEY` is unset |
 | `REVENIUM_PROFITSTREAM_BASE_URL` | same address as `REVENIUM_METERING_BASE_URL` | Agentic outcomes API base URL. Only needed when outcomes live at a different address than usage. By default it follows the `REVENIUM_METERING_BASE_URL` environment variable: a trailing `/meter` is removed and a path prefix is kept. `AgenticOutcomeClient` also follows a usage address set in code with `initialize_metering(base_url=...)` or a `metering_key(..., base_url=...)` block, for its jobs and outcomes as for its usage records, unless this variable or `profitstream_base_url=` sets an outcome address, or `meter_base_url=` names an address other than the one in `REVENIUM_METERING_BASE_URL`. |
-| `REVENIUM_BEDROCK_DISABLE` | - | Set to `1` to stop Anthropic clients being detected as Bedrock; Foundry detection is unaffected. Raw boto3 calls metered with `REVENIUM_BEDROCK_TRANSPORT`, and LangChain's `ChatBedrock` and `ChatBedrockConverse`, are still recorded as AWS |
+| `REVENIUM_BEDROCK_DISABLE` | - | Set to `1` to stop Anthropic clients being detected as Bedrock; Foundry and Google Cloud detection are unaffected. Raw boto3 calls metered with `REVENIUM_BEDROCK_TRANSPORT`, and LangChain's `ChatBedrock` and `ChatBedrockConverse`, are recorded as Bedrock |
 | `REVENIUM_BEDROCK_TRANSPORT` | - | Set to `1` or `true` to meter Claude models called through a raw `boto3.client("bedrock-runtime")` (`invoke_model`, `invoke_model_with_response_stream`, `converse`, `converse_stream`); other Bedrock models are never metered this way |
 | `REVENIUM_BUFFER_MAX_SIZE` | `20000` | Store-and-forward buffer capacity (oldest events evicted when full) |
 | `REVENIUM_BUFFER_FLUSH_INTERVAL` | `30` | Seconds between automatic replay attempts for buffered events |
@@ -2660,7 +2728,7 @@ Per-call `usage_metadata` values take precedence over the `REVENIUM_AGENTIC_JOB_
 
 **Debug mode:** Set `REVENIUM_LOG_LEVEL=DEBUG` (or `REVENIUM_DEBUG=true`, which is the same for every integration) to see detailed provider detection, routing decisions, and metering payloads, with credentials, emails and prompt or reply text redacted. Token counts, ids, model names and attribution names still print.
 
-**Stop Bedrock detection on Anthropic clients:** Set `REVENIUM_BEDROCK_DISABLE=1` to disable Bedrock auto-detection on Anthropic clients. It does not send your calls to Anthropic directly: an `AnthropicBedrock` call still goes to AWS and is billed by AWS, but is recorded as provider `anthropic` at the Anthropic price. Foundry detection is unaffected - a Foundry client is still labelled `Foundry`. Raw boto3 calls metered with `REVENIUM_BEDROCK_TRANSPORT` and LangChain's `ChatBedrock` and `ChatBedrockConverse` are still recorded as AWS.
+**Stop Bedrock detection on Anthropic clients:** Set `REVENIUM_BEDROCK_DISABLE=1` to disable Bedrock auto-detection on Anthropic clients. It does not send your calls to Anthropic directly: an `AnthropicBedrock` call still goes to AWS and is billed by AWS, but is recorded as provider `anthropic` at the Anthropic price. Foundry and Google Cloud detection are unaffected - a Foundry client is still labelled `Foundry` and a Google Cloud client `Google`. Raw boto3 calls metered with `REVENIUM_BEDROCK_TRANSPORT` and LangChain's `ChatBedrock` and `ChatBedrockConverse` are recorded as Bedrock.
 
 **Check initialization status (Anthropic):** Use `revenium_middleware.anthropic.is_initialized()` to verify setup.
 

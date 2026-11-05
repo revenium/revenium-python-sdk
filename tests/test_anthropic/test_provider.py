@@ -23,6 +23,16 @@ requires_foundry_client = pytest.mark.skipif(
     reason="Installed anthropic SDK predates the Foundry client classes"
 )
 
+GOOGLE_CLOUD_HOST_URL = (
+    "https://claude.googleapis.com/v1/projects/demo-project/locations/global/workspaces/wrkspc_demo/invoke/"
+)
+GOOGLE_CLOUD_RECORD = {"provider": "Google", "model_source": "ANTHROPIC"}
+
+requires_google_cloud_client = pytest.mark.skipif(
+    not hasattr(anthropic, "AnthropicGoogleCloud"),
+    reason="Installed anthropic SDK predates the Google Cloud client classes"
+)
+
 
 class _StubAnthropicBase:
     """Base whose module mimics the Anthropic SDK, with a non-Foundry name."""
@@ -202,7 +212,7 @@ class TestProviderMetadata:
         """Test metadata for Bedrock provider."""
         metadata = get_provider_metadata(Provider.BEDROCK)
 
-        assert metadata["provider"] == "AWS"
+        assert metadata["provider"] == "Bedrock"
         assert metadata["model_source"] == "ANTHROPIC"
 
     def test_get_anthropic_metadata(self):
@@ -304,3 +314,169 @@ class TestBedrockDisableSwitch:
         mock_client = MagicMock()
         mock_client.meta.service_model.service_name = "bedrock-runtime"
         assert detect_provider(client=mock_client) == Provider.BEDROCK
+
+
+def _google_cloud_client(client_class, **overrides):
+    import httpx2
+    from entry_points import calls
+    transport = httpx2.MockTransport(calls._anthropic_handler)
+    http_client = httpx2.AsyncClient(transport=transport) if "Async" in client_class.__name__ \
+        else httpx2.Client(transport=transport)
+    options = {"project": "demo-project", "location": "global", "workspace_id": "wrkspc_demo",
+               "skip_auth": True, "http_client": http_client, **overrides}
+    return client_class(**options)
+
+
+def _recorded_provider_fields(mock_revenium_client):
+    from entry_points import calls
+    calls.wait_for_metering()
+    return [{"provider": entry.kwargs["provider"], "model_source": entry.kwargs["model_source"]}
+            for entry in mock_revenium_client.ai.create_completion.call_args_list]
+
+
+def _sync_create(client, kwargs):
+    client.messages.create(**kwargs)
+
+
+def _sync_create_streamed(client, kwargs):
+    for _event in client.messages.create(**kwargs, stream=True):
+        pass
+
+
+def _sync_stream_helper(client, kwargs):
+    with client.messages.stream(**kwargs) as stream:
+        for _event in stream:
+            pass
+
+
+def _sync_beta_create(client, kwargs):
+    client.beta.messages.create(**kwargs)
+
+
+async def _async_create(client, kwargs):
+    await client.messages.create(**kwargs)
+
+
+async def _async_create_streamed(client, kwargs):
+    async for _event in await client.messages.create(**kwargs, stream=True):
+        pass
+
+
+async def _async_stream_helper(client, kwargs):
+    async with client.messages.stream(**kwargs) as stream:
+        async for _event in stream:
+            pass
+
+
+@requires_google_cloud_client
+def test_google_cloud_client_is_labelled_google(mock_revenium_client):
+    """Google Cloud Marketplace bills these calls, so the row must name Google, not Anthropic."""
+    from entry_points import calls
+    client = _google_cloud_client(anthropic.AnthropicGoogleCloud)
+
+    _sync_create(client, calls._ANTHROPIC_KWARGS)
+
+    assert _recorded_provider_fields(mock_revenium_client) == [GOOGLE_CLOUD_RECORD]
+
+
+@requires_google_cloud_client
+@pytest.mark.parametrize("call", [_async_create, _async_create_streamed, _async_stream_helper],
+                         ids=["create", "create_streamed", "stream_helper"])
+def test_async_google_cloud_client_is_labelled_google(call, mock_revenium_client):
+    import asyncio
+    from entry_points import calls
+    client = _google_cloud_client(anthropic.AsyncAnthropicGoogleCloud)
+
+    asyncio.run(call(client, calls._ANTHROPIC_KWARGS))
+
+    assert _recorded_provider_fields(mock_revenium_client) == [GOOGLE_CLOUD_RECORD]
+
+
+@requires_google_cloud_client
+@pytest.mark.parametrize("call", [_sync_create_streamed, _sync_stream_helper, _sync_beta_create],
+                         ids=["create_streamed", "stream_helper", "beta_create"])
+def test_streamed_and_beta_google_cloud_calls_are_labelled_google(call, mock_revenium_client):
+    from entry_points import calls
+    client = _google_cloud_client(anthropic.AnthropicGoogleCloud)
+
+    call(client, calls._ANTHROPIC_KWARGS)
+
+    assert _recorded_provider_fields(mock_revenium_client) == [GOOGLE_CLOUD_RECORD]
+
+
+@requires_google_cloud_client
+def test_google_cloud_client_with_a_custom_base_url_is_labelled_google():
+    client = _google_cloud_client(anthropic.AnthropicGoogleCloud, base_url="https://gateway.example.com/claude/")
+
+    assert get_provider_metadata(detect_provider(client=client)) == GOOGLE_CLOUD_RECORD
+
+
+@requires_google_cloud_client
+@requires_foundry_client
+def test_google_cloud_and_foundry_clients_behind_an_aws_gateway_keep_their_labels():
+    gateway = "https://abc123.execute-api.us-east-1.amazonaws.com/claude/"
+    google_cloud = _google_cloud_client(anthropic.AnthropicGoogleCloud, base_url=gateway)
+    foundry = anthropic.AnthropicFoundry(api_key="test-key", base_url=gateway)
+
+    assert detect_provider(client=google_cloud) == Provider.GOOGLE_CLOUD
+    assert detect_provider(client=foundry) == Provider.FOUNDRY
+    assert detect_provider(client=google_cloud, base_url=gateway) == Provider.GOOGLE_CLOUD
+
+
+def test_explicit_base_url_outranks_the_client_base_url_across_routes():
+    foundry_hosted_client = MagicMock()
+    foundry_hosted_client.base_url = FOUNDRY_BASE_URL
+
+    assert detect_provider(client=foundry_hosted_client, base_url=GOOGLE_CLOUD_HOST_URL) == Provider.GOOGLE_CLOUD
+
+
+def test_google_cloud_host_is_labelled_google():
+    assert get_provider_metadata(detect_provider(base_url=GOOGLE_CLOUD_HOST_URL.upper())) == GOOGLE_CLOUD_RECORD
+
+    mock_client = MagicMock()
+    mock_client.base_url = GOOGLE_CLOUD_HOST_URL
+    assert get_provider_metadata(detect_provider(client=mock_client)) == GOOGLE_CLOUD_RECORD
+
+
+def test_third_party_google_cloud_named_wrapper_is_not_google():
+    class AnthropicGoogleCloudProxy(_StubAnthropicBase):
+        __module__ = "my_company.gateways"
+
+    assert detect_provider(client=AnthropicGoogleCloudProxy()) == Provider.ANTHROPIC
+
+
+def test_other_google_hosts_are_not_google_cloud_claude():
+    assert detect_provider(base_url="https://us-east5-aiplatform.googleapis.com/v1/") == Provider.ANTHROPIC
+    assert detect_provider(base_url="https://generativelanguage.googleapis.com/") == Provider.ANTHROPIC
+
+
+@requires_google_cloud_client
+def test_google_cloud_label_survives_bedrock_being_disabled(monkeypatch):
+    monkeypatch.setenv("REVENIUM_BEDROCK_DISABLE", "1")
+    client = _google_cloud_client(anthropic.AnthropicGoogleCloud)
+
+    assert detect_provider(client=client) == Provider.GOOGLE_CLOUD
+
+
+@requires_foundry_client
+def test_existing_providers_unchanged():
+    """Direct Anthropic, Bedrock and Foundry keep the labels their rows carried before Google Cloud existed."""
+    bedrock_client = MagicMock()
+    bedrock_client.meta.service_model.service_name = "bedrock-runtime"
+    clients = {
+        "direct": anthropic.Anthropic(api_key="test-key"),
+        "direct_async": anthropic.AsyncAnthropic(api_key="test-key"),
+        "bedrock": bedrock_client,
+        "foundry": anthropic.AnthropicFoundry(api_key="test-key", resource=FOUNDRY_RESOURCE),
+        "foundry_async": anthropic.AsyncAnthropicFoundry(api_key="test-key", resource=FOUNDRY_RESOURCE),
+    }
+
+    labels = {name: get_provider_metadata(detect_provider(client=client)) for name, client in clients.items()}
+
+    assert labels == {
+        "direct": {"provider": "ANTHROPIC", "model_source": "ANTHROPIC"},
+        "direct_async": {"provider": "ANTHROPIC", "model_source": "ANTHROPIC"},
+        "bedrock": {"provider": "Bedrock", "model_source": "ANTHROPIC"},
+        "foundry": {"provider": "Foundry", "model_source": "ANTHROPIC"},
+        "foundry_async": {"provider": "Foundry", "model_source": "ANTHROPIC"},
+    }

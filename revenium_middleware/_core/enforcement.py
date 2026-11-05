@@ -1817,15 +1817,21 @@ def _rule_blocks(
 
 _FILTER_OPERATORS = frozenset({"IS", "IS_NOT", "CONTAINS", "STARTS_WITH", "ENDS_WITH", "IN"})
 
-# The server's ProviderVocabulary.ALIAS_BUCKETS (hypercurrent commons): the
-# provider values a call carrying the key label also counts toward. One way
-# only, so a cap on FOUNDRY never covers direct Anthropic calls.
+# The provider values a call carrying the key label also counts toward. The
+# FOUNDRY and coding-assistant rows copy the server's
+# ProviderVocabulary.ALIAS_BUCKETS (hypercurrent commons) and alias one way
+# only, so a cap on FOUNDRY never covers direct Anthropic calls. The Bedrock
+# rows mirror the Bedrock bucket in that same server table (BACK-4461,
+# hypercurrent #7678): the Bedrock spellings name one provider, so each
+# counts toward all of them, both ways.
+_BEDROCK_SPELLINGS = frozenset({"BEDROCK", "AWS", "AMAZON BEDROCK", "AWS BEDROCK"})
 _PROVIDER_ALIAS_BUCKETS = {
     "FOUNDRY": frozenset({"FOUNDRY", "ANTHROPIC"}),
     "CLAUDECODE": frozenset({"CLAUDECODE", "ANTHROPIC"}),
     "CLAUDECOWORK": frozenset({"CLAUDECOWORK", "ANTHROPIC"}),
     "CODEXCLI": frozenset({"CODEXCLI", "OPENAI"}),
     "GEMINICLI": frozenset({"GEMINICLI", "GOOGLE"}),
+    **dict.fromkeys(_BEDROCK_SPELLINGS, _BEDROCK_SPELLINGS),
 }
 
 # Dimensions whose value the SDK itself puts on the metering record, so a call
