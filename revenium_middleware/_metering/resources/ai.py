@@ -86,6 +86,8 @@ class AIResource(SyncAPIResource):
         effort: str | NotGiven = NOT_GIVEN,
         client_surface: str | NotGiven = NOT_GIVEN,
         entrypoint: str | NotGiven = NOT_GIVEN,
+        ccr_session_id: str | NotGiven = NOT_GIVEN,
+        inference_geo: str | NotGiven = NOT_GIVEN,
         prompt_id: str | NotGiven = NOT_GIVEN,
         prompt_length: int | NotGiven = NOT_GIVEN,
         query_source: str | NotGiven = NOT_GIVEN,
@@ -236,6 +238,13 @@ class AIResource(SyncAPIResource):
           entrypoint: How the coding assistant that made this call was launched, for example cli,
               sdk-cli, sdk-ts, sdk-py, claude-vscode or claude-in-slack; other values of the
               same shape are stored as sent (1 to 64 letters, digits, dots, hyphens or
+              underscores)
+
+          ccr_session_id: The Claude Code cloud session this call ran in, so its completions can be
+              grouped by session (1 to 128 letters, digits, hyphens or underscores)
+
+          inference_geo: Where the provider reports the inference ran, for example us; sent as
+              given, the backend normalizes it (1 to 16 letters, digits, hyphens or
               underscores)
 
           prompt_id: Identifier of the user prompt that produced this completion, so every call
@@ -417,6 +426,8 @@ class AIResource(SyncAPIResource):
                     "effort": effort,
                     "client_surface": client_surface,
                     "entrypoint": entrypoint,
+                    "ccr_session_id": ccr_session_id,
+                    "inference_geo": inference_geo,
                     "prompt_id": prompt_id,
                     "prompt_length": prompt_length,
                     "query_source": query_source,
@@ -1400,6 +1411,8 @@ class AsyncAIResource(AsyncAPIResource):
         effort: str | NotGiven = NOT_GIVEN,
         client_surface: str | NotGiven = NOT_GIVEN,
         entrypoint: str | NotGiven = NOT_GIVEN,
+        ccr_session_id: str | NotGiven = NOT_GIVEN,
+        inference_geo: str | NotGiven = NOT_GIVEN,
         prompt_id: str | NotGiven = NOT_GIVEN,
         prompt_length: int | NotGiven = NOT_GIVEN,
         query_source: str | NotGiven = NOT_GIVEN,
@@ -1550,6 +1563,13 @@ class AsyncAIResource(AsyncAPIResource):
           entrypoint: How the coding assistant that made this call was launched, for example cli,
               sdk-cli, sdk-ts, sdk-py, claude-vscode or claude-in-slack; other values of the
               same shape are stored as sent (1 to 64 letters, digits, dots, hyphens or
+              underscores)
+
+          ccr_session_id: The Claude Code cloud session this call ran in, so its completions can be
+              grouped by session (1 to 128 letters, digits, hyphens or underscores)
+
+          inference_geo: Where the provider reports the inference ran, for example us; sent as
+              given, the backend normalizes it (1 to 16 letters, digits, hyphens or
               underscores)
 
           prompt_id: Identifier of the user prompt that produced this completion, so every call
@@ -1731,6 +1751,8 @@ class AsyncAIResource(AsyncAPIResource):
                     "effort": effort,
                     "client_surface": client_surface,
                     "entrypoint": entrypoint,
+                    "ccr_session_id": ccr_session_id,
+                    "inference_geo": inference_geo,
                     "prompt_id": prompt_id,
                     "prompt_length": prompt_length,
                     "query_source": query_source,

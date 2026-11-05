@@ -1628,7 +1628,7 @@ def async_stream_wrapper(wrapped, instance, args, kwargs):
     # Attribution only, no re-routing -- the same choice AsyncMessages.create
     # makes. The sync wrapper's Bedrock fast path is a blocking boto3 call
     # and cannot serve an async context manager, so an AsyncAnthropicBedrock
-    # stream stays on the SDK transport and is metered here under the AWS
+    # stream stays on the SDK transport and is metered here under the Bedrock
     # label rather than being handed to the Bedrock adapter.
     # REVENIUM_BEDROCK_DISABLE is honoured inside detect_provider, so a
     # Foundry stream keeps its Foundry label when Bedrock routing is off.
@@ -1659,7 +1659,7 @@ wrap_once("anthropic.resources.messages.messages.AsyncMessages.stream",
 
 # The Bedrock fast path rebuilds the request from a handful of standard fields
 # and returns a plain Message, so it would drop the beta flags and the parse()
-# output format. These surfaces stay on the SDK transport and keep the AWS label.
+# output format. These surfaces stay on the SDK transport and keep the Bedrock label.
 def _parse_wrapper(wrapped, instance, args, kwargs):
     return create_wrapper(wrapped, instance, args, kwargs, bedrock_fast_path=False)
 

@@ -212,7 +212,7 @@ def test_sync_bedrock_create_records_the_subscriber(stub, records, make_client, 
     make_client(stub).messages.create(usage_metadata=usage_metadata, **REQUEST)
 
     assert len(records) == 1, records
-    assert records[0]["provider"] == "AWS"
+    assert records[0]["provider"] == "Bedrock"
     assert records[0]["subscriber"] == subscriber
 
 
@@ -262,7 +262,7 @@ def assert_metered_once_through_the_sdk(records, fake_boto3, *, streamed=False):
     assert fake_boto3.calls == []
     assert len(records) == 1, records
     record = records[0]
-    assert record["provider"] == "AWS"
+    assert record["provider"] == "Bedrock"
     assert record["is_streamed"] is streamed
     assert record["input_token_count"] == INPUT_TOKENS
     assert record["output_token_count"] == OUTPUT_TOKENS
@@ -453,7 +453,7 @@ def test_bedrock_error_reaches_the_caller_as_without_the_sdk(stub, records, fake
     only_request(stub)
     assert fake_boto3.calls == []
     assert len(records) == 1, records
-    assert (records[0]["stop_reason"], records[0]["provider"]) == ("ERROR", "AWS")
+    assert (records[0]["stop_reason"], records[0]["provider"]) == ("ERROR", "Bedrock")
     assert "RateLimitError (HTTP 429)" in records[0]["error_reason"]
 
 
@@ -464,7 +464,7 @@ def test_a_plain_client_with_a_bedrock_url_keeps_the_fast_path(stub, records, fa
     assert len(fake_boto3.calls) == 1
     assert message.content[0].text == "hello"
     assert len(records) == 1, records
-    assert records[0]["provider"] == "AWS"
+    assert records[0]["provider"] == "Bedrock"
 
 
 def test_a_plain_client_with_an_amazonaws_proxy_url_keeps_its_model_name(stub, records, fake_boto3):

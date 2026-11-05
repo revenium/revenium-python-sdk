@@ -56,6 +56,8 @@ _STREAMING_OPERATIONS = frozenset({
     "ConverseStream",
 })
 
+_PROVIDER_LABEL = "Bedrock"
+
 # Marks botocore calls issued by Revenium's own Bedrock adapter so the
 # transport layer sees but does not meter them (the adapter's wrapper is the
 # sole emitter for that path). Context-local, so it is safe across threads
@@ -220,7 +222,7 @@ def _emit_completion(
         "cost_type": "AI",
         "model": model_id,
         "input_token_count": input_tokens,
-        "provider": "AWS",
+        "provider": _PROVIDER_LABEL,
         "model_source": "ANTHROPIC",
         "reasoning_token_count": 0,
         "request_time": request_time,
@@ -641,12 +643,12 @@ def _make_api_call_wrapper(wrapped, instance, args, kwargs):
     requested_model_id = args[1].get("modelId") if len(args) > 1 else None
     if selectively_unmetered():
         check_unmetered_call(_ambient_usage_metadata(), model=cap_model_names(model_id, requested_model_id),
-                             provider="AWS", callback_transport=BEDROCK)
+                             provider=_PROVIDER_LABEL, callback_transport=BEDROCK)
         return wrapped(*args, **kwargs)
 
     request_time_dt = datetime.datetime.now(datetime.timezone.utc)
     usage_metadata = _call_usage_metadata()
-    check_enforcement(usage_metadata, model=cap_model_names(model_id, requested_model_id), provider="AWS")
+    check_enforcement(usage_metadata, model=cap_model_names(model_id, requested_model_id), provider=_PROVIDER_LABEL)
     metering_client = current_client()
     response = wrapped(*args, **kwargs)  # exceptions/retries pass through untouched
 

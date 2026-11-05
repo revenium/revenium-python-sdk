@@ -488,6 +488,17 @@ def test_an_azure_client_is_checked_under_the_azure_provider_label(_cap_check_ke
     assert _cap_check_keywords == [{"model": "my-deployment", "provider": "Azure"}]
 
 
+@pytest.mark.parametrize("name", _ALL_WRAPPERS)
+def test_an_openrouter_client_is_checked_under_the_openrouter_provider_label(name, _cap_check_keywords):
+    instance = _InstanceOf(_Client("https://openrouter.ai/api/v1"))
+
+    with pytest.raises(BudgetExceededError):
+        _wrapper(name)(_provider_must_not_be_reached, instance, (),
+                       {"model": "openai/gpt-4o-mini", "usage_metadata": {}})
+
+    assert _cap_check_keywords == [{"model": "openai/gpt-4o-mini", "provider": "OPENROUTER"}]
+
+
 @pytest.fixture
 def _without_the_perplexity_middleware(monkeypatch):
     """The OpenAI parse wrap meters a Perplexity-bound parse only when the

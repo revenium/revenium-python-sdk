@@ -5,7 +5,7 @@ This module handles detection of Azure OpenAI vs standard OpenAI based on:
 1. Environment variables (AZURE_OPENAI_ENDPOINT)
 2. Base URL substring matching ("azure")
 3. Client instance type detection
-4. Base URL hostname for OpenAI-compatible providers (xAI)
+4. Base URL hostname for OpenAI-compatible providers (xAI, OpenRouter)
 
 The detection is lazy-loaded.
 """
@@ -26,9 +26,13 @@ class Provider(Enum):
     AZURE_OPENAI = auto()
     OLLAMA = auto()  # Existing provider support
     XAI = auto()
+    OPENROUTER = auto()
 
 
-_OPENAI_COMPATIBLE_HOSTS = (("x.ai", Provider.XAI),)
+_OPENAI_COMPATIBLE_HOSTS = (
+    ("x.ai", Provider.XAI),
+    ("openrouter.ai", Provider.OPENROUTER),
+)
 
 
 def _provider_from_host(url: Optional[Any]) -> Optional[Provider]:
@@ -49,7 +53,7 @@ def detect_provider(client: Optional[Any] = None, base_url: Optional[str] = None
     Detection priority:
     1. Client instance type (AzureOpenAI) - most reliable
     2. Base URL substring matching ("azure")
-    3. Base URL hostname for OpenAI-compatible providers (xAI)
+    3. Base URL hostname for OpenAI-compatible providers (xAI, OpenRouter)
     4. Environment variables (AZURE_OPENAI_ENDPOINT) - only if client suggests Azure
     5. Default to OpenAI
 
@@ -135,6 +139,11 @@ def get_provider_metadata(provider: Provider) -> dict:
         return {
             "provider": "XAI",
             "model_source": "XAI"
+        }
+    elif provider == Provider.OPENROUTER:
+        return {
+            "provider": "OPENROUTER",
+            "model_source": "OPENROUTER"
         }
     else:  # OPENAI
         return {

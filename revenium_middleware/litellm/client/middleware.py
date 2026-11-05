@@ -579,13 +579,24 @@ def _iterations_litellm_attached(chunk):
     return iterations if isinstance(iterations, list) and iterations else None
 
 
-def _iterations_the_stream_accumulated(stream):
+def _provider_iterator(stream):
+    """The provider iterator a LiteLLM stream wraps, or None once LiteLLM has released it.
+
+    LiteLLM 1.108 releases it when the async stream ends, before
+    ``StopAsyncIteration`` reaches the caller, so it must be taken while chunks arrive.
+    """
+    return getattr(stream, "completion_stream", None)
+
+
+def _iterations_the_stream_accumulated(provider_iterator):
     """The ``iterations`` LiteLLM's Anthropic stream iterator gathered from ``message_delta``.
 
     An async stream attaches them to no chunk, so this LiteLLM internal is the
-    only place they survive; any other route or release leaves it absent.
+    only place they survive. Only LiteLLM's direct Anthropic route keeps it, and
+    a LiteLLM version that renames it, or a meter that never saw the iterator,
+    finds nothing.
     """
-    cumulative = getattr(getattr(stream, "completion_stream", None), "_cumulative_usage", None)
+    cumulative = getattr(provider_iterator, "_cumulative_usage", None)
     iterations = cumulative.get("iterations") if isinstance(cumulative, Mapping) else None
     return iterations if isinstance(iterations, list) and iterations else None
 
@@ -598,6 +609,7 @@ class _StreamMeter:
         self._call = call
         self._served_by_perplexity = served_by_perplexity
         self._stream = stream
+        self._provider_iterator = _provider_iterator(stream)
         self._iterations = None
         self._request_time_dt = request_time_dt
         self._metering_client = current_client()
@@ -618,6 +630,7 @@ class _StreamMeter:
         if getattr(chunk, "usage", None) is not None:
             self._usage_chunk = chunk
         self._iterations = _iterations_litellm_attached(chunk) or self._iterations
+        self._provider_iterator = _provider_iterator(self._stream) or self._provider_iterator
         if self._reply is not None:
             self._reply.add(_reply_text(chunk))
         return _belongs_to_caller(chunk, self._caller_requested_usage)
@@ -635,6 +648,9 @@ class _StreamMeter:
         self._finished = True
         self._call_context.run(self._meter, completed, error)
 
+    def _usage_iterations(self):
+        return self._iterations or _iterations_the_stream_accumulated(self._provider_iterator)
+
     def _meter(self, completed, error):
         failure = _failure_of(error, self._outer) if error is not None and self._call is not None else None
         usage = None if self._usage_chunk is not None else _usage_litellm_attached(self._last_chunk)
@@ -651,7 +667,7 @@ class _StreamMeter:
                 handle_response(self._usage_chunk or self._last_chunk, self._request_time_dt,
                                 self._usage_metadata, True, usage=usage, captured_prompts=self._captured_prompts(),
                                 upstream_provider=self._upstream_provider,
-                                usage_iterations=self._iterations or _iterations_the_stream_accumulated(self._stream),
+                                usage_iterations=self._usage_iterations(),
                                 iteration_request=_iteration_request(self._request_kwargs),
                                 served_by_perplexity=self._served_by_perplexity
                                 and (completed or self._usage_chunk is not None))

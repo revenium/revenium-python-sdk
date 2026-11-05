@@ -855,7 +855,12 @@ def _completion_field_hints() -> dict:
     return get_type_hints(AICreateCompletionParams, include_extras=True)
 
 
+_SAMPLES_WITHIN_WIRE_RULES = {"inferenceGeo": "us"}
+
+
 def _sample_value(wire_name: str, hint):
+    if wire_name in _SAMPLES_WITHIN_WIRE_RULES:
+        return _SAMPLES_WITHIN_WIRE_RULES[wire_name]
     while get_origin(hint) in (Required, Annotated):
         hint = get_args(hint)[0]
     if get_origin(hint) is Literal:

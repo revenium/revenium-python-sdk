@@ -178,13 +178,13 @@ def test_is_not_the_claude_name_still_holds_a_bedrock_request_recorded_under_its
     name the SDK also knows the model by (BACK-4281)."""
     cap(filtered_rule([f("MODEL", "IS_NOT", "claude-haiku-4-5-20251001")]))
 
-    assert blocked({}, model=BEDROCK_HAIKU, provider="AWS")
+    assert blocked({}, model=BEDROCK_HAIKU, provider="Bedrock")
 
 
 def test_is_not_the_recorded_bedrock_id_exempts_that_bedrock_request(cap):
     cap(filtered_rule([f("MODEL", "IS_NOT", "anthropic.claude-haiku-4-5-20251001-v1:0")]))
 
-    assert not blocked({}, model=BEDROCK_HAIKU, provider="AWS")
+    assert not blocked({}, model=BEDROCK_HAIKU, provider="Bedrock")
 
 
 def test_a_dash_dated_model_filter_holds_the_vertex_at_spelling(cap):
@@ -795,7 +795,13 @@ SERVER_PROVIDER_ALIASES = {
     "ClaudeCowork": {"ClaudeCowork", "ANTHROPIC"},
     "CodexCli": {"CodexCli", "OPENAI"},
     "GeminiCli": {"GeminiCli", "GOOGLE"},
+    **dict.fromkeys(("BEDROCK", "AWS", "AMAZON BEDROCK", "AWS BEDROCK"),
+                    {"BEDROCK", "AWS", "AMAZON BEDROCK", "AWS BEDROCK"}),
 }
+SERVER_ALIASES_UPPER = {key.upper(): {value.upper() for value in bucket}
+                        for key, bucket in SERVER_PROVIDER_ALIASES.items()}
+BEDROCK_SPELLINGS = ["Bedrock", "AWS", "Amazon Bedrock", "AWS Bedrock"]
+BEDROCK_CASE_VARIANTS = ["aws", "BEDROCK", "amazon bedrock"]
 CLAUDE = "claude-haiku-4-5"
 
 
@@ -857,6 +863,9 @@ def test_provider_substring_filters_ignore_the_alias(cap):
 
 @pytest.mark.parametrize("value, label, refused", [
     ("ANTHROPIC", "AWS", False),
+    ("ANTHROPIC", "Bedrock", False),
+    ("BEDROCK", "ANTHROPIC", False),
+    ("AMAZON_BEDROCK", "Bedrock", False),
     ("OPENAI", "Azure", False),
     ("GOOGLE", "Google", True),
 ])
@@ -869,16 +878,21 @@ def test_hosting_labels_are_not_aliased(cap, value, label, refused):
 def test_provider_aliases_match_the_servers_provider_vocabulary():
     """The SDK's copy of the server's alias table, from hypercurrent develop
     843ba8a9f6 ``commons/.../ProviderVocabulary.kt`` and
-    ``CodingAssistantProviderIds.kt``. This repo cannot read the server, so
-    the test catches the SDK drifting from that copy, not the server moving."""
-    server = {key.upper(): {value.upper() for value in bucket} for key, bucket in SERVER_PROVIDER_ALIASES.items()}
+    ``CodingAssistantProviderIds.kt``. The Bedrock rows copy the bucket
+    BACK-4461 specifies for ``ProviderVocabulary.kt``, not yet merged there.
+    This repo cannot read the server, so the test catches the SDK drifting
+    from that copy, not the server moving."""
+    assert enforcement._PROVIDER_ALIAS_BUCKETS == SERVER_ALIASES_UPPER
 
-    assert enforcement._PROVIDER_ALIAS_BUCKETS == server
+
+def _aliases_back(key, target):
+    return key.upper() in SERVER_ALIASES_UPPER.get(target.upper(), ())
 
 
 ALIAS_PAIRS = [
     pytest.param(key, target, id=f"{key}->{target}")
-    for key, bucket in SERVER_PROVIDER_ALIASES.items() for target in sorted(bucket) if target != key
+    for key, bucket in SERVER_PROVIDER_ALIASES.items() for target in sorted(bucket)
+    if target.upper() != key.upper() and not _aliases_back(key, target)
 ]
 
 
@@ -893,6 +907,34 @@ def test_every_server_alias_is_honoured_one_way(cap, label, target):
 
     cap(filtered_rule([f("PROVIDER", "IS", label)]))
     assert not provider_blocked(target)
+
+
+def test_only_the_bedrock_spellings_alias_both_ways():
+    two_way = {key for key, bucket in SERVER_ALIASES_UPPER.items()
+               if any(_aliases_back(key, target) for target in bucket if target != key)}
+
+    assert two_way == {spelling.upper() for spelling in BEDROCK_SPELLINGS}
+
+
+@pytest.mark.parametrize("label, value", [
+    pytest.param(label, value, id=f"{label}->{value}")
+    for label in BEDROCK_SPELLINGS for value in BEDROCK_SPELLINGS + BEDROCK_CASE_VARIANTS if value != label
+])
+def test_every_bedrock_spelling_holds_every_other_both_ways(cap, label, value):
+    """BACK-4462: the Bedrock spellings name one provider, so a cap on any of them holds a call
+    carrying any other, and IS_NOT exempts it."""
+    cap(filtered_rule([f("PROVIDER", "IS", value)]))
+    assert provider_blocked(label)
+    cap(filtered_rule([f("PROVIDER", "IN", value, [value])]))
+    assert provider_blocked(label)
+    cap(filtered_rule([f("PROVIDER", "IS_NOT", value)]))
+    assert not provider_blocked(label)
+
+
+def test_an_is_not_anthropic_cap_still_holds_a_bedrock_call(cap):
+    cap(filtered_rule([f("PROVIDER", "IS_NOT", "ANTHROPIC")]))
+
+    assert provider_blocked("Bedrock")
 
 
 def test_the_provider_alias_applies_to_the_provider_dimension_only(cap):

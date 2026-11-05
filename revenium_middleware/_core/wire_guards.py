@@ -137,6 +137,8 @@ _RULES_BY_OPERATION: Dict[str, Dict[str, Callable[[Any], Any]]] = {
         "subagent_type": _slug(_SOURCE_SLUG, 128, _SOURCE_CHARACTERS),
         "client_surface": _slug(_SURFACE_SLUG, 64, _SURFACE_CHARACTERS),
         "entrypoint": _slug(_SURFACE_SLUG, 64, _SURFACE_CHARACTERS),
+        "ccr_session_id": _slug(_SLUG, 128, _SLUG_CHARACTERS),
+        "inference_geo": _slug(_SLUG, 16, _SLUG_CHARACTERS),
         "prompt_id": _slug(_SLUG, 64, _SLUG_CHARACTERS),
         "prompt_length": _prompt_length,
         "response_quality_score": _quality_score,

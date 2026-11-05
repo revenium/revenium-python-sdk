@@ -1,39 +1,30 @@
 """
-Provider detection and configuration for AWS Bedrock and Microsoft Foundry support.
+Provider detection for Claude served directly by Anthropic, through AWS Bedrock,
+Microsoft Foundry, or Google Cloud (Anthropic managed).
 
-This module handles detection of AWS Bedrock and Microsoft Foundry vs standard
-Anthropic based on:
-1. Client instance type (boto3 bedrock-runtime client, Anthropic Foundry client)
-2. Base URL substring matching ("amazonaws.com", "services.ai.azure.com")
+Detection is based on:
+1. Client instance type (boto3 bedrock-runtime client, the Anthropic SDK's
+   Foundry and Google Cloud clients)
+2. Base URL substring matching ("amazonaws.com", "services.ai.azure.com",
+   "claude.googleapis.com")
 3. Default to Anthropic
-
-The detection is simple and focused on the MVP requirements.
 """
 
 import logging
 import os
 import threading
+from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional, Any
 
 logger = logging.getLogger("revenium_middleware.extension")
 
-# Foundry clients are the Anthropic SDK's own AnthropicFoundry /
-# AsyncAnthropicFoundry (both deriving from BaseFoundryClient), so a name
-# marker on the class hierarchy identifies them without importing anthropic
-# here -- this module must stay usable when the SDK is not installed.
-_FOUNDRY_CLASS_MARKER = "foundry"
-
-# The name marker only counts on classes the Anthropic SDK itself defines.
+# A class-name marker only counts on classes the Anthropic SDK itself defines.
 # Without that constraint a third-party wrapper -- say a FoundryProxyClient
-# that forwards to a plain Anthropic client -- would be mislabelled as Foundry
-# purely because of how it is named.
-_FOUNDRY_CLASS_MODULE = "anthropic"
-
-# Default Foundry hosts look like https://<resource>.services.ai.azure.com/anthropic/,
-# but the resource name is customer-specific and base_url can be overridden
-# entirely, so the host shape is only a secondary signal.
-_FOUNDRY_HOST_MARKER = "services.ai.azure.com"
+# that forwards to a plain Anthropic client -- would be mislabelled purely
+# because of how it is named. Matching names instead of importing the classes
+# keeps this module usable when the SDK is absent or predates a client class.
+_ANTHROPIC_SDK_MODULE = "anthropic"
 
 
 class Provider(Enum):
@@ -41,6 +32,24 @@ class Provider(Enum):
     ANTHROPIC = auto()
     BEDROCK = auto()
     FOUNDRY = auto()
+    GOOGLE_CLOUD = auto()
+
+
+@dataclass(frozen=True)
+class _ClaudeRoute:
+    """A Claude route the Anthropic SDK reaches through its own client classes."""
+    provider: Provider
+    class_marker: str
+    host_marker: str
+
+
+# The host is only a secondary signal: both clients accept an overridden
+# base_url, and Foundry hosts (https://<resource>.services.ai.azure.com/anthropic/)
+# carry a customer-specific resource name.
+_ANTHROPIC_SDK_ROUTES = (
+    _ClaudeRoute(Provider.FOUNDRY, class_marker="foundry", host_marker="services.ai.azure.com"),
+    _ClaudeRoute(Provider.GOOGLE_CLOUD, class_marker="googlecloud", host_marker="claude.googleapis.com"),
+)
 
 
 def _is_anthropic_sdk_class(klass: Any) -> bool:
@@ -57,62 +66,71 @@ def _is_anthropic_sdk_class(klass: Any) -> bool:
         True if the class comes from the anthropic package
     """
     module = getattr(klass, "__module__", "") or ""
-    return module == _FOUNDRY_CLASS_MODULE or module.startswith(f"{_FOUNDRY_CLASS_MODULE}.")
+    return module == _ANTHROPIC_SDK_MODULE or module.startswith(f"{_ANTHROPIC_SDK_MODULE}.")
 
 
-def _is_foundry_client(client: Optional[Any]) -> bool:
+def _derives_from_anthropic_sdk_class_named(client: Optional[Any], class_marker: str) -> bool:
     """
-    Check whether a client instance is an Anthropic Foundry client.
+    Check whether a client derives from an Anthropic SDK class whose name holds the marker.
 
-    The whole class hierarchy is inspected so subclasses of AnthropicFoundry
-    and AsyncAnthropicFoundry are recognised too. A class only counts when the
-    Anthropic SDK defines it, so a caller's own Foundry-named wrapper around a
-    direct Anthropic client stays attributed to Anthropic.
+    The whole class hierarchy is inspected so subclasses of the SDK's clients
+    are recognised too, and each class is judged by its own defining module
+    because a caller's wrapper sits in the MRO ahead of the SDK bases.
 
     Args:
         client: Client instance to inspect
+        class_marker: Fragment of the SDK class name, compared without regard to case
 
     Returns:
-        True if the client is (or derives from) a Foundry client
+        True if the client is (or derives from) such a class
     """
     if client is None:
         return False
 
     client_type = type(client)
-    for klass in getattr(client_type, "__mro__", (client_type,)):
-        if not _is_anthropic_sdk_class(klass):
-            continue
-        if _FOUNDRY_CLASS_MARKER in getattr(klass, "__name__", "").lower():
-            return True
-
-    return False
+    return any(
+        _is_anthropic_sdk_class(klass) and class_marker.lower() in getattr(klass, "__name__", "").lower()
+        for klass in getattr(client_type, "__mro__", (client_type,))
+    )
 
 
-def _detect_foundry_provider(client: Optional[Any] = None,
-                             base_url: Optional[str] = None) -> Optional[Provider]:
+def _anthropic_sdk_route_by_class(client: Optional[Any]) -> Optional[Provider]:
     """
-    Detect Microsoft Foundry from the client class or an Azure Foundry host.
-
-    The client class is checked first because a Foundry client may be pointed
-    at a custom base_url, in which case the host shape says nothing.
+    Detect Foundry or Google Cloud from the client class.
 
     Args:
-        client: Client instance (may be an Anthropic Foundry client)
+        client: Client instance (may be an Anthropic Foundry or Google Cloud client)
+
+    Returns:
+        The route's provider when the client derives from its SDK class, otherwise None
+    """
+    for route in _ANTHROPIC_SDK_ROUTES:
+        if _derives_from_anthropic_sdk_class_named(client, route.class_marker):
+            logger.debug(f"{route.provider.name} provider detected via client type: {type(client).__name__}")
+            return route.provider
+    return None
+
+
+def _anthropic_sdk_route_by_host(client: Optional[Any] = None,
+                                 base_url: Optional[str] = None) -> Optional[Provider]:
+    """
+    Detect Foundry or Google Cloud from the host, the explicit base_url before the client's own.
+
+    Args:
+        client: Client instance whose base_url is the fallback candidate
         base_url: Base URL for API calls
 
     Returns:
-        Provider.FOUNDRY when a Foundry signal is found, otherwise None
+        The route's provider when a candidate URL holds its host, otherwise None
     """
-    if _is_foundry_client(client):
-        logger.debug(f"Foundry provider detected via client type: {type(client).__name__}")
-        return Provider.FOUNDRY
-
     client_base_url = getattr(client, "base_url", None) if client else None
     for candidate in (base_url, client_base_url):
-        if candidate and _FOUNDRY_HOST_MARKER in str(candidate).lower():
-            logger.debug(f"Foundry provider detected via base_url: {candidate}")
-            return Provider.FOUNDRY
-
+        if not candidate:
+            continue
+        for route in _ANTHROPIC_SDK_ROUTES:
+            if route.host_marker.lower() in str(candidate).lower():
+                logger.debug(f"{route.provider.name} provider detected via base_url: {candidate}")
+                return route.provider
     return None
 
 
@@ -121,21 +139,23 @@ def detect_provider(client: Optional[Any] = None, base_url: Optional[str] = None
     Detect which AI provider is being used based on available information.
 
     Detection priority:
-    1. Client instance type (boto3 bedrock-runtime) - most reliable
-    2. Base URL substring matching ("amazonaws.com")
-    3. Client instance type (Anthropic Foundry client) - most reliable
-    4. Base URL substring matching ("services.ai.azure.com")
+    1. Client instance type (Anthropic Foundry or Google Cloud client), so a
+       custom base_url on one of them, an AWS-hosted gateway included, never
+       changes its label
+    2. Client instance type (boto3 bedrock-runtime)
+    3. Base URL substring matching ("amazonaws.com")
+    4. Base URL substring matching ("services.ai.azure.com", "claude.googleapis.com")
     5. Default to Anthropic
 
-    REVENIUM_BEDROCK_DISABLE=1 switches off the Bedrock signals (1-2) only.
-    Foundry detection still runs, so a Foundry client is never mislabelled as
+    REVENIUM_BEDROCK_DISABLE=1 switches off the Bedrock signals (2-3) only.
+    Foundry and Google Cloud detection still run, so neither client is mislabelled as
     direct Anthropic just because Bedrock routing was turned off - the switch
     is documented as disabling Bedrock support, nothing else. Callers rely on
     this single gate rather than re-checking the variable themselves.
 
     Args:
         client: Client instance (may be boto3 bedrock-runtime client or an
-            Anthropic Foundry client)
+            Anthropic Foundry or Google Cloud client)
         base_url: Base URL for API calls
 
     Returns:
@@ -143,10 +163,15 @@ def detect_provider(client: Optional[Any] = None, base_url: Optional[str] = None
     """
     logger.debug("Detecting AI provider...")
 
+    # 1. Check for a Microsoft Foundry or Google Cloud client
+    client_route = _anthropic_sdk_route_by_class(client)
+    if client_route is not None:
+        return client_route
+
     if os.getenv("REVENIUM_BEDROCK_DISABLE", "").strip() == "1":
         logger.debug("Bedrock detection disabled via REVENIUM_BEDROCK_DISABLE")
     else:
-        # 1. Check if client is boto3 bedrock-runtime client (most reliable)
+        # 2. Check if client is boto3 bedrock-runtime client
         if client and hasattr(client, "meta"):
             try:
                 if hasattr(client.meta, "service_model") and \
@@ -157,21 +182,21 @@ def detect_provider(client: Optional[Any] = None, base_url: Optional[str] = None
                 # If meta doesn't have service_model, continue to next check
                 pass
 
-        # 2. Check base URL for AWS substring
+        # 3. Check base URL for AWS substring
         if base_url and "amazonaws.com" in str(base_url).lower():
             logger.debug(f"Bedrock provider detected via base_url: {base_url}")
             return Provider.BEDROCK
 
-        # 3. Check for client base_url if not provided directly
+        # Check for client base_url if not provided directly
         if client and hasattr(client, 'base_url') and client.base_url:
             if "amazonaws.com" in str(client.base_url).lower():
                 logger.debug(f"Bedrock provider detected via client.base_url: {client.base_url}")
                 return Provider.BEDROCK
 
-    # 4. Check for a Microsoft Foundry client or an Azure Foundry host
-    foundry_provider = _detect_foundry_provider(client=client, base_url=base_url)
-    if foundry_provider is not None:
-        return foundry_provider
+    # 4. Check for a Microsoft Foundry or Google Cloud host
+    host_route = _anthropic_sdk_route_by_host(client=client, base_url=base_url)
+    if host_route is not None:
+        return host_route
 
     # 5. Default to Anthropic
     logger.debug("Defaulting to Anthropic provider")
@@ -190,7 +215,7 @@ def get_provider_metadata(provider: Provider) -> dict:
     """
     if provider == Provider.BEDROCK:
         return {
-            "provider": "AWS",
+            "provider": "Bedrock",
             "model_source": "ANTHROPIC"
         }
     elif provider == Provider.FOUNDRY:
@@ -202,6 +227,14 @@ def get_provider_metadata(provider: Provider) -> dict:
         # ANTHROPIC because Foundry serves Anthropic's own models.
         return {
             "provider": "Foundry",
+            "model_source": "ANTHROPIC"
+        }
+    elif provider == Provider.GOOGLE_CLOUD:
+        # Google Cloud Marketplace bills this route, and "Google" is the value
+        # the Node SDK already sends for Google-billed Claude, so both SDKs'
+        # rows land in the same provider bucket.
+        return {
+            "provider": "Google",
             "model_source": "ANTHROPIC"
         }
     else:  # ANTHROPIC

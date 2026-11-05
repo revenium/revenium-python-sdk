@@ -139,6 +139,18 @@ class AICreateCompletionParams(TypedDict, total=False):
     ^[A-Za-z0-9._-]{1,64}$.
     """
 
+    ccr_session_id: Annotated[str, PropertyInfo(alias="ccrSessionId")]
+    """The Claude Code cloud session this call ran in (max 128 chars).
+
+    Must match ^[A-Za-z0-9_-]{1,128}$.
+    """
+
+    inference_geo: Annotated[str, PropertyInfo(alias="inferenceGeo")]
+    """Where the provider reports the inference ran, for example us (max 16 chars).
+
+    Sent as given; the backend normalizes it. Must match ^[A-Za-z0-9_-]{1,16}$.
+    """
+
     prompt_id: Annotated[str, PropertyInfo(alias="promptId")]
     """Identifier of the user prompt that produced this completion (max 64 chars)"""
 

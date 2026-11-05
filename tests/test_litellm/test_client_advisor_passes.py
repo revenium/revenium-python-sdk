@@ -276,3 +276,17 @@ def test_executor_only_totals_keep_their_counts_and_still_send_the_pass(submissi
     assert (main["input_token_count"], main["output_token_count"]) == (2171, 30)
     assert advisor["model"] == ADVISOR_MODEL
     assert (advisor["input_token_count"], advisor["output_token_count"]) == (2603, 202)
+
+
+def test_a_stream_that_releases_its_provider_iterator_before_ending_still_sends_the_pass():
+    """LiteLLM 1.108 drops ``completion_stream`` when an async stream ends, before the meter runs."""
+    stream = SimpleNamespace(completion_stream=SimpleNamespace(_cumulative_usage={"iterations": REPLAY_ITERATIONS}))
+    meter = mw._StreamMeter(datetime.datetime.now(datetime.timezone.utc), {}, True, stream=stream)
+    usage = litellm.Usage(prompt_tokens=4774, completion_tokens=232)
+    meter.observe(litellm.ModelResponseStream(model="claude-haiku-4-5", usage=usage))
+    stream.completion_stream = None
+
+    with patch.object(mw, "handle_response") as handle_response:
+        meter.finish(completed=True)
+
+    assert handle_response.call_args.kwargs["usage_iterations"] == REPLAY_ITERATIONS

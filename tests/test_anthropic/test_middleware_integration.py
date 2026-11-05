@@ -489,7 +489,7 @@ class TestBedrockStreamingIntegration:
 
 
 class TestAsyncBedrockAttribution:
-    """Bedrock-routed async calls must carry AWS provider metadata.
+    """Bedrock-routed async calls must carry Bedrock provider metadata.
 
     The async wrapper serves Bedrock clients natively (no re-routing), so
     the only Bedrock-specific behaviour is attribution: detection must run
@@ -557,9 +557,9 @@ class TestAsyncBedrockAttribution:
         assert len(payloads) == 1
         return payloads[0]
 
-    def test_async_bedrock_create_emits_aws_provider(self):
+    def test_async_bedrock_create_emits_bedrock_provider(self):
         payload = self._run_create(Provider.BEDROCK)
-        assert payload["provider"] == "AWS"
+        assert payload["provider"] == "Bedrock"
         assert payload["model_source"] == "ANTHROPIC"
 
     def test_async_direct_anthropic_create_unchanged(self):

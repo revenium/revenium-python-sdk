@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-11-05
+
+### Added
+- AI completions can now carry the Claude Code cloud session they ran in and the inference geography the provider reports. `create_completion` (sync and async) accepts `ccr_session_id` and `inference_geo`, and every provider integration that meters completions reads them from `usage_metadata` as `ccr_session_id` / `ccrSessionId` and `inference_geo` / `inferenceGeo`, so spend can be grouped by cloud session and by where the inference ran. `inference_geo` is sent as given; Revenium normalizes it. A value Revenium refuses (empty, longer than 128 characters for the session or 16 for the geography, or holding anything but letters, digits, hyphens and underscores) is left off the record with a WARNING and the call is still recorded. When they are unset they are left off the request, so existing integrations send exactly what they did before. They apply to completions only: passing them on an image, video or audio call changes nothing. The LiteLLM proxy, which takes attribution from `x-revenium-*` headers, does not read them.
+
+### Changed
+- Claude on AWS Bedrock is now recorded under provider `Bedrock` instead of `AWS`, on the Anthropic Bedrock client (`AnthropicBedrock`, `AsyncAnthropicBedrock`), raw boto3 calls with `REVENIUM_BEDROCK_TRANSPORT` on, and LangChain's `ChatBedrock`, `ChatBedrockConverse` and `ChatAnthropicBedrock`, so Python matches Claude Code, AWS billing and the other SDKs and one Bedrock spend shows under one provider. `ChatBedrock` serving a non-Claude model such as Nova or Llama is recorded under `Bedrock` too; its model source still names the vendor. Spending caps, alerts and filters scoped to `AWS`, `Amazon Bedrock`, `AWS Bedrock` or `Bedrock`, in any case, with is, is not or in, all still match these calls; a filter that matches only part of the label (contains, starts with or ends with `AWS`) no longer does. Records already stored keep `aws`.
+
+### Fixed
+- LiteLLM client: a streamed `litellm.acompletion` call to Claude on LiteLLM's direct Anthropic route, on litellm 1.108 or later, again sends a separate record for each advisor and compaction pass, and the main record again carries only the executor's own tokens. litellm 1.108 releases the stream's provider iterator before the stream ends, which is where those passes were read from, so the passes were dropped and billed inside the main record. Streamed Claude on LiteLLM's Bedrock and Vertex AI routes still keeps one summed record, as before.
+- OpenAI client pointed at OpenRouter (a base URL on `openrouter.ai` or one of its subdomains): every call it makes, chat and Responses, sync and async, streamed or not, and embeddings, is recorded with provider and model source `OPENROUTER` instead of `OPENAI`, and the spending-cap check before the call sees `OPENROUTER`. OpenRouter spend now shows under OpenRouter and lines up with the OpenRouter bill, a cap scoped to OpenRouter counts and stops these calls, and a cap scoped to OpenAI no longer does. A gateway or proxy on your own domain is still recorded as OpenAI. OpenAI, Azure OpenAI, Ollama, xAI and Perplexity calls are recorded as before.
+- Claude calls made through Anthropic's Google Cloud clients (`AnthropicGoogleCloud` and `AsyncAnthropicGoogleCloud`, anthropic 2.4.0, Claude Models on Google Cloud (Anthropic managed)) are now recorded with provider `Google` and model source `ANTHROPIC`, the values the Node SDK already sends for Google-billed Claude. They were recorded as direct Anthropic spend, though Google Cloud Marketplace bills them, so provider totals and provider comparisons counted the money against the wrong invoice. The client class is recognised before any host, so a custom `base_url` keeps the label, an AWS-hosted gateway (`*.amazonaws.com`) included, and a client pointed at `claude.googleapis.com` is recognised by its host. A Foundry client behind an AWS-hosted gateway is now recorded as `Foundry` for the same reason; it was recorded as `AWS`. Non-streamed, streamed, beta and async calls all carry the label, and spending caps judge the call by it: a cap scoped to `Google` now counts these calls, and one scoped to `ANTHROPIC` no longer does, matching how Revenium totals the spend. Direct Anthropic, Bedrock (`Bedrock`, see Changed) and Foundry (`Foundry`) calls keep their labels, and an installed anthropic release without the Google Cloud clients works as before. Claude through the older `AnthropicVertex` client is unchanged and still recorded as `ANTHROPIC`.
+
 ## [0.13.0] - 2026-11-02
 
 ### Added
@@ -598,6 +611,7 @@ These can change what your application sees when you upgrade from 0.9.2. Each on
 - Selective metering via `REVENIUM_SELECTIVE_METERING` environment variable
 - Configurable logging with `REVENIUM_LOG_LEVEL`
 
+[0.14.0]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.14.0
 [0.13.0]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.13.0
 [0.12.1]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.12.1
 [0.12.0]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.12.0

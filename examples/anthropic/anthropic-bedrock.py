@@ -51,7 +51,7 @@ def example_1_basic_chat():
             print(
                 f"Tokens: {response.usage.input_tokens} input + {response.usage.output_tokens} output"
             )
-            print("Automatically metered to Revenium with provider='AWS'")
+            print("Automatically metered to Revenium with provider='Bedrock'")
         else:
             print("Warning: Bedrock request returned but response format unexpected")
             print(f"Response: {response}")
@@ -96,7 +96,7 @@ def example_2_chat_with_metadata():
             print(
                 f"Tokens: {response.usage.input_tokens} input + {response.usage.output_tokens} output"
             )
-            print("Metered to Revenium with provider='AWS' and detailed metadata")
+            print("Metered to Revenium with provider='Bedrock' and detailed metadata")
         else:
             print("Warning: Bedrock request returned but response format unexpected")
             print(f"Response: {response}")
@@ -142,7 +142,7 @@ def example_3_bedrock_integration():
             print(
                 f"Tokens: {response.usage.input_tokens} input + {response.usage.output_tokens} output"
             )
-            print("Automatically metered to Revenium with provider='AWS'")
+            print("Automatically metered to Revenium with provider='Bedrock'")
         else:
             print("Warning: Bedrock request returned but response format unexpected")
             print(f"Response: {response}")
@@ -199,7 +199,7 @@ def example_4_streaming():
                 f"Tokens: {final_message.usage.input_tokens} input + {final_message.usage.output_tokens} output"
             )
             print("Routed through AWS Bedrock streaming")
-            print("Automatically metered to Revenium with provider='AWS'")
+            print("Automatically metered to Revenium with provider='Bedrock'")
         else:
             print("Warning: Streaming completed but final message format unexpected")
             print(f"Final message: {final_message}")
@@ -257,7 +257,7 @@ def example_5_bedrock_streaming():
             print(f"   Input tokens: {final_message.usage.input_tokens}")
             print(f"   Output tokens: {final_message.usage.output_tokens}")
             print(f"   Total tokens: {final_message.usage.total_tokens}")
-            print(f"Automatically metered to Revenium with provider='AWS'")
+            print(f"Automatically metered to Revenium with provider='Bedrock'")
         else:
             print("Warning: Streaming completed but final message format unexpected")
             print(f"Final message: {final_message}")
@@ -374,7 +374,7 @@ if __name__ == "__main__":
 
     print("\nAll AWS Bedrock examples complete!")
     print(
-        "Check your Revenium dashboard to see all Bedrock usage metered with provider='AWS'"
+        "Check your Revenium dashboard to see all Bedrock usage metered with provider='Bedrock'"
     )
     print(
         "For more details, see: https://github.com/revenium/revenium-python-sdk"
