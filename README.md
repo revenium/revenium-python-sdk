@@ -1814,7 +1814,7 @@ characters, and `product_name` at 224. Other text fields are sent as given.
 | `effort` | Reasoning effort level requested of the model (free-form string, max 16 chars, `^[A-Za-z0-9_-]+$`) | Report what share of AI spend is high-effort reasoning, and compare cost per effort level |
 | `entrypoint` | How the coding assistant that made the call was launched, such as `cli`, `sdk-py` or `claude-vscode` (completions only, 1 to 64 chars, `^[A-Za-z0-9._-]+$`) | Split coding-assistant spend between the terminal, the SDKs and the editor or chat integrations |
 | `ccr_session_id` | The Claude Code cloud session the call ran in; `ccrSessionId` also accepted (completions only, 1 to 128 chars, `^[A-Za-z0-9_-]+$`) | Group the spend of one Claude Code cloud session |
-| `inference_geo` | Where the provider reports the inference ran, such as `us`; `inferenceGeo` also accepted (completions only, 1 to 16 chars, `^[A-Za-z0-9_-]+$`) | Split spend by where the inference ran |
+| `inference_geo` | Where the provider reports the inference ran, such as `us`; `inferenceGeo` also accepted (completions only, 1 to 16 chars, `^[A-Za-z0-9_-]+$`) | Passed to Revenium with the call; it is not stored as a dimension to group spend by |
 
 **Example:**
 
@@ -1871,7 +1871,8 @@ the Claude Code cloud session a completion ran in, and `inference_geo` records
 where the provider says the inference ran. Both are values you supply per call;
 the SDK does not read them from the environment or from the provider response.
 `inference_geo` is sent exactly as given, with no lowercasing or allow-list;
-the backend normalizes it. A value that is empty, too long (128 characters
+the backend normalizes it. It is not stored as a dimension to group spend by,
+so it cannot break spend down by geography. A value that is empty, too long (128 characters
 for `ccr_session_id`, 16 for `inference_geo`) or holds anything but letters,
 digits, hyphens and underscores is left off the record with a WARNING, and the
 call is still recorded. Both are sent on completions only; image, video and

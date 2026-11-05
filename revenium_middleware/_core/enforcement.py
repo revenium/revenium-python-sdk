@@ -1821,11 +1821,9 @@ _FILTER_OPERATORS = frozenset({"IS", "IS_NOT", "CONTAINS", "STARTS_WITH", "ENDS_
 # FOUNDRY and coding-assistant rows copy the server's
 # ProviderVocabulary.ALIAS_BUCKETS (hypercurrent commons) and alias one way
 # only, so a cap on FOUNDRY never covers direct Anthropic calls. The Bedrock
-# rows mirror the Bedrock bucket that hypercurrent BACK-4461 adds to that
-# server table. That change is in flight and not yet merged, so the server
-# does not alias these spellings yet: no PyPI release may carry them before
-# BACK-4461 is in prod. The Bedrock spellings name one provider, so each
-# counts toward all of them.
+# rows mirror the Bedrock bucket in that same server table (BACK-4461,
+# hypercurrent #7678): the Bedrock spellings name one provider, so each
+# counts toward all of them, both ways.
 _BEDROCK_SPELLINGS = frozenset({"BEDROCK", "AWS", "AMAZON BEDROCK", "AWS BEDROCK"})
 _PROVIDER_ALIAS_BUCKETS = {
     "FOUNDRY": frozenset({"FOUNDRY", "ANTHROPIC"}),

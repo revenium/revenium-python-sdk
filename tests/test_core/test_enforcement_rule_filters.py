@@ -878,10 +878,10 @@ def test_hosting_labels_are_not_aliased(cap, value, label, refused):
 def test_provider_aliases_match_the_servers_provider_vocabulary():
     """The SDK's copy of the server's alias table, from hypercurrent develop
     843ba8a9f6 ``commons/.../ProviderVocabulary.kt`` and
-    ``CodingAssistantProviderIds.kt``. The Bedrock rows copy the bucket
-    BACK-4461 specifies for ``ProviderVocabulary.kt``, not yet merged there.
-    This repo cannot read the server, so the test catches the SDK drifting
-    from that copy, not the server moving."""
+    ``CodingAssistantProviderIds.kt``, plus the Bedrock bucket BACK-4461
+    (hypercurrent #7678) added to ``ProviderVocabulary.kt``. This repo cannot
+    read the server, so the test catches the SDK drifting from that copy, not
+    the server moving."""
     assert enforcement._PROVIDER_ALIAS_BUCKETS == SERVER_ALIASES_UPPER
 
 
