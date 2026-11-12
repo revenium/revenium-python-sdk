@@ -80,11 +80,11 @@ The calls below are billed by the provider (some, such as batch and fine-tuning 
 <!-- not-metered:start -->
 - **OpenAI** (`OpenAI` and `AsyncOpenAI` clients): `batches.create`, `beta.agents.automations.create`, `beta.agents.automations.invocations.create`, `beta.agents.sessions.create`, `beta.agents.sessions.events.create`, `beta.agents.sessions.events.stream`, `beta.agents.sessions.stream`, `beta.agents.sessions.update`, `beta.chatkit.sessions.create`, `beta.realtime.connect`, `beta.responses.compact`, `beta.responses.connect`, `beta.responses.create`, `beta.threads.create_and_run`, `beta.threads.create_and_run_poll`, `beta.threads.create_and_run_stream`, `beta.threads.runs.create`, `beta.threads.runs.create_and_poll`, `beta.threads.runs.create_and_stream`, `beta.threads.runs.stream`, `beta.threads.runs.submit_tool_outputs`, `beta.threads.runs.submit_tool_outputs_and_poll`, `beta.threads.runs.submit_tool_outputs_stream`, `completions.create`, `decisions.create`, `evals.runs.create`, `fine_tuning.alpha.graders.run`, `fine_tuning.jobs.create`, `images.create_variation`, `images.edit`, `images.generate`, `live.connect`, `live.create`, `live.forks.connect`, `live.sessions.accept`, `live.sessions.fork`, `live.sideband.connect`, `realtime.calls.accept`, `realtime.calls.create`, `realtime.connect`, `realtime.translations.connect`, `responses.compact`, `responses.connect`, `videos.create`, `videos.create_and_poll`, `videos.create_character`, `videos.edit`, `videos.extend`, `videos.remix`
 - **Anthropic** (`Anthropic` and `AsyncAnthropic` clients): `beta.deployments.run`, `beta.dreams.create`, `beta.environments.work.poller`, `beta.environments.work.worker`, `beta.messages.batches.create`, `beta.sessions.create`, `beta.sessions.events.send`, `beta.sessions.events.stream`, `beta.sessions.events.tool_runner`, `beta.sessions.threads.events.stream`, `messages.batches.create`
-- **Google Gemini** (`google.genai` `Client` and `Client.aio`): `batches.create`, `batches.create_embeddings`, `caches.create`, `caches.update`, `file_search_stores.import_file`, `file_search_stores.upload_to_file_search_store`, `interactions.create`, `live.connect`, `live.music.connect`, `models.edit_image`, `models.recontext_image`, `models.segment_image`, `models.upscale_image`, `triggers.run`, `tunings.tune`
+- **Google Gemini** (`google.genai` `Client` and `Client.aio`): `batches.create`, `batches.create_embeddings`, `caches.create`, `caches.update`, `decisions.create`, `file_search_stores.import_file`, `file_search_stores.upload_to_file_search_store`, `interactions.create`, `live.connect`, `live.music.connect`, `models.edit_image`, `models.recontext_image`, `models.segment_image`, `models.upscale_image`, `triggers.run`, `tunings.tune`
 - **Google Vertex AI** (`vertexai` classes): `batch_prediction.BatchPredictionJob.submit`, `caching.CachedContent.create`, `caching.CachedContent.update`, `language_models.ChatModel.tune_model`, `language_models.ChatModel.tune_model_rlhf`, `language_models.ChatSession.send_message`, `language_models.ChatSession.send_message_async`, `language_models.ChatSession.send_message_streaming`, `language_models.ChatSession.send_message_streaming_async`, `language_models.CodeChatModel.tune_model`, `language_models.CodeChatSession.send_message`, `language_models.CodeChatSession.send_message_async`, `language_models.CodeChatSession.send_message_streaming`, `language_models.CodeChatSession.send_message_streaming_async`, `language_models.CodeGenerationModel.batch_predict`, `language_models.CodeGenerationModel.predict`, `language_models.CodeGenerationModel.predict_async`, `language_models.CodeGenerationModel.predict_streaming`, `language_models.CodeGenerationModel.predict_streaming_async`, `language_models.CodeGenerationModel.tune_model`, `language_models.TextEmbeddingModel.batch_predict`, `language_models.TextEmbeddingModel.deploy_tuned_model`, `language_models.TextEmbeddingModel.tune_model`, `language_models.TextGenerationModel.batch_predict`, `language_models.TextGenerationModel.predict`, `language_models.TextGenerationModel.predict_async`, `language_models.TextGenerationModel.predict_streaming`, `language_models.TextGenerationModel.predict_streaming_async`, `language_models.TextGenerationModel.tune_model`, `language_models.TextGenerationModel.tune_model_rlhf`, `preview.caching.CachedContent.create`, `preview.caching.CachedContent.update`, `preview.vision_models.ImageCaptioningModel.get_captions`, `preview.vision_models.ImageGenerationModel.upscale_image`, `preview.vision_models.ImageQnAModel.ask_question`, `preview.vision_models.ImageSegmentationModel.segment_image`, `preview.vision_models.ImageTextModel.ask_question`, `preview.vision_models.ImageTextModel.get_captions`, `preview.vision_models.MultiModalEmbeddingModel.get_embeddings`, `preview.vision_models.WatermarkVerificationModel.verify_image`, `tuning.sft.train`, `vision_models.ImageCaptioningModel.get_captions`, `vision_models.ImageGenerationModel.upscale_image`, `vision_models.ImageQnAModel.ask_question`, `vision_models.ImageTextModel.ask_question`, `vision_models.ImageTextModel.get_captions`, `vision_models.MultiModalEmbeddingModel.get_embeddings`
 - **AWS Bedrock** (boto3 bedrock-runtime client; Claude models are metered when REVENIUM_BEDROCK_TRANSPORT is on): `apply_guardrail`, `converse`, `converse_stream`, `invoke_guardrail_checks`, `invoke_model`, `invoke_model_with_response_stream`, `start_async_invoke`
 - **Perplexity** (`Perplexity` and `AsyncPerplexity` clients): `async_.chat.completions.create`, `batches.create`, `browser.sessions.create`, `contextualized_embeddings.create`, `decisions.create`, `embeddings.create`, `responses.create`, `search.create`
-- **LiteLLM** (the `litellm` module): `aadapter_completion`, `aadapter_generate_content`, `acode_interpreter_tool`, `acompact_responses`, `acreate_batch`, `acreate_fine_tuning_job`, `acreate_run`, `acreate_sandbox`, `adapter_completion`, `adecisions`, `agenerate_content`, `aimage_edit`, `aimage_generation`, `aimage_variation`, `aingest`, `anthropic_interface.messages.acreate`, `anthropic_interface.messages.create`, `anthropic_messages`, `anthropic_messages_handler`, `aocr`, `aquery`, `arealtime_calls`, `arerank`, `aresponses`, `aresponses_api_with_mcp`, `aresponses_with_retries`, `arun_code`, `arun_thread`, `arun_thread_stream`, `asearch`, `aspeech`, `asystemone`, `atranscription`, `avideo_create_character`, `avideo_edit`, `avideo_extension`, `avideo_generation`, `avideo_remix`, `compact_responses`, `config_completion`, `create_batch`, `create_fine_tuning_job`, `create_run`, `decisions`, `image_edit`, `image_generation`, `image_variation`, `ingest`, `nlp_cloud_chat_completion`, `ocr`, `query`, `replicate_chat_completion`, `rerank`, `responses`, `responses_with_retries`, `run_thread`, `run_thread_stream`, `search`, `speech`, `systemone`, `transcription`, `video_create_character`, `video_edit`, `video_extension`, `video_generation`, `video_remix`
+- **LiteLLM** (the `litellm` module): `aadapter_completion`, `aadapter_generate_content`, `acode_interpreter_tool`, `acompact_responses`, `acreate_batch`, `acreate_fine_tuning_job`, `acreate_run`, `acreate_sandbox`, `adapter_completion`, `adecisions`, `aextraction`, `agenerate_content`, `aimage_edit`, `aimage_generation`, `aimage_variation`, `aingest`, `anthropic_interface.messages.acreate`, `anthropic_interface.messages.create`, `anthropic_messages`, `anthropic_messages_handler`, `aocr`, `aquery`, `arealtime_calls`, `arerank`, `aresponses`, `aresponses_api_with_mcp`, `aresponses_with_retries`, `arun_code`, `arun_thread`, `arun_thread_stream`, `asearch`, `aspeech`, `asystemone`, `atranscription`, `avideo_create_character`, `avideo_edit`, `avideo_extension`, `avideo_generation`, `avideo_remix`, `compact_responses`, `config_completion`, `create_batch`, `create_fine_tuning_job`, `create_run`, `decisions`, `extraction`, `image_edit`, `image_generation`, `image_variation`, `ingest`, `nlp_cloud_chat_completion`, `ocr`, `query`, `replicate_chat_completion`, `rerank`, `responses`, `responses_with_retries`, `run_thread`, `run_thread_stream`, `search`, `speech`, `systemone`, `transcription`, `video_create_character`, `video_edit`, `video_extension`, `video_generation`, `video_remix`
 - **Ollama** (`Client`, `AsyncClient` and the `ollama` module): `systemone`, `web_fetch`, `web_search`
 - **fal.ai** (`SyncClient`, `AsyncClient` and the `fal_client` module): `realtime`, `realtime_async`, `ws_connect`, `ws_connect_async`
 - **LangChain** (embeddings models from vendors other than OpenAI, Azure OpenAI and Ollama, such as `MistralAIEmbeddings`): `Embeddings.aembed_documents`, `Embeddings.aembed_query`, `Embeddings.embed_documents`, `Embeddings.embed_query`
@@ -265,6 +265,13 @@ explicit override. Economics metric directions are
 
 Use `CUSTOMER_DECLARED` or `MEASURED` for a baseline override. Use `MEASURED`,
 `SELF_REPORTED`, or `DERIVED` for a period fact override.
+
+A baseline can also record the work's throughput and headcount before AI:
+`throughput_value` with a `throughput_period` of `HOUR`, `DAY`, `WEEK`, or
+`MONTH`, an optional `throughput_scope` of `TEAM` (the default) or
+`PER_PERSON`, and `headcount`. Send `throughput_period` whenever
+`throughput_value` is set; the server rejects a period or scope without a
+value.
 
 Facts are append-only and keyed on the period, dimension and metric key
 together. Re-appending that tuple supersedes the active fact, and the server
@@ -1072,6 +1079,10 @@ except calls a spending cap refuses.
 pip install "revenium-python-sdk[litellm-proxy]"   # requires Python 3.10+
 ```
 
+The extra requires **LiteLLM 1.94.0 or newer**. On LiteLLM 1.93.x the proxy cannot
+load the guardrail from the config below: it only looks for a module file beside
+`config.yaml` and stops with `Could not find module file`.
+
 ```yaml
 guardrails:
   - guardrail_name: "revenium"
@@ -1119,7 +1130,7 @@ the call proceeds, and it proceeds without waiting. The pre-call check reads the
 rules the SDK already has cached and refreshes them on a background thread, so a
 Revenium endpoint that hangs, refuses connections, returns errors or rejects your
 key (403) neither blocks nor slows the proxy. A failed refresh is retried once
-per `REVENIUM_CB_POLL_INTERVAL_SECONDS`, not once per request. Right after the
+per `REVENIUM_CB_POLL_INTERVAL_SECONDS` (default 30 s, minimum 5 s), not once per request. Right after the
 proxy starts, before the first rules fetch completes, no rules are cached and
 calls go through; see [Fail-Open vs Fail-Closed](#fail-open-vs-fail-closed).
 Metering is likewise non-disruptive — nothing in the post-call path can turn a
@@ -1317,7 +1328,7 @@ Blank or unset means on; `true`, `1`, `yes`, `on` mean on; any other value turns
 New calls go straight back to two records when you do; records already merged stay
 merged. Four things have to be true for it to work:
 
-* **LiteLLM 1.93.0 or newer.** That is the floor of the `litellm-proxy` extra, which
+* **LiteLLM 1.94.0 or newer.** That is the floor of the `litellm-proxy` extra, which
   is what installs the guardrail. On an older LiteLLM the guardrail logs one warning
   at startup and behaves exactly as it does when opted out: no header is added,
   the provider's response id is reported, and you get two records rather than none.
@@ -2274,7 +2285,7 @@ REVENIUM_ENFORCEMENT_BASE_URL=https://api.revenium.ai/profitstream  # optional: 
 | `REVENIUM_BYPASS` | `false` | When `true`, every `check_enforcement` call short-circuits to a no-op. Useful for incident response. |
 | `REVENIUM_TEAM_ID` | — | Hashed team ID. Path component on rule fetches; required when the breaker is enabled. |
 | `REVENIUM_ENFORCEMENT_BASE_URL` | `https://api.revenium.ai/profitstream` | Base URL for the enforcement API, taken as given. When unset it is the address outcomes and jobs use (`REVENIUM_PROFITSTREAM_BASE_URL`, else the Revenium address `REVENIUM_METERING_BASE_URL` or `initialize_metering(base_url=...)` sits under, without its `/meter` segment) plus `/profitstream`. A rules fetch that answers 404 is retried once at the same address with `/profitstream` removed, or added if it was missing, and the address that answers with rules is used from then on, so a self-hosted server that serves the API at the root, or a value set without `/profitstream`, still reaches the rules. |
-| `REVENIUM_CB_POLL_INTERVAL_SECONDS` | `60` | Background poll interval for rule refreshes. |
+| `REVENIUM_CB_POLL_INTERVAL_SECONDS` | `30` | Seconds between background rule refreshes, and the wait before a failed refresh is retried. Whole seconds from a minimum of `5` to a maximum of `3600`: a lower value is raised to `5` with one warning per process start, and a higher one is capped at `3600`. Anything other than plain digits after trimming spaces (a sign, a decimal point, other text), an empty value and `0` use the default. Read once when polling starts, so a change takes effect when the process restarts. While calls are arriving, rules older than 120 seconds are refreshed on the next call whatever the interval, so a value above `120` only spaces out refreshes on an idle process and the retry after a failed refresh. |
 | `REVENIUM_CB_FAIL_MODE` | `open` | `open` (default) lets calls through when no cache exists; `closed` raises `BudgetExceededError` until rules are loaded. |
 | `REVENIUM_CACHE_DIR` | unset | When set, the rule cache is mirrored to `<dir>/revenium_enforcement_rules.<scope>.json` so a restarted process doesn't fail-closed on the very first call. `<scope>` is a short hash of the enforcement base URL and `REVENIUM_TEAM_ID`, so services for different teams can share one folder and each loads only its own rules. Nothing is saved without `REVENIUM_TEAM_ID`. |
 
@@ -2307,9 +2318,9 @@ LangChain embeddings models run no callbacks: `OpenAIEmbeddings` and `AzureOpenA
 When the circuit breaker is disabled, it is a no-op. When enabled:
 
 1. A daemon thread (`revenium-enforcement-poll`) starts on first use.
-2. It polls `GET {REVENIUM_ENFORCEMENT_BASE_URL}/v2/api/ai/enforcement-rules/{REVENIUM_TEAM_ID}` every `REVENIUM_CB_POLL_INTERVAL_SECONDS` with the `x-api-key` header.
+2. It polls `GET {REVENIUM_ENFORCEMENT_BASE_URL}/v2/api/ai/enforcement-rules/{REVENIUM_TEAM_ID}` every `REVENIUM_CB_POLL_INTERVAL_SECONDS` (default 30 s, minimum 5 s) with the `x-api-key` header.
 3. Rules are cached in-process. The pre-call check only reads that cache: it never makes a network request and never sleeps, so it is safe on an event loop (LiteLLM proxy, `AsyncOpenAI`). When the cache is more than 120 s old the check wakes the poller to refresh it early and carries on with the rules it has. Only one refresh runs at a time per process.
-4. A refresh that fails (timeout, refused connection, 5xx, or any 4xx such as a 403 for a wrong key or team id) keeps the cached rules, logs a warning, and is not retried for one `REVENIUM_CB_POLL_INTERVAL_SECONDS`, however much traffic arrives meanwhile. A 4xx answer the SDK does not retry (any but 408 and 429) is logged at WARNING with the URL and the status, so a wrong address (404) or a wrong key or team id (401, 403) is visible without debug logging.
+4. A refresh that fails (timeout, refused connection, 5xx, or any 4xx such as a 403 for a wrong key or team id) keeps the cached rules, logs a warning, and is not retried for one `REVENIUM_CB_POLL_INTERVAL_SECONDS` (default 30 s, minimum 5 s), however much traffic arrives meanwhile. A 4xx answer the SDK does not retry (any but 408 and 429) is logged at WARNING with the URL and the status, so a wrong address (404) or a wrong key or team id (401, 403) is visible without debug logging.
 5. `204 No Content` is treated as "no rules configured" — the cache is cleared.
 
 A rule with filters (a cap scoped to an agent, model, provider, subscriber, credential, task type, product or organization) blocks or warns only the calls that match all of them; a filter the SDK cannot evaluate, such as the model of a LiteLLM proxy request, keeps the rule applying.
@@ -2417,7 +2428,7 @@ for budget in budgets or []:
 
 Each row has `source` `ANOMALY` and `action` `NOTIFY`, groups by `SUBSCRIBER` with a per-person `groupBreakdown`, and carries `readingAt` when the current window has a reading. The call returns `[]` when the team has no advisory budgets and `None` when the enforcement API cannot be reached.
 
-The background poller is unaffected: it keeps reading the **whole team's** rules every `REVENIUM_CB_POLL_INTERVAL_SECONDS`. That is deliberate. The server computes the department-budget maps team-wide and attaches them to the team-wide read, so a poll narrowed to a single rule would stop receiving them and department budgets would quietly stop blocking anyone. Narrowing is an explicit, opt-in inspection call and never the refresh.
+The background poller is unaffected: it keeps reading the **whole team's** rules every `REVENIUM_CB_POLL_INTERVAL_SECONDS` (default 30 s, minimum 5 s). That is deliberate. The server computes the department-budget maps team-wide and attaches them to the team-wide read, so a poll narrowed to a single rule would stop receiving them and department budgets would quietly stop blocking anyone. Narrowing is an explicit, opt-in inspection call and never the refresh.
 
 ### End-to-End Example
 

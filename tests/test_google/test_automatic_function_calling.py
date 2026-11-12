@@ -326,6 +326,11 @@ class _InsideTool:
     active = False
 
 
+def inner_requests(stub):
+    """The paths of the requests made inside the tool, without the API version google-genai chose."""
+    return [path.split("/", 2)[-1] for sender, path in stub.requests if sender == "inner"]
+
+
 @pytest.fixture
 def unmetered_inside_tools(monkeypatch):
     monkeypatch.setattr(genai_mw, "_metering_skipped", lambda: _InsideTool.active)
@@ -361,7 +366,7 @@ def test_an_unmetered_gemini_call_inside_a_tool_is_not_billed_to_the_outer_call(
         return _sync(client, _config(get_weather))
 
     outer()
-    assert ("inner", f"/v1beta/models/{MODEL}:generateContent") in stub.requests
+    assert inner_requests(stub) == [f"models/{MODEL}:generateContent"]
     assert token_pairs(mock_revenium_client) == [(100, 10), (130, 5)]
 
 
@@ -392,7 +397,7 @@ def test_an_unmetered_gemini_stream_inside_a_tool_is_not_billed_to_the_outer_cal
         _async_stream(client, _config(async_get_weather))
     else:
         _sync_stream(client, _config(get_weather))
-    assert ("inner", f"/v1beta/models/{MODEL}:streamGenerateContent?alt=sse") in stub.requests
+    assert inner_requests(stub) == [f"models/{MODEL}:streamGenerateContent?alt=sse"]
     assert token_pairs(mock_revenium_client) == [(100, 10), (130, 5)]
 
 

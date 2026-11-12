@@ -18,6 +18,7 @@ The measured call is the fixture: input 10, output 235, cache read 31,604,
 cache creation 4,910 (dev trace 04f209d6-2d8c-4a4d-aa09-76cac15b151e), so a
 regression reproduces the customer's 4.5x directly.
 """
+import asyncio
 import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -656,6 +657,9 @@ class TestAOneHourWriteIsSplitOnEveryLeg:
 
 BEDROCK_CLAUDE = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 BEDROCK_NOVA = "us.amazon.nova-micro-v1:0"
+BEDROCK_NOVA_INVOKE = "invoke/us.amazon.nova-pro-v1:0"
+BEDROCK_ARN = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123"
+BEDROCK_GPT_OSS = "chat_completions/openai.gpt-oss-120b-1:0"
 VERTEX_CLAUDE = "claude-haiku-4-5@20251001"
 VERTEX_GEMINI = "gemini-2.5-flash-lite"
 
@@ -689,6 +693,16 @@ def vertex_gemini_usage():
         "promptTokenCount": 4911, "candidatesTokenCount": 1, "totalTokenCount": 4912,
         "cachedContentTokenCount": 4084,
     }})
+
+
+OPENAI_SHAPED_PROMPT = 5012
+
+
+def openai_shaped_usage(cache_write=0):
+    return SimpleNamespace(
+        prompt_tokens=OPENAI_SHAPED_PROMPT, completion_tokens=5, total_tokens=OPENAI_SHAPED_PROMPT + 5,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=ROUTE_READ, cache_write_tokens=cache_write),
+    )
 
 
 CLAUDE_ROUTES = {
@@ -799,7 +813,9 @@ class TestClaudeOnBedrockAndVertexIsNettedOnEveryLeg:
         assert_netted(args)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("provider, model", [("bedrock", BEDROCK_CLAUDE), ("vertex_ai", VERTEX_CLAUDE)])
+    @pytest.mark.parametrize("provider, model", [
+        ("bedrock", BEDROCK_CLAUDE), ("bedrock", BEDROCK_ARN), ("vertex_ai", VERTEX_CLAUDE),
+    ])
     async def test_a_raw_messages_body_is_not_netted_a_second_time(self, guardrail, submit, provider, model):
         """Non-streamed ``/v1/messages`` hands over Anthropic's own count, already net."""
         await guardrail.async_post_call_success_hook(
@@ -905,17 +921,17 @@ class TestClaudeOnBedrockAndVertexIsNettedOnEveryLeg:
         }] * 4
 
     @pytest.mark.asyncio
-    async def test_a_caller_alias_naming_claude_does_not_net_a_nova_deployment(self, guardrail, submit):
+    async def test_a_caller_alias_naming_claude_does_not_net_a_gemini_deployment(self, guardrail, submit):
         """The alias the caller picked appears in the request, the metadata and a
         non-streamed ``response.model``; only the deployment decides."""
         data = guardrail_data(
-            stream=False, model="claude-haiku-alias", custom_llm_provider="bedrock",
-            upstream_model=BEDROCK_NOVA, metadata={"model_group": "claude-haiku-alias"},
+            stream=False, model="claude-haiku-alias", custom_llm_provider="vertex_ai",
+            upstream_model=VERTEX_GEMINI, metadata={"model_group": "claude-haiku-alias"},
         )
-        data["litellm_params"] = {"custom_llm_provider": "bedrock",
+        data["litellm_params"] = {"custom_llm_provider": "vertex_ai",
                                   "metadata": {"model_group": "claude-haiku-alias"}}
-        response = GuardrailResponse(response_id="chatcmpl-alias", usage=bedrock_converse_usage(),
-                                     hidden_params={"litellm_model_name": "bedrock/" + BEDROCK_NOVA})
+        response = GuardrailResponse(response_id="chatcmpl-alias", usage=vertex_gemini_usage(),
+                                     hidden_params={"litellm_model_name": "vertex_ai/" + VERTEX_GEMINI})
         response.model = "claude-haiku-alias"
 
         await guardrail.async_post_call_success_hook(
@@ -923,21 +939,50 @@ class TestClaudeOnBedrockAndVertexIsNettedOnEveryLeg:
         )
 
         args = submitted_args(submit)
-        assert args["input_token_count"] == ROUTE_INPUT + ROUTE_READ + ROUTE_WRITE
-        assert args["cache_read_token_count"] == ROUTE_READ
-        assert args["cache_creation_token_count"] == ROUTE_WRITE
+        assert args["input_token_count"] == 4911
+        assert args["cache_read_token_count"] == 4084
 
-    def test_the_deprecated_callback_does_not_net_a_nova_deployment_behind_a_claude_alias(self):
-        kwargs = base_kwargs(model=BEDROCK_NOVA, custom_llm_provider="bedrock")
+    def test_the_deprecated_callback_does_not_net_a_gemini_deployment_behind_a_claude_alias(self):
+        kwargs = base_kwargs(model=VERTEX_GEMINI, custom_llm_provider="vertex_ai")
         kwargs["litellm_params"]["metadata"]["model_group"] = "claude-haiku-alias"
-        response = make_success_response(bedrock_converse_usage())
+        response = make_success_response(vertex_gemini_usage())
         response.model = "claude-haiku-alias"
 
         args = callback_success(kwargs, response)
 
-        assert args["input_token_count"] == ROUTE_INPUT + ROUTE_READ + ROUTE_WRITE
+        assert args["input_token_count"] == 4911
+        assert args["cache_read_token_count"] == 4084
+
+    @pytest.mark.asyncio
+    async def test_a_caller_alias_naming_nova_does_not_net_a_bedrock_gpt_oss_deployment_in_the_guardrail(
+            self, guardrail, submit):
+        data = guardrail_data(
+            stream=False, model="team-nova", custom_llm_provider="bedrock",
+            upstream_model=BEDROCK_GPT_OSS, metadata={"model_group": "team-nova"},
+        )
+        data["litellm_params"] = {"custom_llm_provider": "bedrock", "metadata": {"model_group": "team-nova"}}
+        response = GuardrailResponse(response_id="chatcmpl-team-nova", usage=openai_shaped_usage(),
+                                     hidden_params={"litellm_model_name": "bedrock/" + BEDROCK_GPT_OSS})
+        response.model = "team-nova"
+
+        await guardrail.async_post_call_success_hook(
+            data=data, user_api_key_dict=make_key_dict(), response=response,
+        )
+
+        args = submitted_args(submit)
+        assert args["input_token_count"] == OPENAI_SHAPED_PROMPT
         assert args["cache_read_token_count"] == ROUTE_READ
-        assert args["cache_creation_token_count"] == ROUTE_WRITE
+
+    def test_a_caller_alias_naming_nova_does_not_net_a_bedrock_gpt_oss_deployment_in_the_callback(self):
+        kwargs = base_kwargs(model=BEDROCK_GPT_OSS, custom_llm_provider="bedrock")
+        kwargs["litellm_params"]["metadata"]["model_group"] = "team-nova"
+        response = make_success_response(openai_shaped_usage())
+        response.model = "team-nova"
+
+        args = callback_success(kwargs, response)
+
+        assert args["input_token_count"] == OPENAI_SHAPED_PROMPT
+        assert args["cache_read_token_count"] == ROUTE_READ
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("cache_tokens", [0, None])
@@ -997,6 +1042,152 @@ class TestClaudeOnBedrockAndVertexIsNettedOnEveryLeg:
             assert args["cache_creation_token_count"] == 4700
 
 
+class TestAnApplicationInferenceProfileArnAndNovaAreNettedOnEveryLeg:
+    """LiteLLM counts the cache inside ``prompt_tokens`` for any Bedrock call it builds
+    with a folding conversion, whatever the model is called."""
+
+    @pytest.mark.asyncio
+    async def test_an_application_inference_profile_arn_is_netted_on_every_leg(self, guardrail, submit):
+        usage = bedrock_converse_usage()
+        assert usage.prompt_tokens == ROUTE_INPUT + ROUTE_READ + ROUTE_WRITE
+        await guardrail.async_post_call_success_hook(
+            data=guardrail_data(stream=False, model=BEDROCK_ARN, custom_llm_provider="bedrock",
+                                upstream_model=BEDROCK_ARN),
+            user_api_key_dict=make_key_dict(),
+            response=GuardrailResponse(response_id="chatcmpl-arn", usage=usage),
+        )
+        streamed = GuardrailResponse(response_id="msg-arn", usage=bedrock_converse_usage())
+        await guardrail.async_log_success_event(logging_kwargs("bedrock", BEDROCK_ARN), streamed, NOW, LATER)
+        failure = RuntimeError("upstream failure")
+        failure.usage = bedrock_converse_usage()
+        error_data = guardrail_data(stream=False, model=BEDROCK_ARN, custom_llm_provider="bedrock",
+                                    upstream_model=BEDROCK_ARN)
+        await guardrail.async_post_call_failure_hook(
+            request_data=after_pre_call(error_data), original_exception=failure,
+            user_api_key_dict=make_key_dict(),
+        )
+
+        kwargs = base_kwargs(model=BEDROCK_ARN, custom_llm_provider="bedrock")
+        callback_error = RuntimeError("upstream failure")
+        callback_error.usage = bedrock_converse_usage()
+        rows = without_the_guardrail(submit) + [
+            callback_success(kwargs, make_success_response(bedrock_converse_usage())),
+            callback_failure(kwargs, callback_error),
+            client_row("bedrock", BEDROCK_ARN, bedrock_converse_usage(), litellm_model_name="bedrock/" + BEDROCK_ARN),
+            client_row("bedrock", BEDROCK_ARN, bedrock_converse_usage()),
+        ]
+        assert len(rows) == 7
+        assert [priced(row) for row in rows] == [{
+            "input_token_count": ROUTE_INPUT,
+            "cache_read_token_count": ROUTE_READ,
+            "cache_creation_token_count": ROUTE_WRITE,
+        }] * 7
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("model", [BEDROCK_NOVA, BEDROCK_NOVA_INVOKE])
+    async def test_nova_is_netted_on_converse_and_invoke(self, guardrail, submit, model):
+        await guardrail.async_post_call_success_hook(
+            data=guardrail_data(stream=False, model="caller-alias", custom_llm_provider="bedrock",
+                                upstream_model=model),
+            user_api_key_dict=make_key_dict(),
+            response=GuardrailResponse(response_id="chatcmpl-nova", usage=bedrock_converse_usage()),
+        )
+
+        rows = without_the_guardrail(submit) + [callback_success(
+            base_kwargs(model=model, custom_llm_provider="bedrock"),
+            make_success_response(bedrock_converse_usage()),
+        )]
+        assert [priced(row) for row in rows] == [{
+            "input_token_count": ROUTE_INPUT,
+            "cache_read_token_count": ROUTE_READ,
+            "cache_creation_token_count": ROUTE_WRITE,
+        }] * 2
+
+    @pytest.mark.asyncio
+    async def test_an_openai_shaped_bedrock_route_does_not_lose_its_write_twice(self, guardrail, submit):
+        usage = openai_shaped_usage(cache_write=ROUTE_WRITE)
+        await guardrail.async_post_call_success_hook(
+            data=guardrail_data(stream=False, model="caller-alias", custom_llm_provider="bedrock",
+                                upstream_model=BEDROCK_GPT_OSS),
+            user_api_key_dict=make_key_dict(),
+            response=GuardrailResponse(response_id="chatcmpl-gpt-oss", usage=usage),
+        )
+
+        rows = without_the_guardrail(submit) + [callback_success(
+            base_kwargs(model=BEDROCK_GPT_OSS, custom_llm_provider="bedrock"), make_success_response(usage),
+        )]
+        for args in rows:
+            assert args["input_token_count"] == OPENAI_SHAPED_PROMPT - ROUTE_WRITE
+            assert args["cache_read_token_count"] == ROUTE_READ
+
+
+class TestAnArnOnV1MessagesIsNetted:
+    """Real ``litellm.anthropic_messages`` against a local Bedrock upstream; the usage is
+    whatever LiteLLM's own logging event carries, never written by hand."""
+
+    @staticmethod
+    def logged_events(stream):
+        from litellm.integrations.custom_logger import CustomLogger
+
+        from . import fake_bedrock_upstream
+        import litellm
+
+        events = []
+
+        class Capture(CustomLogger):
+            async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+                if kwargs.get("model") == BEDROCK_ARN and kwargs.get("call_type") == "anthropic_messages":
+                    events.append((kwargs, response_obj))
+
+        server = fake_bedrock_upstream.start_upstream(
+            fake_bedrock_upstream.converse_usage(ROUTE_INPUT, ROUTE_READ, ROUTE_WRITE))
+
+        async def call():
+            response = await litellm.anthropic_messages(
+                model="bedrock/" + BEDROCK_ARN, messages=[{"role": "user", "content": "hi"}],
+                max_tokens=10, stream=stream,
+                aws_bedrock_runtime_endpoint=fake_bedrock_upstream.endpoint(server),
+                aws_access_key_id="AKIAFAKEFORTESTS", aws_secret_access_key="fake-secret-for-tests",
+                aws_region_name="us-east-1",
+            )
+            if stream:
+                async for _ in response:
+                    pass
+            for _ in range(100):
+                if events:
+                    return
+                await asyncio.sleep(0.05)
+
+        previous = litellm.callbacks
+        litellm.callbacks = [Capture()]
+        try:
+            asyncio.run(call())
+        finally:
+            litellm.callbacks = previous
+            server.shutdown()
+            server.server_close()
+        assert len(events) == 1
+        return events[0]
+
+    @pytest.mark.asyncio
+    async def test_an_arn_on_v1_messages_is_netted_by_the_guardrail_stream(self, guardrail, submit):
+        kwargs, response = await asyncio.to_thread(self.logged_events, True)
+        assert response.usage.prompt_tokens == ROUTE_INPUT + ROUTE_READ + ROUTE_WRITE
+
+        await guardrail.async_log_success_event(kwargs, response, NOW, LATER)
+
+        args = submitted_args(submit)
+        assert args["is_streamed"] is True
+        assert_netted(args)
+
+    @pytest.mark.parametrize("stream", [False, True], ids=["non-streamed", "streamed"])
+    def test_an_arn_on_v1_messages_is_netted_by_the_callback(self, stream):
+        kwargs, response = self.logged_events(stream)
+        assert response.usage.prompt_tokens == ROUTE_INPUT + ROUTE_READ + ROUTE_WRITE
+
+        assert_netted(callback_success(kwargs, response))
+
+
 def test_the_installed_litellm_folds_the_cache_the_way_the_netting_assumes():
     """Pins the vendor behaviour the netting relies on, so a LiteLLM change turns this red."""
     converse = bedrock_converse_usage()
@@ -1009,3 +1200,14 @@ def test_the_installed_litellm_folds_the_cache_the_way_the_netting_assumes():
         folds_write = cache_tokens_module.litellm_folds_cache_write(converse=converse_route)
         folded_write = ROUTE_WRITE if folds_write else 0
         assert usage.prompt_tokens == ROUTE_INPUT + ROUTE_READ + folded_write
+
+
+def test_litellm_routes_bedrock_names_the_way_the_netting_assumes():
+    """Pins the routing the netting reads, so a LiteLLM change turns the unpinned job red."""
+    from litellm.llms.bedrock.base_aws_llm import BaseAWSLLM
+    from litellm.llms.bedrock.common_utils import BedrockModelInfo
+
+    assert BedrockModelInfo.get_bedrock_route(BEDROCK_ARN) == "converse"
+    assert BedrockModelInfo.get_bedrock_route(BEDROCK_GPT_OSS) == "chat_completions"
+    assert BaseAWSLLM.get_bedrock_invoke_provider(BEDROCK_NOVA_INVOKE) == "nova"
+    assert BaseAWSLLM.get_bedrock_invoke_provider("invoke/anthropic/" + BEDROCK_ARN) == "anthropic"

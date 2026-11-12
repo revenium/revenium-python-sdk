@@ -171,6 +171,7 @@ class TestAFailedRefreshBacksOff:
     ):
         """Sixteen threads hammering the check for three intervals: about three fetches."""
         interval = 1
+        monkeypatch.setattr(enforcement, "_MIN_POLL_INTERVAL", interval)
         monkeypatch.setattr(enforcement, "_FETCH_MAX_ATTEMPTS", 1)
         stub = endpoint(UNAVAILABLE, poll_interval=interval)
 
@@ -222,11 +223,84 @@ class TestAFailedRefreshBacksOff:
         enforcement._refresh_cache()
         assert stub.calls > first, "the backoff never released the refresh"
 
-    def test_the_backoff_is_the_poll_interval(self, monkeypatch):
+    def test_the_backoff_is_the_poll_interval(self, fetch_env):
+        """The interval read when the poller started drives both its cadence and the backoff."""
+        monkeypatch, _sleeps = fetch_env
+        monkeypatch.setenv("REVENIUM_CB_POLL_INTERVAL_SECONDS", "45")
+        clock = FakeClock()
+        monkeypatch.setattr(enforcement, "time", clock)
+        monkeypatch.setattr(enforcement, "_FETCH_MAX_ATTEMPTS", 1)
+        fetching, release = threading.Event(), threading.Event()
+
+        def unavailable_once_released(*_args, **_kwargs):
+            fetching.set()
+            release.wait(5)
+            return make_response(503)
+
+        monkeypatch.setattr(enforcement.httpx, "get", unavailable_once_released)
+        poll_waits = []
+        next_poll_wait_seconds = enforcement._next_poll_wait_seconds
+
+        def recording_next_poll_wait(interval):
+            poll_waits.append(interval)
+            return next_poll_wait_seconds(interval)
+
+        monkeypatch.setattr(enforcement, "_next_poll_wait_seconds", recording_next_poll_wait)
+
+        enforcement._ensure_poller_running()
+        assert fetching.wait(5)
+        monkeypatch.setenv("REVENIUM_CB_POLL_INTERVAL_SECONDS", "20")
+        release.set()
+
+        assert wait_until(lambda: poll_waits)
+        assert enforcement._refresh_cooldown_remaining() == 45.0
+        assert enforcement._refresh_failure_backoff_seconds() == 45.0
+        assert poll_waits == [45]
+
+    def test_without_a_poller_the_backoff_reads_the_setting_once(self, monkeypatch):
         monkeypatch.setenv("REVENIUM_CB_POLL_INTERVAL_SECONDS", "45")
         assert enforcement._refresh_failure_backoff_seconds() == 45.0
-        monkeypatch.delenv("REVENIUM_CB_POLL_INTERVAL_SECONDS")
-        assert enforcement._refresh_failure_backoff_seconds() == float(enforcement._DEFAULT_POLL_INTERVAL)
+
+        monkeypatch.setenv("REVENIUM_CB_POLL_INTERVAL_SECONDS", "20")
+        assert enforcement._refresh_failure_backoff_seconds() == 45.0
+
+    def test_with_the_setting_unset_the_backoff_is_thirty_seconds(self, monkeypatch):
+        monkeypatch.delenv("REVENIUM_CB_POLL_INTERVAL_SECONDS", raising=False)
+        assert enforcement._refresh_failure_backoff_seconds() == 30.0
+
+    def test_stopping_the_poller_lets_the_next_backoff_read_the_setting_again(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_CB_POLL_INTERVAL_SECONDS", "45")
+        assert enforcement._refresh_failure_backoff_seconds() == 45.0
+
+        enforcement.stop_polling()
+        monkeypatch.setenv("REVENIUM_CB_POLL_INTERVAL_SECONDS", "20")
+        assert enforcement._refresh_failure_backoff_seconds() == 20.0
+
+    def test_a_poller_that_outlives_the_stop_keeps_its_interval(self, monkeypatch):
+        class PollerStillRefreshing:
+            def join(self, timeout=None):
+                pass
+
+            def is_alive(self):
+                return True
+
+        monkeypatch.setenv("REVENIUM_CB_POLL_INTERVAL_SECONDS", "45")
+        assert enforcement._refresh_failure_backoff_seconds() == 45.0
+        monkeypatch.setattr(enforcement, "_poll_thread", PollerStillRefreshing())
+
+        enforcement.stop_polling()
+        monkeypatch.setenv("REVENIUM_CB_POLL_INTERVAL_SECONDS", "20")
+        assert enforcement._refresh_failure_backoff_seconds() == 45.0
+
+    def test_starting_the_poller_reads_the_setting_again(self, fetch_env):
+        monkeypatch, _sleeps = fetch_env
+        stub_get(monkeypatch, [make_response(200)])
+        monkeypatch.setenv("REVENIUM_CB_POLL_INTERVAL_SECONDS", "45")
+        assert enforcement._refresh_failure_backoff_seconds() == 45.0
+
+        monkeypatch.setenv("REVENIUM_CB_POLL_INTERVAL_SECONDS", "20")
+        enforcement._ensure_poller_running()
+        assert enforcement._refresh_failure_backoff_seconds() == 20.0
 
     def test_requests_inside_the_backoff_do_not_wake_the_poller(self, fetch_env):
         monkeypatch, _sleeps = fetch_env

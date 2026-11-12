@@ -43,6 +43,8 @@ from ._core.outcomes import (
 # Keep these literals aligned with HyperCurrent's JobTypeEconomicsRequests.kt
 # and JobTypeEconomicsResource.kt request contract.
 BaselineProvenance = Literal["CUSTOMER_DECLARED", "MEASURED", "SIGNED_OFF"]
+BaselineThroughputPeriod = Literal["HOUR", "DAY", "WEEK", "MONTH"]
+BaselineThroughputScope = Literal["TEAM", "PER_PERSON"]
 OutcomeMetricProvenance = Literal["MEASURED", "SELF_REPORTED", "DERIVED", "ATTESTED"]
 JobTypeMetricDirection = Literal["HIGHER_IS_BETTER", "LOWER_IS_BETTER"]
 JobTypeMonetizationCategory = Literal["REVENUE", "COST_AVOIDED", "TIME_SAVED", "LEADING_VALUE"]
@@ -90,6 +92,20 @@ class Baseline:
     Currency values must be USD. Omit attribution fields to use the server
     defaults, or set them to record an explicit override with CUSTOMER_DECLARED
     or MEASURED provenance.
+
+    ``throughput_value`` is the units of work the process produced in each
+    ``throughput_period`` before AI, as you count it, such as 3000 tickets a
+    week. Send it together with ``throughput_period`` (HOUR, DAY, WEEK or
+    MONTH), which is required when ``throughput_value`` is set and rejected
+    without it. ``throughput_scope`` says whether the value is the whole
+    team's output (TEAM) or one person's (PER_PERSON); it defaults to TEAM
+    when ``throughput_value`` is set and is rejected without it.
+    ``headcount`` is the number of people who did the work before AI and is
+    accepted with or without a throughput. The server enforces these rules
+    and the value ranges, so the SDK sends the fields as given.
+
+    New fields are appended after ``evidence_url`` so positional callers keep
+    working.
     """
     effective_from: str
     cost_per_unit: Optional[float] = None
@@ -100,6 +116,10 @@ class Baseline:
     provenance: Optional[BaselineProvenance] = None
     declared_by: Optional[str] = None
     evidence_url: Optional[str] = None
+    throughput_value: Optional[float] = None
+    throughput_period: Optional[BaselineThroughputPeriod] = None
+    throughput_scope: Optional[BaselineThroughputScope] = None
+    headcount: Optional[int] = None
 
     def to_wire(self) -> Dict[str, Any]:
         return _camelize(asdict(self))

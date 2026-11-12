@@ -30,6 +30,7 @@ from revenium_middleware.litellm.client import middleware as mw  # noqa: E402
 from . import fake_openai_upstream  # noqa: E402
 
 MODEL = "gpt-4o-mini"
+AZURE_API_VERSION = "2024-10-21"
 MESSAGES = [{"role": "user", "content": "hi"}]
 SUBSCRIBER = {"email": "dev@example.test"}
 
@@ -357,12 +358,14 @@ def test_a_caller_named_only_in_langchain_settings_is_blocked_through_the_openai
 
 def test_a_proxy_served_call_keeps_the_openai_check(upstream, load_rules):
     """The client wrapper leaves a proxy-served call's cap check to the proxy,
-    so without a Revenium guardrail the OpenAI wrapper still checks it."""
+    so without a Revenium guardrail the OpenAI wrapper still checks a call
+    LiteLLM makes through the OpenAI SDK. Its azure/ route does on every
+    release; from LiteLLM 1.108.1 the openai/ route posts past the SDK's create."""
     load_rules([pooled_rule()])
 
     with pytest.raises(Exception, match="Team monthly cap"):
-        litellm.completion(model="openai/gpt-4o-mini", messages=MESSAGES, api_base=upstream, api_key="sk-test",
-                           proxy_server_request={})
+        litellm.completion(model="azure/gpt-4o-mini", messages=MESSAGES, api_base=upstream, api_key="sk-test",
+                           api_version=AZURE_API_VERSION, proxy_server_request={})
 
     assert _CountingHandler.requests == 0
 

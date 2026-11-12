@@ -55,6 +55,7 @@ from revenium_middleware._core.trace_fields import (
     validate_trace_name,
 )
 
+from ._health_check import is_litellm_health_check, note_health_check_skipped
 from ._metering_owner import guardrail_owns_metering
 
 logger = logging.getLogger("revenium_middleware.extension")
@@ -510,6 +511,9 @@ class MiddlewareHandler(CustomLogger):
         log_organization_pin_setting()
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+        if is_litellm_health_check(kwargs.get("litellm_params")):
+            note_health_check_skipped("callback")
+            return
         if guardrail_owns_metering():
             _warn_metering_is_owned_by_the_guardrail()
             return  # the guardrail meters this call; metering it here would double-count
@@ -662,6 +666,9 @@ class MiddlewareHandler(CustomLogger):
         return
 
     async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
+        if is_litellm_health_check(kwargs.get("litellm_params")):
+            note_health_check_skipped("callback")
+            return
         if guardrail_owns_metering():
             _warn_metering_is_owned_by_the_guardrail()
             return  # the guardrail meters this call; metering it here would double-count

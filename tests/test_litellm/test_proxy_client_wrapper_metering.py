@@ -44,6 +44,7 @@ yaml = pytest.importorskip("yaml")
 
 import litellm  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
+from litellm.integrations.custom_logger import CustomLogger  # noqa: E402
 from litellm.proxy import proxy_server  # noqa: E402
 
 import revenium_middleware.openai  # noqa: E402,F401  patches the OpenAI SDK under LiteLLM's openai/ route
@@ -324,6 +325,81 @@ class TestCallsOnlyTheClientWrapperMetersStayMetered:
 
         assert [row["middleware_source"] for row in rows] == [CLIENT_WRAPPER_SOURCE]
 
+    @pytest.mark.parametrize(
+        "body, usage_the_caller_sees",
+        [
+            pytest.param({"model": CHAT_ALIAS, "prompt": "hi", "stream": True}, [], id="completions-streamed"),
+            pytest.param(
+                {"model": CHAT_ALIAS, "prompt": "hi", "stream": True, **CALLER_ASKS_FOR_USAGE},
+                [CHAT_TOKENS],
+                id="completions-streamed-caller-asks-for-usage",
+            ),
+        ],
+    )
+    def test_a_streamed_completion_is_metered_with_its_counts_and_reaches_the_caller_as_sent(
+        self, proxy, metered_rows, body, usage_the_caller_sees
+    ):
+        """On litellm 1.109 a proxy that asks for usage on the caller's behalf
+        marks this stream, and LiteLLM drops the usage chunk before the client
+        wrapper reads it unless the wrapper clears the mark."""
+        response = _post(proxy, "/v1/completions", body)
+
+        rows = metered_rows(CLIENT_WRAPPER_SOURCE)
+        chunks = _streamed_chunks(response)
+
+        assert [(row["middleware_source"], row["input_token_count"], row["output_token_count"]) for row in rows] == [
+            (CLIENT_WRAPPER_SOURCE, *CHAT_TOKENS)
+        ]
+        assert _usage_in(chunks) == usage_the_caller_sees
+        finish_reasons = [choice.get("finish_reason") for chunk in chunks for choice in chunk["choices"]]
+        assert [reason for reason in finish_reasons if reason] == ["stop"]
+        assert response.text.rstrip().endswith("data: [DONE]")
+
+
+def _usage_in(chunks):
+    return [(chunk["usage"]["prompt_tokens"], chunk["usage"]["completion_tokens"]) for chunk in chunks if chunk.get("usage")]
+
+
+class _StreamHookObserver(CustomLogger):
+    """A proxy callback that reads every chunk of a stream before the proxy sends it on."""
+
+    def __init__(self):
+        super().__init__()
+        self.usage = []
+
+    async def async_post_call_streaming_iterator_hook(self, user_api_key_dict, response, request_data):
+        async for chunk in response:
+            if getattr(chunk, "usage", None) is not None:
+                self.usage.append((chunk.usage.prompt_tokens, chunk.usage.completion_tokens))
+            yield chunk
+
+
+USAGE_THE_PROXY_HOOKS_SEE = {"readme": [CHAT_TOKENS], "without-stream-usage": []}
+
+
+class TestAStreamTheProxyStripsUsageFromStaysTheProxys:
+    """Unless ``always_include_stream_usage`` is false, the proxy asks the
+    provider for usage on a stream the caller sent without ``stream_options``
+    and strips that chunk only after its own stream hooks have read it."""
+
+    @pytest.fixture
+    def observer(self, monkeypatch):
+        observer = _StreamHookObserver()
+        monkeypatch.setattr(litellm, "callbacks", [*litellm.callbacks, observer])
+        return observer
+
+    def test_its_hooks_still_see_the_usage_chunk_the_caller_does_not(self, proxy, metered_rows, observer, request):
+        response = _post(proxy, "/v1/chat/completions", {"model": CHAT_ALIAS, "messages": MESSAGES, "stream": True})
+
+        rows = metered_rows(GUARDRAIL_SOURCE)
+
+        assert [(row["middleware_source"], row["input_token_count"], row["output_token_count"]) for row in rows] == [
+            (GUARDRAIL_SOURCE, *CHAT_TOKENS)
+        ]
+        assert observer.usage == USAGE_THE_PROXY_HOOKS_SEE[request.node.callspec.params["proxy"]]
+        assert _usage_in(_streamed_chunks(response)) == []
+        assert response.text.rstrip().endswith("data: [DONE]")
+
 
 def _direct_completion():
     return litellm.completion(model="gpt-4o-mini", messages=MESSAGES, mock_response="hello")
@@ -539,3 +615,39 @@ class TestAStreamTheGuardrailMetersKeepsItsUsage:
 
         assert sent["stream_options"] == {"include_usage": True}
         assert chunks[-1].usage.prompt_tokens == USAGE["prompt_tokens"]
+
+
+PROXY_STRIPPED_USAGE = {"stream_options": {"include_usage": True}, "_litellm_strip_stream_usage": True}
+OPTED_OUT_OF_THE_GUARDRAIL = {"user_api_key_metadata": {"opted_out_global_guardrails": ["revenium"]}}
+
+
+class TestAStreamTheProxyMarksForStrippingKeepsTheMark:
+    """A default proxy marks a usage request it added for the caller with
+    ``_litellm_strip_stream_usage``, so the proxy drops the usage chunk after its
+    stream hooks. Only a text-completion stream needs the mark cleared."""
+
+    @pytest.fixture(autouse=True)
+    def guardrail(self):
+        _metering_owner.reset_metering_owner()
+        yield ReveniumGuardrail(guardrail_name="revenium", event_hook=["pre_call", "post_call"], default_on=True)
+        _metering_owner.reset_metering_owner()
+
+    @pytest.mark.parametrize("call_type", ["acompletion", "anthropic_messages", "aresponses"])
+    @pytest.mark.parametrize("call", [_call_sync, _call_async], ids=["completion", "acompletion"])
+    def test_a_stream_the_guardrail_meters_reaches_the_proxy_with_its_usage_and_no_row_is_sent_here(
+        self, call, call_type, client_wrapper_rows
+    ):
+        sent, chunks = call(_proxied_kwargs(
+            stream=True, litellm_logging_obj=SimpleNamespace(call_type=call_type), **PROXY_STRIPPED_USAGE))
+
+        assert sent["_litellm_strip_stream_usage"] is True
+        assert chunks == PROVIDER_CHUNKS
+        assert client_wrapper_rows == []
+
+    @pytest.mark.parametrize("call", [_call_sync, _call_async], ids=["completion", "acompletion"])
+    def test_a_chat_stream_metered_here_reaches_the_proxy_with_its_usage_and_one_row(self, call, client_wrapper_rows):
+        sent, chunks = call(_guardrail_stream_kwargs(metadata=OPTED_OUT_OF_THE_GUARDRAIL, **PROXY_STRIPPED_USAGE))
+
+        assert sent["_litellm_strip_stream_usage"] is True
+        assert chunks == PROVIDER_CHUNKS
+        assert [(row["input_token_count"], row["output_token_count"]) for row in client_wrapper_rows] == [CHAT_TOKENS]

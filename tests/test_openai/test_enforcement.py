@@ -10,6 +10,7 @@ stubbed so no network calls are made.
 from __future__ import annotations
 
 import importlib
+import logging
 
 import pytest
 
@@ -179,20 +180,46 @@ def test_204_response_clears_cache(monkeypatch):
             return None
 
     monkeypatch.setattr(enforcement.httpx, "get", lambda *a, **kw: _Resp())
-    # (rules, departmentBudgetBlocks, departmentBudgetBlockBalances,
-    # departmentBudgetWarnings, departmentBudgetCandidates): no rules, no
-    # department blocks, no per-person balances, nobody warned and no
-    # candidates.
-    assert enforcement._fetch_rules() == ([], {}, {}, {}, {})
+    assert enforcement._fetch_rules() == enforcement._FetchedRules(
+        rules=[], org_unit_blocks={}, org_unit_block_balances={}, org_unit_warnings={},
+        org_unit_candidates={}, locked_rules=[], owner=enforcement._current_owner())
 
 
-def test_poll_interval_env_var_parsed(monkeypatch):
-    """Custom poll interval honored; invalid values fall back to default."""
-    monkeypatch.setenv("REVENIUM_CB_POLL_INTERVAL_SECONDS", "5")
-    assert enforcement._poll_interval_seconds() == 5
+UNSET = None
 
-    monkeypatch.setenv("REVENIUM_CB_POLL_INTERVAL_SECONDS", "garbage")
-    assert enforcement._poll_interval_seconds() == 60
+
+@pytest.mark.parametrize(("raw", "seconds", "warnings"), [
+    (UNSET, 30, 0),
+    ("10", 10, 0),
+    (" 10 ", 10, 0),
+    ("garbage", 30, 0),
+    ("0", 30, 0),
+    ("-5", 30, 0),
+    ("+10", 30, 0),
+    ("", 30, 0),
+    ("10.5", 30, 0),
+    ("١٠", 30, 0),
+    ("5", 5, 0),
+    ("3", 5, 1),
+    ("3600", 3600, 0),
+    ("99999", 3600, 0),
+    ("9" * 5000, 3600, 0),
+], ids=["unset", "10", "padded-10", "garbage", "zero", "negative", "plus-sign", "empty",
+        "decimal-point", "arabic-indic-digits", "minimum", "below-minimum", "maximum",
+        "above-maximum", "too-long-for-int"])
+def test_poll_interval_env_var_parsed(monkeypatch, caplog, raw, seconds, warnings):
+    """Whole seconds from 5 to 3600; a lower value is raised to 5 with one warning per process start."""
+    if raw is not UNSET:
+        monkeypatch.setenv("REVENIUM_CB_POLL_INTERVAL_SECONDS", raw)
+    caplog.set_level(logging.WARNING, logger="revenium_middleware")
+
+    resolved = [enforcement._poll_interval_seconds() for _ in range(3)]
+
+    assert resolved == [seconds] * 3
+    raised = [record for record in caplog.records
+              if "REVENIUM_CB_POLL_INTERVAL_SECONDS" in record.getMessage()]
+    assert len(raised) == warnings
+    assert all(record.levelno == logging.WARNING for record in raised)
 
 
 def test_cache_dir_persists_and_loads(monkeypatch, tmp_path):

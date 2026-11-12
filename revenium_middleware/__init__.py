@@ -213,7 +213,8 @@ from .job_history import (  # noqa: E402
     get_job_transactions, get_job_types, get_outcome_history, list_jobs,
 )
 from .job_type_economics import (  # noqa: E402
-    Baseline, BaselineProvenance, JobTypeEconomics, JobTypeMetricDirection,
+    Baseline, BaselineProvenance, BaselineThroughputPeriod,
+    BaselineThroughputScope, JobTypeEconomics, JobTypeMetricDirection,
     JobTypeMonetizationBasis, JobTypeMonetizationCategory,
     OutcomeMetricProvenance, PeriodFactEntry,
     create_baseline, get_job_type_economics, list_baselines,
@@ -293,6 +294,8 @@ __all__ = [
     "PeriodFactEntry",
     "Baseline",
     "BaselineProvenance",
+    "BaselineThroughputPeriod",
+    "BaselineThroughputScope",
     "JobTypeEconomics",
     "JobTypeMetricDirection",
     "JobTypeMonetizationBasis",

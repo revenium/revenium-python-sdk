@@ -32,6 +32,8 @@ EXPECTED_ALL = {
     "JobTypeMonetizationCategory", "JobTypeMonetizationBasis",
     "report_period_facts", "get_job_type_economics",
     "upsert_job_type_economics", "create_baseline", "list_baselines",
+    # BACK-5685: a baseline's throughput and headcount
+    "BaselineThroughputPeriod", "BaselineThroughputScope",
     # Metering error visibility (BACK-778)
     "MeteringErrorEvent", "MeteringStatus", "get_metering_status",
     "on_metering_error", "remove_metering_error_callback", "reset_metering_status",
