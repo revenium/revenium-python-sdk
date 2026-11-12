@@ -24,6 +24,7 @@ GEMINI_EMBED_MODEL = "text-embedding-004"
 IMAGEN_MODEL = "imagen-3.0-generate-002"
 VEO_MODEL = "veo-3.0-fast-generate-001"
 VEO_SECONDS = 6
+GENAI_MAJOR_SERVING_VEO_ONLY_IN_VERTEX = 3
 OLLAMA_MODEL = "llama3"
 LITELLM_MODEL = "gpt-4o-mini"
 PERPLEXITY_MODEL = "sonar"
@@ -686,6 +687,16 @@ def _genai_vertex_express():
     return _genai(vertexai=True)
 
 
+def genai_serves_veo_on_the_developer_api():
+    """From google-genai 3.0, generate_videos raises outside Vertex mode."""
+    from google import genai
+    return int(genai.__version__.split(".", 1)[0]) < GENAI_MAJOR_SERVING_VEO_ONLY_IN_VERTEX
+
+
+def _genai_for_veo():
+    return _genai() if genai_serves_veo_on_the_developer_api() else _genai_vertex_express()
+
+
 @call("genai.models.generate_content.sync")
 def _():
     _genai().models.generate_content(model=GEMINI_MODEL, contents="hi")
@@ -725,7 +736,7 @@ def _poll_video_twice(client, operation):
 
 @call("genai.models.generate_videos.sync")
 def _():
-    client = _genai()
+    client = _genai_for_veo()
     _poll_video_twice(client, client.models.generate_videos(
         model=VEO_MODEL, source=_veo_source(), config={"duration_seconds": VEO_SECONDS}))
 
@@ -771,7 +782,7 @@ async def _():
 
 @call("genai.aio.models.generate_videos.async")
 async def _():
-    client = _genai()
+    client = _genai_for_veo()
     operation = await client.aio.models.generate_videos(
         model=VEO_MODEL, source=_veo_source(), config={"duration_seconds": VEO_SECONDS})
     done = await client.aio.operations.get(operation)

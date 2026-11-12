@@ -2,14 +2,16 @@
 import json
 import os
 import warnings
+from dataclasses import fields
 from pathlib import Path
+from typing import get_args
 from unittest.mock import patch
 
 import httpx
 import pytest
 
 from revenium_middleware import (
-    Baseline, JobTypeEconomics, PeriodFactEntry,
+    Baseline, BaselineThroughputPeriod, BaselineThroughputScope, JobTypeEconomics, PeriodFactEntry,
     create_baseline, get_job_type_economics, list_baselines,
     report_period_facts, upsert_job_type_economics,
 )
@@ -112,7 +114,61 @@ def test_contract_fixture_matches_backend_request_enum_sets():
         "metricDirection": ["HIGHER_IS_BETTER", "LOWER_IS_BETTER"],
         "monetizationCategory": ["REVENUE", "COST_AVOIDED", "TIME_SAVED", "LEADING_VALUE"],
         "monetizationBasis": ["REALIZED", "EXPECTED"],
+        "baselineThroughputPeriod": ["HOUR", "DAY", "WEEK", "MONTH"],
+        "baselineThroughputScope": ["TEAM", "PER_PERSON"],
     }
+
+
+def test_the_throughput_literals_match_the_contract_fixture():
+    assert list(get_args(BaselineThroughputPeriod)) == CONTRACT["enums"]["baselineThroughputPeriod"]
+    assert list(get_args(BaselineThroughputScope)) == CONTRACT["enums"]["baselineThroughputScope"]
+
+
+def test_a_baseline_sends_its_throughput_and_headcount_in_camel_case():
+    baseline = Baseline(
+        effective_from="2026-08-01T00:00:00Z",
+        throughput_value=3000.5, throughput_period="WEEK", throughput_scope="PER_PERSON", headcount=12,
+    )
+    expected = CONTRACT["canonicalPayloads"]["baselineWithThroughput"]
+
+    seen = _contract_call(create_baseline, "claims", baseline, expected_body=expected)
+
+    assert seen["method"] == "POST"
+    assert seen["path"] == "/profitstream/v2/api/jobs/types/claims/baselines"
+
+
+def test_a_baseline_without_throughput_still_sends_the_existing_body():
+    baseline = Baseline(
+        cost_per_unit=4.5, currency="USD", provenance="CUSTOMER_DECLARED",
+        declared_by="claims-operations", effective_from="2026-08-01T00:00:00Z",
+    )
+
+    seen = _contract_call(create_baseline, "claims", baseline, expected_body=CONTRACT["canonicalPayloads"]["baseline"])
+
+    assert not {"throughputValue", "throughputPeriod", "throughputScope", "headcount"} & set(seen["body"])
+
+
+def test_throughput_fields_are_appended_after_evidence_url_so_positional_callers_keep_working():
+    assert [field.name for field in fields(Baseline)] == [
+        "effective_from", "cost_per_unit", "minutes_per_unit", "quality_rate", "hourly_rate",
+        "currency", "provenance", "declared_by", "evidence_url",
+        "throughput_value", "throughput_period", "throughput_scope", "headcount",
+    ]
+
+
+def test_list_baselines_returns_throughput_and_headcount_unchanged():
+    resource = {
+        "id": "bl-1", "version": 2, "costPerUnit": 4.5, "currency": "USD",
+        "throughputValue": 3000, "throughputPeriod": "WEEK", "throughputScope": "TEAM", "headcount": 12,
+        "provenance": "CUSTOMER_DECLARED", "declaredBy": "claims-operations",
+        "effectiveFrom": "2026-08-01T00:00:00Z", "created": "2026-08-01T00:00:01Z",
+    }
+    client, _ = _client(reply=[resource])
+
+    with patch.dict(os.environ, ENV):
+        baselines = list_baselines("claims", profitstream_base_url=BASE, http_client=client)
+
+    assert baselines == [resource]
 
 
 def test_management_calls_reject_metering_key_before_request():

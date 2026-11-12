@@ -315,7 +315,8 @@ class TestANewCacheGenerationSignalsAgain:
             "departmentBudgetWarnings": {WARNED_EMAIL: WARN_RULE_ID},
         })])
         # What the descheduled request read before the refresh.
-        stale_rules, stale_departments, _ = enforcement._get_rules()
+        stale = enforcement._get_rules()
+        stale_rules, stale_departments = stale.rules, stale.departments
 
         with caplog.at_level(logging.WARNING, logger=MIDDLEWARE_LOGGER):
             enforcement._refresh_cache()
@@ -336,9 +337,9 @@ class TestANewCacheGenerationSignalsAgain:
     ):
         """Two snapshots either side of a replacement are different verdicts."""
         department_cache([org_unit_rule()], {}, {}, {WARNED_EMAIL: WARN_RULE_ID})
-        before = enforcement._get_rules()[1].generation
+        before = enforcement._get_rules().departments.generation
         department_cache([org_unit_rule()], {}, {}, {WARNED_EMAIL: WARN_RULE_ID})
-        after = enforcement._get_rules()[1].generation
+        after = enforcement._get_rules().departments.generation
 
         assert after > before
 

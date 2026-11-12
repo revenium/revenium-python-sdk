@@ -54,6 +54,7 @@ from revenium_middleware._core.selective_metering import reported_if_unmetered
 from revenium_middleware.litellm.proxy._metering_owner import (
     LITELLM_PROVIDER, guardrail_meters_request, proxy_meters_request
 )
+from revenium_middleware.litellm.proxy._health_check import is_litellm_health_check, note_health_check_skipped
 from .context import metadata_context
 from .hooks import execute_metadata_hooks
 from . import trace_fields
@@ -62,6 +63,7 @@ logger = logging.getLogger("revenium_middleware.extension")
 
 COMPLETION_ENTRY_POINTS = ("completion", "text_completion", "completion_with_retries")
 ASYNC_COMPLETION_ENTRY_POINTS = ("acompletion", "atext_completion", "acompletion_with_retries")
+TEXT_COMPLETION_ENTRY_POINTS = frozenset({"text_completion", "atext_completion"})
 EMBEDDING_ENTRY_POINTS = ("embedding",)
 ASYNC_EMBEDDING_ENTRY_POINTS = ("aembedding",)
 UNRECORDED_ENTRY_POINTS = (
@@ -69,6 +71,7 @@ UNRECORDED_ENTRY_POINTS = (
     "video_generation", "avideo_generation", "search", "asearch",
 )
 
+PROXY_STRIP_STREAM_USAGE = "_litellm_strip_stream_usage"
 CHAT_OPERATION = "CHAT"
 EMBED_OPERATION = "EMBED"
 
@@ -127,6 +130,21 @@ def _with_forced_usage_reporting(kwargs):
     forced = dict(kwargs)
     forced["stream_options"] = {**caller_options, "include_usage": True}
     return forced, caller_options.get("include_usage") is True
+
+
+def _with_proxy_usage_read_here(call):
+    """A text-completion stream this wrapper meters, unmarked so its usage chunk reaches the meter.
+
+    The LiteLLM proxy marks a usage request it added for the caller to be
+    stripped before the caller. From LiteLLM 1.109 a text-completion stream
+    drops that chunk itself, before this wrapper reads the counts, so the mark
+    is cleared and the chunk is hidden here instead. A chat stream keeps the
+    mark: LiteLLM leaves its usage chunk to the proxy, whose stream hooks see
+    it before the proxy strips it.
+    """
+    if call.kwargs.get(PROXY_STRIP_STREAM_USAGE) is not True:
+        return call
+    return call._replace(kwargs={**call.kwargs, PROXY_STRIP_STREAM_USAGE: False}, caller_requested_usage=False)
 
 
 def _prepare_call(args, kwargs, callback_metadata=None, model=None):
@@ -190,6 +208,18 @@ async def _await_unmetered(wrapped, args, kwargs):
     return await _await_owning_metering(wrapped, args, kwargs)
 
 
+def _call_health_check(wrapped, args, kwargs):
+    _take_explicit_metadata(kwargs)
+    note_health_check_skipped("client")
+    return _call_owning_metering(wrapped, args, kwargs)
+
+
+async def _await_health_check(wrapped, args, kwargs):
+    _take_explicit_metadata(kwargs)
+    note_health_check_skipped("client")
+    return await _await_owning_metering(wrapped, args, kwargs)
+
+
 def _inner_check_scope(kwargs):
     return checked_by_outer_wrapper() if _checks_caps_here(kwargs) else nullcontext()
 
@@ -215,7 +245,10 @@ async def _await_owning_metering(wrapped, args, kwargs):
 def _prepare_completion(wrapped, args, kwargs):
     """A completion is the call a LangChain model makes, so it carries the
     attached callback's attribution."""
-    return _prepare_call(args, kwargs, take_callback_metadata(LITELLM), _requested_model(wrapped, args, kwargs))
+    call = _prepare_call(args, kwargs, take_callback_metadata(LITELLM), _requested_model(wrapped, args, kwargs))
+    if call.is_streaming and getattr(wrapped, "__name__", None) in TEXT_COMPLETION_ENTRY_POINTS:
+        return _with_proxy_usage_read_here(call)
+    return call
 
 
 def _requested_model(wrapped, args, kwargs):
@@ -400,6 +433,8 @@ async def _aleave_to_guardrail(wrapped, args, kwargs):
 def completion_wrapper(wrapped, _, args, kwargs):
     if _metered_call_in_progress.get():
         return wrapped(*args, **kwargs)
+    if is_litellm_health_check(kwargs):
+        return _call_health_check(wrapped, args, kwargs)
     if _selectively_unmetered(proxy_meters_request, kwargs):
         return _call_unmetered(wrapped, args, kwargs)
     if proxy_meters_request(kwargs):
@@ -413,6 +448,8 @@ def completion_wrapper(wrapped, _, args, kwargs):
 def acompletion_wrapper(wrapped, _, args, kwargs):
     if _metered_call_in_progress.get():
         return wrapped(*args, **kwargs)
+    if is_litellm_health_check(kwargs):
+        return _await_health_check(wrapped, args, kwargs)
     if _selectively_unmetered(proxy_meters_request, kwargs):
         return _await_unmetered(wrapped, args, kwargs)
     if proxy_meters_request(kwargs):
@@ -430,6 +467,8 @@ async def _metered_acompletion(wrapped, args, kwargs):
 def embedding_wrapper(wrapped, _, args, kwargs):
     if _metered_call_in_progress.get():
         return wrapped(*args, **kwargs)
+    if is_litellm_health_check(kwargs):
+        return _call_health_check(wrapped, args, kwargs)
     if _selectively_unmetered(guardrail_meters_request, kwargs):
         return _call_unmetered(wrapped, args, kwargs)
     if guardrail_meters_request(kwargs):
@@ -442,6 +481,8 @@ def embedding_wrapper(wrapped, _, args, kwargs):
 def aembedding_wrapper(wrapped, _, args, kwargs):
     if _metered_call_in_progress.get():
         return wrapped(*args, **kwargs)
+    if is_litellm_health_check(kwargs):
+        return _await_health_check(wrapped, args, kwargs)
     if _selectively_unmetered(guardrail_meters_request, kwargs):
         return _await_unmetered(wrapped, args, kwargs)
     if guardrail_meters_request(kwargs):

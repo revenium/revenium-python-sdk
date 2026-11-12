@@ -175,9 +175,9 @@ class TestGivingUpStartsACooldown:
         enforcement._poll_wakeup.clear()
 
         for _ in range(50):
-            rules, _blocks, initialized = enforcement._get_rules()
-            assert rules == [{"ruleId": 1, "breached": False}]  # cached rules serve every one
-            assert initialized is True
+            cached = enforcement._get_rules()
+            assert cached.rules == [{"ruleId": 1, "breached": False}]  # cached rules serve every one
+            assert cached.initialized is True
             assert not enforcement._poll_wakeup.is_set(), "a request asked for a refresh inside the window"
             enforcement._refresh_cache()
 
@@ -200,7 +200,7 @@ class TestGivingUpStartsACooldown:
 
         clock.advance(2)  # now past now+120
         enforcement._refresh_cache()
-        rules, _blocks, _initialized = enforcement._get_rules()
+        rules = enforcement._get_rules().rules
 
         assert stub.calls == 2
         assert rules == [{"ruleId": 2}]
@@ -245,7 +245,7 @@ class TestGivingUpStartsACooldown:
 
         clock.advance(2)
         enforcement._refresh_cache()
-        rules, _blocks, _initialized = enforcement._get_rules()
+        rules = enforcement._get_rules().rules
 
         assert stub.calls == 2, "the ceiling did not release the cooldown"
         assert rules == [{"ruleId": 3}]

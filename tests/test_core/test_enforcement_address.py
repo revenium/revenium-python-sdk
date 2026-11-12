@@ -78,7 +78,7 @@ class TestSiblingAddressAfter404:
         assert [url for url, _ in stub.requests] == [ORIGIN_RULES, HOSTED_RULES]
         assert enforcement._fetch_rules() is not None
         assert [url for url, _ in stub.requests][2:] == [HOSTED_RULES]
-        assert enforcement._current_owner() == ("https://api.revenium.ai", "team-1")
+        assert enforcement._current_owner()[:2] == ("https://api.revenium.ai", "team-1")
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert warnings == [
             "Enforcement rules were not found at https://api.revenium.ai (HTTP 404) but are served at "

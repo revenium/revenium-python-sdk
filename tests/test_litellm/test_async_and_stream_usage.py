@@ -449,6 +449,38 @@ class TestInjectedUsageChunkHiding:
         assert self.stream([final]) == [final]
 
 
+class TestAStreamWhoseUsageTheProxyStrips:
+    """A default LiteLLM proxy asks the provider for usage on a streamed call
+    the caller sent without stream_options, and marks the call so the usage
+    chunk never reaches the caller (litellm.proxy.common_request_processing)."""
+
+    PROXY_STRIPPED_USAGE = {"stream_options": {"include_usage": True}, "_litellm_strip_stream_usage": True}
+
+    def streamed_text_completion(self, api_base):
+        async def consume():
+            stream = await litellm.atext_completion(
+                model="hosted_vllm/back-5577-model", prompt="hi", api_base=api_base, api_key="sk-fake", stream=True,
+                proxy_server_request={"url": "http://proxy/v1/completions", "body": {}},
+                **self.PROXY_STRIPPED_USAGE)
+            return await drain(stream)
+
+        return asyncio.run(consume())
+
+    def test_a_streamed_text_completion_is_metered_from_the_usage_the_proxy_asked_for(
+            self, openai_compatible_upstream, payloads):
+        self.streamed_text_completion(openai_compatible_upstream)
+
+        payload = assert_one_metered_call(payloads, streamed=True)
+        assert (payload["input_token_count"], payload["output_token_count"]) == (
+            fake_openai_upstream.USAGE["prompt_tokens"], fake_openai_upstream.USAGE["completion_tokens"])
+
+    def test_the_caller_still_receives_no_usage_chunk(self, openai_compatible_upstream, payloads):
+        chunks = self.streamed_text_completion(openai_compatible_upstream)
+
+        assert chunks
+        assert [chunk for chunk in chunks if getattr(chunk, "usage", None)] == []
+
+
 class TestFailingUnderlyingClose:
     NOW = mw.datetime.datetime.now(mw.datetime.timezone.utc)
 

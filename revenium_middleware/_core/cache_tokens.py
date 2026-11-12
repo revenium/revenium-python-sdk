@@ -13,8 +13,9 @@ fields recurring across multiple emitters) and BACK-1925 for the LiteLLM
 client's cache-token contract, which this module's defaults must not break.
 """
 import logging
+import threading
 from numbers import Number
-from typing import Any, Dict, NamedTuple, Optional
+from typing import Any, Dict, NamedTuple, Optional, Tuple
 
 from revenium_middleware._core.package_versions import installed_version, release_of
 
@@ -123,8 +124,8 @@ def billable_input_tokens(
     (Anthropic's own ``input_tokens`` spelling reports the cache buckets beside
     it and never reaches this function.)
 
-    Getting that scope wrong costs money in both directions. Left folded for an
-    Anthropic response, the cache tokens are priced once at the input rate and
+    Getting that scope wrong costs money in both directions. Left folded for a
+    response whose cache LiteLLM counted inside the prompt, the cache tokens are priced once at the input rate and
     again in ``cache_read_token_count`` / ``cache_creation_token_count``, which
     is the 4.5x this fix exists for (BACK-3334). Taken out for an OpenAI-shaped
     provider, they are taken out twice: hypercurrent's
@@ -138,8 +139,10 @@ def billable_input_tokens(
     overlap itself, exactly once per record: here for the LiteLLM rows (client
     and gateway), for direct Anthropic and for Claude on Bedrock or Vertex AI,
     and through ``prompt_folds_claude_cache`` for the OpenAI client's records
-    of a gateway serving Claude. Every other model's prompt count is reported
-    exactly as LiteLLM built it.
+    of a gateway serving Claude. On Bedrock the cache is also removed for every
+    call whose usage LiteLLM built with a conversion that counts it inside the
+    prompt, whatever the model is called (``prompt_tokens_fold_cache``). Every
+    other model's prompt count is reported exactly as LiteLLM built it.
 
     A count that comes out negative contradicts the cache counts reported
     beside it, so it is reported unchanged and said out loud rather than
@@ -163,17 +166,19 @@ ANTHROPIC_MESSAGES_CALL_TYPE = "anthropic_messages"
 
 # LiteLLM ``custom_llm_provider`` values whose usage conversion folds the cache
 # buckets into ``prompt_tokens`` *and* whose rows the platform stores as sent.
-# Claude's Anthropic-shaped usage is the one usage shape Revenium never
-# normalizes server-side (see billable_input_tokens), so it is the only overlap
-# this row may remove: here for direct Anthropic, and in
-# ``_CLAUDE_HOSTING_PROVIDERS`` for Claude on Bedrock and Vertex AI.
+# Anthropic-shaped usage is the one usage shape Revenium never normalizes
+# server-side (see billable_input_tokens), so it is the only overlap this row
+# may remove: here for direct Anthropic, and in ``_CLAUDE_HOSTING_PROVIDERS``
+# for Claude on Bedrock and Vertex AI, plus the Bedrock conversions that build
+# the same shape whatever the model is named.
 _CACHE_FOLDING_PROVIDERS = frozenset({"anthropic", "anthropic_text"})
 
-# Providers that fold the same way when the model they serve is Claude:
-# LiteLLM's Bedrock Converse, invoke and mantle routes and its Vertex AI Claude
-# route all build ``prompt_tokens`` as uncached input plus cache read plus cache
-# write. Gemini on Vertex AI is reported gross by Google and netted by the
-# platform, and Nova on Bedrock is left as LiteLLM built it.
+# Providers that fold the same way when the model they serve is Claude, or, on
+# Bedrock, when LiteLLM's own routing picked a conversion that folds: its Vertex
+# AI Claude route and its Bedrock Converse, invoke-Nova and invoke-Anthropic
+# conversions all build ``prompt_tokens`` as uncached input plus cache read plus
+# cache write. Gemini on Vertex AI is reported gross by Google and netted by the
+# platform.
 _CLAUDE_HOSTING_PROVIDERS = frozenset({"bedrock", "vertex_ai"})
 
 # Only the top-level fields LiteLLM fills with the deployment it called.
@@ -250,7 +255,14 @@ def upstream_provider(*sources) -> Optional[str]:
 def _provider_folds_cache(provider: str, sources) -> bool:
     if provider in _CACHE_FOLDING_PROVIDERS:
         return True
-    return provider in _CLAUDE_HOSTING_PROVIDERS and names_claude_model(_first_named_model(sources))
+    if provider not in _CLAUDE_HOSTING_PROVIDERS:
+        return False
+    model = _first_named_model(sources)
+    if names_claude_model(model):
+        return True
+    if provider == "bedrock" and model:
+        return _bedrock_usage_folds_cache(str(model))
+    return False
 
 
 def prompt_tokens_fold_cache(*sources):
@@ -281,13 +293,16 @@ def prompt_tokens_fold_cache(*sources):
     LiteLLM only ever serves from an Anthropic-shaped upstream, and covers a
     surface carrying the call type but no provider.
 
-    On ``bedrock`` and ``vertex_ai`` the model decides as well: Claude there is
-    folded like Anthropic (BACK-4162), anything else is not. The model is the
+    On ``vertex_ai`` the model decides as well: Claude there is folded like
+    Anthropic (BACK-4162), anything else is not. On ``bedrock`` Claude is folded
+    by name, and any other model is folded when LiteLLM's own routing for it
+    builds usage with a conversion that counts the cache inside the prompt
+    (BACK-5780): an application inference profile ARN, Nova. The model is the
     first top-level ``model`` or ``litellm_model_name`` on any source, both
     filled by LiteLLM with the deployment it called. The caller's alias, in the
     request body, its metadata or a gateway's non-streamed ``response.model``,
-    is never handed in by a gateway hook, so it cannot turn a Nova
-    deployment's count into a Claude one.
+    is never handed in by a gateway hook, so it cannot turn a Gemini
+    or Bedrock ``chat_completions`` deployment's count into a netted one.
 
     With nothing to read, the prompt count stays as LiteLLM built it: reporting
     a gross count costs the cache overlap twice for Anthropic only, while
@@ -333,25 +348,84 @@ def litellm_folds_cache_write(converse: bool) -> bool:
     return not first <= release < end
 
 
-def _bedrock_model_routes_via_converse(model: str) -> bool:
+_UNKNOWN = object()
+_INVOKE_PROVIDER_UNKNOWN = object()
+
+_BEDROCK_ROUTING_WARNED = False
+_BEDROCK_ROUTING_WARNED_LOCK = threading.Lock()
+
+
+def _bedrock_usage_family(model: str) -> Tuple[Any, Optional[BaseException]]:
+    """Which usage conversion LiteLLM's own dispatch applies to a Bedrock model.
+
+    Returns ``(family, error)``. ``family`` is ``"converse"`` or ``"anthropic"``,
+    both of which count the cache inside ``prompt_tokens`` and differ in when
+    LiteLLM started counting the write; ``None`` for any other route or
+    provider; ``_UNKNOWN`` when LiteLLM cannot route at all; or
+    ``_INVOKE_PROVIDER_UNKNOWN`` for an invoke route whose provider it could not
+    name. ``error`` is the exception LiteLLM raised for the last two, else
+    ``None``. The answer is never cached, so a later call sees LiteLLM as it is
+    then.
+    """
     try:
         from litellm.llms.bedrock.common_utils import BedrockModelInfo
 
-        return BedrockModelInfo.get_bedrock_route(model) in _BEDROCK_CONVERSE_ROUTES
-    except Exception:
-        # LiteLLM routes Claude on Bedrock through Converse unless the model names invoke.
-        return "invoke/" not in model
+        route = BedrockModelInfo.get_bedrock_route(model)
+    except Exception as error:
+        return _UNKNOWN, error
+    if route in _BEDROCK_CONVERSE_ROUTES:
+        return "converse", None
+    if route != "invoke":
+        return None, None
+    try:
+        from litellm.llms.bedrock.base_aws_llm import BaseAWSLLM
+
+        provider = BaseAWSLLM.get_bedrock_invoke_provider(model)
+    except Exception as error:
+        return _INVOKE_PROVIDER_UNKNOWN, error
+    if provider == "nova":
+        return "converse", None
+    if provider == "anthropic":
+        return "anthropic", None
+    return None, None
+
+
+def _warn_bedrock_routing_unavailable_once(error: BaseException) -> None:
+    global _BEDROCK_ROUTING_WARNED
+    with _BEDROCK_ROUTING_WARNED_LOCK:
+        should_log = not _BEDROCK_ROUTING_WARNED
+        _BEDROCK_ROUTING_WARNED = True
+    if should_log:
+        logger.warning(
+            "LiteLLM Bedrock routing unavailable (%s); non-Claude Bedrock rows are "
+            "reported with cache tokens inside the input count",
+            type(error).__name__,
+        )
+
+
+def _bedrock_usage_folds_cache(model: str) -> bool:
+    family, error = _bedrock_usage_family(model)
+    if family is _UNKNOWN or family is _INVOKE_PROVIDER_UNKNOWN:
+        _warn_bedrock_routing_unavailable_once(error)
+        return False
+    return family is not None
 
 
 def routes_via_bedrock_converse(*sources) -> bool:
-    """Whether LiteLLM served this call through Bedrock Converse.
+    """Whether the cache write window of this call is Bedrock Converse's.
 
     Read from the same sources, in the same order, as ``prompt_tokens_fold_cache``,
-    and decided by LiteLLM's own Bedrock routing for the deployment's model.
+    and decided by LiteLLM's own Bedrock routing for the deployment's model: Nova
+    on invoke is built by LiteLLM's Converse conversion, so it counts as Converse.
+    When LiteLLM cannot route, Converse is assumed unless the model names invoke.
     """
     if _upstream_provider(sources) != "bedrock":
         return False
-    return _bedrock_model_routes_via_converse(str(_first_named_model(sources) or ""))
+    model = str(_first_named_model(sources) or "")
+    family, _ = _bedrock_usage_family(model)
+    if family is _UNKNOWN:
+        return "invoke/" not in model
+    return family == "converse"
 
 
 def cache_creation_inside_litellm_prompt(cache_creation_tokens: int, *sources) -> int:

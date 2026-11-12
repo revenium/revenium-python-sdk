@@ -121,6 +121,7 @@ from revenium_middleware._core.failed_calls import is_spending_cap_refusal
 from revenium_middleware._core.fields import merge_extra_body
 from revenium_middleware._core.log_sanitize import sanitize_for_logging
 
+from ._health_check import is_litellm_health_check, note_health_check_skipped
 from ._metering_owner import LITELLM_PROVIDER, register_metering_guardrail
 from .middleware import (
     ANTHROPIC_MESSAGES_CALL_TYPE,
@@ -1327,7 +1328,7 @@ class ReveniumGuardrail(CustomGuardrail):
                     "but no shared call id can be minted here "
                     "(response_headers_hook=%s, mode=%r). Claude Code's own "
                     "usage record cannot be matched to this proxy's, so calls "
-                    "seen by both are counted twice. Fix: LiteLLM 1.93.0 or "
+                    "seen by both are counted twice. Fix: LiteLLM 1.94.0 or "
                     "newer, and mode: [\"pre_call\", \"post_call\"].",
                     _headers_hook_available(),
                     getattr(self, "event_hook", None),
@@ -1759,6 +1760,9 @@ class ReveniumGuardrail(CustomGuardrail):
             end_time: When the stream completed.
         """
         try:
+            if is_litellm_health_check(kwargs.get("litellm_params")):
+                note_health_check_skipped("guardrail")
+                return
             call_type = kwargs.get("call_type")
             if (
                 call_type not in _STREAMED_CALL_TYPES_METERED_FROM_THE_LOGGING_EVENT

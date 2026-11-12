@@ -42,6 +42,27 @@ it names no address because these maps are PII (see ``_normalize_map_keys``).
 An integrator who wants more can read the map, which is cached and persisted
 like the other two. Revisit if a caller asks for a programmatic warn signal.
 
+A Member or Department Admin is answered from their own scope: every rule
+whose figure is not theirs to see leaves ``rules`` for a top-level
+``lockedRules`` list, with its threshold, window, action and filters, a
+``breached`` / ``warnBreached`` standing the server took from that caller's own
+department verdicts, and no spend figure. ``check_enforcement`` blocks or warns
+on a breached locked rule by its ``action``, reporting no ``current_value``
+because the server sent none, and without the department-rule skip a rule in
+``rules`` gets, but only for a call that names no subscriber. Decision
+(BACK-5684): a call naming a subscriber is left to ``rules`` and the
+department maps, which carry each in-scope person's own verdict, because a
+locked rule's standing is the key owner's alone and its filters can be
+broader than the real rule's, the server having dropped the SUBSCRIBER rows
+the caller may not see (see ``_act_on_locked_rules``). Locked rules are cached, cleared
+and persisted with the rest of the payload, in a snapshot file of their own,
+and they alone are bound to the API key the read authenticates with, because
+their verdict is on that key's owner (``_CacheOwner``). That owner is taken
+from the same read of the key the request is sent with, travels with the
+answer (``_FetchedRules.owner``), and is the only owner the answer is installed
+or saved under, and only while it is still the current one; an answer read
+with a key the process has since left, even for a moment, is dropped.
+
 Three inspection calls sit beside the enforcement path without being part of
 it. ``fetch_enforcement_rule(rule_id)`` reads one rule straight from the
 server, ``fetch_enforcement_rule_roster(rule_id)`` reads the people (or
@@ -68,7 +89,7 @@ import re
 import threading
 import time
 from email.utils import parsedate_to_datetime
-from typing import Dict, List, NamedTuple, Optional, Set, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
@@ -88,7 +109,10 @@ from .wire_guards import stored_subscriber_value
 
 logger = logging.getLogger("revenium_middleware.extension")
 
-_DEFAULT_POLL_INTERVAL = 60      # seconds between background refreshes
+_DEFAULT_POLL_INTERVAL = 30      # seconds between background refreshes
+# Shared with the Node and Go SDKs so one setting means the same in each (FRONT-3882).
+_MIN_POLL_INTERVAL = 5
+_MAX_POLL_INTERVAL = 3600
 _CACHE_TTL = 120                  # seconds before a cached rule is considered stale
 
 # Retry posture for the rule fetch (fleet backoff consistency): transient
@@ -151,6 +175,8 @@ _RULES_CACHE_FILE_PREFIX = "revenium_enforcement_rules"
 # outage). The old loader never looks at this filename, so it can carry the
 # new data without being load-bearing for a downgrade.
 _ORG_UNIT_BLOCKS_CACHE_FILE_PREFIX = "revenium_enforcement_org_unit_blocks"
+# Locked-rules snapshot, a separate file for the same rollback reason.
+_LOCKED_RULES_CACHE_FILE_PREFIX = "revenium_enforcement_locked_rules"
 
 # Top-level keys of the server-computed department-budget map on the API
 # response, current spelling first (see ``_wire_value``).
@@ -175,11 +201,12 @@ _ORG_UNIT_WARNINGS_KEYS = ("departmentBudgetWarnings", "orgUnitBudgetWarnings")
 # It has no org-unit spelling: it postdates the rename.
 _ORG_UNIT_CANDIDATES_KEYS = ("departmentBudgetCandidates",)
 _CANDIDATE_TIERS = frozenset({"BLOCK", "WARN"})
-# Filter rows of a candidate's rule that the server already decided when it
-# put the candidate on the person's list, so the SDK never judges them against
-# the call: a SUBSCRIBER row names whoever the cap was written for, not
-# necessarily the caller it was resolved to.
-_CANDIDATE_DECIDED_DIMENSIONS = frozenset({"DEPARTMENT", "ORG_UNIT", "SUBSCRIBER"})
+# Filter rows of a department cap that the server decided in naming the person
+# a verdict is for, so the SDK never judges them against the call
+# (``DepartmentCallScope`` on the server). A SUBSCRIBER row names whoever the
+# cap was written for, which the server settled before it put the person in a
+# candidate list or a locked rule's ``breached``.
+_DEPARTMENT_VERDICT_DECIDED_DIMENSIONS = frozenset({"DEPARTMENT", "ORG_UNIT", "SUBSCRIBER"})
 # ``groupBy`` values of a department rule. Such rules are skipped by the
 # per-rule loop: their verdict comes only from _ORG_UNIT_BLOCKS_KEYS, matching
 # the server's own ``applicableRules`` filter.
@@ -222,12 +249,48 @@ _cached_org_unit_warnings: Dict[str, int] = {}
 # _ORG_UNIT_CANDIDATES_KEYS), cached, persisted and re-keyed like the others,
 # each list already cleaned by _usable_candidates.
 _cached_org_unit_candidates: Dict[str, List[dict]] = {}
+# The payload's ``lockedRules``. Replaced and cleared in the same _cache_lock
+# section as _cached_rules, so no check pairs one fetch's rules with another's
+# locked rules.
+_cached_locked_rules: List[dict] = []
 _cache_lock = threading.Lock()
 _cache_timestamp = 0.0
-# The (enforcement base URL, team id) the cached rules were loaded for, the
-# scope the saved snapshot is kept under too. None until a call, a fetch or a
+
+
+class _CacheOwner(NamedTuple):
+    """Whose enforcement answer the cache holds.
+
+    ``credential`` is the ``_credential_fingerprint`` of the API key the read
+    authenticates with. It is used in two ways.
+
+    What is already cached: a key-only switch drops the locked rules alone
+    (``_forget_another_owners_rules``), and only the locked-rules snapshot
+    envelope is bound to the credential. Their ``breached`` is a verdict on
+    the key's owner, so it must not judge calls made under another key. The
+    rules and department maps carry verdicts on rules and on the subscribers
+    they are keyed by, which stay true whoever read them, so a key-only switch
+    keeps them (BACK-4250) and a dropped cap can never be the price of
+    rotating a key.
+
+    What a fetch brings back: the whole answer, rules and maps included, is
+    installed and saved only under the exact owner, credential included, that
+    its request was sent with (``_refresh_cache_holding_lock``).
+
+    The snapshot files are named for ``base_url`` and ``team_id`` only
+    (``_snapshot_scope``).
+    """
+
+    base_url: str
+    team_id: str
+    credential: str
+
+    def is_same_team(self, other: "_CacheOwner") -> bool:
+        return (self.base_url, self.team_id) == (other.base_url, other.team_id)
+
+
+# The owner the cached rules were loaded for. None until a call, a fetch or a
 # snapshot load adopts the current one. Read and written under _cache_lock.
-_cache_owner: Optional[Tuple[str, str]] = None
+_cache_owner: Optional[_CacheOwner] = None
 # True once any successful fetch (even an empty list / HTTP 204) or a disk
 # snapshot load has populated the cache. Distinguishes "server says no rules
 # apply" from "we have never heard back from the server" — fail-closed must
@@ -237,6 +300,10 @@ _cache_initialized = False
 _poll_thread: Optional[threading.Thread] = None
 _poll_lock = threading.Lock()
 _stop_event = threading.Event()
+# The interval the poller started with, which the failure backoff uses too.
+# None until a poller starts or a backoff needs it. Guarded by _poll_lock.
+_poll_interval: Optional[int] = None
+_poll_interval_raised_warned = False
 
 # Held for the whole of a refresh, so at most one is in flight per process
 # however many threads ask for one; a refresh that finds it held is dropped,
@@ -285,12 +352,15 @@ _warned_org_unit_callers: Set[Tuple[int, str, int]] = set()
 # Rule id -> the ``windowEnd`` of the breach last warned about for a breached
 # rule whose action does not block. An entry for a rule the refreshed cache
 # still serves survives _begin_cache_generation: a refresh every poll interval
-# would otherwise repeat the line once a minute for the rest of the window. An
+# would otherwise repeat the line at every refresh for the rest of the window. An
 # entry for a rule no longer served is dropped there, so the map is bounded by
 # the current rule set. A new window brings a new ``windowEnd`` and so a new
 # line. Guarded by _warn_dedupe_lock and mutated in place so a test can clear
 # it.
 _warned_non_blocking_rules: Dict[str, object] = {}
+
+# The same, for a locked rule over its warning threshold and not its limit.
+_warned_locked_warn_tiers: Dict[str, object] = {}
 
 # (rule id, dimension, operator, reason) for every rule filter the SDK has
 # logged that it cannot evaluate, so the debug line appears once rather than
@@ -317,8 +387,8 @@ _group_indexes: Dict[int, Tuple[list, Dict[str, dict]]] = {}
 # means no cooldown in force. Read and written under _cache_lock.
 _refresh_cooldown_until = 0.0
 # The owner (see _cache_owner) whose fetch set _refresh_cooldown_until, so a
-# switch to another team drops it. Read and written under _cache_lock.
-_refresh_cooldown_owner: Optional[Tuple[str, str]] = None
+# switch to another team or API key drops it. Read and written under _cache_lock.
+_refresh_cooldown_owner: Optional[_CacheOwner] = None
 
 # Single-shot warnings so misconfigured environments don't spam logs
 _team_id_warned = False
@@ -357,16 +427,62 @@ def _checked_by_outer_wrapper() -> bool:
     return _outer_wrapper_check.is_active()
 
 
+_ASCII_DIGITS = re.compile(r"[0-9]+")
+
+
 def _poll_interval_seconds() -> int:
+    """``REVENIUM_CB_POLL_INTERVAL_SECONDS`` as whole seconds from the minimum to the maximum.
+
+    Only ASCII digits count once surrounding whitespace is trimmed: a sign, a
+    decimal point or any other text means the default, as do an empty value and 0.
+    """
     raw = os.environ.get(Config.ENV_REVENIUM_CB_POLL_INTERVAL_SECONDS, "")
-    if not raw:
+    digits = raw.strip()
+    if not _ASCII_DIGITS.fullmatch(digits):
+        if digits:
+            logger.debug("Invalid %s=%r, using default", Config.ENV_REVENIUM_CB_POLL_INTERVAL_SECONDS, raw)
         return _DEFAULT_POLL_INTERVAL
-    try:
-        value = int(raw)
-        return value if value > 0 else _DEFAULT_POLL_INTERVAL
-    except ValueError:
-        logger.debug("Invalid %s=%r, using default", Config.ENV_REVENIUM_CB_POLL_INTERVAL_SECONDS, raw)
+    seconds = _capped_at_max_poll_interval(digits)
+    if seconds == 0:
         return _DEFAULT_POLL_INTERVAL
+    if seconds < _MIN_POLL_INTERVAL:
+        _warn_poll_interval_raised(seconds)
+        return _MIN_POLL_INTERVAL
+    return seconds
+
+
+def _capped_at_max_poll_interval(digits: str) -> int:
+    """``digits`` as an int no larger than ``_MAX_POLL_INTERVAL``.
+
+    Too many digits to fit under the cap means the cap, without handing them
+    to ``int()``, which refuses strings longer than ``sys.get_int_max_str_digits()``.
+    """
+    significant = digits.lstrip("0") or "0"
+    if len(significant) > len(str(_MAX_POLL_INTERVAL)):
+        return _MAX_POLL_INTERVAL
+    return min(int(significant), _MAX_POLL_INTERVAL)
+
+
+def _warn_poll_interval_raised(seconds: int) -> None:
+    global _poll_interval_raised_warned
+    if _poll_interval_raised_warned:
+        return
+    _poll_interval_raised_warned = True
+    logger.warning("%s=%d is below the minimum; using %d",
+                   Config.ENV_REVENIUM_CB_POLL_INTERVAL_SECONDS, seconds, _MIN_POLL_INTERVAL)
+
+
+def _adopt_poll_interval() -> int:
+    """Read the setting into ``_poll_interval``. Caller must hold ``_poll_lock``."""
+    global _poll_interval
+    _poll_interval = _poll_interval_seconds()
+    return _poll_interval
+
+
+def _poll_interval_in_force() -> int:
+    """The interval the poller started with; with no poller yet, the setting as first read."""
+    with _poll_lock:
+        return _poll_interval if _poll_interval is not None else _adopt_poll_interval()
 
 
 def _refresh_failure_backoff_seconds() -> float:
@@ -376,10 +492,11 @@ def _refresh_failure_backoff_seconds() -> float:
     exactly as often as it does when healthy, request traffic adds no
     attempts, and a recovered endpoint is noticed within the same interval a
     healthy cache is refreshed in. A 403 from a wrong key or team id is a
-    misconfiguration that only an operator can fix, and one attempt a minute
-    picks up the fix without flooding the log.
+    misconfiguration that only an operator can fix, and one attempt per
+    interval picks up the fix without flooding the log. It is the interval
+    the poller started with, so changing the setting later moves neither.
     """
-    return float(_poll_interval_seconds())
+    return float(_poll_interval_in_force())
 
 
 def _fail_mode_is_closed() -> bool:
@@ -387,25 +504,38 @@ def _fail_mode_is_closed() -> bool:
     return env_choice(Config.ENV_REVENIUM_CB_FAIL_MODE, ("open", "closed"), "open") == "closed"
 
 
-def _current_owner() -> Tuple[str, str]:
-    """The enforcement base URL and team id the cache is for: whose rules these are."""
-    return _get_enforcement_base_url(), os.environ.get(Config.ENV_REVENIUM_TEAM_ID, "")
+def _credential_fingerprint(api_key: Optional[str]) -> str:
+    """A digest naming ``api_key`` without revealing it; ``""`` for no key."""
+    if not isinstance(api_key, str) or not api_key:
+        return ""
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
 
 
-def _snapshot_scope(owner: Optional[Tuple[str, str]] = None) -> Optional[str]:
+def _process_api_key() -> str:
+    client = _process_metering_client()
+    return client.api_key if client is not None else ""
+
+
+def _current_owner() -> _CacheOwner:
+    """The enforcement base URL, team id and API key the cache is for: whose rules these are."""
+    return _CacheOwner(_get_enforcement_base_url(), os.environ.get(Config.ENV_REVENIUM_TEAM_ID, ""),
+                       _credential_fingerprint(_process_api_key()))
+
+
+def _snapshot_scope(owner: Optional[_CacheOwner] = None) -> Optional[str]:
     """Short digest of the environment and team the cached rules belong to.
 
     ``None`` without ``REVENIUM_TEAM_ID``: no team means no fetch, so there is
     nothing of this process's own to save or load. Hashed so neither the team
     id nor any path character from it reaches a file name.
     """
-    base_url, team_id = owner or _current_owner()
-    if not team_id:
+    owner = owner or _current_owner()
+    if not owner.team_id:
         return None
-    return hashlib.sha256(f"{base_url}|{team_id}".encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(f"{owner.base_url}|{owner.team_id}".encode("utf-8")).hexdigest()[:16]
 
 
-def _scoped_cache_file_path(prefix: str, owner: Optional[Tuple[str, str]] = None) -> Optional[str]:
+def _scoped_cache_file_path(prefix: str, owner: Optional[_CacheOwner] = None) -> Optional[str]:
     cache_dir = os.environ.get(Config.ENV_REVENIUM_CACHE_DIR, "")
     scope = _snapshot_scope(owner)
     if not cache_dir or scope is None:
@@ -413,12 +543,16 @@ def _scoped_cache_file_path(prefix: str, owner: Optional[Tuple[str, str]] = None
     return os.path.join(cache_dir, f"{prefix}.{scope}.json")
 
 
-def _cache_file_path(owner: Optional[Tuple[str, str]] = None) -> Optional[str]:
+def _cache_file_path(owner: Optional[_CacheOwner] = None) -> Optional[str]:
     return _scoped_cache_file_path(_RULES_CACHE_FILE_PREFIX, owner)
 
 
-def _org_unit_blocks_cache_file_path(owner: Optional[Tuple[str, str]] = None) -> Optional[str]:
+def _org_unit_blocks_cache_file_path(owner: Optional[_CacheOwner] = None) -> Optional[str]:
     return _scoped_cache_file_path(_ORG_UNIT_BLOCKS_CACHE_FILE_PREFIX, owner)
+
+
+def _locked_rules_cache_file_path(owner: Optional[_CacheOwner] = None) -> Optional[str]:
+    return _scoped_cache_file_path(_LOCKED_RULES_CACHE_FILE_PREFIX, owner)
 
 
 def _rules_fingerprint(rules: list) -> str:
@@ -683,56 +817,80 @@ def _coerce_candidates(raw) -> Dict[str, List[dict]]:
     return candidates
 
 
-def _load_department_budgets_from_disk(rules: list, owner: Optional[Tuple[str, str]] = None) -> _DepartmentBudgets:
-    """Read the department-budget snapshot written beside ``rules``.
+def _rules_bound_envelope(path: Optional[str], rules: list, required_key: str,
+                          required_type: type, description: str) -> Optional[dict]:
+    """The envelope saved at ``path`` beside ``rules``, or ``None`` when it cannot be trusted.
 
-    The maps live in their own file; absent or malformed means no department
-    blocks until the next successful fetch. The envelope binds them to the
-    rules snapshot they were cut from. A fingerprint mismatch means the pair on
-    disk is torn (e.g. the process died between the two writes): interpreting
-    rule IDs against the wrong rules could block the wrong caller or fail open,
-    so the maps are dropped instead -- department blocks resume on the next
+    Absent, unreadable or malformed means ``None``. So does an envelope whose
+    fingerprint names other rules: the pair on disk is torn (e.g. the process
+    died between the writes), and reading it against the wrong rules could
+    block the wrong caller or fail open. Whatever it held resumes on the next
     successful fetch.
     """
-    empty = _DepartmentBudgets({}, {}, {}, {})
-    blocks_path = _org_unit_blocks_cache_file_path(owner)
-    if not blocks_path or not os.path.exists(blocks_path):
-        return empty
+    if not path or not os.path.exists(path):
+        return None
     try:
-        with open(blocks_path, "r", encoding="utf-8") as handle:
+        with open(path, "r", encoding="utf-8") as handle:
             loaded = json.load(handle)
         if (
             isinstance(loaded, dict)
             and loaded.get("rules_fingerprint") == _rules_fingerprint(rules)
-            and isinstance(loaded.get("blocks"), dict)
+            and isinstance(loaded.get(required_key), required_type)
         ):
-            # Re-keyed on the way in, like the wire payload: a snapshot
-            # written by an older SDK (or edited by hand) can carry keys the
-            # server had not normalized. ``balances``, ``warnings`` and
-            # ``candidates`` are absent from an envelope written before each
-            # map existed: the first reports the rule's own value as it always
-            # did, the second warns nobody until the next successful fetch,
-            # and the third leaves everyone on the single-slot verdict.
-            return _DepartmentBudgets(
-                _normalize_map_keys(loaded["blocks"]),
-                _coerce_balances(loaded.get("balances")),
-                _normalize_map_keys(loaded.get("warnings")),
-                _coerce_candidates(loaded.get("candidates")),
-            )
+            return loaded
         logger.debug(
-            "Dropping department map from %s: it was not written "
-            "against the rules snapshot that loaded", blocks_path,
+            "Dropping %s from %s: it was not written "
+            "against the rules snapshot that loaded", description, path,
         )
     except Exception:
         logger.debug(
-            "Failed to read department map from %s", blocks_path, exc_info=True
+            "Failed to read %s from %s", description, path, exc_info=True
         )
-    return empty
+    return None
+
+
+def _load_department_budgets_from_disk(rules: list, owner: Optional[_CacheOwner] = None) -> _DepartmentBudgets:
+    """Read the department-budget snapshot written beside ``rules``.
+
+    The maps live in their own file, bound to the rules snapshot they were cut
+    from (``_rules_bound_envelope``); absent, malformed or torn means no
+    department blocks until the next successful fetch.
+    """
+    loaded = _rules_bound_envelope(_org_unit_blocks_cache_file_path(owner), rules,
+                                   "blocks", dict, "department map")
+    if loaded is None:
+        return _DepartmentBudgets({}, {}, {}, {})
+    # Re-keyed on the way in, like the wire payload: a snapshot written by an
+    # older SDK (or edited by hand) can carry keys the server had not
+    # normalized. ``balances``, ``warnings`` and ``candidates`` are absent
+    # from an envelope written before each map existed: the first reports the
+    # rule's own value as it always did, the second warns nobody until the
+    # next successful fetch, and the third leaves everyone on the single-slot
+    # verdict.
+    return _DepartmentBudgets(
+        _normalize_map_keys(loaded["blocks"]),
+        _coerce_balances(loaded.get("balances")),
+        _normalize_map_keys(loaded.get("warnings")),
+        _coerce_candidates(loaded.get("candidates")),
+    )
+
+
+def _load_locked_rules_from_disk(rules: list, owner: _CacheOwner) -> List[dict]:
+    """Read the locked-rules snapshot written beside ``rules`` under ``owner``'s API key.
+
+    ``[]`` when there is none to trust, and when it was saved under another
+    key or names none (``_CacheOwner``).
+    """
+    loaded = _rules_bound_envelope(_locked_rules_cache_file_path(owner), rules,
+                                   "lockedRules", list, "locked rules")
+    if loaded is None or loaded.get("credential") != owner.credential:
+        return []
+    return loaded["lockedRules"]
 
 
 def _load_cache_from_disk() -> None:
     global _cached_rules, _cached_org_unit_blocks, _cached_org_unit_block_balances
-    global _cached_org_unit_warnings, _cached_org_unit_candidates
+    global _cached_org_unit_warnings, _cached_org_unit_candidates, _cached_locked_rules
     global _cache_timestamp, _disk_load_attempted, _cache_initialized, _cache_owner
     # Check-and-set under _cache_lock so two cold-start callers can't both
     # observe _disk_load_attempted=False and race on the snapshot read.
@@ -758,6 +916,7 @@ def _load_cache_from_disk() -> None:
         else:
             return
         departments = _load_department_budgets_from_disk(rules, owner)
+        locked_rules = _load_locked_rules_from_disk(rules, owner)
         with _cache_lock:
             if _cache_owner not in (None, owner):
                 return
@@ -767,6 +926,7 @@ def _load_cache_from_disk() -> None:
             _cached_org_unit_block_balances = departments.balances
             _cached_org_unit_warnings = departments.warnings
             _cached_org_unit_candidates = departments.candidates
+            _cached_locked_rules = locked_rules
             _begin_cache_generation()
             # Treat as stale so the next call still triggers a refresh,
             # but the disk snapshot prevents fail-closed from raising on
@@ -774,8 +934,8 @@ def _load_cache_from_disk() -> None:
             _cache_timestamp = 0.0
             _cache_initialized = True
         logger.debug(
-            "Loaded %d enforcement rule(s) and %d department block(s) from %s",
-            len(rules), len(departments.blocks), path,
+            "Loaded %d enforcement rule(s), %d locked rule(s) and %d department block(s) from %s",
+            len(rules), len(locked_rules), len(departments.blocks), path,
         )
     except Exception:
         logger.debug("Failed to read enforcement cache from %s", path, exc_info=True)
@@ -784,8 +944,9 @@ def _load_cache_from_disk() -> None:
 def _persist_cache_to_disk(rules: list, org_unit_blocks: Optional[dict] = None,
                            org_unit_block_balances: Optional[dict] = None,
                            org_unit_warnings: Optional[dict] = None,
-                           *, owner: Optional[Tuple[str, str]] = None,
-                           org_unit_candidates: Optional[dict] = None) -> None:
+                           *, owner: Optional[_CacheOwner] = None,
+                           org_unit_candidates: Optional[dict] = None,
+                           locked_rules: Optional[list] = None) -> None:
     """Write the rules snapshot (legacy bare-list shape) and the maps beside it.
 
     The rules file keeps the exact shape every published SDK version reads —
@@ -797,13 +958,19 @@ def _persist_cache_to_disk(rules: list, org_unit_blocks: Optional[dict] = None,
     fingerprint of the rules it was computed against, so however a crash
     interleaves the two writes, the loader can only ever pair a map with the
     exact rules snapshot it belongs to — a mismatched map is dropped, which
-    merely skips department blocks until the next refresh.
+    merely skips department blocks until the next refresh. The locked rules
+    ride in a third file under the same fingerprint, for the same reasons.
+    The locked-rules envelope also carries the owner's ``credential``
+    (``_load_locked_rules_from_disk``).
 
     The map arguments are optional so callers that only have rules (and the
     existing tests) keep working; an omitted map is written empty, which is
     also what an envelope predating that map loads as. ``owner`` is whose
-    rules these are, the current owner when omitted.
+    rules these are, the current owner when omitted. The refresh always
+    passes the answer's own ``_FetchedRules.owner``, so the envelope names the
+    key the rules were read with, not whichever key is set when it is written.
     """
+    owner = owner or _current_owner()
     path = _cache_file_path(owner)
     if not path:
         return
@@ -817,6 +984,13 @@ def _persist_cache_to_disk(rules: list, org_unit_blocks: Optional[dict] = None,
                 "balances": org_unit_block_balances or {},
                 "warnings": org_unit_warnings or {},
                 "candidates": org_unit_candidates or {},
+            })
+        locked_path = _locked_rules_cache_file_path(owner)
+        if locked_path:
+            _write_private_json(locked_path, {
+                "rules_fingerprint": _rules_fingerprint(rules),
+                "credential": owner.credential,
+                "lockedRules": locked_rules or [],
             })
         _write_private_json(path, rules)
     except Exception:
@@ -860,7 +1034,7 @@ def _retry_after_seconds(response: "httpx.Response") -> Optional[float]:
     return max(0.0, delay)
 
 
-def _begin_refresh_cooldown(seconds: float, owner: Tuple[str, str]) -> Optional[float]:
+def _begin_refresh_cooldown(seconds: float, owner: _CacheOwner) -> Optional[float]:
     """Stop issuing refresh requests for the ``Retry-After`` the fetch declined to wait.
 
     Giving up on the header is only half of honouring it. Without a cooldown
@@ -878,7 +1052,7 @@ def _begin_refresh_cooldown(seconds: float, owner: Tuple[str, str]) -> Optional[
     return _extend_refresh_cooldown(min(max(0.0, seconds), _REFRESH_COOLDOWN_CEILING_SECONDS), owner)
 
 
-def _begin_failure_backoff(owner: Tuple[str, str]) -> Optional[float]:
+def _begin_failure_backoff(owner: _CacheOwner) -> Optional[float]:
     """Stop issuing refresh requests for ``_refresh_failure_backoff_seconds``.
 
     Not clamped by ``_REFRESH_COOLDOWN_CEILING_SECONDS``: that bounds what one
@@ -890,12 +1064,12 @@ def _begin_failure_backoff(owner: Tuple[str, str]) -> Optional[float]:
     return _extend_refresh_cooldown(_refresh_failure_backoff_seconds(), owner)
 
 
-def _extend_refresh_cooldown(seconds: float, owner: Tuple[str, str]) -> Optional[float]:
+def _extend_refresh_cooldown(seconds: float, owner: _CacheOwner) -> Optional[float]:
     """Move ``owner``'s cooldown deadline ``seconds`` out, never shortening one in force.
 
-    A fetch that fails after the process switched to another team sets
-    nothing and returns ``None``: its cooldown would hold off the new team's
-    refresh for a whole poll interval.
+    A fetch that fails after the process switched to another team or API key
+    sets nothing and returns ``None``: its cooldown would hold off the new
+    owner's refresh for a whole poll interval.
     """
     global _refresh_cooldown_until, _refresh_cooldown_owner
     now = time.monotonic()
@@ -931,7 +1105,7 @@ class _RetryPlan(NamedTuple):
 
 
 def _plan_retry(response: "httpx.Response", backoff: float, budget_remaining: float,
-                budget_total: float, owner: Tuple[str, str]) -> _RetryPlan:
+                budget_total: float, owner: _CacheOwner) -> _RetryPlan:
     """Decide how to handle a retryable response, spending the Retry-After budget.
 
     Three outcomes, and the ``None`` is the one that matters:
@@ -979,13 +1153,21 @@ def _wire_value(payload: dict, keys: Tuple[str, ...]):
 
 
 class _FetchedRules(NamedTuple):
-    """One enforcement payload: the rules plus the department-budget maps."""
+    """One enforcement payload: the rules, the department-budget maps and the locked rules.
+
+    ``owner`` is whose answer it is: the ``_FetchTarget.owner`` of the read
+    that brought it, derived from the same read of the API key the request
+    was authenticated with. ``None`` until ``_fetch_rules`` ties a parsed body
+    to its read, and an answer without an owner is never installed.
+    """
 
     rules: list
     org_unit_blocks: dict
     org_unit_block_balances: dict
     org_unit_warnings: dict
     org_unit_candidates: dict
+    locked_rules: list
+    owner: Optional[_CacheOwner] = None
 
 
 def _fetched_from_payload(data) -> Optional[_FetchedRules]:
@@ -1001,27 +1183,36 @@ def _fetched_from_payload(data) -> Optional[_FetchedRules]:
     The warn map is re-keyed exactly like the block map, and its values are
     validated as rule ids at the lookup rather than here, so the two maps
     cannot drift apart in what they accept (``_org_unit_map_entry``).
+
+    ``lockedRules`` is served only to a scoped caller; anything but a list,
+    an absent key included, reads as no locked rules.
     """
     if isinstance(data, list):
-        return _FetchedRules(data, {}, {}, {}, {})
+        return _FetchedRules(data, {}, {}, {}, {}, [])
     if isinstance(data, dict):
+        locked_rules = data.get("lockedRules")
         return _FetchedRules(
             data.get("rules", []),
             _normalize_map_keys(_wire_value(data, _ORG_UNIT_BLOCKS_KEYS)),
             _coerce_balances(_wire_value(data, _ORG_UNIT_BLOCK_BALANCES_KEYS)),
             _normalize_map_keys(_wire_value(data, _ORG_UNIT_WARNINGS_KEYS)),
             _coerce_candidates(_wire_value(data, _ORG_UNIT_CANDIDATES_KEYS)),
+            locked_rules if isinstance(locked_rules, list) else [],
         )
     logger.warning("Unexpected enforcement response shape: %r", type(data).__name__)
     return None
 
 
 class _FetchTarget(NamedTuple):
-    """The credentials and the team-scoped URL every enforcement read hangs off."""
+    """The credentials and the team-scoped URL every enforcement read hangs off.
+
+    ``owner`` is derived from ``api_key`` itself, the key the request header
+    is built from, so it names whoever the read authenticates as.
+    """
 
     api_key: str
     team_url: str
-    owner: Tuple[str, str]
+    owner: _CacheOwner
     # The address ``team_url`` was built on: the configured one, or the
     # sibling an earlier 404 recovered to.
     address: str
@@ -1035,8 +1226,7 @@ def _fetch_target() -> Optional[_FetchTarget]:
     """
     global _team_id_warned, _api_key_warned
 
-    client = _process_metering_client()
-    api_key = client.api_key if client is not None else ""
+    api_key = _process_api_key()
     if not api_key:
         if not _api_key_warned:
             if _fail_mode_is_closed():
@@ -1064,19 +1254,20 @@ def _fetch_target() -> Optional[_FetchTarget]:
 
     base_url = _get_enforcement_base_url()
     address = _effective_enforcement_address(base_url)
-    return _FetchTarget(api_key, _team_rules_url(address, team_id), (base_url, team_id), address)
+    return _FetchTarget(api_key, _team_rules_url(address, team_id),
+                        _CacheOwner(base_url, team_id, _credential_fingerprint(api_key)), address)
 
 
 def _get_enforcement(url: str, api_key: str, resource: str,
                      params: Optional[dict], retry_after_budget: float,
-                     owner: Tuple[str, str]) -> Optional["httpx.Response"]:
+                     owner: _CacheOwner) -> Optional["httpx.Response"]:
     """``_get_enforcement_spending`` for a read that has no second address to spend the rest on."""
     return _get_enforcement_spending(url, api_key, resource, params, retry_after_budget, owner)[0]
 
 
 def _get_enforcement_spending(url: str, api_key: str, resource: str,
                               params: Optional[dict], retry_after_budget: float,
-                              owner: Tuple[str, str]) -> Tuple[Optional["httpx.Response"], float]:
+                              owner: _CacheOwner) -> Tuple[Optional["httpx.Response"], float]:
     """GET one enforcement resource under the shared retry and Retry-After budget.
 
     Returns the response and the Retry-After budget this read left unspent, so
@@ -1158,9 +1349,12 @@ def _fetch_rules(rule_id: Optional[str] = None,
                  ) -> Optional[_FetchedRules]:
     """Fetch the current enforcement payload from the Revenium API.
 
-    Returns the rules and the three department-budget maps on success — any of
-    them may be empty -- or ``None`` on failure so the caller can preserve the
-    previous cache.
+    Returns the rules, the department-budget maps and the locked rules on
+    success — any of them may be empty -- or ``None`` on failure so the caller
+    can preserve the previous cache. The answer carries the ``owner`` of the
+    ``_FetchTarget`` the request was built from, the one read of the API key
+    it was authenticated with, and the refresh installs and saves it under
+    that owner only.
 
     ``rule_id`` sends the server's ``ruleId`` filter and is opt-in: the poller
     and the stale-cache refresh never send it. The server computes the
@@ -1183,7 +1377,13 @@ def _fetch_rules(rule_id: Optional[str] = None,
     target = _fetch_target()
     if target is None:
         return None
+    fetched = _read_rules(target, params, retry_after_budget)
+    return fetched._replace(owner=target.owner) if fetched is not None else None
 
+
+def _read_rules(target: _FetchTarget, params: Optional[dict],
+                retry_after_budget: float) -> Optional[_FetchedRules]:
+    """Read the rules at ``target``'s address, or at its sibling when that one answers 404."""
     response, budget_left = _get_enforcement_spending(target.team_url, target.api_key, "rule",
                                                       params, retry_after_budget, target.owner)
     if response is None:
@@ -1200,14 +1400,15 @@ def _rules_from_response(response: "httpx.Response") -> Optional[_FetchedRules]:
     try:
         # 204 No Content == no rules configured for this team; cache empty
         if response.status_code == 204:
-            return _FetchedRules([], {}, {}, {}, {})
+            return _FetchedRules([], {}, {}, {}, {}, [])
         if 400 <= response.status_code < 500:
             _warn_refused_rules_read(response)
         response.raise_for_status()
         # Server currently returns ``{"rules": [...], "compiledAt": ...,
         # "departmentBudgetBlocks": {...}, "departmentBudgetBlockBalances":
-        # {...}, "departmentBudgetWarnings": {...}}``; a bare list is accepted
-        # too. See ``_fetched_from_payload``.
+        # {...}, "departmentBudgetWarnings": {...}}`` plus ``"lockedRules":
+        # [...]`` for a scoped caller; a bare list is accepted too. See
+        # ``_fetched_from_payload``.
         return _fetched_from_payload(response.json())
     except Exception:
         logger.debug("Failed to fetch enforcement rules, falling open", exc_info=True)
@@ -1236,7 +1437,7 @@ def _rules_at_sibling_address(target: _FetchTarget, params: Optional[dict],
     wrong key or team id at the working address is not hidden behind the
     first address's 404.
     """
-    configured, team_id = target.owner
+    configured, team_id = target.owner.base_url, target.owner.team_id
     sibling = _sibling_enforcement_address(target.address)
     response, budget_left = _get_enforcement_spending(
         _team_rules_url(sibling, team_id), target.api_key, "rule", params,
@@ -1311,7 +1512,7 @@ def _fetch_roster(rule_id: str, page: int = 0, size: int = 25,
         recovered = _rules_at_sibling_address(target, None, budget_left)
         if recovered is None:
             return None
-        response = _get_enforcement(f"{_team_rules_url(recovered.address, target.owner[1])}/roster",
+        response = _get_enforcement(f"{_team_rules_url(recovered.address, target.owner.team_id)}/roster",
                                     target.api_key, "roster", params, recovered.budget_left,
                                     target.owner)
         if response is None:
@@ -1443,13 +1644,23 @@ def _refresh_cache_holding_lock() -> None:
     stale and is refreshed as soon as the backoff allows. The backoff is
     recorded before ``_refresh_lock`` is released, so no pre-call check can
     see a stale cache with neither a refresh nor a backoff in force and wake
-    the poller straight back into the outage.
+    the poller straight back into the outage. That backoff belongs to the
+    owner the refresh started under, so a switch away from it lifts it
+    (``_forget_another_owners_rules``).
+
+    A fetched answer is installed and saved under its own ``owner``, the one
+    ``_fetch_rules`` derived from the API key the request was authenticated
+    with, never under an owner sampled before or after the request. It is
+    dropped unless that owner is still the current one when ``_cache_lock`` is
+    taken to install it, so an answer authenticated with another key -- even
+    one the process has switched away from and back since -- never judges
+    this key's calls or lands in its snapshot.
 
     Disk persistence happens outside ``_cache_lock`` so a slow filesystem write
     can't block concurrent ``check_enforcement`` callers on the pre-call path.
     """
     global _cached_rules, _cached_org_unit_blocks, _cached_org_unit_block_balances
-    global _cached_org_unit_warnings, _cached_org_unit_candidates
+    global _cached_org_unit_warnings, _cached_org_unit_candidates, _cached_locked_rules
     global _cache_timestamp, _cache_initialized, _cache_owner
     if _refresh_is_on_cooldown():
         logger.debug("Enforcement refresh skipped: a cooldown is still in force")
@@ -1459,43 +1670,39 @@ def _refresh_cache_holding_lock() -> None:
     if fetched is None:
         backoff = _begin_failure_backoff(owner)
         if backoff is None:
-            logger.debug("Dropped a failed enforcement fetch for the team the process switched away from")
+            logger.debug("Dropped a failed enforcement fetch for the team or API key the process switched away from")
             return
         # A missing key or team was already reported, once, by _fetch_target.
         if _fetch_target() is not None:
             logger.warning(
                 "Enforcement rules for team %s could not be refreshed; enforcing the rules already "
                 "cached (none, if no fetch has succeeded yet) and trying again in %.0fs",
-                owner[1], backoff,
+                owner.team_id, backoff,
             )
         return
-    # The process moved to another team or address while this fetch was in
-    # flight: its rules must not judge the new team's calls or land in the new
-    # team's snapshot.
-    if _current_owner() != owner:
-        logger.debug("Dropped enforcement rules fetched for the team the process switched away from")
-        return
     with _cache_lock:
-        if _cache_owner not in (None, owner):
-            logger.debug("Dropped enforcement rules fetched for the team the process switched away from")
+        if fetched.owner != _current_owner() or _cache_owner not in (None, fetched.owner):
+            logger.debug("Dropped enforcement rules fetched for the team or API key the process switched away from")
             return
-        _cache_owner = owner
+        _cache_owner = fetched.owner
         _cached_rules = fetched.rules
         _cached_org_unit_blocks = fetched.org_unit_blocks
         _cached_org_unit_block_balances = fetched.org_unit_block_balances
         _cached_org_unit_warnings = fetched.org_unit_warnings
         _cached_org_unit_candidates = fetched.org_unit_candidates
+        _cached_locked_rules = fetched.locked_rules
         _begin_cache_generation()
         _cache_timestamp = time.monotonic()
         _cache_initialized = True
     _persist_cache_to_disk(fetched.rules, fetched.org_unit_blocks,
                            fetched.org_unit_block_balances,
-                           fetched.org_unit_warnings, owner=owner,
-                           org_unit_candidates=fetched.org_unit_candidates)
+                           fetched.org_unit_warnings, owner=fetched.owner,
+                           org_unit_candidates=fetched.org_unit_candidates,
+                           locked_rules=fetched.locked_rules)
 
 
 def _poll_loop() -> None:
-    interval = _poll_interval_seconds()
+    interval = _poll_interval_in_force()
     while not _stop_event.is_set():
         _refresh_cache()
         # A wake-up asked for while that refresh ran was answered by it, so it
@@ -1519,16 +1726,18 @@ def _next_poll_wait_seconds(interval: float) -> float:
 
 
 def _forget_another_owners_rules() -> None:
-    """Drop rules, department maps and backoff cached for another enforcement address or team.
+    """Drop what is cached for another ``_CacheOwner``, and the backoff it started.
 
     A process that switches teams must not judge the new team's calls by the
-    old team's caps or email list. The next disk load then reads the new
-    team's own snapshot, and the poller is woken to fetch its rules. A cache
-    nobody owns yet (never loaded, or seeded by hand) is adopted as it is.
+    old team's caps or email list: everything is dropped, the next disk load
+    reads the new team's own snapshot, and the poller is woken to fetch its
+    rules. One that switches only its API key (for example with
+    ``initialize_metering(api_key=...)``) drops only the locked rules, the
+    previous key owner's own verdicts, and the poller is woken to fetch the
+    new owner's. A cache nobody owns yet (never loaded, or seeded by hand) is
+    adopted as it is.
     """
-    global _cached_rules, _cached_org_unit_blocks, _cached_org_unit_block_balances
-    global _cached_org_unit_warnings, _cached_org_unit_candidates, _cache_timestamp
-    global _cache_initialized, _disk_load_attempted, _refresh_cooldown_until, _cache_owner
+    global _cached_locked_rules, _refresh_cooldown_until, _cache_owner
     owner = _current_owner()
     if _cache_owner == owner:
         return
@@ -1538,18 +1747,34 @@ def _forget_another_owners_rules() -> None:
             _refresh_cooldown_until = 0.0
         if previous is None or previous == owner:
             return
-        _cached_rules = []
-        _cached_org_unit_blocks = {}
-        _cached_org_unit_block_balances = {}
-        _cached_org_unit_warnings = {}
-        _cached_org_unit_candidates = {}
-        _begin_cache_generation()
-        _cache_timestamp = 0.0
-        _cache_initialized = False
-        _disk_load_attempted = False
-        _refresh_cooldown_until = 0.0
-    logger.info("Enforcement rules of the previous team were dropped; loading the rules of team %s", owner[1])
+        key_only = previous.is_same_team(owner)
+        if key_only:
+            _cached_locked_rules = []
+        else:
+            _forget_cached_answer()
+    if key_only:
+        logger.info("Locked enforcement rules of the previous API key were dropped; loading the current key's")
+    else:
+        logger.info("Enforcement rules of the previous team were dropped; loading the rules of team %s", owner.team_id)
     _poll_wakeup.set()
+
+
+def _forget_cached_answer() -> None:
+    """Empty the whole cache so the next check loads it afresh. Caller must hold ``_cache_lock``."""
+    global _cached_rules, _cached_org_unit_blocks, _cached_org_unit_block_balances
+    global _cached_org_unit_warnings, _cached_org_unit_candidates, _cached_locked_rules, _cache_timestamp
+    global _cache_initialized, _disk_load_attempted, _refresh_cooldown_until
+    _cached_rules = []
+    _cached_org_unit_blocks = {}
+    _cached_org_unit_block_balances = {}
+    _cached_org_unit_warnings = {}
+    _cached_org_unit_candidates = {}
+    _cached_locked_rules = []
+    _begin_cache_generation()
+    _cache_timestamp = 0.0
+    _cache_initialized = False
+    _disk_load_attempted = False
+    _refresh_cooldown_until = 0.0
 
 
 def _ensure_poller_running() -> None:
@@ -1558,6 +1783,7 @@ def _ensure_poller_running() -> None:
         if _poll_thread is not None and _poll_thread.is_alive():
             return
         _stop_event.clear()
+        _adopt_poll_interval()
         _poll_thread = threading.Thread(
             target=_poll_loop,
             name="revenium-enforcement-poll",
@@ -1579,8 +1805,17 @@ def _snapshot_department_budgets() -> _DepartmentBudgets:
                               dict(candidates), _cache_generation)
 
 
-def _get_rules() -> Tuple[list, _DepartmentBudgets, bool]:
-    """Return cached rules, the department maps, and the initialized flag.
+class _CachedAnswer(NamedTuple):
+    """What one pre-call check judges the call on, read by ``_get_rules``."""
+
+    rules: list
+    departments: _DepartmentBudgets
+    locked_rules: List[dict]
+    initialized: bool
+
+
+def _get_rules() -> _CachedAnswer:
+    """Return the cached rules, department maps and locked rules, and the initialized flag.
 
     Never fetches. A stale cache is served as it is and the poller is woken to
     refresh it, unless a refresh is already running or a cooldown is in force,
@@ -1588,20 +1823,24 @@ def _get_rules() -> Tuple[list, _DepartmentBudgets, bool]:
 
     Reading every field under one ``_cache_lock`` acquisition prevents the
     fail-closed path from torn-reading ``_cache_initialized`` against a
-    half-written ``_cached_rules`` from the background poller, and keeps the
+    half-written ``_cached_rules`` from the background poller, keeps the
     department maps consistent with each other and with the rules they
-    reference.
+    reference, and never pairs one fetch's rules with another fetch's locked
+    rules.
     """
     now = time.monotonic()
     with _cache_lock:
         stale = not _cache_initialized or now - _cache_timestamp > _CACHE_TTL
         cooling_down = now < _refresh_cooldown_until
-        rules = list(_cached_rules)
-        departments = _snapshot_department_budgets()
-        initialized = _cache_initialized
+        answer = _CachedAnswer(
+            rules=list(_cached_rules),
+            departments=_snapshot_department_budgets(),
+            locked_rules=list(_cached_locked_rules) if isinstance(_cached_locked_rules, list) else [],
+            initialized=_cache_initialized,
+        )
     if stale and not cooling_down and not _refresh_lock.locked():
         _poll_wakeup.set()
-    return rules, departments, initialized
+    return answer
 
 
 def _coerce_float(value) -> Optional[float]:
@@ -1922,6 +2161,18 @@ class _CallScope:
     def names_credential_only_by_value(self) -> bool:
         credential = _credential_sent(self._metadata)
         return credential.get("name") is None and credential.get("value") is not None
+
+    def names_a_subscriber(self) -> bool:
+        """Whether the call says whom it is for, by subscriber id or email.
+
+        Uses the keys every per-person and department lookup identifies a
+        caller by (``_group_lookup_keys``, which covers ``_caller_emails``),
+        so no call one of those paths can judge as someone's reads as naming
+        nobody here. A blank id or address names nobody; a credential alone is
+        not a subscriber.
+        """
+        subscriber = extract_subscriber_from_metadata(self._metadata)
+        return any(key.strip() for key in _group_lookup_keys(subscriber, self._metadata))
 
 
 def _filter_cannot_be_evaluated(rule: dict, dimension, operator, reason: str) -> bool:
@@ -2348,15 +2599,20 @@ def _rule_identifier(rule: dict):
     return rule.get("ruleId") or rule.get("id")
 
 
-def _claim_non_blocking_warning(rule: dict) -> bool:
-    """True the first time a non-blocking breach of this rule is seen in its window."""
+def _claim_once_per_window(rule: dict, warned: Dict[str, object]) -> bool:
+    """True the first time ``rule`` is claimed in ``warned`` for its current window."""
     key = str(_rule_identifier(rule))
     window_end = rule.get("windowEnd")
     with _warn_dedupe_lock:
-        if key in _warned_non_blocking_rules and _warned_non_blocking_rules[key] == window_end:
+        if key in warned and warned[key] == window_end:
             return False
-        _warned_non_blocking_rules[key] = window_end
+        warned[key] = window_end
         return True
+
+
+def _claim_non_blocking_warning(rule: dict) -> bool:
+    """True the first time a non-blocking breach of this rule is seen in its window."""
+    return _claim_once_per_window(rule, _warned_non_blocking_rules)
 
 
 def _warn_non_blocking_breach(rule: dict) -> None:
@@ -2412,6 +2668,62 @@ def _act_on_breached_rule(rule: dict, current_value: Optional[float]) -> None:
         rule_id=_rule_identifier(rule),
         deny_message=deny,
     )
+
+
+def _warn_locked_warn_tier(rule: dict) -> None:
+    """Log, once per window, that a locked rule is over its warning threshold and not its limit."""
+    if not _claim_once_per_window(rule, _warned_locked_warn_tiers):
+        return
+    logger.warning(
+        "Revenium enforcement rule %s (id %s) is over its warning threshold; not blocking",
+        sanitize_for_logging(rule.get("name", "cost limit")), _rule_identifier(rule),
+    )
+
+
+def _act_on_locked_rules(locked_rules: Sequence[dict], scope: _CallScope) -> None:
+    """Act on the rules that bind a scoped caller whose figures are not theirs to see.
+
+    Each one's ``breached`` and ``warnBreached`` are the server's department
+    verdicts for the key's owner (``ScopedEnforcementRules.lockedView``), so
+    they judge only a call that names no subscriber, which is metered as the
+    key owner's. A call that names a subscriber (``_CallScope.names_a_subscriber``),
+    the owner included, is left to ``rules`` and the department maps, which
+    carry each in-scope person's own verdict. The owner's standing says
+    nothing about another person, and the filters served here can be broader
+    than the rule's own, because the server drops the SUBSCRIBER rows the
+    caller may not see (``RuleVisibilityPolicy.disclosedFilters``), so acting
+    on one for a named subscriber could refuse a call the rule does not cover.
+
+    A breached one goes through ``_act_on_breached_rule`` like a breached rule
+    in ``rules``, with two deliberate differences:
+
+    - The ``_is_org_unit_rule`` skip is not applied. In ``rules`` a department
+      rule's ``breached`` says the department is over budget, so it is left to
+      the department map; a locked rule's says the key's owner is, and most
+      locked rules are department-shaped, so skipping them would let every
+      one through again.
+    - ``current_value`` is ``None``. The server sends no spend figure, and
+      none is derived here.
+
+    Its filter rows are judged as for a department candidate
+    (``_department_cap_covers_call``): the server settled the SUBSCRIBER rows
+    in naming the key owner under the rule, which is where ``breached`` came
+    from, so they cover the call. A rule only over its warning threshold is
+    logged.
+    """
+    if not locked_rules or scope.names_a_subscriber():
+        return
+    for rule in locked_rules:
+        if not isinstance(rule, dict) or rule.get("shadowMode", False):
+            continue
+        if _window_has_ended(rule):
+            continue
+        if not _department_cap_covers_call(rule, scope):
+            continue
+        if rule.get("breached", False):
+            _act_on_breached_rule(rule, None)
+        elif rule.get("warnBreached", False):
+            _warn_locked_warn_tier(rule)
 
 
 def _raise_org_unit_block(rules: list, departments: _DepartmentBudgets,
@@ -2496,18 +2808,19 @@ def _begin_cache_generation() -> None:
     this generation is that the generation is part of every key.
 
     The per-person lookup indexes (``_group_indexes``) belong to the replaced
-    rules, so they are dropped here too, as are the warn-only dedupe entries of
-    rules the new cache no longer serves.
+    rules, so they are dropped here too, as are the once-per-window dedupe
+    entries of rules the new cache no longer serves, locked rules included.
     """
     global _cache_generation
     _cache_generation += 1
     _group_indexes.clear()
     served = {str(_rule_identifier(rule))
-              for rule in _cached_rules if isinstance(rule, dict)}
+              for rule in [*_cached_rules, *_cached_locked_rules] if isinstance(rule, dict)}
     with _warn_dedupe_lock:
         _warned_org_unit_callers.clear()
-        for rule_id in set(_warned_non_blocking_rules) - served:
-            del _warned_non_blocking_rules[rule_id]
+        for warned in (_warned_non_blocking_rules, _warned_locked_warn_tiers):
+            for rule_id in set(warned) - served:
+                del warned[rule_id]
         _noted_unevaluable_filters.difference_update(
             [key for key in _noted_unevaluable_filters if key[0] not in served])
 
@@ -2603,17 +2916,21 @@ def _caller_candidates(candidates: dict,
     return None
 
 
-def _candidate_unjudged_dimensions(scope: _CallScope) -> frozenset:
-    """The rows of a candidate's rule that count as covering the call unjudged.
+def _department_cap_covers_call(rule: dict, scope: _CallScope) -> bool:
+    """Whether a department cap whose verdict names the caller counts this call.
 
-    Besides the rows the server decided, a CREDENTIAL row when the call names
-    its credential only by raw value: the server counted the cap's total under
-    the credential's saved name, which a raw value cannot be matched to, so
-    the cap keeps applying, as it does on the server.
+    Its filter rows are judged as the server counted the cap's total: without
+    regard to case, and with the rows the server decided in naming the person
+    (``_DEPARTMENT_VERDICT_DECIDED_DIMENSIONS``) covering the call unjudged.
+    So does a CREDENTIAL row when the call names its credential only by raw
+    value: the server counted the total under the credential's saved name,
+    which a raw value cannot be matched to, so the cap keeps applying, as it
+    does on the server (``EnforcementFilterMatcher.matchesCallScope``).
     """
+    decided = _DEPARTMENT_VERDICT_DECIDED_DIMENSIONS
     if scope.names_credential_only_by_value():
-        return _CANDIDATE_DECIDED_DIMENSIONS | {"CREDENTIAL"}
-    return _CANDIDATE_DECIDED_DIMENSIONS
+        decided = decided | {"CREDENTIAL"}
+    return _rule_applies_to_call(rule, scope, ignore_case=True, decided_dimensions=decided)
 
 
 def _first_candidate_for_call(rules: list, candidates: List[dict],
@@ -2623,9 +2940,8 @@ def _first_candidate_for_call(rules: list, candidates: List[dict],
     A candidate whose rule the cached rules do not carry covers it, as a
     single-slot block naming a missing rule always has. One whose window has
     ended is passed over for the next. Otherwise its rule's filter rows are
-    judged against the call as the server counted the cap's total: without
-    regard to case, and without the rows the server decided in building the
-    list.
+    judged by ``_department_cap_covers_call``, without the rows the server
+    decided in building the list.
     """
     for candidate in candidates:
         rule = _rule_by_id(rules, candidate["ruleId"])
@@ -2633,8 +2949,7 @@ def _first_candidate_for_call(rules: list, candidates: List[dict],
             return candidate
         if _window_has_ended(rule):
             continue
-        if _rule_applies_to_call(rule, scope, ignore_case=True,
-                                 decided_dimensions=_candidate_unjudged_dimensions(scope)):
+        if _department_cap_covers_call(rule, scope):
             return candidate
     return None
 
@@ -2731,6 +3046,17 @@ def check_enforcement(usage_metadata: Optional[dict] = None, *,
     or operator, a malformed entry) keeps the rule applying, so a cap is never
     weakened. Department rules stay decided by the department map alone.
 
+    After those, for a call that names no subscriber (no usable subscriber id
+    or email), the rules a scoped caller (a Member or Department Admin) is
+    served in ``lockedRules`` are judged: one in shadow mode, outside the
+    call's filters or from a window that has ended is skipped, a breached one
+    blocks or warns by its ``action``, even when it is department-shaped, and
+    one only over its warning threshold is logged and never blocks. A call
+    that names a subscriber is never judged by them: their standing is the
+    key owner's own and their filters may cover people the real rule leaves
+    out, so that call is left to the rules and department maps above. See
+    ``_act_on_locked_rules``.
+
     Raises:
         BudgetExceededError: when a cost-limit rule blocks the call.
             All structured fields (``rule_name``, ``current_value``,
@@ -2738,7 +3064,8 @@ def check_enforcement(usage_metadata: Optional[dict] = None, *,
             server provides them. For a grouped rule ``current_value`` is the
             caller's group balance while ``threshold`` stays rule-level; for a
             department budget it is the caller's own balance from
-            ``departmentBudgetBlockBalances`` when the server publishes one.
+            ``departmentBudgetBlockBalances`` when the server publishes one;
+            for a locked rule it is ``None``.
     """
     if is_bypass_enabled() or _checked_by_outer_wrapper():
         return
@@ -2748,13 +3075,14 @@ def check_enforcement(usage_metadata: Optional[dict] = None, *,
     _forget_another_owners_rules()
     _load_cache_from_disk()
     _ensure_poller_running()
-    rules, departments, initialized = _get_rules()
+    cached = _get_rules()
+    rules, departments = cached.rules, cached.departments
 
     # Fail-closed mode: only block when the cache has *never* loaded. An
     # empty list from a successful fetch (HTTP 204 = "no rules apply") is a
     # valid initialized state and must pass through. Use the snapshot taken
     # under _cache_lock so the decision can't see a torn write.
-    if _fail_mode_is_closed() and not initialized:
+    if _fail_mode_is_closed() and not cached.initialized:
         raise BudgetExceededError(
             "Request blocked: enforcement cache is uninitialized and "
             "REVENIUM_CB_FAIL_MODE=closed."
@@ -2799,6 +3127,8 @@ def check_enforcement(usage_metadata: Optional[dict] = None, *,
         if blocks:
             _act_on_breached_rule(rule, current_value)
 
+    _act_on_locked_rules(cached.locked_rules, scope)
+
 
 def check_unmetered_call(api_metadata: Optional[dict] = None, *, model: Optional[str] = None,
                          provider: Optional[str] = None, callback_transport: Optional[str] = None) -> None:
@@ -2828,10 +3158,20 @@ def stop_polling() -> None:
 
     ``_poll_wakeup`` is set after ``_stop_event`` so a poller sleeping out its
     interval wakes now instead of up to one poll interval later.
+
+    Once the poller has exited the interval is forgotten, so the next poller
+    or backoff reads the setting afresh. A poller that outlives the join, or
+    one started meanwhile, keeps the interval it is running on.
     """
+    global _poll_interval
     _stop_event.set()
     _poll_wakeup.set()
     with _poll_lock:
         thread = _poll_thread
     if thread is not None:
         thread.join(timeout=5)
+    with _poll_lock:
+        replaced = _poll_thread is not thread
+        still_running = thread is not None and thread.is_alive()
+        if not replaced and not still_running:
+            _poll_interval = None

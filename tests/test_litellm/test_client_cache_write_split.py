@@ -204,6 +204,7 @@ def test_openai_shaped_prompt_count_stays_gross(payloads, monkeypatch):
 
 BEDROCK_CLAUDE = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 BEDROCK_NOVA = "us.amazon.nova-micro-v1:0"
+BEDROCK_ARN = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123"
 VERTEX_CLAUDE = "claude-haiku-4-5@20251001"
 VERTEX_GEMINI = "gemini-2.5-flash-lite"
 
@@ -270,15 +271,73 @@ def test_bedrock_claude_counts_only_uncached_input(style, case, payloads, bedroc
 
 
 @pytest.mark.parametrize("style", ["completion", "completion-stream"])
-def test_bedrock_nova_prompt_count_stays_gross(style, payloads, bedrock_upstream):
-    """Nova folds the cache on Converse too; it is outside this fix and keeps today's count."""
+def test_bedrock_nova_counts_only_uncached_input(style, payloads, bedrock_upstream):
+    """Nova folds the cache into ``prompt_tokens`` on Converse like Claude, so the row carries Bedrock's own input."""
     endpoint = bedrock_upstream(fake_bedrock_upstream.converse_usage(input_tokens=5, cache_read=4507))
     bedrock_call(style, endpoint, model=BEDROCK_NOVA)
 
     row = only_row(payloads)
-    assert row["input_token_count"] == 4512
+    assert row["input_token_count"] == 5
     assert row["cache_read_token_count"] == 4507
     assert row["cache_creation_token_count"] == 0
+
+
+@pytest.mark.parametrize("case", sorted(BEDROCK_CACHE_CASES))
+@pytest.mark.parametrize("style", sorted(CALL_STYLES))
+def test_bedrock_arn_counts_only_uncached_input(style, case, payloads, bedrock_upstream):
+    cache = BEDROCK_CACHE_CASES[case]
+    bedrock_call(style, bedrock_upstream(fake_bedrock_upstream.converse_usage(input_tokens=12, **cache)),
+                 model=BEDROCK_ARN)
+
+    row = only_row(payloads)
+    assert row["input_token_count"] == 12
+    assert row["cache_read_token_count"] == cache.get("cache_read", 0)
+    assert row["cache_creation_token_count"] == cache.get("cache_write", 0)
+
+
+def test_the_client_judges_the_deployment_not_the_stripped_response_model(payloads):
+    usage = SimpleNamespace(
+        prompt_tokens=5012, completion_tokens=5, total_tokens=5017,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=2000, cache_write_tokens=0),
+    )
+    response = SimpleNamespace(
+        id="chatcmpl-gpt-oss", model="openai.gpt-oss-120b-1:0", usage=usage, finish_reason="stop",
+        _hidden_params={"litellm_model_name": "bedrock/chat_completions/openai.gpt-oss-120b-1:0"},
+    )
+
+    mw.handle_response(response, datetime.datetime.now(datetime.timezone.utc), {}, False,
+                       upstream_provider="bedrock")
+
+    row = only_row(payloads)
+    assert row["input_token_count"] == 5012
+    assert row["cache_read_token_count"] == 2000
+
+
+@pytest.mark.parametrize("streamed", [False, True], ids=["non-streamed", "streamed"])
+def test_a_bedrock_chat_completions_call_keeps_the_gross_count_streamed_or_not(streamed, payloads, monkeypatch):
+    monkeypatch.setattr(fake_openai_upstream, "USAGE", {
+        "prompt_tokens": 5012,
+        "completion_tokens": 5,
+        "total_tokens": 5017,
+        "prompt_tokens_details": {"cached_tokens": 2000},
+    })
+    server = fake_openai_upstream.start_upstream()
+    try:
+        endpoint = fake_openai_upstream.api_base(server)
+        kwargs = bedrock_kwargs(endpoint, "chat_completions/openai.gpt-oss-120b-1:0",
+                                api_base=endpoint, stream=streamed)
+        if streamed:
+            kwargs["stream_options"] = {"include_usage": True}
+        response = litellm.completion(**kwargs)
+        if streamed:
+            list(response)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    row = only_row(payloads)
+    assert row["input_token_count"] == 5012
+    assert row["cache_read_token_count"] == 2000
 
 
 @pytest.mark.parametrize("cache_read", [0, None])

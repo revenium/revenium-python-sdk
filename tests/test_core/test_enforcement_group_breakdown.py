@@ -339,7 +339,7 @@ class TestPerGroupEvaluation:
     def test_a_check_spanning_a_refresh_does_not_cache_the_replaced_breakdown(self, load_rules):
         replaced = two_group_rule(breached=True)
         load_rules([replaced])
-        _, departments, _ = enforcement._get_rules()
+        departments = enforcement._get_rules().departments
         load_rules([two_group_rule(breached=True)])
         enforcement._begin_cache_generation()
 

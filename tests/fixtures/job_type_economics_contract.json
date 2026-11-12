@@ -26,6 +26,16 @@
     "monetizationBasis": [
       "REALIZED",
       "EXPECTED"
+    ],
+    "baselineThroughputPeriod": [
+      "HOUR",
+      "DAY",
+      "WEEK",
+      "MONTH"
+    ],
+    "baselineThroughputScope": [
+      "TEAM",
+      "PER_PERSON"
     ]
   },
   "canonicalPayloads": {
@@ -76,6 +86,13 @@
       "provenance": "CUSTOMER_DECLARED",
       "declaredBy": "claims-operations",
       "effectiveFrom": "2026-08-01T00:00:00Z"
+    },
+    "baselineWithThroughput": {
+      "effectiveFrom": "2026-08-01T00:00:00Z",
+      "throughputValue": 3000.5,
+      "throughputPeriod": "WEEK",
+      "throughputScope": "PER_PERSON",
+      "headcount": 12
     }
   },
   "requiredFields": {

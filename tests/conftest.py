@@ -172,11 +172,16 @@ def _reap_enforcement_poller(monkeypatch):
         if thread is not None and thread.is_alive():
             thread.join(timeout=5)
         enforcement._poll_thread = None
+        enforcement._poll_interval = None
+        enforcement._poll_interval_raised_warned = False
         enforcement._stop_event.clear()
         enforcement._poll_wakeup.clear()
         # Whose rules the cache holds is per test: a test that seeds the cache
-        # by hand must not have it dropped as another team's.
+        # by hand must not have it dropped as another team's. The locked rules
+        # are reset here because the many fixtures that seed the rest of the
+        # cache by name predate them.
         enforcement._cache_owner = None
+        enforcement._cached_locked_rules = []
 
     reap()
     yield
