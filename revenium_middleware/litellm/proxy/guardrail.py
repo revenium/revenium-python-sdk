@@ -121,6 +121,7 @@ from revenium_middleware._core.failed_calls import is_spending_cap_refusal
 from revenium_middleware._core.fields import merge_extra_body
 from revenium_middleware._core.log_sanitize import sanitize_for_logging
 
+from .._failed_calls import proxy_failure_record_fields
 from ._health_check import is_litellm_health_check, note_health_check_skipped
 from ._metering_owner import LITELLM_PROVIDER, register_metering_guardrail
 from .middleware import (
@@ -464,6 +465,41 @@ def _elapsed_ms(start_time, end_time):
         return max((end_time - start_time).total_seconds() * 1000, 0)
     except (TypeError, AttributeError):
         return 0
+
+
+_RECORDED_START_KEYS = ("start_time", "first_api_call_start_time")
+
+
+def _recorded_start(request_data):
+    """When LiteLLM started on a failed request, in UTC, or ``None`` when it left no start on the request.
+
+    LiteLLM removes its logging object from the request before any failure
+    hook runs, copying the instants a failure log needs onto the request
+    first: ``start_time``, the start its own failure log uses, taken before
+    any pre-call guardrail ran (from 1.102.0), and
+    ``first_api_call_start_time``, when the call was first handed to a
+    provider, which a call refused before that lacks. Both are naive local
+    ``datetime.now()`` readings. A request body holds only JSON, never a
+    ``datetime``, so a caller cannot plant either.
+    """
+    request_data = _as_mapping(request_data)
+    for key in _RECORDED_START_KEYS:
+        started = request_data.get(key)
+        if isinstance(started, datetime.datetime):
+            try:
+                return started.astimezone(datetime.timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return None
+    return None
+
+
+def _failed_call_times(request_data):
+    """The start and end of a failed call; the start is the end itself when LiteLLM recorded none."""
+    ended = datetime.datetime.now(datetime.timezone.utc)
+    started = _recorded_start(request_data)
+    if started is None or started > ended:
+        return ended, ended
+    return started, ended
 
 
 def _stamp_meter_key(data):
@@ -1678,6 +1714,7 @@ class ReveniumGuardrail(CustomGuardrail):
                 request_time=start_time,
                 response_time=end_time,
                 request_duration=duration_ms,
+                time_to_first_token=duration_ms,
                 mediation_latency=mediation_latency,
                 stop_reason="END",
                 litellm_session_id=_litellm_session_id(data),
@@ -1828,6 +1865,7 @@ class ReveniumGuardrail(CustomGuardrail):
                 request_time=request_time,
                 response_time=response_time,
                 request_duration=duration_ms,
+                time_to_first_token=duration_ms,
                 mediation_latency=hidden_params.get("litellm_overhead_time_ms") or 0,
                 stop_reason="END",
                 # litellm_params, not kwargs: LiteLLM spreads provider params
@@ -1889,6 +1927,13 @@ class ReveniumGuardrail(CustomGuardrail):
     ):
         """Meter a failed proxied call with ``stop_reason="ERROR"``.
 
+        The record carries the error's class (and its HTTP status, when the
+        call got an HTTP error answer) as the error reason, that status as the
+        error code, and the time from when LiteLLM started on the request to
+        the failure as its duration. No token ever arrived, so the time to
+        first token is 0 and the completion start is the failure, as on every
+        other integration's failed record.
+
         A request LiteLLM refused before the Revenium guardrail's pre-call ran
         on it (a wrong, missing, expired or blocked key, or any other refusal
         during authentication) sends no record.
@@ -1925,8 +1970,8 @@ class ReveniumGuardrail(CustomGuardrail):
                     getattr(original_exception, "_hidden_params", None)
                 )
 
-            now = datetime.datetime.now(datetime.timezone.utc)
-            completion_args = self._completion_args(
+            started, failed = _failed_call_times(request_data)
+            completion_args, extra_body = self._completion_args(
                 data=request_data,
                 headers=headers,
                 metadata=metadata,
@@ -1960,9 +2005,10 @@ class ReveniumGuardrail(CustomGuardrail):
                 operation_type=_failure_operation_type(
                     request_data, metadata, user_api_key_dict
                 ),
-                request_time=now,
-                response_time=now,
-                request_duration=0,
+                request_time=started,
+                response_time=failed,
+                request_duration=round(_elapsed_ms(started, failed)),
+                time_to_first_token=0,
                 mediation_latency=hidden_params.get("litellm_overhead_time_ms") or 0,
                 stop_reason="ERROR",
                 litellm_session_id=_litellm_session_id(request_data),
@@ -1977,7 +2023,8 @@ class ReveniumGuardrail(CustomGuardrail):
                     ),
                 ),
             )
-            self._submit(completion_args, "failure")
+            completion_args.update(proxy_failure_record_fields(original_exception))
+            self._submit((completion_args, extra_body), "failure")
         except Exception as error:
             logger.error(
                 "ReveniumGuardrail: failure-path metering failed (%s: %s)",
@@ -1999,6 +2046,7 @@ class ReveniumGuardrail(CustomGuardrail):
         request_time,
         response_time,
         request_duration,
+        time_to_first_token,
         mediation_latency,
         stop_reason,
         upstream_sources,
@@ -2109,7 +2157,7 @@ class ReveniumGuardrail(CustomGuardrail):
             "response_time": response_time_str,
             "completion_start_time": response_time_str,
             "request_duration": request_duration,
-            "time_to_first_token": request_duration,
+            "time_to_first_token": time_to_first_token,
             "stop_reason": stop_reason,
             "total_token_count": total_tokens,
             "transaction_id": transaction_id,

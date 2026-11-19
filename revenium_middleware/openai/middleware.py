@@ -6,6 +6,8 @@ import inspect
 import itertools
 import logging
 import os
+import queue
+import socket
 import threading
 import time
 import uuid
@@ -996,6 +998,7 @@ def _http_response_of(stream):
 # protect against n > 1 or a compatible provider that finishes early or stalls.
 _MAX_CHUNKS_READ_AFTER_FINISH = 8
 _SECONDS_TO_WAIT_FOR_USAGE_AFTER_FINISH = 2.0
+_SECONDS_TO_WAIT_FOR_AN_INTERRUPTED_READ = 0.5
 
 
 class _ResponseThatMetersOnClose(wrapt.ObjectProxy):
@@ -1016,6 +1019,7 @@ class _ResponseThatMetersOnClose(wrapt.ObjectProxy):
         return self._self_owner()
 
     def close(self):
+        owner = None
         try:
             owner = self._owner_once()
             if owner is not None:
@@ -1023,7 +1027,10 @@ class _ResponseThatMetersOnClose(wrapt.ObjectProxy):
         except Exception as error:
             logger.debug("Could not finish metering a closed chat stream: %s", error)
         finally:
-            self.__wrapped__.close()
+            if owner is None:
+                self.__wrapped__.close()
+            else:
+                owner._close_once_read(self.__wrapped__.close)
 
     async def aclose(self):
         try:
@@ -1044,17 +1051,129 @@ def _log_unread_usage(error):
     logger.debug("Could not read the usage chunk of a finished chat stream: %s", type(error).__name__)
 
 
+_NO_MORE_CHUNKS = object()
+
+
+class _ReadForUsage(threading.Thread):
+    """Reads the stream's next chunks onto ``chunks``, ended by
+    ``_NO_MORE_CHUNKS`` or by the error the read raised.
+
+    A sync read cannot be given a deadline of its own, so a stream that stalls
+    blocks only this thread and the caller stops waiting at its deadline."""
+
+    def __init__(self, stream):
+        super().__init__(name="revenium-openai-usage-after-finish", daemon=True)
+        self.chunks = queue.Queue()
+        self._stream = stream
+        self._lock = threading.Lock()
+        self._read_returned = False
+        self._closes_held = []
+
+    def run(self):
+        try:
+            for chunk in itertools.islice(self._stream, _MAX_CHUNKS_READ_AFTER_FINISH):
+                self.chunks.put(chunk)
+            self.chunks.put(_NO_MORE_CHUNKS)
+        except Exception as error:
+            self.chunks.put(error)
+        finally:
+            self._run_held_closes()
+
+    def _run_held_closes(self):
+        with self._lock:
+            self._read_returned = True
+        for close in self._closes_held:
+            try:
+                close()
+            except Exception as error:
+                logger.debug("Could not close a chat stream after its read returned: %s", type(error).__name__)
+
+    def close_once_read(self, close):
+        """Run ``close`` now if the read has returned, else on this thread as
+        soon as it does: a descriptor closed under a thread about to poll it
+        can be reused by another socket."""
+        with self._lock:
+            if not self._read_returned:
+                self._closes_held.append(close)
+                return
+        close()
+
+
+def _chunks_read_in_background(stream):
+    reader = _ReadForUsage(stream)
+    reader.start()
+    return reader
+
+
+def _still_reading(reader):
+    return reader is not None and reader.is_alive()
+
+
+def _shut_down_stalled_read(response):
+    """Shut down the socket an open HTTP/1.1 chat stream is read from, so a read
+    blocked on it in another thread returns: closing a socket does not wake a
+    thread blocked reading it. Whether it was shut down; never raises."""
+    # An HTTP/2 socket also carries the connection's other streams.
+    if response is None or getattr(response, 'is_closed', True) or getattr(response, 'http_version', None) != 'HTTP/1.1':
+        return False
+    try:
+        response.extensions['network_stream'].get_extra_info('socket').shutdown(socket.SHUT_RDWR)
+        return True
+    except Exception as error:
+        logger.debug("Could not interrupt the stalled read of a closed chat stream: %s", type(error).__name__)
+        return False
+
+
+def _end_stalled_read(reader, response):
+    if _shut_down_stalled_read(response):
+        # A read that returns within the wait lets the caller close the
+        # response itself; one that does not closes it when it returns.
+        reader.join(_SECONDS_TO_WAIT_FOR_AN_INTERRUPTED_READ)
+
+
+def _close_once_read(reader, close):
+    if reader is None:
+        close()
+    else:
+        reader.close_once_read(close)
+
+
+def _close_quietly(stream):
+    try:
+        if hasattr(stream, 'close'):
+            stream.close()
+    except Exception as e:
+        logger.debug(f"Error closing stream: {e}")
+
+
+def _close_streams(iterator, provider_stream):
+    _close_quietly(iterator)
+    if provider_stream is not iterator:
+        _close_quietly(provider_stream)
+
+
 def _read_usage_after_finish(stream_wrapper, still_open):
     """Read on to the usage chunk that follows the finish chunk, when it is
-    still unread. Never raises."""
+    still unread, for at most ``_SECONDS_TO_WAIT_FOR_USAGE_AFTER_FINISH``.
+    Never raises."""
     if not _usage_still_to_come(stream_wrapper, still_open):
         return
     deadline = time.monotonic() + _SECONDS_TO_WAIT_FOR_USAGE_AFTER_FINISH
     try:
-        for chunk in itertools.islice(stream_wrapper.stream, _MAX_CHUNKS_READ_AFTER_FINISH):
-            stream_wrapper._observe(chunk)
-            if stream_wrapper.final_usage is not None or time.monotonic() >= deadline:
+        reader = _chunks_read_in_background(stream_wrapper.stream)
+        stream_wrapper._usage_reader = reader
+        while stream_wrapper.final_usage is None:
+            seconds_left = deadline - time.monotonic()
+            if seconds_left <= 0:
                 return
+            chunk = reader.chunks.get(timeout=seconds_left)
+            if chunk is _NO_MORE_CHUNKS:
+                return
+            if isinstance(chunk, Exception):
+                raise chunk
+            stream_wrapper._observe(chunk)
+    except queue.Empty:
+        return
     except Exception as error:
         _log_unread_usage(error)
 
@@ -1490,7 +1609,9 @@ def handle_streaming_response(
     # management
     class StreamWrapper:
         def __init__(self, stream):
+            self._provider_stream = stream
             self.stream = iter(stream)
+            self._usage_reader = None
             self.response = _response_that_meters_on_close(stream, self)
             self._metering_client = current_client()
             self._call_context = CallContext()
@@ -1581,15 +1702,18 @@ def handle_streaming_response(
             self._close_stream()
 
         def _close_stream(self):
-            """Close the underlying stream if possible."""
-            if not self._closed:
-                try:
-                    if hasattr(self.stream, 'close'):
-                        self.stream.close()
-                except Exception as e:
-                    logger.debug(f"Error closing stream: {e}")
-                finally:
-                    self._closed = True
+            """Close the provider's stream, and with it its response and connection,
+            once a read for the usage chunk still blocked on another thread has
+            returned, interrupting that read where its socket allows."""
+            if self._closed:
+                return
+            self._closed = True
+            if _still_reading(self._usage_reader):
+                _end_stalled_read(self._usage_reader, _http_response_of(self._provider_stream))
+            self._close_once_read(functools.partial(_close_streams, self.stream, self._provider_stream))
+
+        def _close_once_read(self, close):
+            _close_once_read(self._usage_reader, close)
 
         def _process_chunk(self, chunk):
             # The first non-empty id and model: Azure opens a stream with a
@@ -2543,6 +2667,9 @@ def _wrap_async_stream(stream, request_time_dt, usage_metadata, client_instance=
         def _finish(self):
             # A sync close of the async response cannot read on; meter what arrived.
             self._finalize()
+
+        def _close_once_read(self, close):
+            close()
 
         async def _afinish(self):
             try:

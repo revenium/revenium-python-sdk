@@ -7,7 +7,7 @@ import uuid
 from typing import Any, Dict, NamedTuple, Optional
 
 from revenium_middleware._core.context import _MAX_IDEMPOTENCY_KEY_LENGTH, get_idempotency_key
-from revenium_middleware._core.error_text import reportable_exception_text
+from revenium_middleware._core.error_text import QuotesRequest, reportable_exception_text
 from revenium_middleware._core.exceptions import BudgetExceededError
 from revenium_middleware._core.wire_guards import STORED_LENGTHS
 
@@ -73,13 +73,14 @@ def _is_http_status(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599
 
 
-def _error_reason(error: BaseException, status=_STATUS_CODE_ATTRIBUTE) -> str:
+def _error_reason(error: BaseException, status=_STATUS_CODE_ATTRIBUTE,
+                  quotes_request: Optional[QuotesRequest] = None) -> str:
     if status is _STATUS_CODE_ATTRIBUTE:
         status = getattr(error, "status_code", None)
     elif not _is_http_status(status):
         status = None
     suffix = f" (HTTP {status})" if isinstance(status, int) else ""
-    return reportable_exception_text(error, _MAX_ERROR_REASON_LENGTH - len(suffix)) + suffix
+    return reportable_exception_text(error, _MAX_ERROR_REASON_LENGTH - len(suffix), quotes_request) + suffix
 
 
 def _error_code(error: BaseException, status=_STATUS_CODE_ATTRIBUTE) -> Optional[int]:
@@ -104,17 +105,19 @@ def _error_idempotency_key() -> str:
 
 
 def failure_of(error: BaseException, outer: Optional[BaseException] = None,
-               status=_STATUS_CODE_ATTRIBUTE) -> Optional[CallFailure]:
+               status=_STATUS_CODE_ATTRIBUTE, quotes_request: Optional[QuotesRequest] = None) -> Optional[CallFailure]:
     """The record fields for a call that raised ``error``, or None when a
     spending cap refused the call, which is never recorded as a failure.
     ``outer`` is the call's ``exception_in_flight()``. ``status`` is the HTTP
     status for a provider whose errors do not carry it in ``status_code``;
     a value outside 100 to 599 names no status. An error status is also the
-    record's error code."""
+    record's error code. ``quotes_request`` is as for
+    ``reportable_exception_text``."""
     try:
         if _caused_by_spending_cap(error, outer):
             return None
-        return CallFailure(_error_reason(error, status), _error_idempotency_key(), _error_code(error, status))
+        return CallFailure(_error_reason(error, status, quotes_request), _error_idempotency_key(),
+                           _error_code(error, status))
     except Exception as e:
         logger.warning("Could not describe a failed call for its usage record: %s", e)
         return None

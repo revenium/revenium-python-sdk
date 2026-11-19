@@ -55,6 +55,7 @@ from revenium_middleware._core.trace_fields import (
     validate_trace_name,
 )
 
+from .._failed_calls import proxy_failure_record_fields
 from ._health_check import is_litellm_health_check, note_health_check_skipped
 from ._metering_owner import guardrail_owns_metering
 
@@ -715,9 +716,6 @@ class MiddlewareHandler(CustomLogger):
         completion_tokens = get_usage_field(usage, "completion_tokens", 0)
         total_tokens = get_usage_field(usage, "total_tokens", 0)
 
-        error_message = str(response_obj)
-        error_type = type(response_obj).__name__
-
         # Create subscriber object from metadata and headers
         subscriber = {}
 
@@ -811,6 +809,9 @@ class MiddlewareHandler(CustomLogger):
             "operation_type": "CHAT",
             **trace_fields_from_headers(headers),
             "middleware_source": "PROXY",
+            # LiteLLM hands a CustomLogger's failure event the exception in
+            # kwargs, never in response_obj, which is always None here.
+            **proxy_failure_record_fields(kwargs.get("exception")),
         }
 
         logger.debug("Calling client.ai.create_completion with args (failure): %s", sanitize_for_logging(completion_args))

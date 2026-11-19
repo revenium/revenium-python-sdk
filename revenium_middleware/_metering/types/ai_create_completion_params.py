@@ -50,7 +50,15 @@ class AICreateCompletionParams(TypedDict, total=False):
     stop_reason: Required[
         Annotated[
             Literal[
-                "END", "END_SEQUENCE", "TIMEOUT", "TOKEN_LIMIT", "COST_LIMIT", "COMPLETION_LIMIT", "ERROR", "CANCELLED"
+                "END",
+                "END_SEQUENCE",
+                "TIMEOUT",
+                "TOKEN_LIMIT",
+                "COST_LIMIT",
+                "COMPLETION_LIMIT",
+                "ERROR",
+                "CANCELLED",
+                "CONTENT_FILTER",
             ],
             PropertyInfo(alias="stopReason"),
         ]
@@ -70,6 +78,13 @@ class AICreateCompletionParams(TypedDict, total=False):
 
     billing_skipped: Annotated[bool, PropertyInfo(alias="billingSkipped")]
     """If true, backend returns $0 cost"""
+
+    cache_creation12h_token_count: Annotated[int, PropertyInfo(alias="cacheCreation12hTokenCount")]
+    """The number of cached creation tokens written with a 12 hour TTL.
+
+    This is a breakdown of cache_creation_token_count, which remains the
+    aggregate across every TTL.
+    """
 
     cache_creation1h_token_count: Annotated[int, PropertyInfo(alias="cacheCreation1hTokenCount")]
     """The number of cached creation tokens written with a 1 hour TTL.

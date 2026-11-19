@@ -50,11 +50,12 @@ REFUSED = [
 ]
 
 
-def _metered_body(usage_metadata):
-    """The request body a completion metered with ``usage_metadata`` sends."""
+def _metered_body(usage_metadata, **record):
+    """The request body a completion metered with ``usage_metadata`` sends;
+    ``record`` overrides the integration's own fields, such as its provider."""
     client = ReveniumMetering(api_key="test-key")
     mock_post = MagicMock(return_value="completion-result")
-    args = {**COMPLETION_KWARGS, **extract_prompt_context_fields(usage_metadata)}
+    args = {**COMPLETION_KWARGS, **record, **extract_prompt_context_fields(usage_metadata)}
     with patch.object(client.ai, "_post", mock_post), \
             patch("revenium_middleware._core.metering_submission.current_client", lambda: client):
         submit_ai_event("completion", args)
@@ -184,3 +185,38 @@ class TestWireGuard:
 
         assert body["ccrSessionId"] == CCR_SESSION_ID
         _assert_dropped_with_one_warning(body, caplog, "inference_geo")
+
+
+class TestOnlyWhereAnthropicBills:
+    """BACK-5559: only Anthropic's own API applies a US-inference rate, so the
+    geography goes only on a Claude record Anthropic itself bills."""
+
+    @pytest.mark.parametrize("provider", ["Bedrock", "Foundry", "Google", "LITELLM"])
+    def test_a_claude_record_another_party_bills_is_sent_without_it(self, provider):
+        body = _metered_body(FIELDS, provider=provider, model="claude-opus-4-8", model_source="ANTHROPIC")
+
+        assert "inferenceGeo" not in body
+        assert body["provider"] == provider
+        assert body["ccrSessionId"] == CCR_SESSION_ID
+
+    def test_a_litellm_record_names_claude_by_its_model_alone(self):
+        body = _metered_body(FIELDS, provider="LITELLM", model="claude-opus-4-8", model_source="LITELLM")
+
+        assert "inferenceGeo" not in body
+
+    def test_a_bedrock_claude_record_under_a_profile_arn_is_sent_without_it(self):
+        profile = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123"
+        body = _metered_body(FIELDS, provider="Bedrock", model=profile, model_source="ANTHROPIC")
+
+        assert "inferenceGeo" not in body
+
+    @pytest.mark.parametrize("provider", ["ANTHROPIC", "Anthropic"])
+    def test_a_direct_anthropic_record_keeps_it(self, provider):
+        body = _metered_body(FIELDS, provider=provider, model="claude-opus-4-8", model_source="ANTHROPIC")
+
+        assert body["inferenceGeo"] == INFERENCE_GEO
+
+    def test_a_record_for_another_vendors_model_keeps_it(self):
+        body = _metered_body(FIELDS, provider="OPENAI", model="gpt-4o", model_source="OPENAI")
+
+        assert body["inferenceGeo"] == INFERENCE_GEO

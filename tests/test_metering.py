@@ -875,6 +875,76 @@ class TestCreateCompletionBillingSkipAndCacheTTLFields:
             assert wire_name not in body, wire_name
 
 
+class TestCreateCompletion12hCacheBucket:
+    """The 12-hour cache-write bucket on create_completion (BACK-5867).
+
+    OpenAI reports a 12-hour cache TTL that the platform prices on its own,
+    so the count travels as cacheCreation12hTokenCount beside the 5-minute and
+    1-hour buckets, on the sync and the async resource alike.
+    """
+
+    _COMPLETION_KWARGS = TestCreateCompletionBillingSkipAndCacheTTLFields._COMPLETION_KWARGS
+
+    def test_sync_create_completion_sends_the_12h_bucket_under_its_alias(self):
+        from revenium_middleware._metering import ReveniumMetering
+
+        client = ReveniumMetering(api_key="test-key")
+        with patch.object(client.ai, "_post") as mock_post:
+            client.ai.create_completion(
+                transaction_id="txn-12h-1",
+                cache_creation12h_token_count=100000,
+                **self._COMPLETION_KWARGS,
+            )
+        assert mock_post.call_args.kwargs["body"]["cacheCreation12hTokenCount"] == 100000
+
+    @pytest.mark.asyncio
+    async def test_async_create_completion_sends_the_12h_bucket_under_its_alias(self):
+        from revenium_middleware._metering import AsyncReveniumMetering
+
+        client = AsyncReveniumMetering(api_key="test-key")
+        with patch.object(client.ai, "_post", new_callable=AsyncMock) as mock_post:
+            await client.ai.create_completion(
+                transaction_id="txn-12h-2",
+                cache_creation12h_token_count=100000,
+                **self._COMPLETION_KWARGS,
+            )
+        assert mock_post.call_args.kwargs["body"]["cacheCreation12hTokenCount"] == 100000
+
+    def test_sync_unset_12h_bucket_is_absent_not_null(self):
+        from revenium_middleware._metering import ReveniumMetering
+
+        client = ReveniumMetering(api_key="test-key")
+        with patch.object(client.ai, "_post") as mock_post:
+            client.ai.create_completion(transaction_id="txn-12h-3", **self._COMPLETION_KWARGS)
+        assert "cacheCreation12hTokenCount" not in mock_post.call_args.kwargs["body"]
+
+    @pytest.mark.asyncio
+    async def test_async_unset_12h_bucket_is_absent_not_null(self):
+        from revenium_middleware._metering import AsyncReveniumMetering
+
+        client = AsyncReveniumMetering(api_key="test-key")
+        with patch.object(client.ai, "_post", new_callable=AsyncMock) as mock_post:
+            await client.ai.create_completion(transaction_id="txn-12h-4", **self._COMPLETION_KWARGS)
+        assert "cacheCreation12hTokenCount" not in mock_post.call_args.kwargs["body"]
+
+    def test_12h_bucket_does_not_replace_the_aggregate(self):
+        from revenium_middleware._metering import ReveniumMetering
+
+        client = ReveniumMetering(api_key="test-key")
+        with patch.object(client.ai, "_post") as mock_post:
+            client.ai.create_completion(
+                transaction_id="txn-12h-5",
+                cache_creation_token_count=1200,
+                cache_creation12h_token_count=1000,
+                cache_creation5m_token_count=200,
+                **self._COMPLETION_KWARGS,
+            )
+        body = mock_post.call_args.kwargs["body"]
+        assert body["cacheCreationTokenCount"] == 1200
+        assert body["cacheCreation12hTokenCount"] == 1000
+        assert body["cacheCreation5mTokenCount"] == 200
+
+
 class TestCreateCompletionEffortField:
     """The reasoning-effort level on create_completion (BACK-2710).
 

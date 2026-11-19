@@ -284,8 +284,8 @@ def prompt_tokens_fold_cache(*sources):
     arithmetic that sets their billed input count (see BACK-3190 for the same
     rule on headers).
     Measured against a live litellm 1.102.0 proxy: the logging event's
-    ``kwargs`` and its ``litellm_params`` both carry it (also on the 1.93.0
-    floor), while on the non-streamed ``/v1/messages`` route the post-call hook
+    ``kwargs`` and its ``litellm_params`` both carry it (also on 1.93.0),
+    while on the non-streamed ``/v1/messages`` route the post-call hook
     is handed a raw provider body with no ``_hidden_params`` and a request dict
     that names no provider -- there it is ``data["litellm_logging_obj"]``'s
     ``model_call_details`` that carries both the provider and the call type.
@@ -476,6 +476,7 @@ _CONVERSE_TTL_PARAMETERS = {
     "5m": "cache_creation5m_token_count",
     "1h": "cache_creation1h_token_count",
 }
+_TWELVE_HOUR_PARAMETER = "cache_creation12h_token_count"
 
 
 def _reported_split(split: Any) -> Dict[str, int]:
@@ -509,10 +510,32 @@ def _converse_split(usage: Any) -> Dict[str, int]:
     return counts
 
 
+def _openai_responses_split(usage: Any) -> Dict[str, int]:
+    """The 12-hour share of an OpenAI Responses write, kept only when it fits inside the write.
+
+    Only ``ttl_12h_tokens`` has a bucket: ``ttl_30m_tokens`` stays in the
+    write's unattributed remainder, which the platform prices at the
+    five-minute column, where it keeps OpenAI's 30-minute write price. So the
+    share need not add up to the write, but it must lie within the aggregate
+    ``openai_cache_write_tokens`` reads from the same usage. A share with no
+    write to belong to, a negative one or one larger than the write is dropped
+    and the aggregate is sent alone, as ``_converse_split`` does: the platform
+    rejects such a bucket and bills the write flat, or at nothing for a model
+    priced at the input rate. Anthropic-shaped usage reports no OpenAI write
+    (see ``openai_cache_write_tokens``), so it never yields this bucket.
+    """
+    details = _get(_get(usage, "input_tokens_details"), "cache_write_tokens_details")
+    tokens = _optional_token_count(details, "ttl_12h_tokens")
+    written = openai_cache_write_tokens(usage)
+    if not written or tokens is None or not 0 <= tokens <= written:
+        return {}
+    return {_TWELVE_HOUR_PARAMETER: tokens}
+
+
 def extract_cache_creation_ttl_counts(usage: Any) -> Dict[str, int]:
     """Extract the per-TTL cache-creation breakdown as metering parameters.
 
-    Three usage shapes carry the split, and this reads whichever is present:
+    Four usage shapes carry the split, and this reads whichever is present:
 
     - Anthropic, natively and on Bedrock InvokeModel: ``usage.cache_creation``
       (``ephemeral_5m_input_tokens`` / ``ephemeral_1h_input_tokens``).
@@ -520,6 +543,9 @@ def extract_cache_creation_ttl_counts(usage: Any) -> Dict[str, int]:
       ``usage.prompt_tokens_details.cache_creation_token_details``.
     - Bedrock Converse: ``usage.cacheDetails``, one ``{ttl, inputTokens}``
       entry per TTL.
+    - OpenAI Responses: ``usage.input_tokens_details.cache_write_tokens_details``
+      (``ttl_12h_tokens`` / ``ttl_30m_tokens``), of which only the 12-hour
+      share becomes a bucket.
 
     The split is absent on older responses and whenever the extended cache-TTL
     beta is not in play, so it is read defensively.
@@ -530,10 +556,16 @@ def extract_cache_creation_ttl_counts(usage: Any) -> Dict[str, int]:
     zero: the aggregate ``cache_creation_token_count`` stays authoritative and
     the backend prices the flat fallback from it when no split is present,
     whereas an explicit zero would assert a split that never happened. A
-    bucket the provider does report as 0 is forwarded as 0.
+    split that does not fit the aggregate write the same usage reports is
+    dropped as a whole and the aggregate is sent alone: a Converse list that
+    does not add up to the write or names a TTL Revenium has no price for, and
+    an OpenAI 12-hour share that is negative, larger than the write, or
+    reported with no write (a reported 0 included). Any other bucket the
+    provider reports as 0 is forwarded as 0.
     """
     return (
         _reported_split(_get(usage, "cache_creation"))
         or _reported_split(_get(_get(usage, "prompt_tokens_details"), "cache_creation_token_details"))
         or _converse_split(usage)
+        or _openai_responses_split(usage)
     )

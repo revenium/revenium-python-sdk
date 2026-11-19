@@ -33,7 +33,12 @@
 # the project service tier settings openai 3.45.0 added on 2026-11-05, and the
 # organization users sign_out anthropic 2.6.0 added, also on 2026-11-05, and the
 # decisions resource google-genai 3.2.0 added and the extraction calls and local
-# helpers litellm 1.109 made public on 2026-11-12. Group A is
+# helpers litellm 1.109 made public on 2026-11-12, and the claude_tag bundle
+# update anthropic 2.9.0 added and the monitors resource perplexityai 0.47.0
+# added on 2026-11-17 (BACK-5971), and the context resource perplexityai 0.48.0
+# added and the interactions connect google-genai 3.5.0 added on 2026-11-18
+# (BACK-6008), and the Claude Code managed settings anthropic 2.11.0 added on
+# 2026-11-19 (BACK-6092). Group A is
 # the list of known billable gaps: moving a method out of A means adding its wrap
 # and its manifest rows.
 #
@@ -1339,12 +1344,21 @@ providers:
           - "Anthropic.beta.organization.api_keys.list"
           - "Anthropic.beta.organization.api_keys.retrieve"
           - "Anthropic.beta.organization.api_keys.update"
+          - "Anthropic.beta.organization.claude_code.managed_settings.configuration.retrieve"
+          - "Anthropic.beta.organization.claude_code.managed_settings.configuration.update"
+          - "Anthropic.beta.organization.claude_code.managed_settings.rbac_group_default.retrieve"
+          - "Anthropic.beta.organization.claude_code.managed_settings.rbac_group_default.update"
+          - "Anthropic.beta.organization.claude_code.managed_settings.rbac_groups.delete"
+          - "Anthropic.beta.organization.claude_code.managed_settings.rbac_groups.list"
+          - "Anthropic.beta.organization.claude_code.managed_settings.rbac_groups.retrieve"
+          - "Anthropic.beta.organization.claude_code.managed_settings.rbac_groups.set"
           - "Anthropic.beta.organization.claude_tag.bundles.list"
           - "Anthropic.beta.organization.claude_tag.bundles.retrieve"
           - "Anthropic.beta.organization.claude_tag.bundles.targets.create"
           - "Anthropic.beta.organization.claude_tag.bundles.targets.delete"
           - "Anthropic.beta.organization.claude_tag.bundles.targets.list"
           - "Anthropic.beta.organization.claude_tag.bundles.targets.retrieve"
+          - "Anthropic.beta.organization.claude_tag.bundles.update"
           - "Anthropic.beta.organization.claude_tag.slack_channels.create"
           - "Anthropic.beta.organization.claude_tag.slack_channels.delete"
           - "Anthropic.beta.organization.claude_tag.slack_channels.list"
@@ -1561,12 +1575,21 @@ providers:
           - "AsyncAnthropic.beta.organization.api_keys.list"
           - "AsyncAnthropic.beta.organization.api_keys.retrieve"
           - "AsyncAnthropic.beta.organization.api_keys.update"
+          - "AsyncAnthropic.beta.organization.claude_code.managed_settings.configuration.retrieve"
+          - "AsyncAnthropic.beta.organization.claude_code.managed_settings.configuration.update"
+          - "AsyncAnthropic.beta.organization.claude_code.managed_settings.rbac_group_default.retrieve"
+          - "AsyncAnthropic.beta.organization.claude_code.managed_settings.rbac_group_default.update"
+          - "AsyncAnthropic.beta.organization.claude_code.managed_settings.rbac_groups.delete"
+          - "AsyncAnthropic.beta.organization.claude_code.managed_settings.rbac_groups.list"
+          - "AsyncAnthropic.beta.organization.claude_code.managed_settings.rbac_groups.retrieve"
+          - "AsyncAnthropic.beta.organization.claude_code.managed_settings.rbac_groups.set"
           - "AsyncAnthropic.beta.organization.claude_tag.bundles.list"
           - "AsyncAnthropic.beta.organization.claude_tag.bundles.retrieve"
           - "AsyncAnthropic.beta.organization.claude_tag.bundles.targets.create"
           - "AsyncAnthropic.beta.organization.claude_tag.bundles.targets.delete"
           - "AsyncAnthropic.beta.organization.claude_tag.bundles.targets.list"
           - "AsyncAnthropic.beta.organization.claude_tag.bundles.targets.retrieve"
+          - "AsyncAnthropic.beta.organization.claude_tag.bundles.update"
           - "AsyncAnthropic.beta.organization.claude_tag.slack_channels.create"
           - "AsyncAnthropic.beta.organization.claude_tag.slack_channels.delete"
           - "AsyncAnthropic.beta.organization.claude_tag.slack_channels.list"
@@ -1845,14 +1868,18 @@ providers:
       - reason: "billable model usage the SDK does not meter: no wrap is registered. BACK-3593 listed images, audio, videos, realtime and the Gemini image and video calls as out of scope; the rest were first found by this inventory on 2026-10-05. Each enters the manifest with the ticket that adds its wrap"
         disclose: true
         methods:
+          - "AsyncPerplexity.context.create"
           - "AsyncPerplexity.contextualized_embeddings.create"
           - "AsyncPerplexity.decisions.create"
           - "AsyncPerplexity.embeddings.create"
+          - "AsyncPerplexity.monitors.run"
           - "AsyncPerplexity.responses.create"
           - "AsyncPerplexity.search.create"
+          - "Perplexity.context.create"
           - "Perplexity.contextualized_embeddings.create"
           - "Perplexity.decisions.create"
           - "Perplexity.embeddings.create"
+          - "Perplexity.monitors.run"
           - "Perplexity.responses.create"
           - "Perplexity.search.create"
       - reason: "asynchronous job (batch, fine-tuning, evaluation run, async completion): billed when the job runs server-side, not on this call; needs its own ticket, as messages.batches.create records in the manifest"
@@ -1876,6 +1903,15 @@ providers:
           - "AsyncPerplexity.files.list"
           - "AsyncPerplexity.files.retrieve"
           - "AsyncPerplexity.models.list"
+          - "AsyncPerplexity.monitors.delete"
+          - "AsyncPerplexity.monitors.list"
+          - "AsyncPerplexity.monitors.pause"
+          - "AsyncPerplexity.monitors.resume"
+          - "AsyncPerplexity.monitors.retrieve"
+          - "AsyncPerplexity.monitors.runs.list"
+          - "AsyncPerplexity.monitors.runs.retrieve"
+          - "AsyncPerplexity.monitors.update"
+          - "AsyncPerplexity.monitors.webhook.test"
           - "AsyncPerplexity.responses.cancel"
           - "AsyncPerplexity.responses.files.content"
           - "AsyncPerplexity.responses.files.list"
@@ -1899,6 +1935,15 @@ providers:
           - "Perplexity.files.list"
           - "Perplexity.files.retrieve"
           - "Perplexity.models.list"
+          - "Perplexity.monitors.delete"
+          - "Perplexity.monitors.list"
+          - "Perplexity.monitors.pause"
+          - "Perplexity.monitors.resume"
+          - "Perplexity.monitors.retrieve"
+          - "Perplexity.monitors.runs.list"
+          - "Perplexity.monitors.runs.retrieve"
+          - "Perplexity.monitors.update"
+          - "Perplexity.monitors.webhook.test"
           - "Perplexity.responses.cancel"
           - "Perplexity.responses.files.content"
           - "Perplexity.responses.files.list"
@@ -1914,7 +1959,9 @@ providers:
         disclose: true
         methods:
           - "AsyncPerplexity.browser.sessions.create"
+          - "AsyncPerplexity.monitors.create"
           - "Perplexity.browser.sessions.create"
+          - "Perplexity.monitors.create"
       - reason: "generic raw-request passthrough: forwards an arbitrary HTTP call, so there is no operation to meter"
         methods:
           - "AsyncPerplexity.delete"
@@ -1968,6 +2015,7 @@ providers:
           - "Client.aio.decisions.create"
           - "Client.aio.file_search_stores.import_file"
           - "Client.aio.file_search_stores.upload_to_file_search_store"
+          - "Client.aio.interactions.connect"
           - "Client.aio.interactions.create"
           - "Client.aio.live.connect"
           - "Client.aio.live.music.connect"

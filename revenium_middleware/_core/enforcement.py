@@ -105,7 +105,7 @@ from .log_sanitize import sanitize_for_logging
 from .subscriber import extract_subscriber_from_metadata, subscriber_with_credential_alias
 from .trace_fields import get_credential_alias
 from .vendor_model_aliases import SERVED_MODEL_BY_ALIAS
-from .wire_guards import stored_subscriber_value
+from .wire_guards import stored_subscriber_value, stored_tag_value
 
 logger = logging.getLogger("revenium_middleware.extension")
 
@@ -311,8 +311,14 @@ _poll_interval_raised_warned = False
 _refresh_lock = threading.Lock()
 
 # Set to wake the poller early: by a pre-call check that found the cache stale,
-# and by ``stop_polling`` so the poller does not sleep out its interval.
+# by a switch of team or API key, and by ``stop_polling`` so the poller does
+# not sleep out its interval.
 _poll_wakeup = threading.Event()
+
+# How many switches of team or API key ``_hand_cache_to_holding_lock`` has
+# acted on, so the poller can tell a wake-up a switch asked for while a refresh
+# ran from one that refresh answered. Written under _cache_lock.
+_owner_switches = 0
 
 
 def _forget_parent_refresh() -> None:
@@ -520,6 +526,16 @@ def _current_owner() -> _CacheOwner:
     """The enforcement base URL, team id and API key the cache is for: whose rules these are."""
     return _CacheOwner(_get_enforcement_base_url(), os.environ.get(Config.ENV_REVENIUM_TEAM_ID, ""),
                        _credential_fingerprint(_process_api_key()))
+
+
+def _may_install_answer_for(owner: _CacheOwner) -> bool:
+    """True when an answer fetched for ``owner`` may be installed.
+
+    ``owner`` must still be the process's own and the cache unowned or already
+    its, so an answer read before a switch of team or API key never judges
+    the new owner's calls. Caller must hold ``_cache_lock``.
+    """
+    return owner == _current_owner() and _cache_owner in (None, owner)
 
 
 def _snapshot_scope(owner: Optional[_CacheOwner] = None) -> Optional[str]:
@@ -888,10 +904,16 @@ def _load_locked_rules_from_disk(rules: list, owner: _CacheOwner) -> List[dict]:
     return loaded["lockedRules"]
 
 
+class _SnapshotRead(NamedTuple):
+    """What ``_load_cache_from_disk`` read from the snapshot files for one owner."""
+
+    rules: list
+    departments: _DepartmentBudgets
+    locked_rules: List[dict]
+
+
 def _load_cache_from_disk() -> None:
-    global _cached_rules, _cached_org_unit_blocks, _cached_org_unit_block_balances
-    global _cached_org_unit_warnings, _cached_org_unit_candidates, _cached_locked_rules
-    global _cache_timestamp, _disk_load_attempted, _cache_initialized, _cache_owner
+    global _disk_load_attempted, _cache_owner
     # Check-and-set under _cache_lock so two cold-start callers can't both
     # observe _disk_load_attempted=False and race on the snapshot read.
     with _cache_lock:
@@ -915,30 +937,60 @@ def _load_cache_from_disk() -> None:
             rules = data["rules"]
         else:
             return
-        departments = _load_department_budgets_from_disk(rules, owner)
-        locked_rules = _load_locked_rules_from_disk(rules, owner)
+        snapshot = _SnapshotRead(rules, _load_department_budgets_from_disk(rules, owner),
+                                 _load_locked_rules_from_disk(rules, owner))
         with _cache_lock:
-            if _cache_owner not in (None, owner):
-                return
-            _cache_owner = owner
-            _cached_rules = rules
-            _cached_org_unit_blocks = departments.blocks
-            _cached_org_unit_block_balances = departments.balances
-            _cached_org_unit_warnings = departments.warnings
-            _cached_org_unit_candidates = departments.candidates
-            _cached_locked_rules = locked_rules
-            _begin_cache_generation()
-            # Treat as stale so the next call still triggers a refresh,
-            # but the disk snapshot prevents fail-closed from raising on
-            # the very first request after a process restart.
-            _cache_timestamp = 0.0
-            _cache_initialized = True
-        logger.debug(
-            "Loaded %d enforcement rule(s), %d locked rule(s) and %d department block(s) from %s",
-            len(rules), len(locked_rules), len(departments.blocks), path,
-        )
+            # The files were read outside the lock and the team or API key may
+            # have changed since: the cache passes from its owner (``owner``,
+            # whose files they are, when nobody has adopted it yet) to the
+            # current owner as on any switch, and the files are still judged
+            # as ``owner``'s.
+            _cache_owner = _cache_owner or owner
+            current = _current_owner()
+            previous = _hand_cache_to_holding_lock(current)
+            installed = _install_snapshot_holding_lock(current, owner, snapshot)
+        if previous is not None:
+            _announce_owner_switch(previous, current)
+        if installed is not None:
+            rules, departments, locked_rules = installed
+            logger.debug(
+                "Loaded %d enforcement rule(s), %d locked rule(s) and %d department block(s) from %s",
+                len(rules), len(locked_rules), len(departments.blocks), path,
+            )
     except Exception:
         logger.debug("Failed to read enforcement cache from %s", path, exc_info=True)
+
+
+def _install_snapshot_holding_lock(cache_owner: _CacheOwner, read_for: _CacheOwner,
+                                   snapshot: _SnapshotRead) -> Optional[_SnapshotRead]:
+    """Install what of ``snapshot`` may judge ``cache_owner``'s calls, and return it.
+
+    The locked rules only while ``cache_owner`` is ``read_for``, the rules and
+    department maps while it is on ``read_for``'s team: what a key-only switch
+    keeps (``_forget_another_owners_rules``). None, with nothing installed,
+    for another team, and when a refresh has already installed newer rules.
+    Caller must hold ``_cache_lock`` and have handed the cache to ``cache_owner``.
+    """
+    global _cached_rules, _cached_org_unit_blocks, _cached_org_unit_block_balances
+    global _cached_org_unit_warnings, _cached_org_unit_candidates, _cached_locked_rules
+    global _cache_timestamp, _cache_initialized
+    if _cache_initialized or not cache_owner.is_same_team(read_for):
+        return None
+    if cache_owner != read_for:
+        snapshot = snapshot._replace(locked_rules=[])
+    _cached_rules = snapshot.rules
+    _cached_org_unit_blocks = snapshot.departments.blocks
+    _cached_org_unit_block_balances = snapshot.departments.balances
+    _cached_org_unit_warnings = snapshot.departments.warnings
+    _cached_org_unit_candidates = snapshot.departments.candidates
+    _cached_locked_rules = snapshot.locked_rules
+    _begin_cache_generation()
+    # Treat as stale so the next call still triggers a refresh,
+    # but the disk snapshot prevents fail-closed from raising on
+    # the very first request after a process restart.
+    _cache_timestamp = 0.0
+    _cache_initialized = True
+    return snapshot
 
 
 def _persist_cache_to_disk(rules: list, org_unit_blocks: Optional[dict] = None,
@@ -1681,7 +1733,7 @@ def _refresh_cache_holding_lock() -> None:
             )
         return
     with _cache_lock:
-        if fetched.owner != _current_owner() or _cache_owner not in (None, fetched.owner):
+        if not _may_install_answer_for(fetched.owner):
             logger.debug("Dropped enforcement rules fetched for the team or API key the process switched away from")
             return
         _cache_owner = fetched.owner
@@ -1704,14 +1756,31 @@ def _refresh_cache_holding_lock() -> None:
 def _poll_loop() -> None:
     interval = _poll_interval_in_force()
     while not _stop_event.is_set():
+        switches_before = _owner_switches
         _refresh_cache()
-        # A wake-up asked for while that refresh ran was answered by it, so it
-        # is dropped. Stop is checked after the clear because stop_polling sets
-        # _stop_event before _poll_wakeup, so a stop can never be cleared away.
-        _poll_wakeup.clear()
+        _drop_wakeup_answered_by_refresh(switches_before)
+        # Stop is checked after the clear because stop_polling sets _stop_event
+        # before _poll_wakeup, so a stop can never be cleared away.
         if _stop_event.is_set():
             break
         _poll_wakeup.wait(_next_poll_wait_seconds(interval))
+
+
+def _drop_wakeup_answered_by_refresh(switches_before: int) -> None:
+    """Clear a wake-up asked for while the refresh ran, unless the owner switched meanwhile.
+
+    A stale-cache wake-up is answered by that refresh. A switch of team or API
+    key is not: the refresh read the previous owner's rules, which the switch
+    keeps out of the cache or drops from it, and the cache can still read as fresh,
+    so no pre-call check would wake the poller for the new owner's rules
+    before the interval ends.
+    """
+    _poll_wakeup.clear()
+    # Compared after the clear: _hand_cache_to_holding_lock counts a switch
+    # before _announce_owner_switch sets _poll_wakeup, so no switch can be
+    # cleared away.
+    if _owner_switches != switches_before:
+        _poll_wakeup.set()
 
 
 def _next_poll_wait_seconds(interval: float) -> float:
@@ -1737,22 +1806,39 @@ def _forget_another_owners_rules() -> None:
     new owner's. A cache nobody owns yet (never loaded, or seeded by hand) is
     adopted as it is.
     """
-    global _cached_locked_rules, _refresh_cooldown_until, _cache_owner
     owner = _current_owner()
     if _cache_owner == owner:
         return
     with _cache_lock:
-        previous, _cache_owner = _cache_owner, owner
-        if _refresh_cooldown_owner not in (None, owner):
-            _refresh_cooldown_until = 0.0
-        if previous is None or previous == owner:
-            return
-        key_only = previous.is_same_team(owner)
-        if key_only:
-            _cached_locked_rules = []
-        else:
-            _forget_cached_answer()
-    if key_only:
+        previous = _hand_cache_to_holding_lock(owner)
+    if previous is not None:
+        _announce_owner_switch(previous, owner)
+
+
+def _hand_cache_to_holding_lock(owner: _CacheOwner) -> Optional[_CacheOwner]:
+    """Make the cache ``owner``'s, dropping what a switch from its previous owner drops.
+
+    Returns that previous owner, or None when the cache was unowned or already
+    ``owner``'s. Caller must hold ``_cache_lock`` and, on a switch, call
+    ``_announce_owner_switch`` once it is released.
+    """
+    global _cached_locked_rules, _refresh_cooldown_until, _cache_owner, _owner_switches
+    previous, _cache_owner = _cache_owner, owner
+    if _refresh_cooldown_owner not in (None, owner):
+        _refresh_cooldown_until = 0.0
+    if previous is None or previous == owner:
+        return None
+    _owner_switches += 1
+    if previous.is_same_team(owner):
+        _cached_locked_rules = []
+    else:
+        _forget_cached_answer()
+    return previous
+
+
+def _announce_owner_switch(previous: _CacheOwner, owner: _CacheOwner) -> None:
+    """Log what a switch dropped and wake the poller to fetch ``owner``'s rules."""
+    if previous.is_same_team(owner):
         logger.info("Locked enforcement rules of the previous API key were dropped; loading the current key's")
     else:
         logger.info("Enforcement rules of the previous team were dropped; loading the rules of team %s", owner.team_id)
@@ -2126,10 +2212,22 @@ def _credential_value(metadata: dict):
     return name if name is not None else credential.get("value")
 
 
+def _agent_sent(metadata: dict):
+    return stored_tag_value("agent", extract_common_metadata(metadata)["agent"])
+
+
+def _task_type_sent(metadata: dict):
+    return stored_tag_value("task_type", extract_common_metadata(metadata)["task_type"])
+
+
+def _product_sent(metadata: dict):
+    return stored_tag_value("product_name", extract_product_name(metadata))
+
+
 _METADATA_DIMENSION_READERS = {
-    "AGENT": lambda metadata: extract_common_metadata(metadata)["agent"],
-    "TASK_TYPE": lambda metadata: extract_common_metadata(metadata)["task_type"],
-    "PRODUCT": extract_product_name,
+    "AGENT": _agent_sent,
+    "TASK_TYPE": _task_type_sent,
+    "PRODUCT": _product_sent,
     "ORGANIZATION": extract_organization_name,
     "SUBSCRIBER": _subscriber_value,
     "CREDENTIAL": _credential_value,

@@ -36,11 +36,18 @@ What is pinned here:
 7. A fetched answer is installed and saved under the key its request was
    sent with, and only while that key is still the process's: an answer read
    with another key is dropped, even when the key has switched back since.
+8. A snapshot read while the key changes is installed as a key-only switch
+   leaves the cache: the team's rules and department maps, not the previous
+   key's locked rules, and the new key's first refresh is installed. One read
+   while the team changes installs nothing. A key switch during a refresh for
+   the previous key still has the new key's locked rules fetched at once
+   rather than one poll interval later (BACK-5828).
 """
 import datetime
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -982,3 +989,309 @@ def read_with_b_while_every_other_owner_read_sees_a(monkeypatch, client):
     monkeypatch.setattr(enforcement, "_fetch_target", build_the_request_under_b)
     monkeypatch.setattr(enforcement.httpx, "get", answer_after_the_key_returned_to_a)
     return sent_with
+
+
+class PollerWakeup(threading.Event):
+    """``_poll_wakeup`` for a poll loop run on the test's own thread.
+
+    A wait nothing woke ends the loop where the real poller would sleep out
+    its interval, so the loop runs exactly the refreshes it would run before
+    that sleep."""
+
+    def wait(self, timeout=None):
+        if not self.is_set():
+            enforcement._stop_event.set()
+        return self.is_set()
+
+
+@pytest.fixture()
+def poll_on_this_thread(department_cache, fetch_env, mock_revenium_client):
+    """A cache owned by key A and a poller wake-up the test can run the loop with."""
+    monkeypatch, _ = fetch_env
+    monkeypatch.delenv("REVENIUM_CACHE_DIR", raising=False)
+    mock_revenium_client.api_key = KEY_A
+    department_cache([])
+    enforcement.check_enforcement()
+    monkeypatch.setattr(enforcement, "_poll_wakeup", PollerWakeup())
+    return monkeypatch
+
+
+def answer_by_key(sent_with, during_first_read=lambda: None):
+    """An ``httpx.get`` answering key A with no locked rule and key B with a breached one."""
+
+    def get(url, **kwargs):
+        key = kwargs["headers"]["x-api-key"]
+        sent_with.append(key)
+        if len(sent_with) == 1:
+            during_first_read()
+        return answer_with([locked_rule()] if key == KEY_B else [])
+
+    return get
+
+
+class TestAKeySwitchDuringARefreshStillFetchesTheNewKeysLockedRules:
+    """BACK-5828. A key-only switch keeps the rules, so the cache can still
+    read as fresh and no pre-call check wakes the poller. The wake-up the
+    switch asked for while a refresh for the previous key ran must outlive
+    that refresh, or the new key's locked caps wait out a whole interval."""
+
+    def test_a_switch_while_the_previous_keys_read_is_in_flight(
+        self, poll_on_this_thread, mock_revenium_client
+    ):
+        monkeypatch = poll_on_this_thread
+        sent_with = []
+
+        def switch_to_b():
+            mock_revenium_client.api_key = KEY_B
+            blocked()
+
+        monkeypatch.setattr(enforcement.httpx, "get", answer_by_key(sent_with, switch_to_b))
+
+        enforcement._poll_loop()
+
+        assert sent_with == [KEY_A, KEY_B]
+        assert blocked()
+
+    def test_a_switch_after_the_previous_keys_answer_was_installed(
+        self, poll_on_this_thread, mock_revenium_client
+    ):
+        monkeypatch = poll_on_this_thread
+        sent_with = []
+        monkeypatch.setattr(enforcement.httpx, "get", answer_by_key(sent_with))
+        persist = enforcement._persist_cache_to_disk
+
+        def persist_then_switch_to_b(*args, **kwargs):
+            persist(*args, **kwargs)
+            if mock_revenium_client.api_key == KEY_A:
+                mock_revenium_client.api_key = KEY_B
+                blocked()
+
+        monkeypatch.setattr(enforcement, "_persist_cache_to_disk", persist_then_switch_to_b)
+
+        enforcement._poll_loop()
+
+        assert sent_with == [KEY_A, KEY_B]
+        assert blocked()
+
+    def test_a_wake_up_without_a_switch_is_answered_by_the_refresh_in_flight(self, poll_on_this_thread):
+        monkeypatch = poll_on_this_thread
+        sent_with = []
+        monkeypatch.setattr(enforcement.httpx, "get",
+                            answer_by_key(sent_with, enforcement._poll_wakeup.set))
+
+        enforcement._poll_loop()
+
+        assert sent_with == [KEY_A]
+
+    def test_a_stop_asked_for_during_that_refresh_still_ends_the_poller(
+        self, poll_on_this_thread, mock_revenium_client
+    ):
+        monkeypatch = poll_on_this_thread
+        sent_with = []
+
+        def switch_to_b_then_stop():
+            mock_revenium_client.api_key = KEY_B
+            blocked()
+            enforcement._stop_event.set()
+            enforcement._poll_wakeup.set()
+
+        monkeypatch.setattr(enforcement.httpx, "get", answer_by_key(sent_with, switch_to_b_then_stop))
+
+        enforcement._poll_loop()
+
+        assert sent_with == [KEY_A]
+
+
+PREVIOUS_KEYS_LOCKED_RULE_ID = 4300
+SNAPSHOT_TEAM = "team-snapshot"
+NEXT_TEAM = "team-2"
+
+
+def switch_once_the_snapshot_is_read(monkeypatch, switch):
+    """Run ``switch`` after the snapshot files were read and before the loader
+    takes ``_cache_lock`` to install them."""
+    read_locked_rules = enforcement._load_locked_rules_from_disk
+
+    def read_then_switch(rules, owner):
+        loaded = read_locked_rules(rules, owner)
+        switch()
+        return loaded
+
+    monkeypatch.setattr(enforcement, "_load_locked_rules_from_disk", read_then_switch)
+
+
+def run_the_poller():
+    """Run the poller the call asked for on this thread, up to the first sleep nothing wakes."""
+    enforcement._poll_loop()
+
+
+@pytest.fixture()
+def first_call_under_key_a(snapshot_env, mock_revenium_client):
+    """A restart under key A with a poller wake-up the test can run the loop with.
+
+    ``snapshot_env`` keeps the call from starting a poller thread, so the
+    call's own check runs before any refresh lands, and the test runs the
+    poller after it."""
+    monkeypatch, _ = snapshot_env
+    monkeypatch.setattr(enforcement, "_poll_wakeup", PollerWakeup())
+    mock_revenium_client.api_key = KEY_A
+    return monkeypatch
+
+
+def save_a_snapshot_under_key_a(rules, blocks=None):
+    enforcement._persist_cache_to_disk(
+        rules, blocks, locked_rules=[locked_rule(ruleId=PREVIOUS_KEYS_LOCKED_RULE_ID)])
+
+
+class TestAKeySwitchDuringTheSnapshotReadKeepsTheTeamsCaps:
+    """BACK-5828 and BACK-4250. The snapshot files are read outside
+    ``_cache_lock``, so the key can change while they are read. The loader
+    then keeps what a key-only switch keeps: the team's rules and department
+    maps are installed, the previous key owner's locked rules are not, and the
+    cache is the new key's, so its first refresh is installed."""
+
+    @pytest.fixture(autouse=True)
+    def switch_to_b_during_the_read(self, first_call_under_key_a, mock_revenium_client):
+        def switch_to_b():
+            mock_revenium_client.api_key = KEY_B
+
+        switch_once_the_snapshot_is_read(first_call_under_key_a, switch_to_b)
+
+    def test_the_call_in_flight_is_not_refused_by_the_previous_keys_locked_cap(self):
+        save_a_snapshot_under_key_a([pooled_rule()])
+
+        assert not blocked()
+        assert enforcement._cached_locked_rules == []
+        assert enforcement._cached_rules == [pooled_rule()]
+
+    def test_the_teams_pooled_cap_from_the_snapshot_still_refuses_the_call_in_flight(self):
+        save_a_snapshot_under_key_a([pooled_rule(breached=True)])
+
+        with pytest.raises(BudgetExceededError) as raised:
+            enforcement.check_enforcement()
+
+        assert raised.value.rule_id == 9
+
+    def test_the_department_block_from_the_snapshot_still_refuses_the_call_in_flight(self):
+        save_a_snapshot_under_key_a([department_rule()], {MEMBER_EMAIL: DEPARTMENT_RULE_ID})
+
+        with pytest.raises(BudgetExceededError) as raised:
+            enforcement.check_enforcement({"subscriber": {"email": MEMBER_EMAIL}})
+
+        assert raised.value.rule_id == DEPARTMENT_RULE_ID
+
+    def test_a_fail_closed_call_in_flight_is_not_refused_for_an_uninitialized_cache(
+        self, first_call_under_key_a
+    ):
+        first_call_under_key_a.setenv("REVENIUM_CB_FAIL_MODE", "closed")
+        save_a_snapshot_under_key_a([pooled_rule()])
+
+        assert not blocked()
+
+    def test_the_new_keys_first_refresh_fills_the_cache_with_its_locked_rules(self, first_call_under_key_a):
+        save_a_snapshot_under_key_a([pooled_rule()])
+        sent_with = []
+        first_call_under_key_a.setattr(enforcement.httpx, "get", answer_by_key(sent_with))
+        blocked()
+
+        run_the_poller()
+
+        assert sent_with == [KEY_B]
+        assert [rule["ruleId"] for rule in enforcement._cached_locked_rules] == [LOCKED_RULE_ID]
+        assert enforcement._cache_owner.credential == enforcement._credential_fingerprint(KEY_B)
+        with pytest.raises(BudgetExceededError) as raised:
+            enforcement.check_enforcement()
+        assert raised.value.rule_id == LOCKED_RULE_ID
+
+    def test_a_refresh_for_the_previous_key_in_flight_is_followed_at_once_by_the_new_keys(
+        self, first_call_under_key_a
+    ):
+        """The snapshot install hands the cache to B mid-refresh, so A's answer
+        is dropped; the switch it counts keeps the poller from sleeping out its
+        interval before B's read."""
+        save_a_snapshot_under_key_a([pooled_rule()])
+        sent_with = []
+        first_call_under_key_a.setattr(enforcement.httpx, "get", answer_by_key(sent_with, blocked))
+
+        run_the_poller()
+
+        assert sent_with == [KEY_A, KEY_B]
+        assert [rule["ruleId"] for rule in enforcement._cached_locked_rules] == [LOCKED_RULE_ID]
+
+
+def save_a_snapshot_for_the_next_team(monkeypatch, rules):
+    monkeypatch.setenv("REVENIUM_TEAM_ID", NEXT_TEAM)
+    enforcement._persist_cache_to_disk(rules)
+    monkeypatch.setenv("REVENIUM_TEAM_ID", SNAPSHOT_TEAM)
+
+
+def answer_reads(read_from, answer):
+    """An ``httpx.get`` that records the address of each read and gives ``answer``."""
+
+    def get(url, **kwargs):
+        read_from.append(url)
+        return answer
+
+    return get
+
+
+class TestATeamSwitchDuringTheSnapshotReadInstallsNothingOfThePreviousTeam:
+    """BACK-5828. A snapshot read for the team the process switched away from
+    judges none of the new team's calls, and the cache is not left to the
+    previous team: the new team's first refresh is installed, and its own
+    snapshot is read on its next call unless that refresh landed first."""
+
+    @pytest.fixture(autouse=True)
+    def switch_team_during_the_read(self, first_call_under_key_a):
+        monkeypatch = first_call_under_key_a
+        save_a_snapshot_under_key_a([pooled_rule(breached=True)], {MEMBER_EMAIL: DEPARTMENT_RULE_ID})
+        switch_once_the_snapshot_is_read(
+            monkeypatch, lambda: monkeypatch.setenv("REVENIUM_TEAM_ID", NEXT_TEAM))
+
+    def test_the_new_teams_first_refresh_fills_the_cache(self, first_call_under_key_a):
+        read_from = []
+        first_call_under_key_a.setattr(enforcement.httpx, "get",
+                                       answer_reads(read_from, answer_with([locked_rule()])))
+
+        assert not blocked({"subscriber": {"email": MEMBER_EMAIL}})
+        assert enforcement._cached_rules == []
+        assert enforcement._cached_org_unit_blocks == {}
+        run_the_poller()
+
+        assert len(read_from) == 1 and read_from[0].endswith(f"/{NEXT_TEAM}")
+        assert enforcement._cache_owner.team_id == NEXT_TEAM
+        assert [rule["ruleId"] for rule in enforcement._cached_locked_rules] == [LOCKED_RULE_ID]
+
+    def test_the_new_teams_snapshot_does_not_replace_the_rules_its_refresh_installed(
+        self, first_call_under_key_a
+    ):
+        save_a_snapshot_for_the_next_team(first_call_under_key_a, [pooled_rule(ruleId=10, breached=True)])
+        first_call_under_key_a.setattr(enforcement.httpx, "get", answer_reads([], answer_with([])))
+        blocked()
+        run_the_poller()
+
+        assert not blocked()
+        assert enforcement._cached_rules == []
+
+    def test_the_new_teams_snapshot_is_read_on_its_next_call(self, first_call_under_key_a):
+        save_a_snapshot_for_the_next_team(first_call_under_key_a, [pooled_rule(ruleId=10, breached=True)])
+        blocked()
+
+        with pytest.raises(BudgetExceededError) as raised:
+            enforcement.check_enforcement()
+
+        assert raised.value.rule_id == 10
+
+
+class TestARefreshThatLandsDuringTheSnapshotReadIsKept:
+    """BACK-5828. A refresh run by the poller while the first call reads the
+    snapshot installs newer rules than the files hold; the loader leaves them."""
+
+    def test_the_older_snapshot_does_not_replace_them(self, first_call_under_key_a):
+        save_a_snapshot_under_key_a([pooled_rule(breached=True)])
+        first_call_under_key_a.setattr(enforcement.httpx, "get", answer_by_key([]))
+        switch_once_the_snapshot_is_read(first_call_under_key_a, enforcement._refresh_cache)
+
+        assert not blocked()
+        assert enforcement._cached_rules == []
+        assert enforcement._cache_timestamp > 0.0

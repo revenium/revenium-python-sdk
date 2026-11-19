@@ -6,6 +6,7 @@ import logging
 import math
 import threading
 import time
+import typing
 import uuid
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
@@ -20,7 +21,10 @@ from revenium_middleware._core.metering_buffer import MeteringBuffer, delivery_d
 from revenium_middleware._core.metering_submission import submit_ai_event
 from revenium_middleware._core.prompt_extraction import sanitize_credentials
 from revenium_middleware._core.wire_guards import stored_subscriber_value
+from revenium_middleware._core.metering import StopReason
 from revenium_middleware._metering import ReveniumMetering
+from revenium_middleware._metering.resources.ai import AIResource, AsyncAIResource
+from revenium_middleware._metering.types.ai_create_completion_params import AICreateCompletionParams
 
 
 @pytest.fixture
@@ -1351,3 +1355,19 @@ def test_stored_subscriber_value_cuts_only_an_overlong_text_value(field, caplog)
         assert stored_subscriber_value(field, 12345) == 12345
         assert stored_subscriber_value(field, None) is None
     assert caplog.text == ""
+
+
+def _literal_values(annotation):
+    # Python 3.10 leaves a TypedDict key's Required[Annotated[...]] wrappers on the hint; later versions strip them.
+    while typing.get_origin(annotation) is not typing.Literal:
+        annotation = typing.get_args(annotation)[0]
+    return typing.get_args(annotation)
+
+
+@pytest.mark.parametrize(
+    "declaration", [AIResource.create_completion, AsyncAIResource.create_completion, AICreateCompletionParams]
+)
+def test_stop_reason_names_every_stop_reason_create_completion_accepts(declaration):
+    accepted = typing.get_type_hints(declaration)["stop_reason"]
+
+    assert typing.get_args(StopReason) == _literal_values(accepted)

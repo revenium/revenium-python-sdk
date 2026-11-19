@@ -28,7 +28,10 @@ from revenium_middleware._core.shutdown_signals import install_requested_signal_
 logger = logging.getLogger("revenium_middleware")
 
 # Define a StopReason literal type for strict typing of stop_reason
-StopReason = Literal["END", "END_SEQUENCE", "TIMEOUT", "TOKEN_LIMIT", "COST_LIMIT", "COMPLETION_LIMIT", "ERROR"]
+StopReason = Literal[
+    "END", "END_SEQUENCE", "TIMEOUT", "TOKEN_LIMIT", "COST_LIMIT", "COMPLETION_LIMIT", "ERROR", "CANCELLED",
+    "CONTENT_FILTER",
+]
 
 TIMEOUT_ENV = "REVENIUM_METERING_TIMEOUT_SECONDS"
 CONNECT_TIMEOUT_ENV = "REVENIUM_METERING_CONNECT_TIMEOUT_SECONDS"
