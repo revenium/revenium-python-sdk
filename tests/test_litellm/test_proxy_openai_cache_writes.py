@@ -201,3 +201,53 @@ def test_deprecated_callback_takes_openai_cache_writes_out_of_the_prompt(hook, u
 
         args = submitted_args(mock_submit)
         assert {field: args[field] for field in expected} == expected
+
+
+TWELVE_HOUR_SHARE = 4000
+
+
+def litellm_responses_usage(prompt, completion, written, twelve_hour):
+    """The usage LiteLLM parses from an OpenAI ``/v1/responses`` body: ``InputTokensDetails``
+    allows extra keys, so the TTL split OpenAI reports survives the parse."""
+    from litellm.types.llms.openai import ResponsesAPIResponse
+
+    return ResponsesAPIResponse.model_validate({
+        "id": "resp_12h", "created_at": 1, "output": [],
+        "usage": {
+            "input_tokens": prompt, "output_tokens": completion, "total_tokens": prompt + completion,
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": written,
+                                     "cache_write_tokens_details": {"ttl_12h_tokens": twelve_hour,
+                                                                    "ttl_30m_tokens": written - twelve_hour}},
+        },
+    }).usage
+
+
+@pytest.mark.asyncio
+async def test_guardrail_sends_the_12h_share_of_a_responses_write(guardrail, submit):
+    data = guardrail_data(stream=False, model=OPENAI_MODEL, custom_llm_provider="openai", call_type="responses")
+
+    await through_the_guardrail(guardrail, litellm_responses_usage(4583, 5, 4580, TWELVE_HOUR_SHARE), data=data)
+
+    args = submitted_args(submit)
+    assert args["cache_creation12h_token_count"] == TWELVE_HOUR_SHARE
+    assert args["cache_creation_token_count"] == 4580
+    assert args["input_token_count"] == 3
+
+
+def test_deprecated_callback_sends_no_12h_share_because_litellm_logs_responses_usage_as_chat_usage():
+    """LiteLLM hands logging callbacks the Responses usage converted to chat usage, which keeps
+    ``cache_write_tokens`` and drops the TTL split. Should a LiteLLM release start carrying it,
+    this fails and the paths that send the 12-hour share need restating."""
+    from litellm.responses.utils import ResponseAPILoggingUtils
+
+    logged = ResponseAPILoggingUtils._transform_response_api_usage_to_chat_usage(
+        litellm_responses_usage(4583, 5, 4580, TWELVE_HOUR_SHARE))
+
+    with patch.object(deprecated_callback, "run_async_in_thread", side_effect=drive_metering), \
+            patch.object(deprecated_callback, "get_client", return_value=object()), \
+            patch.object(deprecated_callback, "submit_ai_event") as mock_submit:
+        _success(logged)
+
+        args = submitted_args(mock_submit)
+        assert "cache_creation12h_token_count" not in args
+        assert args["cache_creation_token_count"] == 4580

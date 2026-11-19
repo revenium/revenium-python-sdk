@@ -16,6 +16,7 @@ import threading
 import time
 import weakref
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -142,7 +143,7 @@ class FakeOpenAI:
 
     def __init__(self, responses_terminal="response.completed", shape=in_chunks_of(BODY_CHUNK_SIZE),
                  azure=False, fail_after=None, chat_finish_reason="stop", chat_usage=None, fail_status=None,
-                 fail_message="refused", chat_content=None, first_content=None):
+                 fail_message="refused", chat_content=None, first_content=None, responses_usage=None):
         self.requests = []
         self._chat_content = chat_content
         self._first_content = first_content
@@ -151,6 +152,7 @@ class FakeOpenAI:
         # A refused call is raised at once rather than retried after a back-off.
         self._client_options = {"max_retries": 0} if fail_status else {}
         self._chat_usage = chat_usage
+        self._responses_usage = responses_usage
         self._responses_terminal = responses_terminal
         self._chat_finish_reason = chat_finish_reason
         self._shape = shape
@@ -179,11 +181,14 @@ class FakeOpenAI:
             })
         if request.url.path.endswith("/responses"):
             if body.get("stream"):
-                events = event_payloads(self._responses_terminal, RESPONSES_USAGE)
+                events = event_payloads(self._responses_terminal, self._served_responses_usage())
                 return self._stream(_sse(events, False))
             status = TERMINAL_STATUS[self._responses_terminal]
-            return httpx.Response(200, json=response_payload(status=status, usage=RESPONSES_USAGE))
+            return httpx.Response(200, json=response_payload(status=status, usage=self._served_responses_usage()))
         return httpx.Response(404, json={"error": "unrouted"})
+
+    def _served_responses_usage(self):
+        return RESPONSES_USAGE if self._responses_usage is None else self._responses_usage
 
     def _streamed_chat_chunks(self, include_usage):
         chunks = _chat_chunks(include_usage, self._azure, self._chat_finish_reason, self._chat_usage)
@@ -1015,6 +1020,29 @@ def test_openai_native_cache_write_sends_no_split_on_sync_stream(call, payloads)
     assert "cache_creation1h_token_count" not in payloads[0]
 
 
+# ---- twelve-hour cache writes on the Responses API (BACK-5867) ----
+
+RESPONSES_12H_CACHE_WRITE_USAGE = {
+    **RESPONSES_USAGE,
+    "input_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 5, "cache_write_tokens_details": {
+        "ttl_12h_tokens": 4, "ttl_30m_tokens": 1}},
+}
+
+
+@pytest.mark.parametrize("call", [sync_responses_create, async_responses_create] + STREAMED_RESPONSES,
+                         ids=lambda c: c.__name__)
+def test_12h_share_of_a_responses_cache_write_is_sent_on_every_responses_entry_point(call, payloads):
+    """The 30-minute share has no bucket of its own: the platform prices the write's unattributed
+    remainder at the five-minute column, which holds OpenAI's 30-minute write price."""
+    call(FakeOpenAI(responses_usage=RESPONSES_12H_CACHE_WRITE_USAGE), None)
+
+    assert len(payloads) == 1
+    assert payloads[0]["cache_creation_token_count"] == 5
+    assert payloads[0]["cache_creation12h_token_count"] == 4
+    assert "cache_creation5m_token_count" not in payloads[0]
+    assert "cache_creation1h_token_count" not in payloads[0]
+
+
 # ---- BACK-4239: a failed call sends one ERROR record --------------------------
 
 REFUSED_CALLS = [
@@ -1444,6 +1472,20 @@ class _PromptAsyncStream:
             raise StopAsyncIteration
 
 
+class _StalledSyncStream:
+    """Sends nothing until the test releases it, as OpenAI may after the finish chunk."""
+
+    def __init__(self):
+        self.released = threading.Event()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.released.wait()
+        raise StopIteration
+
+
 def _chunks_forever():
     while True:
         yield "text"
@@ -1458,6 +1500,24 @@ def test_reading_on_for_usage_after_a_finish_stops_at_the_time_limit_when_the_as
     asyncio.run(mw._aread_usage_after_finish(stub, still_open=True))
 
     assert time.monotonic() - started < 2
+    assert stub.final_usage is None
+
+
+def test_reading_on_for_usage_after_a_finish_stops_at_the_time_limit_when_the_sync_stream_stalls(monkeypatch):
+    """BACK-4529: closing a sync stream that stalls after its finish chunk waits
+    out the time limit, not the provider's read timeout."""
+    monkeypatch.setattr(mw, "_SECONDS_TO_WAIT_FOR_USAGE_AFTER_FINISH", 0.05)
+    stream = _StalledSyncStream()
+    stub = _FinishedStreamStub(stream)
+    closing = threading.Thread(target=mw._read_usage_after_finish, args=(stub,), kwargs={"still_open": True},
+                               daemon=True)
+
+    try:
+        closing.start()
+        closing.join(timeout=1)
+        assert not closing.is_alive()
+    finally:
+        stream.released.set()
     assert stub.final_usage is None
 
 
@@ -1482,6 +1542,188 @@ def test_reading_on_for_usage_after_a_finish_still_picks_up_a_usage_chunk_that_a
 
     assert sync_stub.final_usage == CUT_OFF_USAGE
     assert async_stub.final_usage == CUT_OFF_USAGE
+
+
+_USAGE_READER_NAME = "revenium-openai-usage-after-finish"
+
+
+def _chunk_object(chunk):
+    choices = [SimpleNamespace(index=c["index"], delta=SimpleNamespace(**c["delta"]),
+                               finish_reason=c["finish_reason"]) for c in chunk["choices"]]
+    return SimpleNamespace(id=chunk["id"], model=chunk["model"], system_fingerprint=None, usage=None,
+                           choices=choices)
+
+
+class _ResponseOfAStalledRead:
+    def __init__(self, read_returned):
+        self.closed = threading.Event()
+        self.closed_while_the_read_was_blocked = False
+        self._read_returned = read_returned
+
+    def close(self):
+        if not self._read_returned.is_set():
+            self.closed_while_the_read_was_blocked = True
+        self.closed.set()
+
+
+class _StreamThatStallsAfterItsFinishChunk:
+    """Shaped like ``openai.Stream``: ``iter()`` hands out a generator reading
+    the response, which sends nothing after the finish chunk until the test
+    releases it, and ``close()`` closes that response."""
+
+    def __init__(self):
+        self.read_released = threading.Event()
+        self.read_returned = threading.Event()
+        self.response = _ResponseOfAStalledRead(self.read_returned)
+        self.reader = None
+
+    def __iter__(self):
+        for chunk in _chat_chunks(include_usage=False):
+            yield _chunk_object(chunk)
+        self.reader = threading.current_thread()
+        self.read_released.wait()
+        self.read_returned.set()
+
+    def close(self):
+        self.response.close()
+
+
+def _close_directly(stream):
+    stream.close()
+
+
+def _leave_its_with_block(stream):
+    with stream:
+        pass
+
+
+def _close_its_response_as_the_stream_helpers_do(stream):
+    stream.response.close()
+
+
+def _a_read_whose_socket_cannot_be_shut_down(monkeypatch):
+    pass
+
+
+def _an_interrupted_read_that_outlasts_the_wait(monkeypatch):
+    monkeypatch.setattr(mw, "_shut_down_stalled_read", lambda response: True)
+    monkeypatch.setattr(mw, "_SECONDS_TO_WAIT_FOR_AN_INTERRUPTED_READ", 0.05)
+
+
+@pytest.mark.parametrize("stalled_read", [_a_read_whose_socket_cannot_be_shut_down,
+                                          _an_interrupted_read_that_outlasts_the_wait])
+@pytest.mark.parametrize("close", [_close_directly, _leave_its_with_block,
+                                   _close_its_response_as_the_stream_helpers_do])
+def test_closing_a_sync_stream_whose_stalled_read_goes_on_closes_the_response_only_once_that_read_returns(
+        payloads, monkeypatch, close, stalled_read):
+    """BACK-4529: a descriptor closed under a thread still reading it can be reused by another
+    connection, so closing must return at the deadline yet leave the response to the reader."""
+    monkeypatch.setattr(mw, "_SECONDS_TO_WAIT_FOR_USAGE_AFTER_FINISH", 0.05)
+    stalled_read(monkeypatch)
+    provider_stream = _StreamThatStallsAfterItsFinishChunk()
+    stream = mw.handle_streaming_response(provider_stream, datetime.datetime.now(datetime.timezone.utc),
+                                          {}, None, {"model": MODEL})
+    assert [c.choices[0].finish_reason for c in itertools.islice(stream, 2)] == [None, "stop"]
+
+    try:
+        started = time.monotonic()
+        close(stream)
+        assert time.monotonic() - started < 1
+        assert len(payloads) == 1
+        assert not provider_stream.response.closed.is_set()
+    finally:
+        provider_stream.read_released.set()
+
+    assert provider_stream.response.closed.wait(timeout=1)
+    assert not provider_stream.response.closed_while_the_read_was_blocked
+    assert provider_stream.reader is not None and provider_stream.reader.name == _USAGE_READER_NAME
+    provider_stream.reader.join(timeout=1)
+    assert not provider_stream.reader.is_alive()
+
+
+def test_closing_a_sync_stream_after_its_finish_chunk_records_the_call_when_no_reader_thread_can_start(
+        payloads, monkeypatch):
+    def no_thread_can_start(stream):
+        raise RuntimeError("can't create new thread at interpreter shutdown")
+
+    monkeypatch.setattr(mw, "_chunks_read_in_background", no_thread_can_start)
+    provider_stream = _StreamThatStallsAfterItsFinishChunk()
+    stream = mw.handle_streaming_response(provider_stream, datetime.datetime.now(datetime.timezone.utc),
+                                          {}, None, {"model": MODEL})
+    assert [c.choices[0].finish_reason for c in itertools.islice(stream, 2)] == [None, "stop"]
+
+    stream.close()
+
+    assert len(payloads) == 1
+    assert provider_stream.response.closed.is_set()
+
+
+class _ChatServerThatStallsAfterTheFinishChunk(BaseHTTPRequestHandler):
+    """Streams a chat completion up to its finish chunk, then sends nothing and
+    records when the client drops the connection."""
+
+    protocol_version = "HTTP/1.1"
+    connection_dropped = None
+    released = None
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers["Content-Length"]))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        body = _sse(_chat_chunks(include_usage=False), done_marker=False)
+        self.wfile.write(b"%x\r\n%s\r\n" % (len(body), body))
+        self.wfile.flush()
+        self.connection.settimeout(5)
+        try:
+            if self.rfile.read(1) == b"":
+                self.connection_dropped.set()
+        except OSError:
+            self.connection_dropped.set()
+        self.released.wait(timeout=5)
+
+
+@pytest.fixture
+def stalling_chat_server():
+    handler = type("Handler", (_ChatServerThatStallsAfterTheFinishChunk,),
+                   {"connection_dropped": threading.Event(), "released": threading.Event()})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    serving = threading.Thread(target=server.serve_forever, daemon=True)
+    serving.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/v1", handler.connection_dropped
+    finally:
+        handler.released.set()
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize("close", [_close_directly, _leave_its_with_block,
+                                   _close_its_response_as_the_stream_helpers_do])
+def test_closing_a_real_openai_stream_that_stalls_after_its_finish_chunk_drops_its_connection(
+        payloads, monkeypatch, stalling_chat_server, close):
+    """BACK-4529: closing an httpx response does not wake a thread blocked reading its socket,
+    so a direct close must end the stalled read over a real socket, on whichever OpenAI major is installed."""
+    monkeypatch.setattr(mw, "_SECONDS_TO_WAIT_FOR_USAGE_AFTER_FINISH", 0.05)
+    base_url, connection_dropped = stalling_chat_server
+    client = OpenAI(api_key="sk-test", base_url=base_url, max_retries=0, timeout=10)
+    stream = client.chat.completions.create(**CHAT_REQUEST, stream=True)
+    assert [c.choices[0].finish_reason for c in itertools.islice(stream, 2)] == [None, "stop"]
+
+    started = time.monotonic()
+    close(stream)
+
+    assert time.monotonic() - started < 1
+    assert stream.response.is_closed
+    assert connection_dropped.wait(timeout=1)
+    for reader in [t for t in threading.enumerate() if t.name == _USAGE_READER_NAME]:
+        reader.join(timeout=1)
+        assert not reader.is_alive()
+    assert len(payloads) == 1
 
 
 class _CallerError(RuntimeError):

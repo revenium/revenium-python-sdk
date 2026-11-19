@@ -511,6 +511,44 @@ class TestReportableExceptionText:
 
         assert self.text(error) == "RuntimeError"
 
+    @staticmethod
+    def http_exception(status_code, detail):
+        class HTTPException(Exception):
+            def __init__(self):
+                super().__init__(f"{status_code}: {detail}")
+                self.status_code = status_code
+                self.detail = detail
+
+        return HTTPException()
+
+    def test_an_http_exception_sends_its_message_with_error_capture_on(self, monkeypatch):
+        """A customer's own HTTPException is no provider error, so prompt capture does not gate it."""
+        monkeypatch.setenv("REVENIUM_CAPTURE_ERROR_MESSAGES", "true")
+        monkeypatch.delenv("REVENIUM_CAPTURE_PROMPTS", raising=False)
+
+        assert self.text(self.http_exception(404, "order not found")) == "HTTPException: 404: order not found"
+
+    def test_an_exception_the_caller_says_quotes_the_request_sends_class_only_with_prompt_capture_off(
+            self, monkeypatch):
+        """BACK-5842: a LiteLLM proxy guardrail refuses with an HTTPException whose detail quotes what it matched."""
+        from revenium_middleware._core.error_text import is_http_exception, reportable_exception_text
+
+        monkeypatch.setenv("REVENIUM_CAPTURE_ERROR_MESSAGES", "true")
+        monkeypatch.delenv("REVENIUM_CAPTURE_PROMPTS", raising=False)
+        refusal = self.wrapped(self.http_exception(400, {"matched_phrase": "reveal ZEBRA42"}), 1)
+
+        assert reportable_exception_text(refusal, quotes_request=is_http_exception) == "RuntimeError"
+
+    def test_an_exception_the_caller_says_quotes_the_request_sends_its_message_with_prompt_capture_on(
+            self, monkeypatch):
+        from revenium_middleware._core.error_text import is_http_exception, reportable_exception_text
+
+        monkeypatch.setenv("REVENIUM_CAPTURE_ERROR_MESSAGES", "true")
+        monkeypatch.setenv("REVENIUM_CAPTURE_PROMPTS", "true")
+        refusal = self.http_exception(400, "blocked")
+
+        assert reportable_exception_text(refusal, quotes_request=is_http_exception) == "HTTPException: 400: blocked"
+
     def test_long_chain_without_a_provider_error_still_sends_its_message(self, monkeypatch):
         monkeypatch.setenv("REVENIUM_CAPTURE_ERROR_MESSAGES", "true")
         monkeypatch.delenv("REVENIUM_CAPTURE_PROMPTS", raising=False)
@@ -1264,6 +1302,7 @@ SAFE_LOG_LINES = {
     ('litellm/client/middleware.py', 'logger.debug("Metering call result: %s", result)'): METERING_RESULT,
     ('litellm/proxy/_health_check.py', 'logger.debug("Skipped metering a LiteLLM health-check call (%s)", where)'): OPERATION,
     ('litellm/proxy/guardrail.py', 'count,'): NUMBER,
+    ('litellm/proxy/shutdown.py', 'budget, Config.ENV_REVENIUM_SHUTDOWN_TIMEOUT_SECONDS,'): NUMBER,
     ('litellm/proxy/guardrail.py', '"ignoring them", len(values), field'): ID_LIST,
     ('litellm/proxy/guardrail.py', 'getattr(self, "guardrail_name", None),'): SETTING,
     ('litellm/proxy/guardrail.py', 'getattr(self, "event_hook", None),'): SETTING,

@@ -913,6 +913,8 @@ def expected_guardrail_payload(transaction_id, stop_reason, operation_type):
         "mediation_latency": 10,
         "middleware_source": "GUARDRAIL",
         "extra_body": None,
+        # The fixture's failure is a bare Exception: no HTTP status, so no error code.
+        **({"error_reason": "Exception"} if stop_reason == "ERROR" else {}),
     }
 
 

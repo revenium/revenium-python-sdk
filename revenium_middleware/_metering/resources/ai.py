@@ -70,12 +70,21 @@ class AIResource(SyncAPIResource):
         request_time: str,
         response_time: str,
         stop_reason: Literal[
-            "END", "END_SEQUENCE", "TIMEOUT", "TOKEN_LIMIT", "COST_LIMIT", "COMPLETION_LIMIT", "ERROR", "CANCELLED"
+            "END",
+            "END_SEQUENCE",
+            "TIMEOUT",
+            "TOKEN_LIMIT",
+            "COST_LIMIT",
+            "COMPLETION_LIMIT",
+            "ERROR",
+            "CANCELLED",
+            "CONTENT_FILTER",
         ],
         total_token_count: int,
         transaction_id: str,
         agent: str | NotGiven = NOT_GIVEN,
         billing_skipped: bool | NotGiven = NOT_GIVEN,
+        cache_creation12h_token_count: int | NotGiven = NOT_GIVEN,
         cache_creation1h_token_count: int | NotGiven = NOT_GIVEN,
         cache_creation5m_token_count: int | NotGiven = NOT_GIVEN,
         cache_creation_token_cost: float | NotGiven = NOT_GIVEN,
@@ -201,6 +210,10 @@ class AIResource(SyncAPIResource):
           agent: The AI agent that is making the request
 
           billing_skipped: If true, backend returns $0 cost
+
+          cache_creation12h_token_count: The number of cached creation tokens written with a 12 hour TTL. This is a
+              breakdown of cache_creation_token_count, which remains the aggregate across
+              every TTL.
 
           cache_creation1h_token_count: The number of cached creation tokens written with a 1 hour TTL. This is a
               breakdown of cache_creation_token_count, which remains the aggregate across
@@ -416,6 +429,7 @@ class AIResource(SyncAPIResource):
                     "transaction_id": transaction_id,
                     "agent": agent,
                     "billing_skipped": billing_skipped,
+                    "cache_creation12h_token_count": cache_creation12h_token_count,
                     "cache_creation1h_token_count": cache_creation1h_token_count,
                     "cache_creation5m_token_count": cache_creation5m_token_count,
                     "cache_creation_token_cost": cache_creation_token_cost,
@@ -1395,12 +1409,21 @@ class AsyncAIResource(AsyncAPIResource):
         request_time: str,
         response_time: str,
         stop_reason: Literal[
-            "END", "END_SEQUENCE", "TIMEOUT", "TOKEN_LIMIT", "COST_LIMIT", "COMPLETION_LIMIT", "ERROR", "CANCELLED"
+            "END",
+            "END_SEQUENCE",
+            "TIMEOUT",
+            "TOKEN_LIMIT",
+            "COST_LIMIT",
+            "COMPLETION_LIMIT",
+            "ERROR",
+            "CANCELLED",
+            "CONTENT_FILTER",
         ],
         total_token_count: int,
         transaction_id: str,
         agent: str | NotGiven = NOT_GIVEN,
         billing_skipped: bool | NotGiven = NOT_GIVEN,
+        cache_creation12h_token_count: int | NotGiven = NOT_GIVEN,
         cache_creation1h_token_count: int | NotGiven = NOT_GIVEN,
         cache_creation5m_token_count: int | NotGiven = NOT_GIVEN,
         cache_creation_token_cost: float | NotGiven = NOT_GIVEN,
@@ -1526,6 +1549,10 @@ class AsyncAIResource(AsyncAPIResource):
           agent: The AI agent that is making the request
 
           billing_skipped: If true, backend returns $0 cost
+
+          cache_creation12h_token_count: The number of cached creation tokens written with a 12 hour TTL. This is a
+              breakdown of cache_creation_token_count, which remains the aggregate across
+              every TTL.
 
           cache_creation1h_token_count: The number of cached creation tokens written with a 1 hour TTL. This is a
               breakdown of cache_creation_token_count, which remains the aggregate across
@@ -1741,6 +1768,7 @@ class AsyncAIResource(AsyncAPIResource):
                     "transaction_id": transaction_id,
                     "agent": agent,
                     "billing_skipped": billing_skipped,
+                    "cache_creation12h_token_count": cache_creation12h_token_count,
                     "cache_creation1h_token_count": cache_creation1h_token_count,
                     "cache_creation5m_token_count": cache_creation5m_token_count,
                     "cache_creation_token_cost": cache_creation_token_cost,

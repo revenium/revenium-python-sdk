@@ -80,10 +80,10 @@ The calls below are billed by the provider (some, such as batch and fine-tuning 
 <!-- not-metered:start -->
 - **OpenAI** (`OpenAI` and `AsyncOpenAI` clients): `batches.create`, `beta.agents.automations.create`, `beta.agents.automations.invocations.create`, `beta.agents.sessions.create`, `beta.agents.sessions.events.create`, `beta.agents.sessions.events.stream`, `beta.agents.sessions.stream`, `beta.agents.sessions.update`, `beta.chatkit.sessions.create`, `beta.realtime.connect`, `beta.responses.compact`, `beta.responses.connect`, `beta.responses.create`, `beta.threads.create_and_run`, `beta.threads.create_and_run_poll`, `beta.threads.create_and_run_stream`, `beta.threads.runs.create`, `beta.threads.runs.create_and_poll`, `beta.threads.runs.create_and_stream`, `beta.threads.runs.stream`, `beta.threads.runs.submit_tool_outputs`, `beta.threads.runs.submit_tool_outputs_and_poll`, `beta.threads.runs.submit_tool_outputs_stream`, `completions.create`, `decisions.create`, `evals.runs.create`, `fine_tuning.alpha.graders.run`, `fine_tuning.jobs.create`, `images.create_variation`, `images.edit`, `images.generate`, `live.connect`, `live.create`, `live.forks.connect`, `live.sessions.accept`, `live.sessions.fork`, `live.sideband.connect`, `realtime.calls.accept`, `realtime.calls.create`, `realtime.connect`, `realtime.translations.connect`, `responses.compact`, `responses.connect`, `videos.create`, `videos.create_and_poll`, `videos.create_character`, `videos.edit`, `videos.extend`, `videos.remix`
 - **Anthropic** (`Anthropic` and `AsyncAnthropic` clients): `beta.deployments.run`, `beta.dreams.create`, `beta.environments.work.poller`, `beta.environments.work.worker`, `beta.messages.batches.create`, `beta.sessions.create`, `beta.sessions.events.send`, `beta.sessions.events.stream`, `beta.sessions.events.tool_runner`, `beta.sessions.threads.events.stream`, `messages.batches.create`
-- **Google Gemini** (`google.genai` `Client` and `Client.aio`): `batches.create`, `batches.create_embeddings`, `caches.create`, `caches.update`, `decisions.create`, `file_search_stores.import_file`, `file_search_stores.upload_to_file_search_store`, `interactions.create`, `live.connect`, `live.music.connect`, `models.edit_image`, `models.recontext_image`, `models.segment_image`, `models.upscale_image`, `triggers.run`, `tunings.tune`
+- **Google Gemini** (`google.genai` `Client` and `Client.aio`): `batches.create`, `batches.create_embeddings`, `caches.create`, `caches.update`, `decisions.create`, `file_search_stores.import_file`, `file_search_stores.upload_to_file_search_store`, `interactions.connect`, `interactions.create`, `live.connect`, `live.music.connect`, `models.edit_image`, `models.recontext_image`, `models.segment_image`, `models.upscale_image`, `triggers.run`, `tunings.tune`
 - **Google Vertex AI** (`vertexai` classes): `batch_prediction.BatchPredictionJob.submit`, `caching.CachedContent.create`, `caching.CachedContent.update`, `language_models.ChatModel.tune_model`, `language_models.ChatModel.tune_model_rlhf`, `language_models.ChatSession.send_message`, `language_models.ChatSession.send_message_async`, `language_models.ChatSession.send_message_streaming`, `language_models.ChatSession.send_message_streaming_async`, `language_models.CodeChatModel.tune_model`, `language_models.CodeChatSession.send_message`, `language_models.CodeChatSession.send_message_async`, `language_models.CodeChatSession.send_message_streaming`, `language_models.CodeChatSession.send_message_streaming_async`, `language_models.CodeGenerationModel.batch_predict`, `language_models.CodeGenerationModel.predict`, `language_models.CodeGenerationModel.predict_async`, `language_models.CodeGenerationModel.predict_streaming`, `language_models.CodeGenerationModel.predict_streaming_async`, `language_models.CodeGenerationModel.tune_model`, `language_models.TextEmbeddingModel.batch_predict`, `language_models.TextEmbeddingModel.deploy_tuned_model`, `language_models.TextEmbeddingModel.tune_model`, `language_models.TextGenerationModel.batch_predict`, `language_models.TextGenerationModel.predict`, `language_models.TextGenerationModel.predict_async`, `language_models.TextGenerationModel.predict_streaming`, `language_models.TextGenerationModel.predict_streaming_async`, `language_models.TextGenerationModel.tune_model`, `language_models.TextGenerationModel.tune_model_rlhf`, `preview.caching.CachedContent.create`, `preview.caching.CachedContent.update`, `preview.vision_models.ImageCaptioningModel.get_captions`, `preview.vision_models.ImageGenerationModel.upscale_image`, `preview.vision_models.ImageQnAModel.ask_question`, `preview.vision_models.ImageSegmentationModel.segment_image`, `preview.vision_models.ImageTextModel.ask_question`, `preview.vision_models.ImageTextModel.get_captions`, `preview.vision_models.MultiModalEmbeddingModel.get_embeddings`, `preview.vision_models.WatermarkVerificationModel.verify_image`, `tuning.sft.train`, `vision_models.ImageCaptioningModel.get_captions`, `vision_models.ImageGenerationModel.upscale_image`, `vision_models.ImageQnAModel.ask_question`, `vision_models.ImageTextModel.ask_question`, `vision_models.ImageTextModel.get_captions`, `vision_models.MultiModalEmbeddingModel.get_embeddings`
 - **AWS Bedrock** (boto3 bedrock-runtime client; Claude models are metered when REVENIUM_BEDROCK_TRANSPORT is on): `apply_guardrail`, `converse`, `converse_stream`, `invoke_guardrail_checks`, `invoke_model`, `invoke_model_with_response_stream`, `start_async_invoke`
-- **Perplexity** (`Perplexity` and `AsyncPerplexity` clients): `async_.chat.completions.create`, `batches.create`, `browser.sessions.create`, `contextualized_embeddings.create`, `decisions.create`, `embeddings.create`, `responses.create`, `search.create`
+- **Perplexity** (`Perplexity` and `AsyncPerplexity` clients): `async_.chat.completions.create`, `batches.create`, `browser.sessions.create`, `context.create`, `contextualized_embeddings.create`, `decisions.create`, `embeddings.create`, `monitors.create`, `monitors.run`, `responses.create`, `search.create`
 - **LiteLLM** (the `litellm` module): `aadapter_completion`, `aadapter_generate_content`, `acode_interpreter_tool`, `acompact_responses`, `acreate_batch`, `acreate_fine_tuning_job`, `acreate_run`, `acreate_sandbox`, `adapter_completion`, `adecisions`, `aextraction`, `agenerate_content`, `aimage_edit`, `aimage_generation`, `aimage_variation`, `aingest`, `anthropic_interface.messages.acreate`, `anthropic_interface.messages.create`, `anthropic_messages`, `anthropic_messages_handler`, `aocr`, `aquery`, `arealtime_calls`, `arerank`, `aresponses`, `aresponses_api_with_mcp`, `aresponses_with_retries`, `arun_code`, `arun_thread`, `arun_thread_stream`, `asearch`, `aspeech`, `asystemone`, `atranscription`, `avideo_create_character`, `avideo_edit`, `avideo_extension`, `avideo_generation`, `avideo_remix`, `compact_responses`, `config_completion`, `create_batch`, `create_fine_tuning_job`, `create_run`, `decisions`, `extraction`, `image_edit`, `image_generation`, `image_variation`, `ingest`, `nlp_cloud_chat_completion`, `ocr`, `query`, `replicate_chat_completion`, `rerank`, `responses`, `responses_with_retries`, `run_thread`, `run_thread_stream`, `search`, `speech`, `systemone`, `transcription`, `video_create_character`, `video_edit`, `video_extension`, `video_generation`, `video_remix`
 - **Ollama** (`Client`, `AsyncClient` and the `ollama` module): `systemone`, `web_fetch`, `web_search`
 - **fal.ai** (`SyncClient`, `AsyncClient` and the `fal_client` module): `realtime`, `realtime_async`, `ws_connect`, `ws_connect_async`
@@ -446,6 +446,8 @@ client.close()
 ```
 
 In an `emit_completion` payload the agent is named by `agent`. `agentName` and `currency` are not sent (Revenium does not store them); `emit_completion` names them in its one-time warning about unsent keys.
+
+`cacheCreationTokenCount` is the whole cache write. When the provider reports how that write splits by cache lifetime, send the split beside it as `cacheCreation5mTokenCount`, `cacheCreation1hTokenCount` and `cacheCreation12hTokenCount` so each part is priced at its own rate; leave a bucket out when the provider does not report it rather than sending 0. `get_client().ai.create_completion` takes the same buckets as `cache_creation5m_token_count`, `cache_creation1h_token_count` and `cache_creation12h_token_count`.
 
 `emit_completion` and `emit_tool_event` queue the record and return at once, like every automatic record: the SDK's background threads send it with the same timeouts and retries (see [Metering Delivery and Timeouts](#metering-delivery-and-timeouts)), and a record that fails with a timeout, a refused connection or a 5xx goes to the store-and-forward buffer and is sent when Revenium is reachable again. Delivery errors are logged, not raised; `emit_completion` still raises `ValueError` before anything is queued when the payload is missing a required key. Both calls return the payload you passed.
 
@@ -1064,7 +1066,7 @@ response = litellm.completion(
 )
 ```
 
-Client mode meters `completion`, `acompletion`, `text_completion`, `atext_completion`, `completion_with_retries` and `acompletion_with_retries`, streamed or not, and `embedding` / `aembedding` as embedding calls. When you stream without `stream_options={"include_usage": True}`, the middleware asks LiteLLM for the usage chunk itself and keeps it out of your stream. LiteLLM adds that chunk for every provider, including ones it does not send `stream_options` to. `litellm.responses` and `litellm.aresponses` are not metered, except on providers LiteLLM serves through `completion`. A completion that fails, or a stream that breaks off, sends one record with stop reason `ERROR`, zero tokens for a call that never started, and the error's class and HTTP status as its error reason (plus the provider's redacted error message when both `REVENIUM_CAPTURE_ERROR_MESSAGES` and `REVENIUM_CAPTURE_PROMPTS` are `true`; a provider's error can quote the request, so it is never sent with prompt capture off); your code still gets the original exception. The HTTP status is also sent as the record's error code; a call that got no HTTP error answer (a connection error, a timeout, or a stream that broke off) has none. LiteLLM gives a connection error a 500 and a timeout a 408 that no server answered, so those get no error code and no HTTP status in their error reason, including the `InternalServerError` LiteLLM raises for a refused connection on its `openai/` and `anthropic/` providers. LiteLLM also raises a few real provider answers, such as a Vertex AI 502, as connection errors, and those get no error code either. Failure records sent by the LiteLLM gateway (proxy) do not carry the error code yet.
+Client mode meters `completion`, `acompletion`, `text_completion`, `atext_completion`, `completion_with_retries` and `acompletion_with_retries`, streamed or not, and `embedding` / `aembedding` as embedding calls. When you stream without `stream_options={"include_usage": True}`, the middleware asks LiteLLM for the usage chunk itself and keeps it out of your stream. LiteLLM adds that chunk for every provider, including ones it does not send `stream_options` to. `litellm.responses` and `litellm.aresponses` are not metered, except on providers LiteLLM serves through `completion`. A completion that fails, or a stream that breaks off, sends one record with stop reason `ERROR`, zero tokens for a call that never started, and the error's class and HTTP status as its error reason (plus the provider's redacted error message when both `REVENIUM_CAPTURE_ERROR_MESSAGES` and `REVENIUM_CAPTURE_PROMPTS` are `true`; a provider's error can quote the request, so it is never sent with prompt capture off); your code still gets the original exception. The HTTP status is also sent as the record's error code; a call that got no HTTP error answer (a connection error, a timeout, or a stream that broke off) has none. LiteLLM gives a connection error a 500 and a timeout a 408 that no server answered, so those get no error code and no HTTP status in their error reason, including the `InternalServerError` LiteLLM raises for a refused connection on its `openai/` and `anthropic/` providers. LiteLLM also raises a few real provider answers, such as a Vertex AI 502, as connection errors, and those get no error code either. Failure records sent by the LiteLLM gateway (proxy) are described under Proxy Mode below.
 
 Inside a LiteLLM proxy running `ReveniumGuardrail` with `default_on: true` and `post_call` among its modes, client mode leaves each proxied request to the guardrail, so the request is recorded once, with the guardrail's subscriber. The row names the deployment's model (the `litellm_params.model` behind the `model_name` your callers use, without its provider prefix), so a call to an alias is priced as the model it reached. The guardrail also meters streamed `/v1/responses` calls (Codex CLI, the OpenAI Agents SDK) for every provider. Client mode still records the proxied calls the guardrail does not meter, which today are streamed `/v1/completions` calls, and every call your own code in the proxy's process makes to LiteLLM directly.
 
@@ -1106,6 +1108,26 @@ calls: a failed call is recorded only for a request the Revenium guardrail's
 `pre_call` hook ran on, so a request LiteLLM refuses for a wrong or missing key
 sends no record. Adding `pre_call` enforces no budget unless
 `REVENIUM_CIRCUIT_BREAKER_ENABLED=true`.
+
+**A failed call** sends one record with stop reason `ERROR`, zero tokens (or the
+tokens the error reports), and the error's class as its error reason, followed by
+its HTTP status when the call got an HTTP error answer: `RateLimitError (HTTP 429)`
+for a provider's rate limit, `HTTPException (HTTP 400)` for a request another
+guardrail refused. That status is also the record's error code. A timeout, a
+refused connection and a failure with no HTTP status (`RuntimeError`, say) carry
+no error code. The message is added only as for the other integrations: with
+`REVENIUM_CAPTURE_ERROR_MESSAGES=true`, redacted, at most 255 characters, and for
+a provider's error or a guardrail's refusal, which can quote the request, only with
+`REVENIUM_CAPTURE_PROMPTS=true` as well. The duration runs from when LiteLLM
+started on the request (LiteLLM 1.102.0 and later; on older releases, from when
+it first handed the call to a provider) to the failure, and is 0 when LiteLLM
+recorded neither: before 1.102.0 for a call refused before it reached a provider,
+and on the moderation and audio routes. The time to first token is 0 and the
+completion start time is the moment of failure, as on the other integrations'
+failed records. A content block, whether a guardrail's or a provider's
+content-policy refusal, is recorded as `ERROR` with its class as the reason, not
+as `CONTENT_FILTER`. The deprecated callback's failure record carries the same
+error reason and error code.
 
 **Budget enforcement** reuses the SDK's own circuit breaker, so a proxy enforces
 exactly what every other Revenium integration enforces — including department
@@ -1378,6 +1400,44 @@ total, so a mint that quietly stopped shows up in the proxy log rather than as a
 return of double counting. Your other routes never carry an identifier and are never
 counted or warned about, so a proxy that also serves chat completions or embeddings
 stays quiet.
+
+##### Restarts and shutdown
+
+A proxy stopped by SIGTERM (a rolling restart, a scale-down) loses the usage
+records the SDK still holds for its last calls unless you serve it as shown here.
+uvicorn, which the `litellm` command starts, ends the process by re-raising SIGTERM
+once its own graceful shutdown is over, before the SDK's exit flush can run (see
+[Shutdown](#shutdown)), and LiteLLM calls no shutdown method on a guardrail or
+callback (checked on LiteLLM 1.94.0, 1.105.7 and 1.109.1), so the `guardrails`
+block cannot add one.
+
+Serve the proxy with uvicorn, through the SDK's wrapper of LiteLLM's app, instead of
+the `litellm` command:
+
+```bash
+CONFIG_FILE_PATH=config.yaml uvicorn revenium_middleware.litellm.proxy.asgi:app --host 0.0.0.0 --port 4000
+```
+
+It is LiteLLM's own app with one addition: once LiteLLM has finished its shutdown,
+spend-log flush included, the SDK sends the records it still holds, queued or held
+back while Revenium was not answering, before uvicorn ends the process. Requests
+pass through untouched. The flush takes at most `REVENIUM_SHUTDOWN_TIMEOUT_SECONDS`
+(5 seconds by default), so a Revenium that is slow or down delays the stop by that
+much at most; records still unsent then are dropped and counted in one warning, as
+at any other exit. An `on_metering_error` callback still running when that time is up
+does not hold the stop either: the proxy stops without waiting for it and logs a
+warning that says so. Leave room for it in the time your platform gives the proxy to
+stop (Kubernetes `terminationGracePeriodSeconds`, 30 seconds by default), on top of
+LiteLLM's own wait for in-flight requests. The flush ends metering in that process,
+and each uvicorn worker process flushes its own records.
+
+What the `litellm` command did before it started uvicorn is then yours to do. Its
+options become uvicorn options or environment variables (`--num_workers` is
+uvicorn's `--workers`), and a proxy with a database needs its schema set up first:
+`litellm --config config.yaml --skip_server_startup` does that and exits, on
+LiteLLM releases that have that option. An ASGI app you build around LiteLLM's
+yourself gets the same flush from `DrainMeteringOnShutdown(app)` in
+`revenium_middleware.litellm.proxy.shutdown`.
 
 ##### Migrating from the callback
 
@@ -1807,7 +1867,8 @@ Add business context to a call the SDK records by passing a `usage_metadata` dic
 These fields are shortened with a WARNING when longer than Revenium stores, so the call is still
 recorded: `trace_id`, `task_type`, `agent`, `subscription_id`, `parent_transaction_id`, `environment`,
 `region`, `transaction_name`, `operation_subtype`, `subscriber.id` and `subscriber.email` at 255
-characters, and `product_name` at 224. Other text fields are sent as given.
+characters, and `product_name` at 224. Other text fields are sent as given. A spending cap filtered
+on agent, task type or product judges the call by the shortened value, the one its record carries.
 
 | Field | Description | Use Case |
 |-------|-------------|----------|
@@ -1825,7 +1886,7 @@ characters, and `product_name` at 224. Other text fields are sent as given.
 | `effort` | Reasoning effort level requested of the model (free-form string, max 16 chars, `^[A-Za-z0-9_-]+$`) | Report what share of AI spend is high-effort reasoning, and compare cost per effort level |
 | `entrypoint` | How the coding assistant that made the call was launched, such as `cli`, `sdk-py` or `claude-vscode` (completions only, 1 to 64 chars, `^[A-Za-z0-9._-]+$`) | Split coding-assistant spend between the terminal, the SDKs and the editor or chat integrations |
 | `ccr_session_id` | The Claude Code cloud session the call ran in; `ccrSessionId` also accepted (completions only, 1 to 128 chars, `^[A-Za-z0-9_-]+$`) | Group the spend of one Claude Code cloud session |
-| `inference_geo` | Where the provider reports the inference ran, such as `us`; `inferenceGeo` also accepted (completions only, 1 to 16 chars, `^[A-Za-z0-9_-]+$`) | Passed to Revenium with the call; it is not stored as a dimension to group spend by |
+| `inference_geo` | Where the provider reports the inference ran, such as `us`; `inferenceGeo` also accepted (completions only, 1 to 16 chars, `^[A-Za-z0-9_-]+$`) | Passed to Revenium with the call, except on a Claude call recorded under a provider other than `ANTHROPIC`, since only Anthropic's own API applies a US-inference rate. It is not stored as a dimension to group spend by |
 
 **Example:**
 
@@ -1883,7 +1944,13 @@ where the provider says the inference ran. Both are values you supply per call;
 the SDK does not read them from the environment or from the provider response.
 `inference_geo` is sent exactly as given, with no lowercasing or allow-list;
 the backend normalizes it. It is not stored as a dimension to group spend by,
-so it cannot break spend down by geography. A value that is empty, too long (128 characters
+so it cannot break spend down by geography. Only Anthropic's own API applies a
+US-inference rate, so on a Claude call `inference_geo` is sent only when the call
+is recorded with provider `ANTHROPIC`. On a Claude call recorded under any other provider, such as
+`Bedrock`, `Foundry`, `Google` or `LITELLM`, it is left off. Claude through the
+older `AnthropicVertex` client is recorded as `ANTHROPIC` and still sends it.
+Calls to other vendors' models, and a direct `client.ai.create_completion`
+call, send it as given. A value that is empty, too long (128 characters
 for `ccr_session_id`, 16 for `inference_geo`) or holds anything but letters,
 digits, hyphens and underscores is left off the record with a WARNING, and the
 call is still recorded. Both are sent on completions only; image, video and
@@ -2614,7 +2681,9 @@ or unsent at the end are dropped and logged once, as a warning with a count.
 
 A process ended by SIGTERM's default action skips `atexit`, and with it that
 final flush. uvicorn, and so the LiteLLM proxy, ends that way once its own
-graceful shutdown has finished. For a script or worker with no SIGTERM handling
+graceful shutdown has finished; serve the proxy as described in
+[Restarts and shutdown](#restarts-and-shutdown) to flush within that shutdown
+instead. For a script or worker with no SIGTERM handling
 of its own, set `REVENIUM_INSTALL_SIGNAL_HANDLERS=1`: SIGTERM then flushes
 first and ends the process the same way. A SIGTERM handler your code installed
 before importing the SDK is called unchanged, and one installed afterwards
@@ -2666,7 +2735,7 @@ timeout raises `ValueError`.
 | `REVENIUM_METERING_BASE_URL` | `https://api.revenium.ai` | Revenium API endpoint |
 | `REVENIUM_LOG_LEVEL` | `INFO` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
 | `REVENIUM_CAPTURE_PROMPTS` | `false` | Enable prompt capture |
-| `REVENIUM_CAPTURE_ERROR_MESSAGES` | `false` | Send the exception message, redacted and capped at 2048 characters, with failed `@meter_tool` events and auto-failed `JobContext` outcomes, and cut to 255 characters (keeping its "(HTTP <status>)" ending) on the record of a failed OpenAI, Anthropic, LiteLLM, Google, Perplexity or Ollama call; off sends the exception class only (with the HTTP status for a failed call). A provider HTTP error's message, which can quote the request, is sent only when `REVENIUM_CAPTURE_PROMPTS` is also on |
+| `REVENIUM_CAPTURE_ERROR_MESSAGES` | `false` | Send the exception message, redacted and capped at 2048 characters, with failed `@meter_tool` events and auto-failed `JobContext` outcomes, and cut to 255 characters (keeping its "(HTTP <status>)" ending) on the record of a failed OpenAI, Anthropic, LiteLLM, Google, Perplexity or Ollama call; off sends the exception class only (with the HTTP status for a failed call). A provider HTTP error's message, or on a failed LiteLLM proxy call's record the `HTTPException` a guardrail refused it with, which can quote the request, is sent only when `REVENIUM_CAPTURE_PROMPTS` is also on |
 | `REVENIUM_SELECTIVE_METERING` | `false` | Only meter `@revenium_meter` decorated functions |
 | `REVENIUM_TEAM_ID` | - | Team ID for cost lookups and outcome reporting (JobContext team resolution) |
 | `REVENIUM_ENVIRONMENT` | - | Deployment environment (auto-detects from `ENVIRONMENT`, `DEPLOYMENT_ENV`) |

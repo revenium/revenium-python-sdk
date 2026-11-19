@@ -22,6 +22,7 @@ __all__ = [
     "STORED_LENGTHS",
     "guard_wire_fields",
     "stored_subscriber_value",
+    "stored_tag_value",
 ]
 
 _SLUG = re.compile(r"[A-Za-z0-9_-]+")
@@ -174,20 +175,29 @@ COMPLETION_FIELDS_REFUSING_EMPTY = frozenset(
 )
 
 
-def stored_subscriber_value(field: str, value: Any) -> Any:
-    """``value`` as Revenium stores a subscriber ``field`` (``id`` or ``email``), without logging."""
-    limit = _SUBSCRIBER_STORED_LENGTHS[field]
+def _stored(value: Any, limit: int) -> Any:
     if isinstance(value, str) and len(value) > limit:
         return value[:limit]
     return value
+
+
+def stored_subscriber_value(field: str, value: Any) -> Any:
+    """``value`` as Revenium stores a subscriber ``field`` (``id`` or ``email``), without logging."""
+    return _stored(value, _SUBSCRIBER_STORED_LENGTHS[field])
+
+
+def stored_tag_value(field: str, value: Any) -> Any:
+    """``value`` as Revenium stores a record ``field`` named in ``STORED_LENGTHS``, without logging."""
+    return _stored(value, STORED_LENGTHS[field])
 
 
 def _cut_overlong(record: Mapping[str, Any], lengths: Mapping[str, int], prefix: str) -> Dict[str, Any]:
     cut = dict(record)
     for field, limit in lengths.items():
         value = cut.get(field)
-        if isinstance(value, str) and len(value) > limit:
-            cut[field] = value[:limit]
+        shortened = _stored(value, limit)
+        if shortened is not value:
+            cut[field] = shortened
             logger.warning(_CUT_MESSAGE, prefix, field, len(value), limit)
     return cut
 

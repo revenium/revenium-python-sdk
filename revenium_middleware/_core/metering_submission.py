@@ -11,6 +11,7 @@ from revenium_middleware._core.context import (
     next_idempotency_key,
 )
 from revenium_middleware._core.delivery_circuit import get_circuit
+from revenium_middleware._core.inference_geo import without_inference_geo_anthropic_does_not_bill
 from revenium_middleware._core.json_safe import json_safe_record
 from revenium_middleware._core.metering import current_client
 from revenium_middleware._core import metering_buffer
@@ -90,6 +91,12 @@ def _accepted_fields(operation: str, args: Dict[str, Any]) -> Dict[str, Any]:
         return args
 
 
+def _fields_to_send(operation: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    if operation == "completion":
+        args = without_inference_geo_anthropic_does_not_bill(args)
+    return _accepted_fields(operation, _json_safe_args(operation, args))
+
+
 def _replay_payload(operation: str, merged_args: Dict[str, Any], client: Any) -> Dict[str, Any]:
     return {
         "operation": operation,
@@ -166,7 +173,7 @@ def submit_ai_event(
             "not via extra_headers; the wrapper owns this header"
         )
     merged_args = {
-        **_accepted_fields(operation, _json_safe_args(operation, args)),
+        **_fields_to_send(operation, args),
         "extra_headers": {**existing_headers, "Idempotency-Key": key},
     }
     _mask_prompt_fields(merged_args)

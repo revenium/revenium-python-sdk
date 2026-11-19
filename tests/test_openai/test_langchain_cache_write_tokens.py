@@ -13,6 +13,7 @@ from .test_cache_write_tokens import (  # noqa: F401  served_usage and served_mo
     LITELLM_CLAUDE_CHAT_USAGE,
     PROMPT,
     WRITING_CHAT_USAGE,
+    WRITING_RESPONSES_USAGE,
     WRITTEN,
     served_model,
     served_usage,
@@ -23,7 +24,11 @@ from .test_openai_sdk_entry_points import FakeOpenAI, payloads, sync_chat_create
 langchain_openai = pytest.importorskip("langchain_openai")
 
 from langchain_core.outputs import LLMResult  # noqa: E402
-from langchain_openai.chat_models.base import _create_usage_metadata  # noqa: E402
+from langchain_openai.chat_models.base import (  # noqa: E402
+    _construct_lc_result_from_responses_api,
+    _create_usage_metadata,
+)
+from openai.types.responses import Response  # noqa: E402
 
 from revenium_middleware._core.metering import current_client  # noqa: E402
 from revenium_middleware.openai.langchain.unified_handler import UnifiedReveniumCallbackHandler  # noqa: E402
@@ -85,6 +90,27 @@ def test_langchain_streamed_or_responses_openai_record_takes_cache_writes_out_of
     record = the_one_record(payloads)
     assert record["input_token_count"] == PROMPT - WRITTEN
     assert record["cache_creation_token_count"] == WRITTEN
+
+
+def test_langchain_responses_record_keeps_the_whole_write_and_sends_no_12h_share(payloads):
+    """langchain-openai rebuilds Responses usage as ``usage_metadata`` with only ``cache_read`` and
+    ``cache_creation``, so the 12-hour share OpenAI reports never reaches the callback."""
+    usage = {**WRITING_RESPONSES_USAGE, "input_tokens_details": {
+        **WRITING_RESPONSES_USAGE["input_tokens_details"],
+        "cache_write_tokens_details": {"ttl_12h_tokens": 4000, "ttl_30m_tokens": WRITTEN - 4000}}}
+    response = Response.model_validate({
+        "id": "resp_langchain", "created_at": 1, "model": LANGCHAIN_MODEL, "object": "response", "output": [],
+        "parallel_tool_calls": False, "tool_choice": "auto", "tools": [], "usage": usage,
+    })
+    chat_result = _construct_lc_result_from_responses_api(response)
+    llm_result = LLMResult(generations=[chat_result.generations], llm_output=chat_result.llm_output)
+
+    _meter_through_the_callback(llm_result, _run_info("openai"))
+
+    record = the_one_record(payloads)
+    assert "cache_creation12h_token_count" not in record
+    assert record["cache_creation_token_count"] == WRITTEN
+    assert record["input_token_count"] == PROMPT - WRITTEN
 
 
 def test_langchain_record_for_an_unlabelled_provider_is_unchanged(payloads):

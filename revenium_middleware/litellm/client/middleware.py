@@ -1,7 +1,5 @@
 import wrapt
-import httpx
 import inspect
-import openai
 import litellm
 import logging
 import datetime
@@ -41,9 +39,7 @@ from revenium_middleware._core.usage_iterations import (
     submit_iteration_records,
 )
 from revenium_middleware._core.prompt_extraction import extract_prompt_data_if_enabled
-from revenium_middleware._core.failed_calls import (
-    ERROR_STOP_REASON, exception_in_flight, failed_transaction_id, failure_of, raised_from_any,
-)
+from revenium_middleware._core.failed_calls import ERROR_STOP_REASON, exception_in_flight, failed_transaction_id
 from revenium_middleware._core.context import is_inside_decorated_function
 from revenium_middleware._core import submit_ai_event
 from revenium_middleware._core.log_sanitize import sanitize_for_logging
@@ -55,6 +51,7 @@ from revenium_middleware.litellm.proxy._metering_owner import (
     LITELLM_PROVIDER, guardrail_meters_request, proxy_meters_request
 )
 from revenium_middleware.litellm.proxy._health_check import is_litellm_health_check, note_health_check_skipped
+from .._failed_calls import litellm_call_failure
 from .context import metadata_context
 from .hooks import execute_metadata_hooks
 from . import trace_fields
@@ -357,9 +354,6 @@ def _meter_completion(response, call):
     return metered
 
 
-_NO_SERVER_ANSWERED = (openai.APIConnectionError, httpx.TransportError)
-
-
 def _failed_response(model):
     return SimpleNamespace(id=failed_transaction_id(), model=model,
                            usage=SimpleNamespace(prompt_tokens=0, completion_tokens=0, total_tokens=0))
@@ -379,16 +373,6 @@ def _record_failure(failure, call, last_chunk=None, usage=None):
         logger.warning("Could not record a failed LiteLLM call: %s", e)
 
 
-def _failure_of(error, outer):
-    """LiteLLM gives a connection error a status of 500 and a timeout one of
-    408 that no server answered, so neither names an HTTP status. On its
-    ``openai/`` and ``anthropic/`` providers it raises a refused connection as
-    an ``InternalServerError``, with the connection error only in its chain."""
-    if raised_from_any(error, outer, _NO_SERVER_ANSWERED):
-        return failure_of(error, outer, status=None)
-    return failure_of(error, outer)
-
-
 @contextmanager
 def _recording_failure(call):
     """Record a call the provider refused, then let the caller's exception through unchanged."""
@@ -396,7 +380,7 @@ def _recording_failure(call):
     try:
         yield
     except Exception as error:
-        _record_failure(_failure_of(error, outer), call)
+        _record_failure(litellm_call_failure(error, outer), call)
         raise
 
 
@@ -693,7 +677,7 @@ class _StreamMeter:
         return self._iterations or _iterations_the_stream_accumulated(self._provider_iterator)
 
     def _meter(self, completed, error):
-        failure = _failure_of(error, self._outer) if error is not None and self._call is not None else None
+        failure = litellm_call_failure(error, self._outer) if error is not None and self._call is not None else None
         usage = None if self._usage_chunk is not None else _usage_litellm_attached(self._last_chunk)
         if failure is not None:
             _record_failure(failure, self._call, self._usage_chunk or self._last_chunk, usage)

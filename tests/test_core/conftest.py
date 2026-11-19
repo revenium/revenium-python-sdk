@@ -312,7 +312,8 @@ class RecordingMeter:
 
             def _record_and_answer(self):
                 self.rfile.read(int(self.headers.get("Content-Length", 0)))
-                requests.append({"method": self.command, "path": self.path, "headers": dict(self.headers)})
+                requests.append({"method": self.command, "path": self.path, "headers": dict(self.headers),
+                                 "client_port": self.client_address[1]})
                 status, extra = (meter.status, meter.headers) if self.path.startswith("/meter/") else (201, {})
                 time.sleep(meter.delay)
                 reply = b'{"resourceType":"metered-event"}'

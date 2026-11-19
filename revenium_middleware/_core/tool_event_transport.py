@@ -8,16 +8,26 @@ to the loop that opened them.
 
 The client is never closed at exit, because the exit drain still sends
 queued tool events after ``atexit`` has run.
+
+Events of every customer key share the client's connections, which carry no
+state of their own: each request names its key in its own header. A cookie
+jar would carry state, so the client keeps none, and a Set-Cookie a gateway
+answers one key's event with never rides on another key's.
 """
 
 import os
 import threading
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import Any, Dict, Optional, Union
 
 import httpx
 
 _client: Optional[httpx.Client] = None
 _lock = threading.Lock()
+
+
+def _jar_that_keeps_no_cookies() -> CookieJar:
+    return CookieJar(policy=DefaultCookiePolicy(allowed_domains=[]))
 
 
 def _shared_client() -> httpx.Client:
@@ -31,7 +41,7 @@ def _shared_client() -> httpx.Client:
             # which sends through this module.
             from revenium_middleware._metering._constants import DEFAULT_CONNECTION_LIMITS
 
-            _client = httpx.Client(limits=DEFAULT_CONNECTION_LIMITS)
+            _client = httpx.Client(limits=DEFAULT_CONNECTION_LIMITS, cookies=_jar_that_keeps_no_cookies())
         return _client
 
 

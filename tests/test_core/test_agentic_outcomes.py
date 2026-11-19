@@ -941,6 +941,28 @@ def test_emit_completion_sends_token_counts_cost_and_subscriber():
 
 
 @pytest.mark.usefixtures("isolated_metering")
+def test_emit_completion_forwards_the_12h_cache_bucket_without_an_unknown_key_warning(caplog):
+    client, requests = _completion_client_recording_requests()
+    cache_write = {
+        "cacheCreationTokenCount": 120000,
+        "cacheCreation12hTokenCount": 100000,
+        "cacheCreation5mTokenCount": 20000,
+    }
+
+    with caplog.at_level("WARNING", logger="revenium_middleware.agentic_outcomes"):
+        client.emit_completion({**_REQUIRED_COMPLETION_FIELDS, **cache_write})
+        _wait_for_delivery()
+
+    body = _sent_body(requests[0])
+    assert {name: body.get(name, "<absent>") for name in cache_write} == cache_write
+    assert not [
+        r for r in caplog.records
+        if r.name == "revenium_middleware.agentic_outcomes" and "did not send payload keys" in r.getMessage()
+    ]
+    client.close()
+
+
+@pytest.mark.usefixtures("isolated_metering")
 def test_emit_completion_omits_fields_the_caller_did_not_set():
     client, requests = _completion_client_recording_requests()
     client.emit_completion(dict(_REQUIRED_COMPLETION_FIELDS))

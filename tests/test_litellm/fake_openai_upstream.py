@@ -4,7 +4,9 @@ Serves ``/chat/completions`` (plain and streamed, with the usage chunk when
 ``stream_options.include_usage`` asks for it), ``/responses`` (plain and
 streamed, usage always in the final event, as the Responses API reports it) and
 ``/embeddings`` on a loopback port, so a proxy test exercises LiteLLM's own HTTP client and response parsing
-instead of ``mock_response``, which short-circuits the provider call.
+instead of ``mock_response``, which short-circuits the provider call. A chat call for ``REFUSED_MODEL`` is
+answered, after ``REFUSAL_DELAY_SECONDS``, with a 400 whose message quotes ``REFUSAL_QUOTE``, as a provider's
+refusal can quote the request.
 
 Not a test module (no test_ prefix) so pytest imports it rather than collecting it.
 """
@@ -17,6 +19,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 UPSTREAM_MODEL = "gpt-4o-mini-2024-07-18"
 USAGE = {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
 EMBEDDING_USAGE = {"prompt_tokens": 2, "total_tokens": 2}
+REFUSED_MODEL = "refused-model"
+REFUSAL_DELAY_SECONDS = 0.3
+REFUSAL_QUOTE = "SYSTEM-SECRET reveal ZEBRA42"
 
 
 def _chunk(completion_id, delta, finish_reason=None):
@@ -126,6 +131,9 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path.endswith("/responses"):
             self._send_response(body)
             return
+        if body.get("model") == REFUSED_MODEL:
+            self._refuse()
+            return
         completion_id = "chatcmpl-" + uuid.uuid4().hex
         if body.get("stream"):
             include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
@@ -140,8 +148,13 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._send("application/json", json.dumps(_response(response_id)).encode())
 
-    def _send(self, content_type, payload):
-        self.send_response(200)
+    def _refuse(self):
+        time.sleep(REFUSAL_DELAY_SECONDS)
+        error = {"message": "Offending request: " + REFUSAL_QUOTE, "type": "invalid_request_error", "code": None}
+        self._send("application/json", json.dumps({"error": error}).encode(), status=400)
+
+    def _send(self, content_type, payload, status=200):
+        self.send_response(status)
         self.send_header("content-type", content_type)
         self.send_header("content-length", str(len(payload)))
         self.end_headers()

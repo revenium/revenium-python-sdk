@@ -463,6 +463,21 @@ class TestFailedToolErrorText:
         assert "AIzaFAKE-0001" not in json.dumps(body)
         assert "Downing" not in json.dumps(body)
 
+    def test_opt_in_sends_a_web_frameworks_http_exception_message(self, endpoint, monkeypatch):
+        """Prompt capture gates only a provider's error; a tool's own HTTPException is the customer's to send."""
+        starlette_exceptions = pytest.importorskip("starlette.exceptions")
+        monkeypatch.setenv(CAPTURE_ERROR_MESSAGES, "true")
+        monkeypatch.delenv("REVENIUM_CAPTURE_PROMPTS", raising=False)
+
+        @meter_tool("orders")
+        def lookup_order():
+            raise starlette_exceptions.HTTPException(404, detail="order not found")
+
+        with pytest.raises(Exception):
+            lookup_order()
+
+        assert posted_body(endpoint)["errorMessage"] == "HTTPException: 404: order not found"
+
     def test_opt_in_sends_message_with_query_values_redacted_and_capped(self, endpoint, monkeypatch):
         monkeypatch.setenv(CAPTURE_ERROR_MESSAGES, "true")
 

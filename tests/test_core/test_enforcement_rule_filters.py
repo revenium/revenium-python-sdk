@@ -16,6 +16,7 @@ import pytest
 
 from revenium_middleware._core import enforcement
 from revenium_middleware._core.exceptions import BudgetExceededError
+from revenium_middleware._core.wire_guards import STORED_LENGTHS, guard_wire_fields
 
 from .enforcement_stub_server import HEALTHY, EnforcementStub, point_enforcement_at, shut_down, wait_until
 
@@ -543,6 +544,41 @@ def test_task_type_product_and_organization_filters_read_the_metered_fields(cap,
 
     assert blocked({key: "wanted"})
     assert not blocked({key: "other"})
+
+
+@pytest.mark.parametrize("dimension, key", [
+    ("AGENT", "agent"),
+    ("TASK_TYPE", "task_type"),
+    ("PRODUCT", "product_name"),
+])
+def test_a_tag_longer_than_revenium_stores_is_judged_by_the_value_its_record_carries(cap, dimension, key):
+    """BACK-4529: the record cuts the tag to its stored length, so a cap
+    naming the cut value holds the longer one the caller sent."""
+    stored_length = STORED_LENGTHS[key]
+    sent = "a" * stored_length + "-and-more"
+    cap(filtered_rule([f(dimension, "IS", sent[:stored_length])]))
+
+    assert blocked({key: sent})
+    assert not blocked({key: "b" * stored_length + "-and-more"})
+
+
+@pytest.mark.parametrize("dimension, key", [
+    ("AGENT", "agent"),
+    ("TASK_TYPE", "task_type"),
+    ("PRODUCT", "product_name"),
+])
+def test_a_non_ascii_tag_cut_at_its_stored_length_is_judged_by_the_value_the_wire_record_carries(
+        cap, dimension, key):
+    """BACK-4529: the cap check and the record cut a tag whose last stored
+    character is not ASCII to the same characters."""
+    stored_length = STORED_LENGTHS[key]
+    sent = "a" * (stored_length - 1) + "é語-and-more"
+    carried = guard_wire_fields({key: sent}, "completion")[key]
+    assert carried == "a" * (stored_length - 1) + "é"
+    cap(filtered_rule([f(dimension, "IS", carried)]))
+
+    assert blocked({key: sent})
+    assert not blocked({key: "a" * (stored_length - 1) + "語-and-more"})
 
 
 # ---- AC4: no filters --------------------------------------------------------
