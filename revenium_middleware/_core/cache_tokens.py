@@ -102,7 +102,9 @@ def without_openai_cache_writes(prompt_tokens: int, usage: Any) -> int:
     """``prompt_tokens`` less the OpenAI cache write it contains, never below 0.
 
     Cache reads stay in: the platform removes them itself for OpenAI-shaped
-    rows (see ``billable_input_tokens``).
+    rows (see ``billable_input_tokens``). The one exception is Bedrock's
+    OpenAI-compatible runtime routes, whose read ``billable_input_tokens``
+    removes (``_BEDROCK_OPENAI_SHAPED_ROUTES``, BACK-6110).
     """
     written = openai_cache_write_tokens(usage)
     if not prompt_tokens or not written:
@@ -141,8 +143,12 @@ def billable_input_tokens(
     and through ``prompt_folds_claude_cache`` for the OpenAI client's records
     of a gateway serving Claude. On Bedrock the cache is also removed for every
     call whose usage LiteLLM built with a conversion that counts it inside the
-    prompt, whatever the model is called (``prompt_tokens_fold_cache``). Every
-    other model's prompt count is reported exactly as LiteLLM built it.
+    prompt, whatever the model is called (``prompt_tokens_fold_cache``). That
+    includes the one OpenAI-shaped case removed here: GPT and Grok on Bedrock's
+    OpenAI-compatible runtime routes, priced from a ``bedrock_converse`` row the
+    platform does not net (``_BEDROCK_OPENAI_SHAPED_ROUTES``, BACK-6110). If the
+    platform starts netting those rows, that case must go in the same release.
+    Every other model's prompt count is reported exactly as LiteLLM built it.
 
     A count that comes out negative contradicts the cache counts reported
     beside it, so it is reported unchanged and said out loud rather than
@@ -167,10 +173,11 @@ ANTHROPIC_MESSAGES_CALL_TYPE = "anthropic_messages"
 # LiteLLM ``custom_llm_provider`` values whose usage conversion folds the cache
 # buckets into ``prompt_tokens`` *and* whose rows the platform stores as sent.
 # Anthropic-shaped usage is the one usage shape Revenium never normalizes
-# server-side (see billable_input_tokens), so it is the only overlap this row
-# may remove: here for direct Anthropic, and in ``_CLAUDE_HOSTING_PROVIDERS``
+# server-side (see billable_input_tokens), so it is the overlap this row
+# removes: here for direct Anthropic, and in ``_CLAUDE_HOSTING_PROVIDERS``
 # for Claude on Bedrock and Vertex AI, plus the Bedrock conversions that build
-# the same shape whatever the model is named.
+# the same shape whatever the model is named. The only OpenAI-shaped overlap
+# removed is the read on ``_BEDROCK_OPENAI_SHAPED_ROUTES``.
 _CACHE_FOLDING_PROVIDERS = frozenset({"anthropic", "anthropic_text"})
 
 # Providers that fold the same way when the model they serve is Claude, or, on
@@ -179,7 +186,12 @@ _CACHE_FOLDING_PROVIDERS = frozenset({"anthropic", "anthropic_text"})
 # conversions all build ``prompt_tokens`` as uncached input plus cache read plus
 # cache write. Gemini on Vertex AI is reported gross by Google and netted by the
 # platform.
-_CLAUDE_HOSTING_PROVIDERS = frozenset({"bedrock", "vertex_ai"})
+#
+# ``bedrock_mantle`` is LiteLLM's second name for Bedrock's Mantle endpoint
+# (``bedrock/mantle/<model>`` reports ``bedrock``). Only Claude is netted there:
+# the platform nets the OpenAI-shaped Mantle rows itself, so netting them here
+# as well would take the read out twice (BACK-6110, BACK-6099).
+_CLAUDE_HOSTING_PROVIDERS = frozenset({"bedrock", "bedrock_mantle", "vertex_ai"})
 
 # Only the top-level fields LiteLLM fills with the deployment it called.
 _MODEL_FIELDS = ("model", "litellm_model_name")
@@ -297,12 +309,14 @@ def prompt_tokens_fold_cache(*sources):
     Anthropic (BACK-4162), anything else is not. On ``bedrock`` Claude is folded
     by name, and any other model is folded when LiteLLM's own routing for it
     builds usage with a conversion that counts the cache inside the prompt
-    (BACK-5780): an application inference profile ARN, Nova. The model is the
+    (BACK-5780): an application inference profile ARN, Nova, and the
+    OpenAI-compatible runtime routes unless the id is an in-Region ``openai.*``
+    one (BACK-6110). On ``bedrock_mantle`` only Claude is folded. The model is the
     first top-level ``model`` or ``litellm_model_name`` on any source, both
     filled by LiteLLM with the deployment it called. The caller's alias, in the
     request body, its metadata or a gateway's non-streamed ``response.model``,
     is never handed in by a gateway hook, so it cannot turn a Gemini
-    or Bedrock ``chat_completions`` deployment's count into a netted one.
+    or Bedrock Mantle GPT deployment's count into a netted one.
 
     With nothing to read, the prompt count stays as LiteLLM built it: reporting
     a gross count costs the cache overlap twice for Anthropic only, while
@@ -328,6 +342,25 @@ _ANTHROPIC_STYLE_READ_ONLY_FOLD_RELEASES = ((1, 66, 0), (1, 77, 3))
 _CONVERSE_READ_ONLY_FOLD_RELEASES = ((1, 66, 0), (1, 78, 0))
 
 _BEDROCK_CONVERSE_ROUTES = frozenset({"converse", "converse_like"})
+
+# LiteLLM's OpenAI-compatible routes to Bedrock's runtime endpoint: its default
+# for GPT 5.6 and, from 1.110, Grok, and the ``chat_completions/`` and
+# ``openai/`` prefixes. They report the cache read inside ``prompt_tokens`` the
+# way OpenAI does, but the platform prices these models from the same catalog
+# row as their Converse calls, which arrive net, so it cannot net one and not
+# the other: the read comes out here (BACK-6110).
+_BEDROCK_OPENAI_SHAPED_ROUTES = frozenset({"chat_completions", "openai"})
+_OPENAI_SHAPED = "openai"
+
+# An in-Region OpenAI id (``openai.gpt-5.6-luna``, no ``us.`` or ``global.``
+# profile) has no catalog row of its own: the platform prices it from the
+# ``bedrock_mantle/openai.*`` row and nets the read there (hypercurrent's
+# ``CachePoolShape.isOpenAiOnMantle``), so it stays gross here.
+_IN_REGION_OPENAI_ID_PREFIX = "openai."
+
+
+def _platform_nets_the_read(model: str) -> bool:
+    return model.rsplit("/", 1)[-1].lower().startswith(_IN_REGION_OPENAI_ID_PREFIX)
 
 
 def _installed_litellm_version() -> Optional[str]:
@@ -360,7 +393,9 @@ def _bedrock_usage_family(model: str) -> Tuple[Any, Optional[BaseException]]:
 
     Returns ``(family, error)``. ``family`` is ``"converse"`` or ``"anthropic"``,
     both of which count the cache inside ``prompt_tokens`` and differ in when
-    LiteLLM started counting the write; ``None`` for any other route or
+    LiteLLM started counting the write; ``_OPENAI_SHAPED`` for a route that
+    counts the read inside it and whose write ``without_openai_cache_writes``
+    has already removed; ``None`` for any other route or
     provider; ``_UNKNOWN`` when LiteLLM cannot route at all; or
     ``_INVOKE_PROVIDER_UNKNOWN`` for an invoke route whose provider it could not
     name. ``error`` is the exception LiteLLM raised for the last two, else
@@ -375,6 +410,8 @@ def _bedrock_usage_family(model: str) -> Tuple[Any, Optional[BaseException]]:
         return _UNKNOWN, error
     if route in _BEDROCK_CONVERSE_ROUTES:
         return "converse", None
+    if route in _BEDROCK_OPENAI_SHAPED_ROUTES:
+        return _OPENAI_SHAPED, None
     if route != "invoke":
         return None, None
     try:
@@ -408,6 +445,8 @@ def _bedrock_usage_folds_cache(model: str) -> bool:
     if family is _UNKNOWN or family is _INVOKE_PROVIDER_UNKNOWN:
         _warn_bedrock_routing_unavailable_once(error)
         return False
+    if family == _OPENAI_SHAPED:
+        return not _platform_nets_the_read(model)
     return family is not None
 
 
@@ -429,15 +468,32 @@ def routes_via_bedrock_converse(*sources) -> bool:
 
 
 def cache_creation_inside_litellm_prompt(cache_creation_tokens: int, *sources) -> int:
-    """The part of a cache write that LiteLLM's ``prompt_tokens`` contains.
+    """The part of a cache write still inside a LiteLLM prompt count that has
+    been through ``without_openai_cache_writes``.
 
     What ``billable_input_tokens`` may take out of a folded LiteLLM prompt
     count; the write itself is still reported in full beside it. ``sources``
     are the ones handed to ``prompt_tokens_fold_cache`` for the same call.
+
+    Callers apply ``without_openai_cache_writes`` to ``prompt_tokens`` first.
+    On Bedrock's OpenAI-compatible routes (``_BEDROCK_OPENAI_SHAPED_ROUTES``)
+    that step has already removed the write, so the answer there is 0.
     """
+    if _write_left_the_prompt_as_an_openai_write(sources):
+        return 0
     if litellm_folds_cache_write(converse=routes_via_bedrock_converse(*sources)):
         return cache_creation_tokens
     return 0
+
+
+def _write_left_the_prompt_as_an_openai_write(sources) -> bool:
+    if _upstream_provider(sources) != "bedrock":
+        return False
+    model = _first_named_model(sources)
+    if not model or names_claude_model(model):
+        return False
+    family, _ = _bedrock_usage_family(str(model))
+    return family == _OPENAI_SHAPED
 
 
 def total_priced_tokens(

@@ -660,6 +660,10 @@ BEDROCK_NOVA = "us.amazon.nova-micro-v1:0"
 BEDROCK_NOVA_INVOKE = "invoke/us.amazon.nova-pro-v1:0"
 BEDROCK_ARN = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123"
 BEDROCK_GPT_OSS = "chat_completions/openai.gpt-oss-120b-1:0"
+BEDROCK_MANTLE_ROUTE_GPT = "mantle/openai.gpt-5.5"
+BEDROCK_RUNTIME_GPT = "us.openai.gpt-5.6-luna"
+MANTLE_PROVIDER = "bedrock_mantle"
+MANTLE_CLAUDE = "anthropic.claude-haiku-4-5"
 VERTEX_CLAUDE = "claude-haiku-4-5@20251001"
 VERTEX_GEMINI = "gemini-2.5-flash-lite"
 
@@ -954,15 +958,15 @@ class TestClaudeOnBedrockAndVertexIsNettedOnEveryLeg:
         assert args["cache_read_token_count"] == 4084
 
     @pytest.mark.asyncio
-    async def test_a_caller_alias_naming_nova_does_not_net_a_bedrock_gpt_oss_deployment_in_the_guardrail(
+    async def test_a_caller_alias_naming_nova_does_not_net_a_bedrock_mantle_gpt_deployment_in_the_guardrail(
             self, guardrail, submit):
         data = guardrail_data(
             stream=False, model="team-nova", custom_llm_provider="bedrock",
-            upstream_model=BEDROCK_GPT_OSS, metadata={"model_group": "team-nova"},
+            upstream_model=BEDROCK_MANTLE_ROUTE_GPT, metadata={"model_group": "team-nova"},
         )
         data["litellm_params"] = {"custom_llm_provider": "bedrock", "metadata": {"model_group": "team-nova"}}
         response = GuardrailResponse(response_id="chatcmpl-team-nova", usage=openai_shaped_usage(),
-                                     hidden_params={"litellm_model_name": "bedrock/" + BEDROCK_GPT_OSS})
+                                     hidden_params={"litellm_model_name": "bedrock/" + BEDROCK_MANTLE_ROUTE_GPT})
         response.model = "team-nova"
 
         await guardrail.async_post_call_success_hook(
@@ -973,8 +977,8 @@ class TestClaudeOnBedrockAndVertexIsNettedOnEveryLeg:
         assert args["input_token_count"] == OPENAI_SHAPED_PROMPT
         assert args["cache_read_token_count"] == ROUTE_READ
 
-    def test_a_caller_alias_naming_nova_does_not_net_a_bedrock_gpt_oss_deployment_in_the_callback(self):
-        kwargs = base_kwargs(model=BEDROCK_GPT_OSS, custom_llm_provider="bedrock")
+    def test_a_caller_alias_naming_nova_does_not_net_a_bedrock_mantle_gpt_deployment_in_the_callback(self):
+        kwargs = base_kwargs(model=BEDROCK_MANTLE_ROUTE_GPT, custom_llm_provider="bedrock")
         kwargs["litellm_params"]["metadata"]["model_group"] = "team-nova"
         response = make_success_response(openai_shaped_usage())
         response.model = "team-nova"
@@ -1104,21 +1108,140 @@ class TestAnApplicationInferenceProfileArnAndNovaAreNettedOnEveryLeg:
         }] * 2
 
     @pytest.mark.asyncio
-    async def test_an_openai_shaped_bedrock_route_does_not_lose_its_write_twice(self, guardrail, submit):
+    async def test_an_openai_shaped_bedrock_route_loses_its_read_and_its_write_once(self, guardrail, submit):
         usage = openai_shaped_usage(cache_write=ROUTE_WRITE)
         await guardrail.async_post_call_success_hook(
             data=guardrail_data(stream=False, model="caller-alias", custom_llm_provider="bedrock",
-                                upstream_model=BEDROCK_GPT_OSS),
+                                upstream_model=BEDROCK_RUNTIME_GPT),
             user_api_key_dict=make_key_dict(),
-            response=GuardrailResponse(response_id="chatcmpl-gpt-oss", usage=usage),
+            response=GuardrailResponse(response_id="chatcmpl-runtime-gpt", usage=usage),
         )
 
         rows = without_the_guardrail(submit) + [callback_success(
-            base_kwargs(model=BEDROCK_GPT_OSS, custom_llm_provider="bedrock"), make_success_response(usage),
+            base_kwargs(model=BEDROCK_RUNTIME_GPT, custom_llm_provider="bedrock"), make_success_response(usage),
         )]
         for args in rows:
-            assert args["input_token_count"] == OPENAI_SHAPED_PROMPT - ROUTE_WRITE
+            assert args["input_token_count"] == OPENAI_SHAPED_PROMPT - ROUTE_WRITE - ROUTE_READ
             assert args["cache_read_token_count"] == ROUTE_READ
+            assert args["cache_creation_token_count"] == ROUTE_WRITE
+
+
+# --- LiteLLM's ``bedrock_mantle`` provider and its OpenAI-compatible Bedrock routes (BACK-6110) ---
+#
+# Counts captured on revenium-python-sdk 0.16.0 with LiteLLM 1.110.2 against real Bedrock.
+
+MANTLE_HIT = {"input_tokens": 25, "output_tokens": 18, "cache_read_input_tokens": 5742}
+MANTLE_WRITE = {"input_tokens": 23, "output_tokens": 18, "cache_creation_input_tokens": 5742}
+RUNTIME_GPT_PROMPT, RUNTIME_GPT_READ = 4830, 4828
+
+
+def mantle_claude_usage(reported):
+    """Mantle serves Claude on Anthropic's Messages API, which LiteLLM converts with
+    ``AnthropicConfig.calculate_usage``; its Mantle config inherits it unchanged."""
+    return AnthropicConfig().calculate_usage(dict(reported), None)
+
+
+def runtime_gpt_usage():
+    return SimpleNamespace(
+        prompt_tokens=RUNTIME_GPT_PROMPT, completion_tokens=40, total_tokens=RUNTIME_GPT_PROMPT + 40,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=RUNTIME_GPT_READ),
+    )
+
+
+async def rows_of_every_integration(guardrail, submit, provider, model, usage):
+    """The same call as the guardrail's two hooks, the deprecated callback and the client meter it."""
+    await guardrail.async_post_call_success_hook(
+        data=guardrail_data(stream=False, model="caller-alias", custom_llm_provider=provider,
+                            upstream_model=model),
+        user_api_key_dict=make_key_dict(),
+        response=GuardrailResponse(response_id="chatcmpl-every-integration", usage=usage()),
+    )
+    await guardrail.async_log_success_event(
+        logging_kwargs(provider, model), GuardrailResponse(response_id="msg-every-integration", usage=usage()),
+        NOW, LATER,
+    )
+    rows = without_the_guardrail(submit) + [
+        callback_success(base_kwargs(model=model, custom_llm_provider=provider), make_success_response(usage())),
+        client_row(provider, model, usage(), litellm_model_name=provider + "/" + model),
+    ]
+    assert len(rows) == 4
+    return [priced(row) for row in rows]
+
+
+class TestClaudeOnTheBedrockMantleProviderIsNettedInEveryIntegration:
+
+    @pytest.mark.asyncio
+    async def test_a_cache_hit_is_sent_with_only_its_uncached_input(self, guardrail, submit):
+        assert mantle_claude_usage(MANTLE_HIT).prompt_tokens == 5767
+
+        rows = await rows_of_every_integration(
+            guardrail, submit, MANTLE_PROVIDER, MANTLE_CLAUDE, lambda: mantle_claude_usage(MANTLE_HIT))
+
+        assert rows == [{
+            "input_token_count": 25, "cache_read_token_count": 5742, "cache_creation_token_count": 0,
+        }] * 4
+
+    @pytest.mark.asyncio
+    async def test_a_cache_write_is_sent_with_only_its_uncached_input(self, guardrail, submit):
+        assert mantle_claude_usage(MANTLE_WRITE).prompt_tokens == 5765
+
+        rows = await rows_of_every_integration(
+            guardrail, submit, MANTLE_PROVIDER, MANTLE_CLAUDE, lambda: mantle_claude_usage(MANTLE_WRITE))
+
+        assert rows == [{
+            "input_token_count": 23, "cache_read_token_count": 0, "cache_creation_token_count": 5742,
+        }] * 4
+
+    def test_the_client_nets_the_model_name_litellm_resolved(self):
+        row = client_row(MANTLE_PROVIDER, "claude-haiku-4-5-20251001", mantle_claude_usage(MANTLE_HIT))
+
+        assert row["input_token_count"] == 25
+        assert row["cache_read_token_count"] == 5742
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("model", ["openai.gpt-5.5", "xai.grok-4.3"])
+    async def test_a_gpt_or_grok_call_on_the_same_provider_stays_gross_for_the_platform_to_net(
+            self, guardrail, submit, model):
+        rows = await rows_of_every_integration(guardrail, submit, MANTLE_PROVIDER, model, runtime_gpt_usage)
+
+        assert rows == [{
+            "input_token_count": RUNTIME_GPT_PROMPT, "cache_read_token_count": RUNTIME_GPT_READ,
+            "cache_creation_token_count": 0,
+        }] * 4
+
+
+class TestBedrockRuntimeRoutesToGptAndGrokCountACachedReadOnce:
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("model", [
+        BEDROCK_RUNTIME_GPT,
+        "chat_completions/" + BEDROCK_RUNTIME_GPT,
+        "openai/" + BEDROCK_RUNTIME_GPT,
+        "chat_completions/us.xai.grok-4.7",
+        "openai/us.xai.grok-4.7",
+    ])
+    async def test_every_integration_takes_the_read_out_of_the_input(self, guardrail, submit, model):
+        rows = await rows_of_every_integration(guardrail, submit, "bedrock", model, runtime_gpt_usage)
+
+        assert rows == [{
+            "input_token_count": RUNTIME_GPT_PROMPT - RUNTIME_GPT_READ,
+            "cache_read_token_count": RUNTIME_GPT_READ,
+            "cache_creation_token_count": 0,
+        }] * 4
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("model", [
+        BEDROCK_MANTLE_ROUTE_GPT,
+        "chat_completions/openai.gpt-5.6-luna",
+        "openai/openai.gpt-5.6-luna",
+    ], ids=["mantle-route", "in-region-id-chat-completions", "in-region-id-openai-route"])
+    async def test_a_call_the_platform_prices_from_a_mantle_row_stays_gross(self, guardrail, submit, model):
+        rows = await rows_of_every_integration(guardrail, submit, "bedrock", model, runtime_gpt_usage)
+
+        assert rows == [{
+            "input_token_count": RUNTIME_GPT_PROMPT, "cache_read_token_count": RUNTIME_GPT_READ,
+            "cache_creation_token_count": 0,
+        }] * 4
 
 
 class TestAnArnOnV1MessagesIsNetted:
@@ -1209,5 +1332,8 @@ def test_litellm_routes_bedrock_names_the_way_the_netting_assumes():
 
     assert BedrockModelInfo.get_bedrock_route(BEDROCK_ARN) == "converse"
     assert BedrockModelInfo.get_bedrock_route(BEDROCK_GPT_OSS) == "chat_completions"
+    assert BedrockModelInfo.get_bedrock_route(BEDROCK_RUNTIME_GPT) == "chat_completions"
+    assert BedrockModelInfo.get_bedrock_route("openai/" + BEDROCK_RUNTIME_GPT) == "openai"
+    assert BedrockModelInfo.get_bedrock_route(BEDROCK_MANTLE_ROUTE_GPT) == "mantle"
     assert BaseAWSLLM.get_bedrock_invoke_provider(BEDROCK_NOVA_INVOKE) == "nova"
     assert BaseAWSLLM.get_bedrock_invoke_provider("invoke/anthropic/" + BEDROCK_ARN) == "anthropic"
