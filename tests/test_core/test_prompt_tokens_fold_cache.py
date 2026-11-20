@@ -71,8 +71,6 @@ def test_bedrock_usage_litellm_folds_is_netted_whatever_the_model(model):
 
 @pytest.mark.parametrize("model, expected", [
     pytest.param("invoke/us.meta.llama3-3-70b-instruct-v1:0", False, id="llama-invoke"),
-    pytest.param("chat_completions/openai.gpt-oss-120b-1:0", False, id="chat-completions"),
-    pytest.param("openai/openai.gpt-oss-120b-1:0", False, id="openai-route"),
     pytest.param("mantle/openai.gpt-5.5", False, id="mantle"),
     pytest.param("invoke/" + BEDROCK_ARN, False, id="invoke-application-profile-arn"),
     pytest.param(BEDROCK_ARN.upper(), False, id="upper-case-arn"),
@@ -80,6 +78,59 @@ def test_bedrock_usage_litellm_folds_is_netted_whatever_the_model(model):
 ])
 def test_bedrock_routes_whose_usage_litellm_does_not_fold_keep_the_claude_rule(model, expected):
     assert prompt_tokens_fold_cache({"custom_llm_provider": "bedrock", "model": model}) is expected
+
+
+@pytest.mark.parametrize("model", [
+    pytest.param("us.openai.gpt-5.6-luna", id="gpt-5.6-default-route"),
+    pytest.param("chat_completions/us.openai.gpt-5.6-luna", id="gpt-5.6-chat-completions"),
+    pytest.param("openai/us.openai.gpt-5.6-luna", id="gpt-5.6-openai-route"),
+    pytest.param("us.xai.grok-4.7", id="grok-default-route"),
+    pytest.param("chat_completions/us.xai.grok-4.7", id="grok-chat-completions"),
+    pytest.param("openai/us.xai.grok-4.7", id="grok-openai-route"),
+    pytest.param("converse/us.xai.grok-4.7", id="grok-converse"),
+    pytest.param("chat_completions/global.openai.gpt-5.6-luna", id="gpt-5.6-global-profile"),
+    pytest.param("chat_completions/xai.grok-4.7", id="grok-in-region"),
+])
+@requires_litellm
+def test_every_bedrock_runtime_route_to_gpt_and_grok_is_netted(model):
+    """These models are priced from one catalog row whichever route served them (BACK-6110)."""
+    assert prompt_tokens_fold_cache({"custom_llm_provider": "bedrock", "model": model}) is True
+    assert prompt_tokens_fold_cache({"custom_llm_provider": "bedrock", "litellm_model_name": model}) is True
+
+
+@pytest.mark.parametrize("model", [
+    pytest.param("chat_completions/openai.gpt-5.6-luna", id="chat-completions"),
+    pytest.param("openai/openai.gpt-5.6-luna", id="openai-route"),
+    pytest.param("bedrock/chat_completions/openai.gpt-5.6-luna", id="provider-prefixed"),
+    pytest.param("chat_completions/OPENAI.gpt-5.6-luna", id="upper-case"),
+    pytest.param("chat_completions/openai.gpt-oss-120b-1:0", id="gpt-oss"),
+])
+@requires_litellm
+def test_an_in_region_openai_id_on_those_routes_stays_gross_for_the_platform_to_net(model):
+    """It is priced from the ``bedrock_mantle/openai.*`` row, whose read the platform takes out."""
+    assert prompt_tokens_fold_cache({"custom_llm_provider": "bedrock", "model": model}) is False
+
+
+@pytest.mark.parametrize("model", [
+    pytest.param("anthropic.claude-haiku-4-5", id="deployment-name"),
+    pytest.param("claude-haiku-4-5-20251001", id="resolved-name"),
+    pytest.param("bedrock_mantle/anthropic.claude-haiku-4-5", id="provider-prefixed"),
+])
+def test_claude_on_the_bedrock_mantle_provider_folds(model):
+    """``bedrock_mantle/<model>`` is a provider of its own; ``bedrock/mantle/<model>`` reports ``bedrock``."""
+    assert prompt_tokens_fold_cache({"custom_llm_provider": "bedrock_mantle", "model": model}) is True
+    assert prompt_tokens_fold_cache({"custom_llm_provider": "bedrock_mantle", "litellm_model_name": model}) is True
+
+
+@pytest.mark.parametrize("sources", [
+    pytest.param(({"custom_llm_provider": "bedrock_mantle", "model": "openai.gpt-5.5"},), id="gpt"),
+    pytest.param(({"custom_llm_provider": "bedrock_mantle", "model": "xai.grok-4.3"},), id="grok"),
+    pytest.param(({"custom_llm_provider": "bedrock_mantle", "model": "chat_completions/openai.gpt-5.5"},),
+                 id="a-runtime-route-name-on-mantle"),
+    pytest.param(({"custom_llm_provider": "bedrock_mantle"},), id="no-model"),
+])
+def test_the_platform_nets_every_other_model_on_the_bedrock_mantle_provider(sources):
+    assert prompt_tokens_fold_cache(*sources) is False
 
 
 @pytest.fixture
@@ -223,6 +274,8 @@ def test_bedrock_claude_routes_via_converse(sources):
                  id="bedrock-invoke-litellm-model-name"),
     pytest.param(({"custom_llm_provider": "vertex_ai", "model": VERTEX_CLAUDE},), id="vertex-claude"),
     pytest.param(({"custom_llm_provider": "anthropic", "model": "claude-haiku-4-5"},), id="anthropic"),
+    pytest.param(({"custom_llm_provider": "bedrock_mantle", "model": "anthropic.claude-haiku-4-5"},),
+                 id="bedrock-mantle-claude"),
     pytest.param(({"call_type": "anthropic_messages"}, {"custom_llm_provider": "bedrock", "model": BEDROCK_CLAUDE}),
                  id="anthropic-messages-call-type-first"),
     pytest.param((), id="no-sources"),
@@ -256,6 +309,10 @@ def test_converse_is_assumed_unless_invoke_is_named_when_litellm_cannot_say(
                  marks=requires_litellm),
     ("1.77.3", ({"custom_llm_provider": "bedrock", "model": "invoke/anthropic/" + BEDROCK_ARN},), 4700),
     ("1.104.2", ({"custom_llm_provider": "bedrock", "model": BEDROCK_ARN},), 4700),
+    ("1.104.2", ({"custom_llm_provider": "bedrock_mantle", "model": "anthropic.claude-haiku-4-5"},), 4700),
+    ("1.70.0", ({"custom_llm_provider": "bedrock_mantle", "model": "anthropic.claude-haiku-4-5"},), 0),
+    pytest.param("1.104.2", ({"custom_llm_provider": "bedrock", "model": "chat_completions/us.openai.gpt-5.6-luna"},),
+                 0, marks=requires_litellm, id="an-openai-write-is-already-out-of-the-prompt"),
 ])
 def test_only_a_write_litellm_folded_is_taken_out(litellm_version, version, sources, expected):
     litellm_version(version)

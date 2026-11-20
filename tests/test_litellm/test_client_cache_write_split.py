@@ -301,8 +301,8 @@ def test_the_client_judges_the_deployment_not_the_stripped_response_model(payloa
         prompt_tokens_details=SimpleNamespace(cached_tokens=2000, cache_write_tokens=0),
     )
     response = SimpleNamespace(
-        id="chatcmpl-gpt-oss", model="openai.gpt-oss-120b-1:0", usage=usage, finish_reason="stop",
-        _hidden_params={"litellm_model_name": "bedrock/chat_completions/openai.gpt-oss-120b-1:0"},
+        id="chatcmpl-mantle-gpt", model="openai.gpt-5.5", usage=usage, finish_reason="stop",
+        _hidden_params={"litellm_model_name": "bedrock/mantle/openai.gpt-5.5"},
     )
 
     mw.handle_response(response, datetime.datetime.now(datetime.timezone.utc), {}, False,
@@ -314,7 +314,8 @@ def test_the_client_judges_the_deployment_not_the_stripped_response_model(payloa
 
 
 @pytest.mark.parametrize("streamed", [False, True], ids=["non-streamed", "streamed"])
-def test_a_bedrock_chat_completions_call_keeps_the_gross_count_streamed_or_not(streamed, payloads, monkeypatch):
+def test_a_bedrock_chat_completions_call_counts_its_cached_read_once_streamed_or_not(
+        streamed, payloads, monkeypatch):
     monkeypatch.setattr(fake_openai_upstream, "USAGE", {
         "prompt_tokens": 5012,
         "completion_tokens": 5,
@@ -324,7 +325,7 @@ def test_a_bedrock_chat_completions_call_keeps_the_gross_count_streamed_or_not(s
     server = fake_openai_upstream.start_upstream()
     try:
         endpoint = fake_openai_upstream.api_base(server)
-        kwargs = bedrock_kwargs(endpoint, "chat_completions/openai.gpt-oss-120b-1:0",
+        kwargs = bedrock_kwargs(endpoint, "chat_completions/us.openai.gpt-5.6-luna",
                                 api_base=endpoint, stream=streamed)
         if streamed:
             kwargs["stream_options"] = {"include_usage": True}
@@ -336,7 +337,7 @@ def test_a_bedrock_chat_completions_call_keeps_the_gross_count_streamed_or_not(s
         server.server_close()
 
     row = only_row(payloads)
-    assert row["input_token_count"] == 5012
+    assert row["input_token_count"] == 3012
     assert row["cache_read_token_count"] == 2000
 
 

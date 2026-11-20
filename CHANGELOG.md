@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-11-20
+
+### Fixed
+- LiteLLM guardrail, callback and client no longer count prompt-cache tokens twice for Claude called through LiteLLM's `bedrock_mantle/<model>` provider (BACK-6110). The row's input count is now only the uncached input; it used to keep the cache read and the cache write inside it as well, so a cache hit on Claude Haiku 4.5 was charged about 9 times too much and a cache write about 1.8 times. Claude through `bedrock/mantle/<model>` and through Converse was already counted once and is unchanged, and GPT and Grok models on `bedrock_mantle` are still sent as LiteLLM reports them.
+- LiteLLM guardrail, callback and client no longer count a cached prompt twice for GPT 5.6 and Grok called through LiteLLM's OpenAI-compatible Bedrock routes: the default route LiteLLM picks for these models, `bedrock/chat_completions/<model>` and `bedrock/openai/<model>` (BACK-6110). The cache read now comes out of the input count, as it already did on `bedrock/converse/<model>`. A call named by an in-Region OpenAI id with no `us.` or `global.` profile (`openai.gpt-5.6-luna`) is unchanged, because Revenium takes the read out itself for those.
+
 ## [0.16.0] - 2026-11-19
 
 ### Added
@@ -644,6 +650,7 @@ These can change what your application sees when you upgrade from 0.9.2. Each on
 - Selective metering via `REVENIUM_SELECTIVE_METERING` environment variable
 - Configurable logging with `REVENIUM_LOG_LEVEL`
 
+[0.16.1]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.16.1
 [0.16.0]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.16.0
 [0.15.0]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.15.0
 [0.14.0]: https://github.com/revenium/revenium-python-sdk/releases/tag/v0.14.0
